@@ -1,0 +1,23 @@
+{
+  "name": "global-quant-watch",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A local, read-only multi-market equity analysis dashboard for ASX, US stocks, and China A-shares.",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check app.js",
+    "check:providers": "node tools/check-providers.mjs"
+  },
+  "keywords": [
+    "stocks",
+    "asx",
+    "us-stocks",
+    "a-shares",
+    "quant",
+    "portfolio",
+    "technical-analysis"
+  ],
+  "author": "",
+  "license": "MIT"
+}
