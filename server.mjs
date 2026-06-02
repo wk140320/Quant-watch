@@ -24,7 +24,7 @@ loadLocalEnv();
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-06-02-learning-visibility-v25";
+const APP_VERSION = "2026-06-02-meta-label-oos-v30";
 const SERVER_STARTED_AT = new Date().toISOString();
 const providerBackoff = new Map();
 const marketResponseCache = new Map();
@@ -3806,32 +3806,72 @@ function liquidityFactor(candles) {
   };
 }
 
-function calibrationFactor(candles, horizon = 15, targetUpside = 5) {
+function strategyOutcomeWindow(rows, index, horizon = 15, targetUpside = 5, stopLoss = 4) {
+  const entry = Number(rows[index]?.close || 0);
+  const endIndex = Math.min(rows.length - 1, index + Math.max(1, Number(horizon || 15)));
+  if (!entry || index >= endIndex) return { targetWins: false, stopWins: false, forwardReturn: 0, maxUpside: 0, maxDrawdown: 0 };
+  const target = Math.max(0.5, Number(targetUpside || 5));
+  const stop = Math.max(0.8, Math.abs(Number(stopLoss || 4)));
+  let maxHigh = entry;
+  let minLow = entry;
+  let firstEvent = null;
+  for (let offset = index + 1; offset <= endIndex; offset += 1) {
+    const row = rows[offset];
+    const highReturn = pctChange(row.high || row.close, entry);
+    const lowReturn = pctChange(row.low || row.close, entry);
+    maxHigh = Math.max(maxHigh, Number(row.high || row.close));
+    minLow = Math.min(minLow, Number(row.low || row.close));
+    if (!firstEvent && highReturn >= target) firstEvent = "target";
+    if (!firstEvent && lowReturn <= -stop) firstEvent = "stop";
+  }
+  const maxUpside = pctChange(maxHigh, entry);
+  const maxDrawdown = pctChange(minLow, entry);
+  const hitTarget = maxUpside >= target;
+  const hitStop = maxDrawdown <= -stop;
+  return {
+    targetWins: hitTarget && (!hitStop || firstEvent === "target"),
+    stopWins: hitStop && (!hitTarget || firstEvent === "stop"),
+    forwardReturn: pctChange(rows[endIndex].close, entry),
+    maxUpside,
+    maxDrawdown,
+  };
+}
+
+function calibrationFactor(candles, horizon = 15, targetUpside = 5, stopLoss = 4) {
   const rows = sanitizeCandleRows(candles);
   if (rows.length < 90 + horizon) return { available: false, source: "walk-forward-local", score: 0, thesis: ["Not enough history for walk-forward calibration."] };
   let samples = 0;
   let hits = 0;
   let falseSignals = 0;
+  let stopFirst = 0;
+  const returns = [];
   for (let index = 55; index < rows.length - horizon - 1; index += 2) {
-    const close = rows[index].close;
     const ret20 = pctReturn(rows.slice(0, index + 1), 20);
-    const forwardMax = Math.max(...rows.slice(index + 1, index + horizon + 1).map((row) => row.close));
-    const reachedTarget = ((forwardMax - close) / close) * 100 >= targetUpside;
+    const ret5 = pctReturn(rows.slice(0, index + 1), 5);
     const signal = ret20 > 1.5;
     if (signal) {
+      const outcome = strategyOutcomeWindow(rows, index, horizon, targetUpside, stopLoss);
       samples += 1;
-      if (reachedTarget) hits += 1;
+      returns.push(outcome.forwardReturn);
+      if (outcome.targetWins) hits += 1;
+      else if (outcome.stopWins) {
+        falseSignals += 1;
+        stopFirst += 1;
+      }
       else falseSignals += 1;
+      if (ret5 > targetUpside * 0.8 && outcome.stopWins) stopFirst += 0.5;
     }
   }
   const hitRate = samples ? hits / samples * 100 : 0;
-  const score = samples ? Math.max(-10, Math.min(10, (hitRate - 50) / 4)) : 0;
+  const stopRate = samples ? stopFirst / samples * 100 : 0;
+  const avgReturn = mean(returns) ?? 0;
+  const score = samples ? Math.max(-10, Math.min(10, (hitRate - 52) / 4 + avgReturn * 0.18 - stopRate * 0.035)) : 0;
   return {
     available: samples > 5,
     source: "walk-forward-local-calibration",
     score,
-    thesis: samples > 5 ? [`Walk-forward calibration: ${hits}/${samples} comparable momentum signals reached +${targetUpside}% within ${horizon} days; hit rate ${hitRate.toFixed(0)}%.`] : ["Too few comparable signals for calibration."],
-    values: { samples, hits, falseSignals, hitRate },
+    thesis: samples > 5 ? [`Walk-forward calibration: ${hits}/${samples} comparable momentum signals reached +${targetUpside}% before stop-loss within ${horizon} days; hit rate ${hitRate.toFixed(0)}%, stop-first ${stopRate.toFixed(0)}%, avg return ${avgReturn.toFixed(2)}%.`] : ["Too few comparable signals for calibration."],
+    values: { samples, hits, falseSignals, hitRate, stopRate, avgReturn },
   };
 }
 
@@ -3891,7 +3931,7 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     flowOptions: get(5, (error) => ({ available: false, source: "flow-options-unavailable", score: 0, thesis: [`Flow/options factor unavailable: ${error.message || error}`] })),
     marketRegime: marketRegimeFactor(candles),
     liquidity: liquidityFactor(candles),
-    calibration: calibrationFactor(candles, Number(strategy.horizonDays || 15), Number(strategy.targetUpside || 5)),
+    calibration: calibrationFactor(candles, Number(strategy.horizonDays || 15), Number(strategy.targetUpside || 5), Number(strategy.stopLoss || 4)),
   };
   const signal = factorSignal(factors);
   const value = { symbol: normalizeMarketSymbol(symbol, key), market: key, source: "factor-layer", factors, signal };
@@ -4014,7 +4054,7 @@ function ensembleModel(name, confidence, projectedUpside, weight, available, rea
 }
 
 function fundamentalsView(fundamentals) {
-  if (!fundamentals) return ensembleModel("基本面估值", 0, 0, 0.11, false, "Fundamental provider returned no usable data.");
+  if (!fundamentals) return ensembleModel("基本面估值", 0, 0, 0.09, false, "Fundamental provider returned no usable data.");
   const pe = finiteNumber(fundamentals.peRatio, NaN);
   const forwardPe = finiteNumber(fundamentals.forwardPE, NaN);
   const dividendYieldRaw = finiteNumber(fundamentals.dividendYield, NaN);
@@ -4053,7 +4093,7 @@ function fundamentalsView(fundamentals) {
     "基本面估值",
     hasData ? 50 + score * 1.8 : 0,
     hasData ? score * 0.16 : 0,
-    0.11,
+    0.09,
     hasData,
     hasData ? reasons.join(" · ") : "Fundamental data was present but did not include PE, dividend, margin, or beta.",
     { pe, forwardPe, dividendYield, profitMargin, beta, score },
@@ -4078,7 +4118,7 @@ function breakoutVolatilityView(technicals, strategy = {}) {
     "突破波动模型",
     48 + score * 2.2,
     score * 0.18 + Math.min(2.2, target * 0.22),
-    0.1,
+    0.07,
     true,
     `Breakout/volatility score ${score.toFixed(1)} from trend ${trend.toFixed(0)}, momentum ${momentum.toFixed(0)}, volume ratio ${volume.toFixed(2)}, volatility ${volatility.toFixed(2)}.`,
     { score, trend, momentum, volume, volatility, change20d, rsi: rsiValue },
@@ -4098,11 +4138,338 @@ function riskRewardView(technicals, strategy = {}) {
     "风险收益模型",
     50 + score * 1.9,
     projected * 0.55 + score * 0.08,
-    0.1,
+    0.08,
     true,
     `Reward/risk ${rewardRisk.toFixed(2)}, stop ${stop.toFixed(1)}%, volatility ${volatility.toFixed(2)}, risk score ${riskScore.toFixed(0)}.`,
     { rewardRisk, volatility, riskScore, score },
   );
+}
+
+function openSourceStrategyReviewView({ technicals, analog, factor, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const trend = finiteNumber(technicals?.trendScore, 50);
+  const momentum = finiteNumber(technicals?.momentumScore, 50);
+  const volumeScore = finiteNumber(technicals?.volumeScore, 50);
+  const volumeRatio = finiteNumber(technicals?.volumeRatio, 1);
+  const riskScore = finiteNumber(technicals?.riskScore, 50);
+  const rsiValue = finiteNumber(technicals?.rsi, 50);
+  const macdHistogram = finiteNumber(technicals?.macdHistogram, 0);
+  const change5d = finiteNumber(technicals?.change5d, 0);
+  const volatility = finiteNumber(technicals?.volatility, 2);
+  const factorScore = finiteNumber(factor?.score, 0);
+  const analogCount = Number(analog?.count || 0);
+  const modelSampleCount = Number(analog?.model?.sampleCount || 0);
+  const targetHitRate = finiteNumber(analog?.targetHitRate ?? analog?.winRate, 0);
+  const directionalHitRate = finiteNumber(analog?.directionalHitRate ?? analog?.winRate, 0);
+  const strategyHitProbability = finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate ?? analog?.winRate, 0);
+  const stopRate = finiteNumber(analog?.stopRate, 0);
+  const riskAdjustedReturn = finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0);
+  const modelTargetHitAccuracy = finiteNumber(analog?.model?.targetHitAccuracy ?? analog?.model?.directionalAccuracy, 0);
+  const modelReturn = finiteNumber(analog?.model?.predictedReturn, 0);
+  const hasHistory = analogCount >= 5 || modelSampleCount >= 60;
+  if (!hasHistory) {
+    return ensembleModel(
+      "开源策略复核",
+      0,
+      0,
+      0.07,
+      false,
+      "No out-of-sample strategy history yet for Freqtrade/LEAN-style entry-risk review.",
+    );
+  }
+
+  let score = 0;
+  const reasons = [];
+  if (trend >= 58 && momentum >= 54) {
+    score += 6;
+    reasons.push("trend/momentum confirmation");
+  } else if (trend < 48 || momentum < 48) {
+    score -= 5;
+    reasons.push("trend or momentum weak");
+  }
+  if (volumeRatio >= 1.08 && volumeRatio <= 2.8 && volumeScore >= 50) score += 4;
+  else if (volumeRatio < 0.9) {
+    score -= 4;
+    reasons.push("weak participation");
+  }
+  if (rsiValue >= 42 && rsiValue <= 68) score += 3;
+  if (rsiValue > 76 || change5d > target * 1.15) {
+    score -= 6;
+    reasons.push("overbought/chasing risk");
+  }
+  if (macdHistogram > 0) score += 3;
+  else score -= 2;
+  if (riskScore < 42 || volatility > Math.max(3.8, stop * 0.9)) {
+    score -= 5;
+    reasons.push("volatility/drawdown risk");
+  }
+  if (analogCount >= 5) {
+    score += (directionalHitRate - 50) * 0.22;
+    score += (strategyHitProbability - 45) * 0.08;
+    score -= stopRate * 0.08;
+    if (riskAdjustedReturn > 0) score += Math.min(5, riskAdjustedReturn * 0.7);
+    else score += Math.max(-5, riskAdjustedReturn * 0.8);
+    reasons.push(`analog direction ${directionalHitRate.toFixed(0)}%, target-hit ${targetHitRate.toFixed(0)}%, stop-first ${stopRate.toFixed(0)}%`);
+  }
+  if (modelSampleCount >= 60) {
+    score += (modelTargetHitAccuracy - 52) * 0.18;
+    score += Math.max(-4, Math.min(4, modelReturn * 0.35));
+    reasons.push(`walk-forward target accuracy ${modelTargetHitAccuracy.toFixed(0)}%`);
+  }
+  if (factorScore > 4) score += 2;
+  if (factorScore < -4) score -= 3;
+
+  const projectedUpside = (finiteNumber(technicals?.projectedUpside, 0) * 0.22)
+    + (riskAdjustedReturn * 0.42)
+    + (modelReturn * 0.28)
+    + (factorScore * 0.04);
+  const confidence = 48 + score * 1.55;
+  return ensembleModel(
+    "开源策略复核",
+    confidence,
+    clampNumber(projectedUpside, -Math.max(stop, target * 1.2), target * 1.35),
+    0.07,
+    true,
+    `Freqtrade/LEAN-style review: ${reasons.slice(0, 4).join(" · ") || "neutral"}; score ${score.toFixed(1)}.`,
+    { score, directionalHitRate, strategyHitProbability, targetHitRate, stopRate, modelTargetHitAccuracy, modelReturn, riskAdjustedReturn },
+  );
+}
+
+function freqtradeDistilledView({ technicals, analog, factor, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const trend = finiteNumber(technicals?.trendScore, 50);
+  const momentum = finiteNumber(technicals?.momentumScore, 50);
+  const volumeRatio = finiteNumber(technicals?.volumeRatio, 1);
+  const rsiValue = finiteNumber(technicals?.rsi, 50);
+  const macdHistogram = finiteNumber(technicals?.macdHistogram, 0);
+  const change5d = finiteNumber(technicals?.change5d, 0);
+  const volatility = finiteNumber(technicals?.volatility, 2);
+  const factorScore = finiteNumber(factor?.score, 0);
+  const strategyProb = finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate, 0);
+  const stopRate = finiteNumber(analog?.stopRate, 0);
+  const riskReturn = finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0);
+  let score = 0;
+  const reasons = [];
+  if (trend >= 58 && momentum >= 54 && macdHistogram > 0) {
+    score += 9;
+    reasons.push("entry trend+momentum+MACD");
+  } else if (trend < 48 || momentum < 48) {
+    score -= 7;
+    reasons.push("entry filters weak");
+  }
+  if (volumeRatio >= 1.05 && volumeRatio <= 2.7) score += 4;
+  else if (volumeRatio < 0.9 || volumeRatio > 4) score -= 4;
+  if (rsiValue >= 42 && rsiValue <= 70) score += 3;
+  if (rsiValue > 76 || change5d > target * 1.2) score -= 7;
+  if (strategyProb >= 48) score += (strategyProb - 48) * 0.12;
+  if (stopRate >= 45) score -= (stopRate - 40) * 0.12;
+  if (volatility > stop * 0.9) score -= 4;
+  score += Math.max(-4, Math.min(4, riskReturn * 0.55 + factorScore * 0.08));
+  const projected = finiteNumber(technicals?.projectedUpside, 0) * 0.35 + riskReturn * 0.42 + factorScore * 0.04;
+  return ensembleModel(
+    "蒸馏-Freqtrade",
+    50 + score * 1.45,
+    clampNumber(projected, -Math.max(stop, target), target * 1.35),
+    0.11,
+    true,
+    `Freqtrade-style ROI/stop/entry filters: ${reasons.join(" · ") || "neutral"}; target-hit ${strategyProb.toFixed(0)}%, stop-first ${stopRate.toFixed(0)}%.`,
+    { distilled: true, family: "freqtrade", score, strategyProb, stopRate },
+  );
+}
+
+function leanFrameworkDistilledView({ technicals, factor, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const trend = finiteNumber(technicals?.trendScore, 50);
+  const momentum = finiteNumber(technicals?.momentumScore, 50);
+  const risk = finiteNumber(technicals?.riskScore, 50);
+  const volume = finiteNumber(technicals?.volumeScore, 50);
+  const volatility = finiteNumber(technicals?.volatility, 2);
+  const factorScore = finiteNumber(factor?.score, 0);
+  const alpha = (trend - 50) * 0.32 + (momentum - 50) * 0.28 + factorScore * 0.34;
+  const portfolio = (risk - 50) * 0.26 + (volume - 50) * 0.12;
+  const riskControl = volatility > stop ? -7 : volatility > stop * 0.7 ? -3 : 3;
+  const execution = volume >= 50 ? 2 : -3;
+  const score = alpha + portfolio + riskControl + execution;
+  const projected = alpha * 0.09 + portfolio * 0.04 + riskControl * 0.06;
+  return ensembleModel(
+    "蒸馏-LEAN风控",
+    50 + score * 1.25,
+    clampNumber(projected, -Math.max(stop, target), target * 1.25),
+    0.1,
+    true,
+    `LEAN-style Alpha/Portfolio/Risk/Execution split: alpha ${alpha.toFixed(1)}, risk ${riskControl.toFixed(1)}, execution ${execution.toFixed(1)}.`,
+    { distilled: true, family: "lean", score, alpha, portfolio, riskControl, execution },
+  );
+}
+
+function backtraderIndicatorDistilledView({ technicals, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const close = finiteNumber(technicals?.close, 0);
+  const sma20Value = finiteNumber(technicals?.sma20, close);
+  const sma50Value = finiteNumber(technicals?.sma50, close);
+  const rsiValue = finiteNumber(technicals?.rsi, 50);
+  const macdHistogram = finiteNumber(technicals?.macdHistogram, 0);
+  const volumeRatio = finiteNumber(technicals?.volumeRatio, 1);
+  const change20d = finiteNumber(technicals?.change20d, 0);
+  let score = 0;
+  const reasons = [];
+  if (close > sma20Value && sma20Value > sma50Value) {
+    score += 8;
+    reasons.push("close>SMA20>SMA50");
+  } else if (close < sma20Value && sma20Value < sma50Value) {
+    score -= 8;
+    reasons.push("close<SMA20<SMA50");
+  }
+  if (macdHistogram > 0) score += 4;
+  else score -= 4;
+  if (rsiValue >= 45 && rsiValue <= 68) score += 4;
+  else if (rsiValue > 75) score -= 5;
+  else if (rsiValue < 38) score -= 3;
+  if (volumeRatio >= 1.05) score += 2;
+  if (change20d > target * 3) score -= 3;
+  const projected = score * 0.16 + Math.max(-2, Math.min(2, change20d * 0.08));
+  return ensembleModel(
+    "蒸馏-Backtrader指标",
+    50 + score * 1.65,
+    clampNumber(projected, -Math.max(stop, target), target * 1.2),
+    0.09,
+    true,
+    `Backtrader-style indicator stack: ${reasons.join(" · ") || "mixed"}; RSI ${rsiValue.toFixed(0)}, volume ${volumeRatio.toFixed(2)}x.`,
+    { distilled: true, family: "backtrader", score, rsi: rsiValue, volumeRatio },
+  );
+}
+
+function hummingbotExecutionDistilledView({ technicals, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const volumeRatio = finiteNumber(technicals?.volumeRatio, 1);
+  const volatility = finiteNumber(technicals?.volatility, 2);
+  const riskScore = finiteNumber(technicals?.riskScore, 50);
+  const change5d = finiteNumber(technicals?.change5d, 0);
+  const momentum = finiteNumber(technicals?.momentumScore, 50);
+  let score = 0;
+  if (volumeRatio >= 1 && volumeRatio <= 2.8) score += 6;
+  else if (volumeRatio < 0.8) score -= 6;
+  if (volatility <= stop * 0.65) score += 4;
+  else if (volatility > stop) score -= 8;
+  if (riskScore >= 58) score += 4;
+  else if (riskScore < 42) score -= 5;
+  if (Math.abs(change5d) > target * 1.3) score -= 4;
+  if (momentum >= 55) score += 2;
+  const projected = score * 0.12 + Math.max(-1.5, Math.min(1.5, (momentum - 50) * 0.04));
+  return ensembleModel(
+    "蒸馏-Hummingbot执行",
+    50 + score * 1.55,
+    clampNumber(projected, -Math.max(stop, target), target),
+    0.07,
+    true,
+    `Hummingbot-style execution/liquidity review: volume ${volumeRatio.toFixed(2)}x, volatility ${volatility.toFixed(2)}, risk ${riskScore.toFixed(0)}.`,
+    { distilled: true, family: "hummingbot", score, volumeRatio, volatility, riskScore },
+  );
+}
+
+function finrlEnsembleDistilledView({ technicals, analog, macroSignal, factor, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const modelReturn = finiteNumber(analog?.model?.predictedReturn, 0);
+  const modelDirection = finiteNumber(analog?.model?.directionalAccuracy, 0);
+  const analogDirection = finiteNumber(analog?.directionalHitRate ?? analog?.winRate, 0);
+  const strategyProb = finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate, 0);
+  const techReturn = finiteNumber(technicals?.projectedUpside, 0);
+  const macroScore = finiteNumber(macroSignal?.score, 0);
+  const factorScore = finiteNumber(factor?.score, 0);
+  const reward = modelReturn * 0.36 + techReturn * 0.26 + factorScore * 0.08 + macroScore * 0.05;
+  const reliability = Math.max(modelDirection, analogDirection);
+  const policyBonus = strategyProb >= 50 ? 4 : strategyProb >= 42 ? 1.5 : -3;
+  const score = reward + (reliability - 50) * 0.16 + policyBonus;
+  return ensembleModel(
+    "蒸馏-FinRL集成",
+    48 + score * 1.5 + Math.max(0, reliability - 55) * 0.2,
+    clampNumber(reward, -Math.max(stop, target), target * 1.3),
+    0.1,
+    modelDirection > 0 || analogDirection > 0,
+    `FinRL-style train/validate/trade ensemble: reward ${reward.toFixed(2)}, reliability ${reliability.toFixed(0)}%, policy ${strategyProb.toFixed(0)}%.`,
+    { distilled: true, family: "finrl", score, reward, reliability, strategyProb },
+  );
+}
+
+function metaLabelOosDistilledView({ analog, technicals, strategy }) {
+  const model = analog?.model || {};
+  const sampleCount = Number(model.sampleCount || 0);
+  const oosSamples = Number(model.oosSampleCount || 0);
+  if (sampleCount < 60 || oosSamples < 8) {
+    return ensembleModel(
+      "蒸馏-MetaLabel样本外",
+      0,
+      0,
+      0.12,
+      false,
+      "Meta-label validation needs more walk-forward samples.",
+    );
+  }
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const predicted = finiteNumber(model.predictedReturn, 0);
+  const directionAccuracy = finiteNumber(model.oosDirectionalAccuracy ?? model.directionalAccuracy, 0);
+  const targetAccuracy = finiteNumber(model.oosTargetHitAccuracy ?? model.targetHitAccuracy, 0);
+  const metaTrade = finiteNumber(model.metaLabelProbability, 0);
+  const metaDirection = finiteNumber(model.metaDirectionalProbability, 0);
+  const p80 = finiteNumber(model.conformalP80Error, 4);
+  const p90 = finiteNumber(model.conformalP90Error, 6);
+  const currentVolatility = finiteNumber(technicals?.volatility, 2);
+  const uncertainty = p80 / Math.max(1, Math.abs(predicted), target * 0.35);
+  let score = 0;
+  score += (directionAccuracy - 50) * 0.28;
+  score += (metaDirection - 50) * 0.24;
+  score += (targetAccuracy - 50) * 0.12;
+  score += (metaTrade - 45) * 0.1;
+  score += Math.min(5, Math.abs(predicted) * 0.55);
+  score -= Math.min(12, uncertainty * 5.5);
+  if (p90 > Math.max(stop, target) * 1.25) score -= 4;
+  if (currentVolatility > stop) score -= 3;
+  const projected = predicted * clampNumber(1 - Math.min(0.45, uncertainty * 0.18), 0.55, 1);
+  return ensembleModel(
+    "蒸馏-MetaLabel样本外",
+    50 + score * 1.45,
+    clampNumber(projected, -Math.max(stop, target * 1.2), target * 1.35),
+    0.12,
+    true,
+    `Meta-label/OOS review: direction ${directionAccuracy.toFixed(0)}%, meta-direction ${metaDirection.toFixed(0)}%, trade-label ${metaTrade.toFixed(0)}%, P80 error ${p80.toFixed(2)}%.`,
+    { distilled: true, family: "meta-label", score, directionAccuracy, targetAccuracy, metaTrade, metaDirection, p80, p90, uncertainty },
+  );
+}
+
+function rebalanceModelAgreementWeights(models = []) {
+  const active = models.filter((model) => model.available && model.weight > 0 && Math.abs(Number(model.projectedUpside || 0)) >= 0.15);
+  if (active.length < 3) return { majority: "mixed", agreementRatio: 0, boosted: 0 };
+  const upsideCount = active.filter((model) => Number(model.projectedUpside || 0) > 0).length;
+  const downsideCount = active.filter((model) => Number(model.projectedUpside || 0) < 0).length;
+  const majority = upsideCount >= downsideCount ? "upside" : "downside";
+  const agreementCount = majority === "upside" ? upsideCount : downsideCount;
+  const agreementRatio = agreementCount / active.length;
+  let boosted = 0;
+  for (const model of models) {
+    model.baseWeight = model.weight;
+    if (!model.available || model.weight <= 0 || Math.abs(Number(model.projectedUpside || 0)) < 0.15) continue;
+    const direction = Number(model.projectedUpside || 0) > 0 ? "upside" : "downside";
+    if (direction === majority && agreementRatio >= 0.55) {
+      const familyBoost = model.values?.family === "meta-label" ? 0.12 : model.values?.distilled ? 0.08 : 0.03;
+      const uncertaintyPenalty = model.values?.family === "meta-label" && Number(model.values?.uncertainty || 0) > 1.6 ? 0.08 : 0;
+      const boost = clampNumber((agreementRatio - 0.5) * 0.72 + familyBoost - uncertaintyPenalty, 0.03, 0.38);
+      model.weight = Number((model.weight * (1 + boost)).toFixed(4));
+      model.values = { ...(model.values || {}), agreementBoost: Number(boost.toFixed(3)) };
+      boosted += 1;
+    } else if (agreementRatio >= 0.68) {
+      const cut = clampNumber((agreementRatio - 0.58) * 0.45, 0.02, 0.18);
+      model.weight = Number((model.weight * (1 - cut)).toFixed(4));
+      model.values = { ...(model.values || {}), agreementCut: Number(cut.toFixed(3)) };
+    }
+  }
+  return { majority, agreementRatio: Number((agreementRatio * 100).toFixed(0)), boosted };
 }
 
 function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, factor, fundamentals, strategy }) {
@@ -4116,41 +4483,79 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   const targetUpside = finiteNumber(strategy?.targetUpside, 5);
   const analogCount = Number(analog?.count || 0);
   const modelSampleCount = Number(analog?.model?.sampleCount || 0);
+  const analogHitRate = finiteNumber(analog?.targetHitRate ?? analog?.winRate, 0);
+  const analogDirectionHitRate = finiteNumber(analog?.directionalHitRate ?? analog?.winRate, 0);
+  const analogStrategyHitProbability = finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate ?? analog?.winRate, 0);
+  const analogRiskAdjustedReturn = finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0);
+  const analogStopRate = finiteNumber(analog?.stopRate, 0);
+  const modelTargetHitAccuracy = finiteNumber(analog?.model?.targetHitAccuracy ?? analog?.model?.directionalAccuracy, 0);
+  const modelDirectionalAccuracy = finiteNumber(analog?.model?.directionalAccuracy, 0);
+  const modelPredictedReturn = finiteNumber(analog?.model?.predictedReturn, 0);
   const macroChecked = Number(macroSignal?.checkedItems || 0);
   const socialChecked = Number(socialSignal?.checkedItems || 0);
   const factorChecked = Number(factor?.checked || 0);
+  const analogReliable = analogCount >= 5;
+  const modelReliable = modelSampleCount >= 60;
+  const samplePower = Math.max(
+    analogReliable ? Math.min(0.45, analogCount / 18) : 0,
+    modelReliable ? Math.min(0.85, modelSampleCount / 260) : 0,
+  );
+  const reliabilityInputs = [
+    analogReliable ? { value: analogDirectionHitRate, weight: Math.min(0.45, analogCount / 18) } : null,
+    modelReliable ? { value: modelDirectionalAccuracy || modelTargetHitAccuracy, weight: Math.min(0.85, modelSampleCount / 260) } : null,
+  ].filter(Boolean);
+  const strategyInputs = [
+    analogReliable ? { value: analogStrategyHitProbability, weight: Math.min(0.45, analogCount / 18) } : null,
+    modelReliable ? { value: modelTargetHitAccuracy, weight: Math.min(0.85, modelSampleCount / 260) } : null,
+  ].filter(Boolean);
+  const reliabilityWeight = reliabilityInputs.reduce((sum, item) => sum + item.weight, 0) || 1;
+  const strategyWeight = strategyInputs.reduce((sum, item) => sum + item.weight, 0) || 1;
+  const historyReliability = reliabilityInputs.length
+    ? reliabilityInputs.reduce((sum, item) => sum + item.value * item.weight, 0) / reliabilityWeight
+    : 0;
+  const strategyHitProbability = strategyInputs.length
+    ? strategyInputs.reduce((sum, item) => sum + item.value * item.weight, 0) / strategyWeight
+    : 0;
+  const historySupportsUpside = (
+    (analogReliable && analogStrategyHitProbability >= 52 && analogRiskAdjustedReturn > 0 && analogStopRate <= 42)
+    || (modelReliable && modelTargetHitAccuracy >= 56 && modelPredictedReturn > targetUpside * 0.2)
+  );
+  const historyWarnsUpside = (
+    (analogReliable && (analogStrategyHitProbability < 38 || analogRiskAdjustedReturn < -0.45 || analogStopRate >= 48))
+    || (modelReliable && modelTargetHitAccuracy < 52 && modelPredictedReturn < targetUpside * 0.2)
+  );
   const models = [
     ensembleModel(
       "技术面模型",
       technicalScore,
       finiteNumber(technicals?.projectedUpside, 0),
-      0.28,
+      0.2,
       true,
       `Trend ${finiteNumber(technicals?.trendScore, 50).toFixed(0)}, momentum ${finiteNumber(technicals?.momentumScore, 50).toFixed(0)}, volume ${finiteNumber(technicals?.volumeScore, 50).toFixed(0)}, risk ${finiteNumber(technicals?.riskScore, 50).toFixed(0)}.`,
     ),
     ensembleModel(
       "历史相似模型",
       finiteNumber(analog?.confidence, 0),
-      finiteNumber(analog?.averageForwardReturn, 0),
-      0.17,
+      finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0),
+      0.22,
       analogCount > 0,
-      analogCount ? `${analogCount} similar windows, win rate ${finiteNumber(analog?.winRate, 0).toFixed(0)}%.` : "Not enough similar historical windows.",
-      { count: analogCount, winRate: finiteNumber(analog?.winRate, 0) },
+      analogCount ? `${analogCount} similar windows, directional hit rate ${analogDirectionHitRate.toFixed(0)}%, strategy target hit rate ${analogStrategyHitProbability.toFixed(0)}%, stop-first rate ${analogStopRate.toFixed(0)}%.` : "Not enough similar historical windows.",
+      { count: analogCount, winRate: finiteNumber(analog?.winRate, 0), directionalHitRate: analogDirectionHitRate, targetHitRate: analogHitRate, strategyHitProbability: analogStrategyHitProbability, stopRate: analogStopRate },
     ),
     ensembleModel(
       "自监督回测模型",
       finiteNumber(analog?.model?.confidence, 0),
-      finiteNumber(analog?.model?.predictedReturn, 0),
-      0.12,
+      modelPredictedReturn,
+      0.18,
       modelSampleCount > 0,
-      modelSampleCount ? `${modelSampleCount} walk-forward samples, directional accuracy ${finiteNumber(analog?.model?.directionalAccuracy, 0).toFixed(0)}%, MAE ${finiteNumber(analog?.model?.mae, 0).toFixed(2)}%.` : "Self-supervised sample set is still too small.",
-      { sampleCount: modelSampleCount, directionalAccuracy: finiteNumber(analog?.model?.directionalAccuracy, 0), mae: finiteNumber(analog?.model?.mae, 0) },
+      modelSampleCount ? `${modelSampleCount} walk-forward samples, target-hit accuracy ${modelTargetHitAccuracy.toFixed(0)}%, directional accuracy ${finiteNumber(analog?.model?.directionalAccuracy, 0).toFixed(0)}%, MAE ${finiteNumber(analog?.model?.mae, 0).toFixed(2)}%.` : "Self-supervised sample set is still too small.",
+      { sampleCount: modelSampleCount, targetHitAccuracy: modelTargetHitAccuracy, directionalAccuracy: finiteNumber(analog?.model?.directionalAccuracy, 0), mae: finiteNumber(analog?.model?.mae, 0) },
     ),
     ensembleModel(
       "新闻社媒模型",
       50 + finiteNumber(macroSignal?.score, 0) * 1.1 + finiteNumber(socialSignal?.score, 0) * 0.75,
       finiteNumber(macroSignal?.score, 0) * 0.07 + finiteNumber(socialSignal?.score, 0) * 0.04,
-      0.14,
+      0.08,
       macroChecked + socialChecked > 0,
       macroChecked + socialChecked ? `News ${macroSignal?.stance || "mixed"}, social ${socialSignal?.stance || "mixed"}; checked ${macroChecked + socialChecked} items.` : "No fresh news/social items available.",
       { macroScore: finiteNumber(macroSignal?.score, 0), socialScore: finiteNumber(socialSignal?.score, 0), checked: macroChecked + socialChecked },
@@ -4159,15 +4564,23 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
       "因子模型",
       50 + finiteNumber(factor?.score, 0) * 1.45,
       finiteNumber(factor?.score, 0) * 0.12,
-      0.18,
+      0.16,
       factorChecked > 0,
       factorChecked ? `Factor stance ${factor?.stance || "mixed"}, score ${finiteNumber(factor?.score, 0).toFixed(1)}, groups ${factorChecked}.` : "No live factor groups available.",
       { score: finiteNumber(factor?.score, 0), checked: factorChecked },
     ),
+    freqtradeDistilledView({ technicals, analog, factor, strategy }),
+    leanFrameworkDistilledView({ technicals, factor, strategy }),
+    backtraderIndicatorDistilledView({ technicals, strategy }),
+    hummingbotExecutionDistilledView({ technicals, strategy }),
+    finrlEnsembleDistilledView({ technicals, analog, macroSignal, factor, strategy }),
+    metaLabelOosDistilledView({ analog, technicals, strategy }),
+    openSourceStrategyReviewView({ technicals, analog, factor, strategy }),
     breakoutVolatilityView(technicals, strategy),
     riskRewardView(technicals, strategy),
     fundamentalsView(fundamentals),
   ];
+  const agreementWeighting = rebalanceModelAgreementWeights(models);
   const available = models.filter((model) => model.available && model.weight > 0);
   const totalWeight = available.reduce((sum, model) => sum + model.weight, 0) || 1;
   for (const model of models) {
@@ -4181,8 +4594,11 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   const downsideWeight = directional.filter((model) => model.projectedUpside < 0).reduce((sum, model) => sum + model.normalizedWeight, 0);
   const upsideAgreement = upsideWeight / directionalWeight;
   const consensusAgreement = Math.max(upsideWeight, downsideWeight) / directionalWeight;
-  const targetFit = Math.max(-10, Math.min(8, (weightedUpside - targetUpside * 0.45) * 1.2));
-  const agreementAdjustment = (upsideAgreement - 0.5) * 16;
+  const directionalStrength = Math.abs(weightedUpside);
+  const targetFit = weightedUpside >= 0
+    ? Math.max(-5, Math.min(7, (directionalStrength - targetUpside * 0.3) * 0.9))
+    : Math.max(-4, Math.min(7, (directionalStrength - targetUpside * 0.18) * 0.9));
+  const agreementAdjustment = (consensusAgreement - 0.5) * 18;
   const upsideMean = weightedUpside;
   const dispersion = Math.sqrt(models.reduce((sum, model) => sum + ((model.projectedUpside - upsideMean) ** 2) * model.normalizedWeight, 0));
   const disagreementPenalty = Math.min(9, dispersion * 1.15);
@@ -4199,6 +4615,21 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     targetFit: Number(targetFit.toFixed(2)),
     disagreementPenalty: Number(disagreementPenalty.toFixed(2)),
     evidenceBonus: Number(evidenceBonus.toFixed(2)),
+    agreementWeighting,
+    historyGate: {
+      samplePower: Number(samplePower.toFixed(2)),
+      reliability: Number(historyReliability.toFixed(1)),
+      strategyHitProbability: Number(strategyHitProbability.toFixed(1)),
+      analogDirectionalHitRate: Number(analogDirectionHitRate.toFixed(1)),
+      analogTargetHitRate: Number(analogHitRate.toFixed(1)),
+      analogStopRate: Number(analogStopRate.toFixed(1)),
+      modelDirectionalAccuracy: Number(modelDirectionalAccuracy.toFixed(1)),
+      modelTargetHitAccuracy: Number(modelTargetHitAccuracy.toFixed(1)),
+      supportsUpside: historySupportsUpside,
+      blocksUpside: historyWarnsUpside,
+      modelPredictedReturn: Number(modelPredictedReturn.toFixed(2)),
+      analogRiskAdjustedReturn: Number(analogRiskAdjustedReturn.toFixed(2)),
+    },
     models,
   };
 }
@@ -4209,8 +4640,13 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   const upsideAgreement = Number(ensemble.upsideAgreement || 0);
   const disagreement = Number(ensemble.disagreementPenalty || 0);
   const evidenceBonus = Number(ensemble.evidenceBonus || 0);
+  const historyGate = ensemble.historyGate || {};
   const target = Math.max(1, Number(targetUpside || 5));
   const minTradeConfidence = Math.max(Number(targetConfidence || 80), 72);
+  const historySamplePower = Number(historyGate.samplePower || 0);
+  const historyReliability = Number(historyGate.reliability || 0);
+  const strategyHitProbability = Number(historyGate.strategyHitProbability || 0);
+  const historyOkForBuy = historySamplePower >= 0.25 && strategyHitProbability >= 48 && historyReliability >= 52 && !historyGate.blocksUpside;
 
   let shrink = 0.68;
   if (consensus >= 78) shrink += 0.14;
@@ -4222,6 +4658,10 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   if (disagreement > 5) shrink -= Math.min(0.18, (disagreement - 5) * 0.035);
   if (marketValidation?.degraded) shrink -= 0.1;
   if (calibration?.sampleCount >= 5 && Number(calibration.confidence || 0) < Number(score || 0)) shrink -= 0.05;
+  if (Number(projectedUpsideRaw || 0) > 0 && historySamplePower >= 0.25) {
+    if (historyOkForBuy) shrink += 0.06;
+    else shrink -= 0.18;
+  }
   shrink = clampNumber(shrink, 0.42, 0.9);
 
   const positiveCap = consensus >= 78 && upsideAgreement >= 65
@@ -4260,17 +4700,25 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     confidenceCap = Math.min(confidenceCap, 84);
     reasons.push("历史校准样本仍在收集");
   }
+  if (Number(projectedUpsideRaw || 0) > 0 && historySamplePower < 0.25) {
+    reasons.push("样本外策略达标验证不足");
+  } else if (Number(projectedUpsideRaw || 0) > 0 && !historyOkForBuy) {
+    if (historyReliability > 0 && historyReliability < 45) confidenceCap = Math.min(confidenceCap, 58);
+    reasons.push(`策略达标概率不足 ${strategyHitProbability ? `${strategyHitProbability.toFixed(0)}%` : "样本不足"}`);
+  }
 
   let confidenceBonus = 0;
   if (consensus >= 76 && availableModelCount >= 5 && disagreement <= 4) confidenceBonus += 2;
   if (calibration?.sampleCount >= 5 && Number(calibration.confidence || 0) >= Number(score || 0)) confidenceBonus += 1.5;
+  if (historyOkForBuy && consensus >= 66) confidenceBonus += 2;
   const confidence = Math.round(Math.min(confidenceCap, Number(score || 0) + confidenceBonus));
   const buyEligible = confidence >= minTradeConfidence
     && projectedUpside >= target
     && consensus >= 62
     && upsideAgreement >= 58
     && availableModelCount >= 4
-    && disagreement <= 7.5;
+    && disagreement <= 7.5
+    && historyOkForBuy;
 
   return {
     confidence,
@@ -4282,6 +4730,11 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     buyEligible,
     blocked: !buyEligible,
     reasons,
+    historyGate: {
+      ...historyGate,
+      okForBuy: historyOkForBuy,
+      strategyHitProbability: Number(strategyHitProbability.toFixed(1)),
+    },
   };
 }
 
@@ -4414,6 +4867,9 @@ function localAnalysis(input) {
       `Conservative calibration: projected upside shrink ${conservative.shrink}x, confidence cap ${conservative.confidenceCap}%, ${conservative.buyEligible ? "high-conviction gate passed" : `high-conviction gate blocked (${conservative.reasons.join("、") || "证据仍不足"})`}.`,
       positiveAgreement ? "Most available models agree on upside direction." : negativeAgreement ? "Most available models agree on downside risk." : "Forecast engines are mixed; confidence is constrained.",
       analog?.count ? `Historical analogs: ${analog.count} similar windows, average ${Number(analog.averageForwardReturn || 0).toFixed(2)}% over the strategy horizon, win rate ${Number(analog.winRate || 0).toFixed(0)}%.` : "Not enough historical analog windows were available.",
+      ensemble.historyGate?.samplePower >= 0.25
+        ? `Reliability split: directional reliability ${Number(ensemble.historyGate.reliability || 0).toFixed(0)}%, strategy-hit probability ${Number(ensemble.historyGate.strategyHitProbability || 0).toFixed(0)}%, analog target-hit ${Number(ensemble.historyGate.analogTargetHitRate || 0).toFixed(0)}%, self-supervised target-hit accuracy ${Number(ensemble.historyGate.modelTargetHitAccuracy || 0).toFixed(0)}%; ${ensemble.historyGate.supportsUpside ? "supports upside" : ensemble.historyGate.blocksUpside ? "blocks upside" : "neutral"}.`
+        : "Strategy hit validation: not enough out-of-sample history to lift confidence.",
       fundamentals ? `Fundamentals checked: PE ${fundamentals.peRatio || "n/a"}, dividend yield ${fundamentals.dividendYield || "n/a"}, beta ${fundamentals.beta || "n/a"}.` : "Fundamental data was not available from the configured provider.",
       news.length ? `Macro/industry/news signal: ${macroSignal.stance}, score ${macroSignal.score}, checked ${macroSignal.checkedItems} multi-source items across direct, peer, upstream, sector, macro, and global channels.` : "No fresh macro or company news was available from the configured provider.",
       ...(macroSignal.influences || []).slice(0, 3).map((item) => `News impact ${item.channel || "mixed"} (${item.source || "source"}, weight ${item.weight}): ${item.title}`),
@@ -4627,13 +5083,30 @@ function compactAiInput(input) {
       confidence: compactNumber(analog.confidence),
       averageForwardReturn: compactNumber(analog.averageForwardReturn),
       winRate: compactNumber(analog.winRate),
+      directionalHitRate: compactNumber(analog.directionalHitRate),
+      strategyHitProbability: compactNumber(analog.strategyHitProbability),
+      targetHitRate: compactNumber(analog.targetHitRate),
+      stopRate: compactNumber(analog.stopRate),
+      averageRiskAdjustedReturn: compactNumber(analog.averageRiskAdjustedReturn),
       modelPredictedReturn: compactNumber(model.predictedReturn),
       modelConfidence: compactNumber(model.confidence),
       modelMae: compactNumber(model.mae),
       modelDirectionalAccuracy: compactNumber(model.directionalAccuracy),
+      modelTargetHitAccuracy: compactNumber(model.targetHitAccuracy),
+      modelOosSamples: Number(model.oosSampleCount || 0),
+      modelOosDirectionalAccuracy: compactNumber(model.oosDirectionalAccuracy),
+      modelOosTargetHitAccuracy: compactNumber(model.oosTargetHitAccuracy),
+      metaLabelProbability: compactNumber(model.metaLabelProbability),
+      metaDirectionalProbability: compactNumber(model.metaDirectionalProbability),
+      conformalP80Error: compactNumber(model.conformalP80Error),
+      conformalP90Error: compactNumber(model.conformalP90Error),
       examples: (analog.examples || []).slice(0, 3).map((item) => ({
         date: item.date,
         forwardReturn: compactNumber(item.forwardReturn),
+        maxUpside: compactNumber(item.maxUpside),
+        maxDrawdown: compactNumber(item.maxDrawdown),
+        targetWins: Boolean(item.targetWins),
+        stopWins: Boolean(item.stopWins),
         distance: compactNumber(item.distance, 4),
       })),
     },
@@ -4838,49 +5311,80 @@ async function openAiBatchAnalysis(items) {
     return { results: localResults, source: "local-rules" };
   }
 
+  const maxAiItems = Math.max(3, Math.min(18, Number(process.env.OPENAI_BATCH_MAX_ITEMS || 10)));
+  const reviewRows = inputs
+    .map((input, index) => {
+      const analysis = localResults[index].analysis || {};
+      const ensemble = analysis.ensemble || {};
+      const action = String(analysis.action || "");
+      const highImpact = Boolean(input.holding)
+        || ["STRONG_BUY", "WATCH_BUY", "LIGHT_BUY", "STRONG_AVOID", "CRITICAL_SELL", "AVOID_OR_REDUCE"].includes(action)
+        || Number(analysis.projectedUpside || 0) >= Number(input.strategy?.targetUpside || 5) * 0.45
+        || Number(analysis.downsideConfidence || 0) >= 58
+        || Number(ensemble.disagreementPenalty || 0) >= 5
+        || Number(ensemble.consensusAgreement || 0) < 62;
+      const priority = (input.holding ? 35 : 0)
+        + Math.abs(Number(analysis.projectedUpside || 0)) * 4
+        + Number(analysis.confidence || 0) * 0.18
+        + Number(analysis.downsideConfidence || 0) * 0.18
+        + Number(ensemble.disagreementPenalty || 0) * 2.2
+        + (action.includes("BUY") || action.includes("AVOID") || action.includes("SELL") ? 12 : 0);
+      return { input, local: localResults[index], index, highImpact, priority };
+    })
+    .filter((row) => row.highImpact)
+    .sort((a, b) => b.priority - a.priority)
+    .slice(0, maxAiItems);
+
+  if (!reviewRows.length) {
+    return { results: localResults, source: "local-rules-no-ai-candidates" };
+  }
+
   try {
     const parsed = await callOpenAiJson([
       {
         role: "system",
-        content: "You are a cautious multi-market portfolio analyst covering ASX, US stocks, and China A-shares. Analyze all rows together for speed and consistency. Respect calibrationSummary, recent learning events, and adaptive penalties; when past similar forecasts failed, lower confidence or shrink upside rather than forcing a bullish pick. Return JSON only: {\"results\":[{\"symbol\":\"BHP\",\"confidence\":0-99,\"projectedUpside\":number,\"horizonDays\":number,\"thesis\":[...],\"risks\":[...]}]}. Use global macro/news/social context where relevant. Do not decide trade size or final action; the app applies user strategy and capital rules.",
+        content: "You are a fast cautious multi-market portfolio reviewer. Review only high-impact rows. Keep confidence as directional prediction reliability; keep strategy target-hit probability separate in reasoning. Respect local baselines, calibration, and adaptive penalties. Return JSON only: {\"results\":[{\"symbol\":\"BHP\",\"confidence\":0-99,\"projectedUpside\":number,\"horizonDays\":number,\"thesis\":[...],\"risks\":[...]}]}. Be concise.",
       },
       {
         role: "user",
         content: JSON.stringify({
           generatedAt: new Date().toISOString(),
-          stocks: inputs.map((input, index) => ({
+          skippedCount: inputs.length - reviewRows.length,
+          stocks: reviewRows.map(({ input, local }) => ({
             ...compactAiInput(input),
             localRuleBaseline: {
-              confidence: localResults[index].analysis.confidence,
-              projectedUpside: localResults[index].analysis.projectedUpside,
-              action: localResults[index].analysis.action,
-              ensemble: localResults[index].analysis.ensemble ? {
-                direction: localResults[index].analysis.ensemble.direction,
-                upsideAgreement: localResults[index].analysis.ensemble.upsideAgreement,
-                consensusAgreement: localResults[index].analysis.ensemble.consensusAgreement,
+              confidence: local.analysis.confidence,
+              projectedUpside: local.analysis.projectedUpside,
+              action: local.analysis.action,
+              ensemble: local.analysis.ensemble ? {
+                direction: local.analysis.ensemble.direction,
+                upsideAgreement: local.analysis.ensemble.upsideAgreement,
+                consensusAgreement: local.analysis.ensemble.consensusAgreement,
+                strategyHitProbability: local.analysis.qualityGate?.historyGate?.strategyHitProbability,
               } : null,
             },
           })),
         }),
       },
-    ], Number(process.env.OPENAI_BATCH_TIMEOUT_MS || 10000));
+    ], Number(process.env.OPENAI_BATCH_TIMEOUT_MS || 5500));
     const rows = Array.isArray(parsed.results) ? parsed.results : [];
     const batchMarket = safeMarket(inputs[0]?.market || "ASX");
     const bySymbol = new Map(rows.map((row) => [cleanCode(row.symbol, batchMarket), row]));
-    const results = inputs.map((input, index) => {
-      const row = bySymbol.get(cleanCode(input.symbol, input.market || batchMarket)) || rows[index];
-      if (!row) return localAnalysisEnvelope(input, "local-rules-openai-partial");
-      const baseline = localResults[index].analysis;
+    const results = [...localResults];
+    reviewRows.forEach(({ input, local, index }, reviewIndex) => {
+      const row = bySymbol.get(cleanCode(input.symbol, input.market || batchMarket)) || rows[reviewIndex];
+      if (!row) return;
+      const baseline = local.analysis;
       const aiEstimate = blendAiWithBaseline({ ...row, symbol: input.symbol }, baseline);
       if (!aiEstimate.thesis.length) aiEstimate.thesis = baseline.thesis?.slice(0, 5) || [];
       if (!aiEstimate.risks.length) aiEstimate.risks = baseline.risks?.slice(0, 5) || [];
-      return {
+      results[index] = {
         symbol: input.symbol,
         analysis: strategyDecision(aiEstimate, input),
         source: "openai-batch-ensemble",
       };
     });
-    return { results, source: "openai-batch" };
+    return { results, source: `openai-batch-top-${reviewRows.length}` };
   } catch (error) {
     const results = inputs.map((input) => {
       const fallback = localAnalysis(input);

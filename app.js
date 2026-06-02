@@ -992,10 +992,53 @@ function computeMacdSeries(candles) {
   return { macd, signal, histogram };
 }
 
-function computeHistoricalAnalog(candles, lookback = 15, horizon = 15) {
+function forwardStrategyOutcome(rows, startIndex, horizon = 15, strategy = {}) {
+  const entry = Number(rows[startIndex]?.close || 0);
+  const targetUpside = Math.max(0.5, Number(strategy.targetUpside || 5));
+  const stopLoss = Math.max(0.8, Math.abs(Number(strategy.stopLoss || 4)));
+  const endIndex = Math.min(rows.length - 1, startIndex + Math.max(1, Number(horizon || 15)));
+  if (!entry || startIndex >= endIndex) {
+    return { forwardReturn: 0, maxUpside: 0, maxDrawdown: 0, targetWins: false, stopWins: false, hitTarget: false, hitStop: false };
+  }
+
+  let maxHigh = entry;
+  let minLow = entry;
+  let firstEvent = null;
+  for (let index = startIndex + 1; index <= endIndex; index += 1) {
+    const row = rows[index];
+    const highReturn = pctChange(row.high || row.close, entry);
+    const lowReturn = pctChange(row.low || row.close, entry);
+    maxHigh = Math.max(maxHigh, row.high || row.close);
+    minLow = Math.min(minLow, row.low || row.close);
+    if (!firstEvent && highReturn >= targetUpside) firstEvent = "target";
+    if (!firstEvent && lowReturn <= -stopLoss) firstEvent = "stop";
+  }
+
+  const forwardReturn = pctChange(rows[endIndex].close, entry);
+  const maxUpside = pctChange(maxHigh, entry);
+  const maxDrawdown = pctChange(minLow, entry);
+  const hitTarget = maxUpside >= targetUpside;
+  const hitStop = maxDrawdown <= -stopLoss;
+  return {
+    forwardReturn,
+    maxUpside,
+    maxDrawdown,
+    hitTarget,
+    hitStop,
+    targetWins: hitTarget && (!hitStop || firstEvent === "target"),
+    stopWins: hitStop && (!hitTarget || firstEvent === "stop"),
+    riskAdjustedReturn: hitTarget && (!hitStop || firstEvent === "target")
+      ? Math.min(maxUpside, targetUpside)
+      : hitStop && (!hitTarget || firstEvent === "stop")
+        ? -stopLoss
+        : forwardReturn,
+  };
+}
+
+function computeHistoricalAnalog(candles, lookback = 15, horizon = 15, strategy = getStrategy()) {
   const rows = normalizeCandles(candles);
   if (rows.length < lookback * 3 + horizon) {
-    return { count: 0, confidence: 0, averageForwardReturn: 0, winRate: 0, examples: [] };
+    return { count: 0, confidence: 0, averageForwardReturn: 0, winRate: 0, targetHitRate: 0, examples: [] };
   }
   const closes = rows.map((row) => row.close);
   const volumes = rows.map((row) => row.volume || 0);
@@ -1013,22 +1056,33 @@ function computeHistoricalAnalog(candles, lookback = 15, horizon = 15) {
   const matches = [];
   for (let end = lookback; end < rows.length - horizon - 1; end += 1) {
     const dist = distance(target, vectorAt(end));
-    const forwardReturn = pctChange(closes[end + horizon], closes[end]);
+    const outcome = forwardStrategyOutcome(rows, end, horizon, strategy);
     matches.push({
       date: rows[end].date,
       distance: dist,
-      forwardReturn,
+      forwardReturn: outcome.forwardReturn,
+      maxUpside: outcome.maxUpside,
+      maxDrawdown: outcome.maxDrawdown,
+      targetWins: outcome.targetWins,
+      stopWins: outcome.stopWins,
+      riskAdjustedReturn: outcome.riskAdjustedReturn,
       close: closes[end],
     });
   }
   const best = matches.sort((a, b) => a.distance - b.distance).slice(0, 8);
   const averageForwardReturn = best.reduce((sum, item) => sum + item.forwardReturn, 0) / best.length;
+  const averageRiskAdjustedReturn = best.reduce((sum, item) => sum + item.riskAdjustedReturn, 0) / best.length;
   const winRate = best.filter((item) => item.forwardReturn > 0).length / best.length * 100;
-  const confidence = clamp(35 + winRate * 0.35 + averageForwardReturn * 3 - (best[0]?.distance || 0) * 10, 0, 95);
-  const model = computeSelfSupervisedForecast(rows, horizon);
+  const targetHitRate = best.filter((item) => item.targetWins).length / best.length * 100;
+  const stopRate = best.filter((item) => item.stopWins).length / best.length * 100;
+  const downsideRate = best.filter((item) => item.forwardReturn < 0 || item.stopWins).length / best.length * 100;
+  const directionalHitRate = averageRiskAdjustedReturn >= 0 ? winRate : downsideRate;
+  const strategyHitProbability = averageRiskAdjustedReturn >= 0 ? targetHitRate : Math.max(stopRate, downsideRate);
+  const confidence = clamp(34 + directionalHitRate * 0.42 + strategyHitProbability * 0.12 + Math.abs(averageRiskAdjustedReturn) * 1.6 - (best[0]?.distance || 0) * 8, 0, 95);
+  const model = computeSelfSupervisedForecast(rows, horizon, strategy);
   const blendedReturn = model.sampleCount
-    ? averageForwardReturn * 0.55 + model.predictedReturn * 0.45
-    : averageForwardReturn;
+    ? averageRiskAdjustedReturn * 0.58 + model.predictedReturn * 0.42
+    : averageRiskAdjustedReturn;
   const blendedConfidence = model.sampleCount
     ? clamp(confidence * 0.58 + model.confidence * 0.42, 0, 95)
     : confidence;
@@ -1037,6 +1091,12 @@ function computeHistoricalAnalog(candles, lookback = 15, horizon = 15) {
     confidence: blendedConfidence,
     averageForwardReturn: blendedReturn,
     winRate,
+    targetHitRate,
+    stopRate,
+    downsideRate,
+    directionalHitRate,
+    strategyHitProbability,
+    averageRiskAdjustedReturn,
     model,
     examples: best.slice(0, 5),
   };
@@ -1068,16 +1128,17 @@ function featureVector(candles, end) {
   ].map((value) => Number.isFinite(value) ? value : 0);
 }
 
-function computeSelfSupervisedForecast(candles, horizon) {
+function computeSelfSupervisedForecast(candles, horizon, strategy = getStrategy()) {
   const rows = normalizeCandles(candles);
   if (rows.length < 95 + horizon) {
-    return { sampleCount: 0, predictedReturn: 0, confidence: 0, mae: 0, directionalAccuracy: 0 };
+    return { sampleCount: 0, predictedReturn: 0, confidence: 0, mae: 0, directionalAccuracy: 0, targetHitAccuracy: 0 };
   }
   const latest = rows.at(-1) || {};
-  const cacheKey = `${latest.date}:${latest.close}:${latest.volume}:stacked:${horizon}:${rows.length}`;
+  const targetUpside = Math.max(0.5, Number(strategy.targetUpside || 5));
+  const stopLoss = Math.max(0.8, Math.abs(Number(strategy.stopLoss || 4)));
+  const cacheKey = `${latest.date}:${latest.close}:${latest.volume}:stacked:${horizon}:${rows.length}:${targetUpside}:${stopLoss}`;
   const cached = state.forecastCache.get(cacheKey);
   if (cached) return cached;
-  const closes = rows.map((row) => row.close);
   const requestedHorizon = Math.max(1, Number(horizon || 15));
   const horizons = [...new Set([
     Math.max(3, Math.round(requestedHorizon * 0.5)),
@@ -1089,44 +1150,93 @@ function computeSelfSupervisedForecast(candles, horizon) {
     if (!featureCache.has(end)) featureCache.set(end, featureVector(rows, end));
     return featureCache.get(end);
   };
+  const dot = (weights, x) => weights.reduce((sum, weight, index) => sum + weight * x[index], 0);
+  const trainLinear = (trainingSamples, epochs = 20) => {
+    if (!trainingSamples.length) return [];
+    const weights = Array(trainingSamples[0].x.length).fill(0);
+    const lr = 0.016;
+    const ridge = 0.002;
+    for (let epoch = 0; epoch < epochs; epoch += 1) {
+      for (const sample of trainingSamples) {
+        const pred = dot(weights, sample.x);
+        const error = pred - sample.y;
+        for (let index = 0; index < weights.length; index += 1) {
+          weights[index] -= lr * (error * sample.x[index] + ridge * weights[index]);
+        }
+      }
+    }
+    return weights;
+  };
   const samples = [];
-  for (let end = 55; end < rows.length - Math.min(...horizons) - 1; end += 1) {
+  for (let end = 55; end < rows.length - Math.min(...horizons) - 1; end += 2) {
     const x = vectorFor(end);
     horizons.forEach((targetHorizon) => {
       if (end + targetHorizon >= rows.length) return;
       const scale = Math.sqrt(requestedHorizon / targetHorizon);
+      const outcome = forwardStrategyOutcome(rows, end, targetHorizon, strategy);
       samples.push({
+        end,
         x,
-        y: (pctChange(closes[end + targetHorizon], closes[end]) / 10) * scale,
+        y: (outcome.riskAdjustedReturn / 10) * scale,
+        targetWins: outcome.targetWins,
+        forwardReturn: outcome.forwardReturn,
       });
     });
   }
-  if (!samples.length) return { sampleCount: 0, predictedReturn: 0, confidence: 0, mae: 0, directionalAccuracy: 0 };
-  const weights = Array(samples[0].x.length).fill(0);
-  const lr = 0.016;
-  const ridge = 0.002;
-  for (let epoch = 0; epoch < 42; epoch += 1) {
-    for (const sample of samples) {
-      const pred = weights.reduce((sum, weight, index) => sum + weight * sample.x[index], 0);
-      const error = pred - sample.y;
-      for (let index = 0; index < weights.length; index += 1) {
-        weights[index] -= lr * (error * sample.x[index] + ridge * weights[index]);
-      }
-    }
-  }
-  const predictions = samples.map((sample) => weights.reduce((sum, weight, index) => sum + weight * sample.x[index], 0) * 10);
-  const actuals = samples.map((sample) => sample.y * 10);
-  const mae = predictions.reduce((sum, prediction, index) => sum + Math.abs(prediction - actuals[index]), 0) / predictions.length;
-  const directionalAccuracy = predictions.filter((prediction, index) => Math.sign(prediction) === Math.sign(actuals[index])).length / predictions.length * 100;
-  const predictedReturn = weights.reduce((sum, weight, index) => sum + weight * vectorFor(rows.length - 1)[index], 0) * 10;
+  if (!samples.length) return { sampleCount: 0, predictedReturn: 0, confidence: 0, mae: 0, directionalAccuracy: 0, targetHitAccuracy: 0 };
+
+  samples.sort((a, b) => a.end - b.end);
+  const purge = Math.max(2, Math.round(requestedHorizon / 2));
+  const testSize = Math.max(18, Math.min(80, Math.floor(samples.length * 0.24)));
+  const testStart = Math.max(1, samples.length - testSize);
+  const trainSamples = samples.slice(0, Math.max(1, testStart - purge));
+  const testSamples = samples.slice(testStart);
+  const validationWeights = trainLinear(trainSamples.length >= 20 ? trainSamples : samples, 18);
+  const validationRows = testSamples.length >= 8 ? testSamples : samples;
+  const validationPredictions = validationRows.map((sample) => dot(validationWeights, sample.x) * 10);
+  const validationActuals = validationRows.map((sample) => sample.y * 10);
+  const mae = validationPredictions.reduce((sum, prediction, index) => sum + Math.abs(prediction - validationActuals[index]), 0) / validationPredictions.length;
+  const directionalAccuracy = validationPredictions.filter((prediction, index) => Math.sign(prediction) === Math.sign(validationActuals[index])).length / validationPredictions.length * 100;
+  const positiveThreshold = Math.max(0.7, targetUpside * 0.35);
+  const targetHitAccuracy = validationPredictions.filter((prediction, index) => (prediction >= positiveThreshold) === Boolean(validationRows[index].targetWins)).length / validationPredictions.length * 100;
+  const absoluteErrors = validationPredictions.map((prediction, index) => Math.abs(prediction - validationActuals[index])).sort((a, b) => a - b);
+  const quantile = (q) => absoluteErrors[Math.min(absoluteErrors.length - 1, Math.max(0, Math.floor((absoluteErrors.length - 1) * q)))] || mae;
+  const p80Error = quantile(0.8);
+  const p90Error = quantile(0.9);
+  const weights = trainLinear(samples, 22);
+  const currentVector = vectorFor(rows.length - 1);
+  const predictedReturn = dot(weights, currentVector) * 10;
+  const distanceRows = samples.map((sample) => ({
+    distance: Math.sqrt(sample.x.reduce((sum, value, index) => sum + (value - currentVector[index]) ** 2, 0) / sample.x.length),
+    targetWins: sample.targetWins,
+    forwardReturn: sample.forwardReturn,
+  })).sort((a, b) => a.distance - b.distance).slice(0, 24);
+  const distanceWeightSum = distanceRows.reduce((sum, row) => sum + 1 / Math.max(0.08, row.distance), 0) || 1;
+  const metaLabelProbability = distanceRows.reduce((sum, row) => sum + (row.targetWins ? 1 : 0) / Math.max(0.08, row.distance), 0) / distanceWeightSum * 100;
+  const metaDirectionalProbability = distanceRows.reduce((sum, row) => sum + ((predictedReturn >= 0 ? row.forwardReturn >= 0 : row.forwardReturn < 0) ? 1 : 0) / Math.max(0.08, row.distance), 0) / distanceWeightSum * 100;
   const sampleBonus = clamp(Math.log10(samples.length) * 5, 0, 14);
-  const confidence = clamp(28 + directionalAccuracy * 0.48 + Math.abs(predictedReturn) * 1.3 - mae * 2.1 + sampleBonus, 0, 95);
+  const uncertaintyPenalty = clamp(p80Error * 0.9 + Math.max(0, p90Error - Math.abs(predictedReturn)) * 0.35, 0, 18);
+  const confidence = clamp(30 + directionalAccuracy * 0.34 + metaDirectionalProbability * 0.18 + targetHitAccuracy * 0.08 + Math.min(8, Math.abs(predictedReturn) * 0.75) - mae * 1.25 - uncertaintyPenalty * 0.35 + sampleBonus, 0, 95);
   const result = {
     sampleCount: samples.length,
+    oosSampleCount: validationRows.length,
     predictedReturn,
     confidence,
     mae,
     directionalAccuracy,
+    targetHitAccuracy,
+    oosDirectionalAccuracy: directionalAccuracy,
+    oosTargetHitAccuracy: targetHitAccuracy,
+    metaLabelProbability,
+    metaDirectionalProbability,
+    conformalP80Error: p80Error,
+    conformalP90Error: p90Error,
+    predictionInterval: {
+      low80: predictedReturn - p80Error,
+      high80: predictedReturn + p80Error,
+      low90: predictedReturn - p90Error,
+      high90: predictedReturn + p90Error,
+    },
   };
   state.forecastCache.set(cacheKey, result);
   if (state.forecastCache.size > 80) state.forecastCache.delete(state.forecastCache.keys().next().value);
@@ -1937,9 +2047,9 @@ function buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, yo
 
 function signalTimeouts(options = {}) {
   if (options.backgroundSignals) {
-    return { news: 6500, fundamentals: 2600, x: 3200, youtube: 3200, factors: 7000 };
+    return { news: 4200, fundamentals: 1800, x: 1800, youtube: 1800, factors: 4600 };
   }
-  return { news: 2800, fundamentals: 1600, x: 1300, youtube: 1300, factors: 3600 };
+  return { news: 1800, fundamentals: 1000, x: 900, youtube: 900, factors: 2400 };
 }
 
 async function prepareSymbol(symbol, options = {}) {
@@ -4184,8 +4294,10 @@ function renderDetail() {
       <div class="detail-item"><span>换手/成交强度代理</span><strong>${technicals.volumeRatio.toFixed(2)}x</strong></div>
       <div class="detail-item"><span>20日涨跌</span><strong>${formatPct(technicals.change20d)}</strong></div>
       <div class="detail-item"><span>主力仓位代理</span><strong>${technicals.mainForceProxy.toFixed(0)} / 100</strong></div>
-      <div class="detail-item"><span>历史相似胜率</span><strong>${item.analog?.count ? `${asNumber(item.analog.winRate).toFixed(0)}% / ${formatPct(item.analog.averageForwardReturn)}` : "样本不足"}</strong></div>
-      <div class="detail-item"><span>自监督预测</span><strong>${item.analog?.model?.sampleCount ? `${formatPct(item.analog.model.predictedReturn)} · 命中 ${asNumber(item.analog.model.directionalAccuracy).toFixed(0)}% · MAE ${asNumber(item.analog.model.mae).toFixed(2)}%` : "样本不足"}</strong></div>
+      <div class="detail-item"><span>历史策略命中</span><strong>${item.analog?.count ? `${asNumber(item.analog.targetHitRate ?? item.analog.winRate).toFixed(0)}% / ${formatPct(item.analog.averageRiskAdjustedReturn ?? item.analog.averageForwardReturn)}${item.analog.stopRate != null ? ` · 先止损 ${asNumber(item.analog.stopRate).toFixed(0)}%` : ""}` : "样本不足"}</strong></div>
+      <div class="detail-item"><span>方向/达标拆分</span><strong>${item.analog?.count ? `方向 ${asNumber(item.analog.directionalHitRate ?? item.analog.winRate).toFixed(0)}% · 达标 ${asNumber(item.analog.strategyHitProbability ?? item.analog.targetHitRate ?? 0).toFixed(0)}%` : "样本不足"}</strong></div>
+      <div class="detail-item"><span>自监督预测</span><strong>${item.analog?.model?.sampleCount ? `${formatPct(item.analog.model.predictedReturn)} · 目标命中 ${asNumber(item.analog.model.targetHitAccuracy ?? item.analog.model.directionalAccuracy).toFixed(0)}% · MAE ${asNumber(item.analog.model.mae).toFixed(2)}%` : "样本不足"}</strong></div>
+      <div class="detail-item"><span>样本外/Meta</span><strong>${item.analog?.model?.oosSampleCount ? `OOS方向 ${asNumber(item.analog.model.oosDirectionalAccuracy ?? item.analog.model.directionalAccuracy).toFixed(0)}% · Meta ${asNumber(item.analog.model.metaLabelProbability).toFixed(0)}% · P80 ${formatPct(item.analog.model.conformalP80Error)}` : "样本不足"}</strong></div>
       <div class="detail-item"><span>可用资金 / 建议票额</span><strong>${formatMoney(getCapital().availableCash)} / ${formatMoney(analysis.suggestedTradeValue || 0)}</strong></div>
       <div class="detail-item"><span>基本面</span><strong>${item.fundamentals ? `PE ${Number(item.fundamentals.peRatio || 0).toFixed(1)} · Yield ${formatPct(Number(item.fundamentals.dividendYield || 0) * 100)}` : "套餐未授权"}</strong></div>
       <div class="detail-item"><span>X / YouTube 信号</span><strong>${item.xPosts?.length || 0} / ${item.youtubeItems?.length || 0}</strong></div>
