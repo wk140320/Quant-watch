@@ -24,7 +24,7 @@ loadLocalEnv();
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-06-02-meta-label-oos-v30";
+const APP_VERSION = "2026-06-03-final-max-confidence-v34";
 const SERVER_STARTED_AT = new Date().toISOString();
 const providerBackoff = new Map();
 const marketResponseCache = new Map();
@@ -158,15 +158,96 @@ function horizonLabel(bucket) {
 
 function sampleForecastError(sample) {
   if (!sample?.outcome?.resolved) return null;
-  return Number(sample.projectedUpside || 0) - Number(sample.outcome.forwardReturnPct || 0);
+  return Number(sample.projectedFinalReturn ?? sample.projectedUpside ?? 0) - Number(sample.outcome.forwardReturnPct || 0);
+}
+
+function sampleMagnitudeForecastError(sample) {
+  if (!sample?.outcome?.resolved) return null;
+  const projected = Number(sample.projectedFinalReturn ?? sample.projectedUpside ?? 0);
+  const expectedMove = Math.abs(projected);
+  const observedMove = projected >= 0
+    ? Number(sample.outcome.forwardReturnPct ?? 0)
+    : Math.abs(Math.min(0, Number(sample.outcome.forwardReturnPct ?? 0)));
+  return expectedMove - Math.max(0, observedMove);
+}
+
+function sampleMaxUpsideForecastError(sample) {
+  if (!sample?.outcome?.resolved) return null;
+  const projectedMax = Math.max(0, Number(sample.projectedMaxUpside ?? sample.qualityGate?.projectedMaxUpside ?? sample.projectedUpside ?? 0));
+  if (projectedMax < 0.25) return null;
+  return projectedMax - Math.max(0, Number(sample.outcome.maxUpsidePct ?? sample.outcome.forwardReturnPct ?? 0));
+}
+
+const BUY_ACTIONS = new Set(["STRONG_BUY", "WATCH_BUY", "LIGHT_BUY"]);
+const RISK_ACTIONS = new Set(["AVOID_OR_REDUCE", "STRONG_AVOID", "CRITICAL_SELL", "SELL_REDUCE", "SELL_EXIT"]);
+
+function sampleIsExplicitBuy(sample = {}) {
+  return BUY_ACTIONS.has(sample?.action);
+}
+
+function samplePredictedDirection(sample = {}) {
+  const action = String(sample?.action || "");
+  if (BUY_ACTIONS.has(action)) return "upside";
+  if (RISK_ACTIONS.has(action)) return "downside";
+  const projected = Number(sample?.projectedUpside || 0);
+  if (projected >= 0.35) return "upside";
+  if (projected <= -0.35) return "downside";
+  const explicit = String(sample?.direction || sample?.ensemble?.direction || "").toLowerCase();
+  if (explicit === "upside" || explicit === "downside") return explicit;
+  return "neutral";
+}
+
+function sampleStrategyProbabilityRaw(sample = {}) {
+  const explicit = Number(sample.strategyHitProbability ?? sample.strategyConfidence);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.max(0, Math.min(99, explicit));
+  const gateValue = Number(sample.qualityGate?.strategyHitProbability ?? sample.qualityGate?.historyGate?.strategyHitProbability);
+  if (Number.isFinite(gateValue) && gateValue > 0) return Math.max(0, Math.min(99, gateValue));
+  return null;
+}
+
+function sampleMagnitudeProbability(sample = {}) {
+  const explicit = Number(sample.magnitudeHitProbability ?? sample.magnitudeConfidence ?? sample.moveHitProbability ?? sample.projectedMoveConfidence);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.max(0, Math.min(99, explicit));
+  const gateValue = Number(sample.qualityGate?.magnitudeHitProbability ?? sample.qualityGate?.moveHitProbability);
+  if (Number.isFinite(gateValue) && gateValue > 0) return Math.max(0, Math.min(99, gateValue));
+  const projected = Math.abs(Number(sample.projectedUpside || 0));
+  if (projected < 0.25) return 0;
+  return clampNumber(Number(sample.predictionConfidence ?? sample.confidence ?? 0) * 0.68 - projected * 3.2 + 10, 0, 88);
+}
+
+function sampleFinalReturnProbability(sample = {}) {
+  const explicit = Number(sample.finalReturnHitProbability ?? sample.finalReturnConfidence);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.max(0, Math.min(99, explicit));
+  const projected = Math.abs(Number(sample.projectedFinalReturn ?? sample.projectedUpside ?? 0));
+  if (projected < 0.25) return sampleMagnitudeProbability(sample);
+  return clampNumber(sampleMagnitudeProbability(sample) - Math.min(18, projected * 2.2), 0, 90);
+}
+
+function sampleMaxUpsideProbability(sample = {}) {
+  const explicit = Number(sample.maxUpsideHitProbability ?? sample.maxUpsideConfidence);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.max(0, Math.min(99, explicit));
+  const projectedMax = Math.max(0, Number(sample.projectedMaxUpside ?? sample.qualityGate?.projectedMaxUpside ?? sample.projectedUpside ?? 0));
+  const projectedFinal = Math.abs(Number(sample.projectedFinalReturn ?? sample.projectedUpside ?? 0));
+  if (projectedMax < 0.25) return sampleMagnitudeProbability(sample);
+  return clampNumber(sampleMagnitudeProbability(sample) - Math.min(14, Math.max(0, projectedMax - projectedFinal) * 2.4), 0, 90);
 }
 
 function sampleWasPositive(sample) {
-  return ["STRONG_BUY", "WATCH_BUY", "LIGHT_BUY"].includes(sample?.action) || Number(sample?.projectedUpside || 0) > 0 || Number(sample?.confidence || 0) >= 65;
+  const projected = Number(sample?.projectedFinalReturn ?? sample?.projectedUpside ?? 0);
+  const cycleProjected = Math.max(projected, Math.max(0, Number(sample?.projectedMaxUpside ?? sample?.qualityGate?.projectedMaxUpside ?? 0)) * 0.72);
+  const target = Math.max(1, Number(sample?.targetUpside || 5));
+  const confidence = Number(sample?.confidence ?? sample?.predictionConfidence ?? 0);
+  const strategyProbability = sampleStrategyProbabilityRaw(sample);
+  if (sampleIsExplicitBuy(sample)) return true;
+  if (samplePredictedDirection(sample) !== "upside") return false;
+  if (cycleProjected >= target && confidence >= 58) return true;
+  return cycleProjected >= Math.max(0.8, target * 0.35)
+    && confidence >= 52
+    && Number(strategyProbability || 0) >= 55;
 }
 
 function sampleMissed(sample) {
-  if (sample?.outcome?.resolved) return sampleWasPositive(sample) && !sample.outcome.hitTarget;
+  if (sample?.outcome?.resolved) return sampleWasPositive(sample) && !positiveTargetOutcomeHit(sample);
   const interim = sample?.interim || {};
   return sampleWasPositive(sample)
     && Number(interim.observedDays || 0) > 0
@@ -182,7 +263,8 @@ function predictionBehaviorPatterns(sample = {}) {
   const signals = sample.signalCounts || {};
   const ensemble = sample.ensemble || {};
   const confidence = Number(sample.confidence ?? sample.rawConfidence ?? 0);
-  const projectedUpside = Number(sample.projectedUpside || 0);
+  const projectedUpside = Number(sample.projectedFinalReturn ?? sample.projectedUpside ?? 0);
+  const cycleProjected = Math.max(projectedUpside, Math.max(0, Number(sample.projectedMaxUpside ?? sample.qualityGate?.projectedMaxUpside ?? 0)) * 0.72);
   const targetUpside = Math.max(1, Number(sample.targetUpside || 5));
   const horizon = horizonBucketForDays(sample.horizonDays);
   const newsCount = Number(signals.news || 0) + Number(signals.x || 0) + Number(signals.youtube || 0);
@@ -194,7 +276,7 @@ function predictionBehaviorPatterns(sample = {}) {
   const analog = Number(feature.analogConfidence || 0);
   const consensus = Number(ensemble.consensusAgreement || 0);
   const upsideAgreement = Number(ensemble.upsideAgreement || 0);
-  const positive = sampleWasPositive(sample) || projectedUpside > 0;
+  const positive = sampleWasPositive(sample) || cycleProjected > 0;
   const patterns = [];
 
   if (!positive) return patterns;
@@ -204,7 +286,7 @@ function predictionBehaviorPatterns(sample = {}) {
   }
   if ((trend >= 60 || momentum >= 60) && volume > 0 && volume < 52) {
     patterns.push(behaviorPattern("strong-momentum-weak-volume", "趋势/动量强但量能弱"));
-    if (projectedUpside >= targetUpside) patterns.push(behaviorPattern("target-with-weak-volume", "涨幅达标但量能不足"));
+    if (cycleProjected >= targetUpside) patterns.push(behaviorPattern("target-with-weak-volume", "涨幅达标但量能不足"));
   }
   if (ensemble.direction === "upside" && consensus >= 65 && volume > 0 && volume < 55) {
     patterns.push(behaviorPattern("upside-consensus-weak-volume", "模型一致看涨但量能不足"));
@@ -212,20 +294,20 @@ function predictionBehaviorPatterns(sample = {}) {
   if (factor > 0 && factor < 45 && confidence >= 62) {
     patterns.push(behaviorPattern("factor-weak-positive", "因子偏弱仍乐观"));
   }
-  if (analog > 0 && analog < 45 && projectedUpside > 0) {
+  if (analog > 0 && analog < 45 && cycleProjected > 0) {
     patterns.push(behaviorPattern("analog-weak-positive", "历史相似样本偏弱仍乐观"));
   }
   if (confidence >= 72 && consensus > 0 && consensus < 62) {
     patterns.push(behaviorPattern("low-consensus-high-confidence", "模型共识不足仍高置信"));
   }
-  if (projectedUpside >= targetUpside * 1.25 && confidence >= 65) {
+  if (cycleProjected >= targetUpside * 1.25 && confidence >= 65) {
     patterns.push(behaviorPattern("aggressive-upside-target", "预估涨幅偏激进"));
     patterns.push(behaviorPattern(`${horizon}-aggressive-upside-target`, `${horizonLabel(horizon)}预估涨幅偏激进`));
   }
   if (upsideAgreement >= 65 && newsCount <= 1) {
     patterns.push(behaviorPattern("model-consensus-thin-news", "模型看涨但新闻证据薄"));
   }
-  if (confidence >= 70 && projectedUpside >= targetUpside && newsCount <= 1) {
+  if (confidence >= 70 && cycleProjected >= targetUpside && newsCount <= 1) {
     patterns.push(behaviorPattern("target-thin-news", "达标预测但新闻证据薄"));
   }
 
@@ -235,6 +317,55 @@ function predictionBehaviorPatterns(sample = {}) {
     seen.add(item.key);
     return true;
   });
+}
+
+function sampleStrategyProbability(sample = {}) {
+  const explicit = sampleStrategyProbabilityRaw(sample);
+  if (explicit != null) return explicit;
+  return sampleWasPositive(sample) ? Math.max(0, Math.min(99, Number(sample.confidence || 0) * 0.72)) : 0;
+}
+
+function sampleRegimeKey(sample = {}) {
+  const raw = String(sample.marketRegime || sample.regimeBucket || sample.ensemble?.marketRegime?.regime || "").trim().toLowerCase();
+  if (["uptrend", "bull", "risk-on"].includes(raw)) return "uptrend";
+  if (["downtrend", "bear", "risk-off"].includes(raw)) return "downtrend";
+  if (["volatile", "high-volatility"].includes(raw)) return "volatile";
+  if (["range", "mixed", "neutral"].includes(raw)) return "range";
+  return raw || "unknown";
+}
+
+function forecastErrorTypes(sample = {}) {
+  const outcome = sample.outcome || {};
+  const types = [];
+  if (!outcome.resolved || !sampleWasPositive(sample)) return types;
+  const forwardReturn = Number(outcome.forwardReturnPct || 0);
+  const projected = Number(sample.projectedFinalReturn ?? sample.projectedUpside ?? 0);
+  const confidence = Number(sample.confidence || 0);
+  const strategyProbability = sampleStrategyProbability(sample);
+  const consensus = Number(sample.ensemble?.consensusAgreement || 0);
+  const upsideAgreement = Number(sample.ensemble?.upsideAgreement || 0);
+  const factorScore = Number(sample.featureScores?.factor || 0);
+  const newsCount = Number(sample.signalCounts?.news || 0) + Number(sample.signalCounts?.x || 0) + Number(sample.signalCounts?.youtube || 0);
+
+  if (outcome.stopWins) types.push("stop_first");
+  if (!outcome.targetWins) types.push("target_miss");
+  if (forwardReturn < 0) types.push("direction_wrong");
+  if (!finalReturnOutcomeHit(sample)) types.push("final_return_miss");
+  if (!maxUpsideOutcomeHit(sample)) types.push("max_upside_miss");
+  if (!cycleMoveOutcomeHit(sample)) types.push("magnitude_miss");
+  if (projected - forwardReturn > 1.2) types.push("over_prediction");
+  if ((sampleMagnitudeForecastError(sample) || 0) > 1) types.push("magnitude_over_prediction");
+  if ((sampleMaxUpsideForecastError(sample) || 0) > 1) types.push("max_upside_over_prediction");
+  if (confidence >= 65 && !outcome.targetWins) types.push("high_confidence_miss");
+  if (strategyProbability >= 58 && !outcome.targetWins) types.push("strategy_probability_miss");
+  if (sampleFinalReturnProbability(sample) >= 58 && !finalReturnOutcomeHit(sample)) types.push("final_probability_miss");
+  if (sampleMaxUpsideProbability(sample) >= 58 && !maxUpsideOutcomeHit(sample)) types.push("max_upside_probability_miss");
+  if (consensus >= 62 && upsideAgreement >= 58 && !outcome.targetWins) types.push("model_consensus_false_positive");
+  if (newsCount <= 1 && confidence >= 62) types.push("thin_news_evidence");
+  if (factorScore < 0 && projected > 0) types.push("factor_conflict_ignored");
+  const regime = sampleRegimeKey(sample);
+  if ((regime === "downtrend" || regime === "volatile") && projected > 0) types.push("market_regime_conflict");
+  return [...new Set(types)];
 }
 
 async function deleteServerSnapshotSymbols(market, symbols = []) {
@@ -443,14 +574,31 @@ function normalizePredictionSample(sample, market = "ASX") {
     currentPrice: Number.isFinite(Number(sample?.currentPrice)) && Number(sample.currentPrice) > 0 ? Number(sample.currentPrice) : close,
     currentDate: sample?.currentDate || null,
     confidence: Math.max(0, Math.min(99, Number(sample?.confidence || 0))),
+    predictionConfidence: Math.max(0, Math.min(99, Number(sample?.predictionConfidence ?? sample?.confidence ?? 0))),
+    strategyConfidence: Math.max(0, Math.min(99, Number(sample?.strategyConfidence ?? sample?.strategyHitProbability ?? 0))),
+    strategyHitProbability: Math.max(0, Math.min(99, Number(sample?.strategyHitProbability ?? sample?.strategyConfidence ?? 0))),
+    magnitudeConfidence: Math.max(0, Math.min(99, Number(sample?.magnitudeConfidence ?? sample?.magnitudeHitProbability ?? sample?.moveHitProbability ?? sample?.projectedMoveConfidence ?? 0))),
+    magnitudeHitProbability: Math.max(0, Math.min(99, Number(sample?.magnitudeHitProbability ?? sample?.magnitudeConfidence ?? sample?.moveHitProbability ?? sample?.projectedMoveConfidence ?? 0))),
+    moveHitProbability: Math.max(0, Math.min(99, Number(sample?.moveHitProbability ?? sample?.magnitudeHitProbability ?? sample?.magnitudeConfidence ?? sample?.projectedMoveConfidence ?? 0))),
     rawConfidence: Math.max(0, Math.min(99, Number(sample?.rawConfidence ?? sample?.confidence ?? 0))),
     projectedUpside: Number(sample?.projectedUpside || 0),
+    projectedFinalReturn: Number(sample?.projectedFinalReturn ?? sample?.projectedUpside ?? 0),
+    finalReturnConfidence: Math.max(0, Math.min(99, Number(sample?.finalReturnConfidence ?? sample?.finalReturnHitProbability ?? sample?.magnitudeConfidence ?? 0))),
+    finalReturnHitProbability: Math.max(0, Math.min(99, Number(sample?.finalReturnHitProbability ?? sample?.finalReturnConfidence ?? sample?.magnitudeHitProbability ?? 0))),
+    projectedMaxUpside: Math.max(0, Number(sample?.projectedMaxUpside ?? sample?.qualityGate?.projectedMaxUpside ?? sample?.projectedUpside ?? 0)),
+    maxUpsideConfidence: Math.max(0, Math.min(99, Number(sample?.maxUpsideConfidence ?? sample?.maxUpsideHitProbability ?? sample?.magnitudeConfidence ?? 0))),
+    maxUpsideHitProbability: Math.max(0, Math.min(99, Number(sample?.maxUpsideHitProbability ?? sample?.maxUpsideConfidence ?? sample?.magnitudeHitProbability ?? 0))),
+    direction: sample?.direction || null,
     action: sample?.action || "HOLD_WATCH",
     source: sample?.source || "unknown",
     featureScores: sample?.featureScores || {},
     signalCounts: sample?.signalCounts || {},
     ensemble: sample?.ensemble || null,
     calibration: sample?.calibration || null,
+    strategyCalibration: sample?.strategyCalibration || null,
+    marketRegime: sample?.marketRegime || sample?.ensemble?.marketRegime?.regime || null,
+    regimeBucket: sampleRegimeKey(sample),
+    errorTypes: Array.isArray(sample?.errorTypes) ? sample.errorTypes : [],
     outcome: sample?.outcome || null,
     interim: sample?.interim || null,
     lastEvaluatedAt: sample?.lastEvaluatedAt || null,
@@ -539,11 +687,60 @@ function evaluatePredictionOutcome(sample, candles = [], live = {}) {
     maxUpsidePct: ((maxHigh - entry) / entry) * 100,
     maxDrawdownPct: ((minLow - entry) / entry) * 100,
   };
-  return { ...sample, interim, outcome, resolvedAt: outcome.resolvedAt, lastEvaluatedAt: outcome.resolvedAt };
+  const evaluated = { ...sample, interim, outcome, resolvedAt: outcome.resolvedAt, lastEvaluatedAt: outcome.resolvedAt };
+  const errorTypes = forecastErrorTypes(evaluated);
+  return { ...evaluated, errorTypes, outcome: { ...outcome, errorTypes } };
+}
+
+function positiveTargetOutcomeHit(item) {
+  return Boolean(item?.outcome?.targetWins ?? item?.outcome?.hitTarget);
+}
+
+function projectedMoveOutcomeHit(item) {
+  const outcome = item?.outcome || {};
+  if (!outcome.resolved) return false;
+  const projected = Number(item?.projectedFinalReturn ?? item?.projectedUpside ?? 0);
+  const expectedMove = Math.abs(projected);
+  if (expectedMove < 0.25) return directionalOutcomeHit(item);
+  const tolerance = Math.max(0.15, Math.min(0.55, expectedMove * 0.12));
+  if (projected >= 0) {
+    return Number(outcome.forwardReturnPct ?? 0) >= expectedMove - tolerance;
+  }
+  return Number(outcome.forwardReturnPct ?? 0) <= -expectedMove + tolerance;
+}
+
+function finalReturnOutcomeHit(item) {
+  return projectedMoveOutcomeHit(item);
+}
+
+function maxUpsideOutcomeHit(item) {
+  const outcome = item?.outcome || {};
+  if (!outcome.resolved) return false;
+  const projectedMax = Math.max(0, Number(item?.projectedMaxUpside ?? item?.qualityGate?.projectedMaxUpside ?? item?.projectedUpside ?? 0));
+  if (projectedMax < 0.25) return directionalOutcomeHit(item);
+  const tolerance = Math.max(0.15, Math.min(0.55, projectedMax * 0.12));
+  return Number(outcome.maxUpsidePct ?? outcome.forwardReturnPct ?? 0) >= projectedMax - tolerance;
+}
+
+function cycleMoveOutcomeHit(item) {
+  return finalReturnOutcomeHit(item) || maxUpsideOutcomeHit(item);
+}
+
+function directionalOutcomeHit(item) {
+  const outcome = item?.outcome || {};
+  if (!outcome.resolved) return false;
+  const actualReturn = Number(outcome.forwardReturnPct || 0);
+  const direction = samplePredictedDirection(item);
+  const target = Math.max(1, Number(item?.targetUpside || 5));
+  const tolerance = Math.max(0.15, Math.min(0.65, target * 0.08));
+  if (direction === "upside") return positiveTargetOutcomeHit(item) || actualReturn > tolerance;
+  if (direction === "downside") return Boolean(outcome.stopWins) || actualReturn < -tolerance;
+  const neutralBand = Math.max(0.45, Math.min(1.2, Math.abs(Number(item?.stopLoss || 4)) * 0.25));
+  return Math.abs(actualReturn) <= neutralBand && !outcome.targetWins && !outcome.stopWins;
 }
 
 function outcomeHit(item) {
-  return Boolean(item?.outcome?.targetWins ?? item?.outcome?.hitTarget);
+  return directionalOutcomeHit(item);
 }
 
 function summarizeSampleGroup(rows = []) {
@@ -551,19 +748,33 @@ function summarizeSampleGroup(rows = []) {
   const buyResolved = resolved.filter(sampleWasPositive);
   const misses = rows.filter(sampleMissed);
   const errors = resolved.map(sampleForecastError).filter(Number.isFinite);
+  const magnitudeErrors = resolved.map(sampleMagnitudeForecastError).filter(Number.isFinite);
+  const maxUpsideErrors = resolved.map(sampleMaxUpsideForecastError).filter(Number.isFinite);
   const overPredictions = errors.filter((value) => value > 0);
+  const magnitudeOverPredictions = magnitudeErrors.filter((value) => value > 0);
+  const maxUpsideOverPredictions = maxUpsideErrors.filter((value) => value > 0);
   const interimRows = rows.filter((item) => item.interim && !item.outcome?.resolved);
   return {
     total: rows.length,
     pending: rows.length - resolved.length,
     resolved: resolved.length,
-    hitRate: resolved.length ? resolved.filter(outcomeHit).length / resolved.length * 100 : null,
+    hitRate: resolved.length ? resolved.filter(directionalOutcomeHit).length / resolved.length * 100 : null,
+    directionalHitRate: resolved.length ? resolved.filter(directionalOutcomeHit).length / resolved.length * 100 : null,
+    magnitudeHitRate: resolved.length ? resolved.filter(cycleMoveOutcomeHit).length / resolved.length * 100 : null,
+    finalReturnHitRate: resolved.length ? resolved.filter(finalReturnOutcomeHit).length / resolved.length * 100 : null,
+    maxUpsideHitRate: resolved.length ? resolved.filter(maxUpsideOutcomeHit).length / resolved.length * 100 : null,
     buyResolved: buyResolved.length,
-    buyHitRate: buyResolved.length ? buyResolved.filter(outcomeHit).length / buyResolved.length * 100 : null,
+    buyHitRate: buyResolved.length ? buyResolved.filter(positiveTargetOutcomeHit).length / buyResolved.length * 100 : null,
+    strategyHitRate: buyResolved.length ? buyResolved.filter(positiveTargetOutcomeHit).length / buyResolved.length * 100 : null,
     avgForwardReturn: mean(resolved.map((item) => item.outcome?.forwardReturnPct)),
-    avgProjectedUpside: mean(rows.map((item) => item.projectedUpside)),
+    avgProjectedUpside: mean(rows.map((item) => item.projectedFinalReturn ?? item.projectedUpside)),
+    avgProjectedMaxUpside: mean(rows.map((item) => item.projectedMaxUpside)),
     avgForecastError: mean(errors),
     avgOverPrediction: mean(overPredictions),
+    avgMagnitudeError: mean(magnitudeErrors),
+    avgMagnitudeOverPrediction: mean(magnitudeOverPredictions),
+    avgMaxUpsideError: mean(maxUpsideErrors),
+    avgMaxUpsideOverPrediction: mean(maxUpsideOverPredictions),
     avgInterimReturn: mean(interimRows.map((item) => item.interim?.forwardReturnPct)),
     avgInterimDrawdown: mean(interimRows.map((item) => item.interim?.maxDrawdownPct)),
     missCount: misses.length,
@@ -620,6 +831,145 @@ function buildBehaviorPatternStats(scoped = []) {
   );
 }
 
+function buildErrorTypeStats(scoped = []) {
+  const byType = new Map();
+  for (const sample of scoped) {
+    const types = Array.isArray(sample.errorTypes?.length ? sample.errorTypes : sample.outcome?.errorTypes)
+      ? (sample.errorTypes?.length ? sample.errorTypes : sample.outcome.errorTypes)
+      : [];
+    for (const type of types) {
+      const rows = byType.get(type) || [];
+      rows.push(sample);
+      byType.set(type, rows);
+    }
+  }
+  return Object.fromEntries([...byType.entries()]
+    .map(([type, rows]) => {
+      const stat = summarizeSampleGroup(rows);
+      return [type, {
+        type,
+        label: {
+          stop_first: "止损先触发",
+          target_miss: "周期未达标",
+          direction_wrong: "方向判断错误",
+          magnitude_miss: "预估幅度未达",
+          final_return_miss: "周期结束收益未达",
+          max_upside_miss: "周期内最高触达未达",
+          over_prediction: "涨幅高估",
+          magnitude_over_prediction: "幅度高估",
+          max_upside_over_prediction: "最高触达高估",
+          high_confidence_miss: "高置信误判",
+          strategy_probability_miss: "策略达标概率误判",
+          final_probability_miss: "结束收益置信误判",
+          max_upside_probability_miss: "最高触达置信误判",
+          model_consensus_false_positive: "模型共识假阳性",
+          thin_news_evidence: "新闻证据薄",
+          factor_conflict_ignored: "因子冲突被忽略",
+          market_regime_conflict: "市场环境冲突",
+        }[type] || type,
+        ...stat,
+      }];
+    })
+    .sort(([, a], [, b]) => Number(b.total || 0) - Number(a.total || 0))
+    .slice(0, 16));
+}
+
+function buildModelPerformanceStats(scoped = []) {
+  const byModel = new Map();
+  for (const sample of scoped.filter((item) => item.outcome?.resolved && item.ensemble?.models?.length)) {
+    const actualReturn = Number(sample.outcome.forwardReturnPct || 0);
+    for (const model of sample.ensemble.models || []) {
+      if (model?.available === false || !model.name) continue;
+      const projected = Number(model.projectedUpside || 0);
+      if (Math.abs(projected) < 0.1) continue;
+      const rows = byModel.get(model.name) || [];
+      const directionHit = projected >= 0 ? actualReturn >= 0 : actualReturn < 0;
+      const strategyHit = projected >= 0
+        ? Boolean(sample.outcome.targetWins)
+        : Boolean(sample.outcome.stopWins || actualReturn < 0 || !sample.outcome.targetWins);
+      rows.push({
+        directionHit,
+        strategyHit,
+        projected,
+        actualReturn,
+        confidence: Number(model.confidence || 0),
+        weight: Number(model.weight || 0),
+      });
+      byModel.set(model.name, rows);
+    }
+  }
+  return Object.fromEntries([...byModel.entries()]
+    .map(([name, rows]) => {
+      const directionalHitRate = rows.filter((row) => row.directionHit).length / rows.length * 100;
+      const strategyHitRate = rows.filter((row) => row.strategyHit).length / rows.length * 100;
+      const avgError = mean(rows.map((row) => row.projected - row.actualReturn));
+      const multiplier = rows.length >= 5
+        ? clampNumber(0.76 + (directionalHitRate - 50) * 0.012 + (strategyHitRate - 50) * 0.009 + Math.min(0.12, rows.length * 0.004), 0.45, 1.35)
+        : 1;
+      return [name, {
+        name,
+        samples: rows.length,
+        directionalHitRate,
+        strategyHitRate,
+        avgError,
+        weightMultiplier: Number(multiplier.toFixed(2)),
+      }];
+    })
+    .sort(([, a], [, b]) => Number(b.samples || 0) - Number(a.samples || 0))
+    .slice(0, 32));
+}
+
+function buildRegimeStats(scoped = []) {
+  const buckets = ["uptrend", "range", "downtrend", "volatile", "unknown"];
+  return Object.fromEntries(buckets.map((bucket) => {
+    const rows = scoped.filter((item) => sampleRegimeKey(item) === bucket);
+    const stat = summarizeSampleGroup(rows);
+    return [bucket, {
+      label: {
+        uptrend: "上升市",
+        range: "震荡市",
+        downtrend: "下跌市",
+        volatile: "高波动",
+        unknown: "未知环境",
+      }[bucket],
+      regime: bucket,
+      ...stat,
+    }];
+  }).filter(([, stat]) => stat.total > 0));
+}
+
+function buildStrategyProbabilityBuckets(buyResolved = []) {
+  return [
+    [0, 39],
+    [40, 49],
+    [50, 59],
+    [60, 69],
+    [70, 79],
+    [80, 99],
+  ].map(([min, max]) => {
+    const rows = buyResolved.filter((item) => {
+      const probability = sampleStrategyProbability(item);
+      return probability >= min && probability <= max;
+    });
+    const hits = rows.filter(positiveTargetOutcomeHit).length;
+    const brierScore = rows.length
+      ? rows.reduce((sum, item) => {
+        const probability = Math.max(0, Math.min(1, sampleStrategyProbability(item) / 100));
+        return sum + (probability - (positiveTargetOutcomeHit(item) ? 1 : 0)) ** 2;
+      }, 0) / rows.length
+      : null;
+    return {
+      label: `${min}-${max}`,
+      min,
+      max,
+      count: rows.length,
+      hitRate: rows.length ? hits / rows.length * 100 : null,
+      avgReturn: rows.length ? rows.reduce((sum, item) => sum + Number(item.outcome.forwardReturnPct || 0), 0) / rows.length : null,
+      brierScore,
+    };
+  });
+}
+
 function buildAdaptiveCalibration(scoped = []) {
   const resolved = scoped.filter((item) => item.outcome?.resolved);
   const recent = scoped
@@ -631,24 +981,40 @@ function buildAdaptiveCalibration(scoped = []) {
   const recentPositiveResolved = recentResolved.filter(sampleWasPositive);
   const recentMisses = recent.filter(sampleMissed).length;
   const recentAdverse = recent.filter((item) => item.interim?.adverse && !item.outcome?.resolved).length;
-  const buyHit = recentPositiveResolved.length ? recentPositiveResolved.filter(outcomeHit).length / recentPositiveResolved.length * 100 : null;
-  const overallHit = recentResolved.length ? recentResolved.filter(outcomeHit).length / recentResolved.length * 100 : null;
+  const buyHit = recentPositiveResolved.length ? recentPositiveResolved.filter(positiveTargetOutcomeHit).length / recentPositiveResolved.length * 100 : null;
+  const overallHit = recentResolved.length ? recentResolved.filter(directionalOutcomeHit).length / recentResolved.length * 100 : null;
+  const magnitudeHit = recentResolved.length ? recentResolved.filter(cycleMoveOutcomeHit).length / recentResolved.length * 100 : null;
+  const finalReturnHit = recentResolved.length ? recentResolved.filter(finalReturnOutcomeHit).length / recentResolved.length * 100 : null;
+  const maxUpsideHit = recentResolved.length ? recentResolved.filter(maxUpsideOutcomeHit).length / recentResolved.length * 100 : null;
   const avgForecastError = mean(recentResolved.map(sampleForecastError).filter(Number.isFinite));
   const avgOverPrediction = mean(recentResolved.map(sampleForecastError).filter((value) => Number.isFinite(value) && value > 0));
+  const avgMagnitudeOverPrediction = mean(recentResolved.map(sampleMagnitudeForecastError).filter((value) => Number.isFinite(value) && value > 0));
+  const avgMaxUpsideOverPrediction = mean(recentResolved.map(sampleMaxUpsideForecastError).filter((value) => Number.isFinite(value) && value > 0));
 
   let confidencePenalty = 0;
-  if (recentResolved.length >= 8 && overallHit != null && overallHit < 52) confidencePenalty += (52 - overallHit) * 0.11;
-  if (recentPositiveResolved.length >= 5 && buyHit != null && buyHit < 55) confidencePenalty += (55 - buyHit) * 0.16;
-  if (recentPositive.length >= 5) confidencePenalty += Math.min(7, recentMisses * 0.55 + recentAdverse * 0.75);
+  if (recentResolved.length >= 8 && overallHit != null && overallHit < 50) confidencePenalty += (50 - overallHit) * 0.18;
+  if (recentResolved.length >= 8 && overallHit != null && overallHit < 55) confidencePenalty += (55 - overallHit) * 0.06;
+  if (recentResolved.length >= 8 && magnitudeHit != null && magnitudeHit < 50) confidencePenalty += (50 - magnitudeHit) * 0.14;
+  if (recentResolved.length >= 8 && maxUpsideHit != null && maxUpsideHit < 50) confidencePenalty += (50 - maxUpsideHit) * 0.1;
+  if (recentPositiveResolved.length >= 4 && buyHit != null && buyHit < 50) confidencePenalty += (50 - buyHit) * 0.25;
+  if (recentPositiveResolved.length >= 4 && buyHit != null && buyHit < 58) confidencePenalty += (58 - buyHit) * 0.08;
+  if (recentPositive.length >= 5) confidencePenalty += Math.min(9, recentMisses * 0.65 + recentAdverse * 0.9);
   else if (recentAdverse > 0) confidencePenalty += Math.min(3, recentAdverse * 0.55);
   if (avgForecastError != null && avgForecastError > 1) confidencePenalty += Math.min(5, avgForecastError * 0.45);
-  confidencePenalty = Math.max(0, Math.min(14, confidencePenalty));
+  if (avgMagnitudeOverPrediction != null && avgMagnitudeOverPrediction > 0.8) confidencePenalty += Math.min(4, avgMagnitudeOverPrediction * 0.42);
+  if (avgMaxUpsideOverPrediction != null && avgMaxUpsideOverPrediction > 0.8) confidencePenalty += Math.min(3.5, avgMaxUpsideOverPrediction * 0.35);
+  confidencePenalty = Math.max(0, Math.min(20, confidencePenalty));
 
   let upsideShrink = 1;
   if (avgOverPrediction != null && avgOverPrediction > 0.6) upsideShrink -= Math.min(0.24, avgOverPrediction * 0.035);
-  if (recentPositive.length >= 5) upsideShrink -= Math.min(0.22, recentMisses * 0.018 + recentAdverse * 0.025);
-  if (buyHit != null && buyHit < 55) upsideShrink -= Math.min(0.18, (55 - buyHit) * 0.006);
-  upsideShrink = Math.max(0.55, Math.min(1, upsideShrink));
+  if (avgMagnitudeOverPrediction != null && avgMagnitudeOverPrediction > 0.7) upsideShrink -= Math.min(0.2, avgMagnitudeOverPrediction * 0.04);
+  if (avgMaxUpsideOverPrediction != null && avgMaxUpsideOverPrediction > 0.7) upsideShrink -= Math.min(0.16, avgMaxUpsideOverPrediction * 0.03);
+  if (recentPositive.length >= 5) upsideShrink -= Math.min(0.28, recentMisses * 0.022 + recentAdverse * 0.03);
+  if (overallHit != null && overallHit < 50) upsideShrink -= Math.min(0.16, (50 - overallHit) * 0.005);
+  if (magnitudeHit != null && magnitudeHit < 50) upsideShrink -= Math.min(0.16, (50 - magnitudeHit) * 0.006);
+  if (maxUpsideHit != null && maxUpsideHit < 50) upsideShrink -= Math.min(0.12, (50 - maxUpsideHit) * 0.005);
+  if (buyHit != null && buyHit < 55) upsideShrink -= Math.min(0.24, (55 - buyHit) * 0.008);
+  upsideShrink = Math.max(0.45, Math.min(1, upsideShrink));
 
   const horizonStats = Object.fromEntries(["short", "medium", "long"].map((bucket) => {
     const rows = scoped.filter((item) => horizonBucketForDays(item.horizonDays) === bucket);
@@ -665,11 +1031,14 @@ function buildAdaptiveCalibration(scoped = []) {
   for (const [symbol, rows] of bySymbol.entries()) {
     const stat = summarizeSampleGroup(rows.slice().sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || ""))).slice(0, 80));
     let symbolPenalty = 0;
-    if (stat.resolved >= 3 && stat.buyHitRate != null && stat.buyHitRate < 50) symbolPenalty += (50 - stat.buyHitRate) * 0.12;
-    symbolPenalty += Math.min(9, Number(stat.missCount || 0) * 0.9 + Number(stat.adversePending || 0) * 1.6);
+    if (stat.resolved >= 4 && stat.hitRate != null && stat.hitRate < 50) symbolPenalty += (50 - stat.hitRate) * 0.1;
+    if (stat.resolved >= 4 && stat.magnitudeHitRate != null && stat.magnitudeHitRate < 50) symbolPenalty += (50 - stat.magnitudeHitRate) * 0.12;
+    if (stat.resolved >= 4 && stat.maxUpsideHitRate != null && stat.maxUpsideHitRate < 50) symbolPenalty += (50 - stat.maxUpsideHitRate) * 0.08;
+    if (stat.resolved >= 3 && stat.buyHitRate != null && stat.buyHitRate < 50) symbolPenalty += (50 - stat.buyHitRate) * 0.16;
+    symbolPenalty += Math.min(10, Number(stat.missCount || 0) * 1 + Number(stat.adversePending || 0) * 1.75);
     if (Number(stat.avgInterimReturn || 0) < -0.6) symbolPenalty += Math.min(4, Math.abs(Number(stat.avgInterimReturn || 0)) * 0.8);
     if (Number(stat.avgInterimDrawdown || 0) < -0.9) symbolPenalty += Math.min(4, Math.abs(Number(stat.avgInterimDrawdown || 0)) * 0.55);
-    const symbolUpsideShrink = Math.max(0.52, Math.min(1, 1 - symbolPenalty * 0.035 - Math.max(0, Number(stat.avgOverPrediction || 0)) * 0.025));
+    const symbolUpsideShrink = Math.max(0.42, Math.min(1, 1 - symbolPenalty * 0.04 - Math.max(0, Number(stat.avgOverPrediction || 0)) * 0.03 - Math.max(0, Number(stat.avgMagnitudeOverPrediction || 0)) * 0.035 - Math.max(0, Number(stat.avgMaxUpsideOverPrediction || 0)) * 0.025));
     symbolStats[symbol] = {
       ...stat,
       confidencePenalty: Number(Math.min(12, symbolPenalty).toFixed(2)),
@@ -687,8 +1056,15 @@ function buildAdaptiveCalibration(scoped = []) {
     recentResolved: recentResolved.length,
     buyHitRate: buyHit,
     overallHitRate: overallHit,
+    directionalHitRate: overallHit,
+    magnitudeHitRate: magnitudeHit,
+    finalReturnHitRate: finalReturnHit,
+    maxUpsideHitRate: maxUpsideHit,
+    strategyHitRate: buyHit,
     avgForecastError,
     avgOverPrediction,
+    avgMagnitudeOverPrediction,
+    avgMaxUpsideOverPrediction,
     horizonStats,
     symbolStats,
     patternStats,
@@ -715,7 +1091,10 @@ function sampleOutcomeDrawdown(sample = {}) {
 function sampleStatusLabel(sample = {}) {
   if (sample.outcome?.targetWins) return "目标达成";
   if (sample.outcome?.stopWins) return "止损触发";
-  if (sample.outcome?.resolved) return outcomeHit(sample) ? "周期命中" : "周期未达标";
+  if (sample.outcome?.resolved && sampleWasPositive(sample) && !positiveTargetOutcomeHit(sample)) {
+    return directionalOutcomeHit(sample) ? "方向对但未达标" : "周期未达标";
+  }
+  if (sample.outcome?.resolved) return directionalOutcomeHit(sample) ? "方向命中" : "方向未命中";
   if (sample.interim?.adverse) return "未完成逆行";
   return "等待验证";
 }
@@ -727,11 +1106,11 @@ function rollingLearningCurve(scoped = []) {
   return resolved.map((sample, index) => {
     const window = resolved.slice(Math.max(0, index - 19), index + 1);
     const buyWindow = window.filter(sampleWasPositive);
-    const hits = window.filter(outcomeHit).length;
-    const buyHits = buyWindow.filter(outcomeHit).length;
+    const hits = window.filter(directionalOutcomeHit).length;
+    const buyHits = buyWindow.filter(positiveTargetOutcomeHit).length;
     const brierScore = mean(window.map((item) => {
       const probability = Math.max(0, Math.min(1, Number(item.confidence || 0) / 100));
-      return (probability - (outcomeHit(item) ? 1 : 0)) ** 2;
+      return (probability - (directionalOutcomeHit(item) ? 1 : 0)) ** 2;
     }));
     return {
       date: sampleEventDate(sample),
@@ -749,8 +1128,8 @@ function rollingLearningCurve(scoped = []) {
 
 function summarizeResolvedSegment(rows = []) {
   const positives = rows.filter(sampleWasPositive);
-  const hitRate = rows.length ? rows.filter(outcomeHit).length / rows.length * 100 : null;
-  const buyHitRate = positives.length ? positives.filter(outcomeHit).length / positives.length * 100 : null;
+  const hitRate = rows.length ? rows.filter(directionalOutcomeHit).length / rows.length * 100 : null;
+  const buyHitRate = positives.length ? positives.filter(positiveTargetOutcomeHit).length / positives.length * 100 : null;
   return {
     samples: rows.length,
     hitRate,
@@ -758,7 +1137,7 @@ function summarizeResolvedSegment(rows = []) {
     avgReturn: mean(rows.map((item) => Number(item.outcome?.forwardReturnPct || 0))),
     brierScore: mean(rows.map((item) => {
       const probability = Math.max(0, Math.min(1, Number(item.confidence || 0) / 100));
-      return (probability - (outcomeHit(item) ? 1 : 0)) ** 2;
+      return (probability - (directionalOutcomeHit(item) ? 1 : 0)) ** 2;
     })),
   };
 }
@@ -834,11 +1213,43 @@ function buildAccuracyBoostPlan(summary = {}, adaptive = {}) {
       effect: "这是让置信度从主观分数变成可校准概率的前提。",
     });
   }
+  if (summary.hitRate != null && Number(summary.hitRate) < 50) {
+    rows.push({
+      priority: "高",
+      title: "方向准确率低于50%",
+      action: "进入保守预测模式：降低低样本模型权重、提高模型共识门槛、压缩正向涨幅上限。",
+      effect: "先减少错误方向的高置信输出，再逐步恢复可交易信号数量。",
+    });
+  }
+  if (summary.magnitudeHitRate != null && Number(summary.magnitudeHitRate) < 50) {
+    rows.push({
+      priority: "高",
+      title: "幅度达成率低于50%",
+      action: "收缩预估涨跌幅，降低幅度置信度，并优先采用样本外误差较小的模型。",
+      effect: "避免方向猜对但涨跌幅夸大，减少高估导致的错误买入。",
+    });
+  }
+  if (summary.finalReturnHitRate != null && Number(summary.finalReturnHitRate) < 50) {
+    rows.push({
+      priority: "高",
+      title: "周期结束收益命中不足",
+      action: "单独收缩周期末收益预测，并降低“结束涨跌幅置信”，避免把中途机会误当成持有到期收益。",
+      effect: "让收盘收益预测更保守，减少持仓周期末的高估。",
+    });
+  }
+  if (summary.maxUpsideHitRate != null && Number(summary.maxUpsideHitRate) < 50) {
+    rows.push({
+      priority: "高",
+      title: "最高触达命中不足",
+      action: "收缩最高触达涨幅，要求更高的量能/趋势/模型一致性才能给出触达型买入提醒。",
+      effect: "提升“15日内到过目标价”的可靠度。",
+    });
+  }
   if (summary.buyHitRate != null && Number(summary.buyHitRate) < 58) {
     rows.push({
       priority: "高",
       title: "上调买入门槛",
-      action: "买入候选必须同时满足预测可靠度、上涨一致度、共识强度和正向涨幅；低于门槛只进入观察，不再推荐买入。",
+      action: "买入候选必须同时满足方向置信、幅度达成率、上涨一致度、共识强度和策略达标率；低于门槛只进入观察，不再推荐买入。",
       effect: "减少 WOW 这类短期反向后的低质量买入信号。",
     });
   }
@@ -866,8 +1277,8 @@ function buildAccuracyBoostPlan(summary = {}, adaptive = {}) {
     rows.push({
       priority: "中",
       title: "校准置信桶",
-      action: "用 50-59、60-69、70-79 等置信桶的实际命中率反校准新预测可靠度。",
-      effect: "让“置信度”更接近预测正确概率，而不是模型情绪分。",
+      action: "用 50-59、60-69、70-79 等置信桶的方向准确率反校准新预测可靠度。",
+      effect: "让“方向置信度”更接近方向预测正确概率，而不是模型情绪分。",
     });
   }
   rows.push({
@@ -883,15 +1294,44 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
   const key = safeMarket(market);
   const scoped = samples.filter((item) => safeMarket(item.market || key) === key);
   const resolved = scoped.filter((item) => item.outcome?.resolved);
-  const buyResolved = resolved.filter((item) => ["STRONG_BUY", "WATCH_BUY", "LIGHT_BUY"].includes(item.action) || Number(item.confidence || 0) >= 65);
-  const hitRate = resolved.length ? resolved.filter(outcomeHit).length / resolved.length * 100 : null;
-  const buyHitRate = buyResolved.length ? buyResolved.filter(outcomeHit).length / buyResolved.length * 100 : null;
+  const buyResolved = resolved.filter(sampleWasPositive);
+  const hitRate = resolved.length ? resolved.filter(directionalOutcomeHit).length / resolved.length * 100 : null;
+  const magnitudeHitRate = resolved.length ? resolved.filter(cycleMoveOutcomeHit).length / resolved.length * 100 : null;
+  const finalReturnHitRate = resolved.length ? resolved.filter(finalReturnOutcomeHit).length / resolved.length * 100 : null;
+  const maxUpsideHitRate = resolved.length ? resolved.filter(maxUpsideOutcomeHit).length / resolved.length * 100 : null;
+  const buyHitRate = buyResolved.length ? buyResolved.filter(positiveTargetOutcomeHit).length / buyResolved.length * 100 : null;
   const avgForwardReturn = resolved.length ? resolved.reduce((sum, item) => sum + Number(item.outcome.forwardReturnPct || 0), 0) / resolved.length : null;
   const brierScore = resolved.length
     ? resolved.reduce((sum, item) => {
       const probability = Math.max(0, Math.min(1, Number(item.confidence || 0) / 100));
-      const actual = outcomeHit(item) ? 1 : 0;
+      const actual = directionalOutcomeHit(item) ? 1 : 0;
       return sum + (probability - actual) ** 2;
+    }, 0) / resolved.length
+    : null;
+  const strategyBrierScore = buyResolved.length
+    ? buyResolved.reduce((sum, item) => {
+      const probability = Math.max(0, Math.min(1, sampleStrategyProbability(item) / 100));
+      const actual = positiveTargetOutcomeHit(item) ? 1 : 0;
+      return sum + (probability - actual) ** 2;
+    }, 0) / buyResolved.length
+    : null;
+  const magnitudeBrierScore = resolved.length
+    ? resolved.reduce((sum, item) => {
+      const probability = Math.max(0, Math.min(1, sampleMagnitudeProbability(item) / 100));
+      const actual = cycleMoveOutcomeHit(item) ? 1 : 0;
+      return sum + (probability - actual) ** 2;
+    }, 0) / resolved.length
+    : null;
+  const finalReturnBrierScore = resolved.length
+    ? resolved.reduce((sum, item) => {
+      const probability = Math.max(0, Math.min(1, sampleFinalReturnProbability(item) / 100));
+      return sum + (probability - (finalReturnOutcomeHit(item) ? 1 : 0)) ** 2;
+    }, 0) / resolved.length
+    : null;
+  const maxUpsideBrierScore = resolved.length
+    ? resolved.reduce((sum, item) => {
+      const probability = Math.max(0, Math.min(1, sampleMaxUpsideProbability(item) / 100));
+      return sum + (probability - (maxUpsideOutcomeHit(item) ? 1 : 0)) ** 2;
     }, 0) / resolved.length
     : null;
   const grossProfit = resolved.filter((item) => Number(item.outcome.forwardReturnPct || 0) > 0).reduce((sum, item) => sum + Number(item.outcome.forwardReturnPct || 0), 0);
@@ -917,11 +1357,11 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     [90, 99],
   ].map(([min, max]) => {
     const rows = resolved.filter((item) => Number(item.confidence || 0) >= min && Number(item.confidence || 0) <= max);
-    const hits = rows.filter(outcomeHit).length;
+    const hits = rows.filter(directionalOutcomeHit).length;
     const bucketBrier = rows.length
       ? rows.reduce((sum, item) => {
         const probability = Math.max(0, Math.min(1, Number(item.confidence || 0) / 100));
-        return sum + (probability - (outcomeHit(item) ? 1 : 0)) ** 2;
+        return sum + (probability - (directionalOutcomeHit(item) ? 1 : 0)) ** 2;
       }, 0) / rows.length
       : null;
     return {
@@ -940,15 +1380,28 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
     .slice(0, 8);
   const adaptive = buildAdaptiveCalibration(scoped);
+  const strategyBuckets = buildStrategyProbabilityBuckets(buyResolved);
+  const modelStats = buildModelPerformanceStats(scoped);
+  const regimeStats = buildRegimeStats(scoped);
+  const errorTypeStats = buildErrorTypeStats(scoped);
   const summaryBase = {
     total: scoped.length,
     pending: scoped.length - resolved.length,
     resolved: resolved.length,
     hitRate,
+    directionalHitRate: hitRate,
+    magnitudeHitRate,
+    finalReturnHitRate,
+    maxUpsideHitRate,
     buyResolved: buyResolved.length,
     buyHitRate,
+    strategyHitRate: buyHitRate,
     avgForwardReturn,
     brierScore,
+    strategyBrierScore,
+    magnitudeBrierScore,
+    finalReturnBrierScore,
+    maxUpsideBrierScore,
   };
   return {
     market: key,
@@ -956,10 +1409,19 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     pending: scoped.length - resolved.length,
     resolved: resolved.length,
     hitRate,
+    directionalHitRate: hitRate,
+    magnitudeHitRate,
+    finalReturnHitRate,
+    maxUpsideHitRate,
     buyResolved: buyResolved.length,
     buyHitRate,
+    strategyHitRate: buyHitRate,
     avgForwardReturn,
     brierScore,
+    strategyBrierScore,
+    magnitudeBrierScore,
+    finalReturnBrierScore,
+    maxUpsideBrierScore,
     profitFactor,
     profitFactorNoLosses,
     payoffRatio,
@@ -968,6 +1430,10 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     grossProfit,
     grossLoss,
     buckets,
+    strategyBuckets,
+    modelStats,
+    regimeStats,
+    errorTypeStats,
     horizonStats: adaptive.horizonStats,
     adaptive,
     learningCurve: rollingLearningCurve(scoped),
@@ -1001,6 +1467,28 @@ function calibrateConfidenceValue(confidence, summary) {
   };
 }
 
+function calibrateStrategyProbabilityValue(probability, summary) {
+  const value = Math.max(0, Math.min(99, Number(probability || 0)));
+  const bucket = (summary?.strategyBuckets || []).find((item) => value >= item.min && value <= item.max && item.count >= 5 && item.hitRate != null);
+  if (!bucket) {
+    return {
+      probability: value,
+      adjustment: 0,
+      message: "Strategy target-hit calibration has too few resolved samples for this bucket.",
+      sampleCount: bucket?.count || 0,
+    };
+  }
+  const calibrated = Math.round(value * 0.55 + Number(bucket.hitRate) * 0.45);
+  return {
+    probability: Math.max(0, Math.min(99, calibrated)),
+    adjustment: calibrated - value,
+    message: `Strategy bucket ${bucket.label} actual target-hit rate ${Number(bucket.hitRate).toFixed(0)}% from ${bucket.count} resolved samples.`,
+    sampleCount: bucket.count,
+    bucket: bucket.label,
+    hitRate: bucket.hitRate,
+  };
+}
+
 function adaptiveForecastAdjustment(summary, symbol, horizonDays = 15, candidate = null) {
   const key = String(symbol || "").trim().toUpperCase();
   const adaptive = summary?.adaptive || {};
@@ -1016,8 +1504,14 @@ function adaptiveForecastAdjustment(summary, symbol, horizonDays = 15, candidate
     .sort((a, b) => Number(b.confidencePenalty || 0) - Number(a.confidencePenalty || 0))
     .slice(0, 3);
   const globalPenalty = Number(adaptive.confidencePenalty || 0);
+  const horizonDirectionPenalty = horizon.resolved >= 6 && horizon.hitRate != null && horizon.hitRate < 50
+    ? Math.min(7, (50 - Number(horizon.hitRate)) * 0.12)
+    : 0;
+  const horizonMagnitudePenalty = horizon.resolved >= 6 && horizon.magnitudeHitRate != null && Number(horizon.magnitudeHitRate) < 50
+    ? Math.min(7, (50 - Number(horizon.magnitudeHitRate)) * 0.14)
+    : 0;
   const horizonPenalty = horizon.resolved >= 4 && horizon.buyHitRate != null && horizon.buyHitRate < 55
-    ? Math.min(6, (55 - Number(horizon.buyHitRate)) * 0.08)
+    ? Math.min(8, (55 - Number(horizon.buyHitRate)) * 0.11)
     : 0;
   const horizonAdversePenalty = Number(horizon.adversePending || 0) > 0
     ? Math.min(5, Number(horizon.adversePending || 0) * 0.65 + Math.max(0, -Number(horizon.avgInterimReturn || 0)) * 0.35)
@@ -1027,17 +1521,25 @@ function adaptiveForecastAdjustment(summary, symbol, horizonDays = 15, candidate
     const weight = index === 0 ? 1 : 0.45;
     return sum + Number(stat.confidencePenalty || 0) * weight;
   }, 0);
-  const confidencePenalty = clampNumber(globalPenalty + horizonPenalty + horizonAdversePenalty + symbolPenalty + patternPenalty, 0, 22);
+  const confidencePenalty = clampNumber(globalPenalty + horizonDirectionPenalty + horizonMagnitudePenalty + horizonPenalty + horizonAdversePenalty + symbolPenalty + patternPenalty, 0, 28);
   const globalShrink = Number(adaptive.upsideShrink || 1) || 1;
+  const horizonDirectionShrink = horizon.resolved >= 6 && horizon.hitRate != null && horizon.hitRate < 50
+    ? Math.max(0.72, 1 - (50 - Number(horizon.hitRate)) * 0.007)
+    : 1;
+  const horizonMagnitudeShrink = horizon.resolved >= 6 && horizon.magnitudeHitRate != null && horizon.magnitudeHitRate < 50
+    ? Math.max(0.68, 1 - (50 - Number(horizon.magnitudeHitRate)) * 0.009)
+    : 1;
   const horizonShrink = horizon.resolved >= 4 && Number(horizon.avgOverPrediction || 0) > 0
     ? Math.max(0.68, 1 - Number(horizon.avgOverPrediction || 0) * 0.025)
     : 1;
   const symbolShrink = Number(symbolStat.upsideShrink || 1) || 1;
   const patternShrink = matchedPatternStats.reduce((value, stat) => Math.min(value, Number(stat.upsideShrink || 1) || 1), 1);
-  const upsideShrink = clampNumber(globalShrink * horizonShrink * symbolShrink * patternShrink, 0.42, 1);
+  const upsideShrink = clampNumber(globalShrink * horizonDirectionShrink * horizonMagnitudeShrink * horizonShrink * symbolShrink * patternShrink, 0.35, 1);
   const reasons = [];
   if (globalPenalty > 0.4) reasons.push(`全局近期预测惩罚 ${globalPenalty.toFixed(1)}%`);
-  if (horizonPenalty > 0.4) reasons.push(`${horizon.label || horizonLabel(horizonBucketForDays(horizonDays))} 命中不足，扣 ${horizonPenalty.toFixed(1)}%`);
+  if (horizonDirectionPenalty > 0.4) reasons.push(`${horizon.label || horizonLabel(horizonBucketForDays(horizonDays))} 方向准确率不足，扣 ${horizonDirectionPenalty.toFixed(1)}%`);
+  if (horizonMagnitudePenalty > 0.4) reasons.push(`${horizon.label || horizonLabel(horizonBucketForDays(horizonDays))} 幅度达成率不足，扣 ${horizonMagnitudePenalty.toFixed(1)}%`);
+  if (horizonPenalty > 0.4) reasons.push(`${horizon.label || horizonLabel(horizonBucketForDays(horizonDays))} 买入达标不足，扣 ${horizonPenalty.toFixed(1)}%`);
   if (horizonAdversePenalty > 0.4) reasons.push(`${horizon.label || horizonLabel(horizonBucketForDays(horizonDays))} 未到期预测已逆行，扣 ${horizonAdversePenalty.toFixed(1)}%`);
   if (symbolPenalty > 0.4) reasons.push(`${key} 近期偏差惩罚 ${symbolPenalty.toFixed(1)}%`);
   if (patternPenalty > 0.4) reasons.push(`相似预测行为惩罚 ${patternPenalty.toFixed(1)}%：${matchedPatternStats.map((stat) => stat.label).join("、")}`);
@@ -4053,6 +4555,128 @@ function ensembleModel(name, confidence, projectedUpside, weight, available, rea
   };
 }
 
+function marketRegimeProfile(factors = {}, technicals = {}) {
+  const regimeFactor = factors?.marketRegime || {};
+  const values = regimeFactor.values || {};
+  const trend = finiteNumber(values.trend, finiteNumber(technicals?.change20d, 0));
+  const volatility = finiteNumber(values.volatility, finiteNumber(technicals?.volatility, 2));
+  const score = finiteNumber(regimeFactor.score, 0);
+  let regime = String(values.regime || "").toLowerCase();
+  if (!regime) {
+    if (score <= -6 || trend <= -3) regime = "downtrend";
+    else if (volatility >= 3.4) regime = "volatile";
+    else if (score >= 5 || trend >= 3) regime = "uptrend";
+    else regime = "range";
+  }
+  if (volatility >= 3.6 && regime !== "downtrend") regime = "volatile";
+  const riskLevel = regime === "downtrend" ? "high" : regime === "volatile" ? "elevated" : regime === "uptrend" ? "constructive" : "neutral";
+  return {
+    regime,
+    riskLevel,
+    score,
+    trend,
+    volatility,
+    buyThresholdBonus: regime === "downtrend" ? 8 : regime === "volatile" ? 5 : regime === "range" ? 2 : 0,
+    upsideShrink: regime === "downtrend" ? 0.72 : regime === "volatile" ? 0.82 : regime === "range" ? 0.92 : 1,
+    confidenceBias: regime === "uptrend" ? 1.5 : regime === "range" ? -0.5 : regime === "volatile" ? -3 : -5,
+  };
+}
+
+function marketRegimeModelView(profile, strategy = {}) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const score = finiteNumber(profile?.score, 0);
+  const trend = finiteNumber(profile?.trend, 0);
+  const volatility = finiteNumber(profile?.volatility, 2);
+  const projected = score * 0.11 + trend * 0.08 - Math.max(0, volatility - stop * 0.55) * 0.18;
+  const confidence = 52 + score * 1.7 - (profile?.regime === "volatile" ? 4 : 0);
+  return ensembleModel(
+    "市场环境模型",
+    confidence,
+    clampNumber(projected, -Math.max(stop, target), target * 0.9),
+    0.1,
+    true,
+    `Market regime ${profile?.regime || "range"} (${profile?.riskLevel || "neutral"}): trend ${trend.toFixed(2)}%, volatility ${volatility.toFixed(2)}, regime score ${score.toFixed(1)}.`,
+    { family: "market-regime", regime: profile?.regime || "range", riskLevel: profile?.riskLevel || "neutral", score, trend, volatility },
+  );
+}
+
+function strategyTargetModelView({ analog, strategy }) {
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const strategyProb = finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate, 0);
+  const stopRate = finiteNumber(analog?.stopRate, 0);
+  const riskReturn = finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0);
+  const modelMeta = finiteNumber(analog?.model?.metaLabelProbability, 0);
+  const modelTarget = finiteNumber(analog?.model?.oosTargetHitAccuracy ?? analog?.model?.targetHitAccuracy, 0);
+  const sampleCount = Number(analog?.count || 0) + Number(analog?.model?.oosSampleCount || 0);
+  if (sampleCount < 8 && !strategyProb && !modelMeta) {
+    return ensembleModel("策略达标模型", 0, 0, 0.16, false, "Strategy target model needs resolved analog/OOS evidence.");
+  }
+  const blendedProb = [strategyProb, modelMeta, modelTarget].filter((value) => value > 0).reduce((sum, value, index, arr) => sum + value / arr.length, 0);
+  const projected = riskReturn * 0.5 + (blendedProb - 50) * 0.055 - stopRate * 0.025;
+  const confidence = 42 + blendedProb * 0.62 + Math.min(8, Math.log10(Math.max(1, sampleCount)) * 3) - Math.max(0, stopRate - 35) * 0.12;
+  return ensembleModel(
+    "策略达标模型",
+    confidence,
+    clampNumber(projected, -Math.max(stop, target), target * 1.15),
+    0.18,
+    true,
+    `Primary strategy label: target-before-stop probability ${blendedProb.toFixed(0)}%, stop-first ${stopRate.toFixed(0)}%, risk-adjusted return ${riskReturn.toFixed(2)}%.`,
+    { family: "strategy-label", strategyProb: blendedProb, analogStrategyProb: strategyProb, metaLabelProbability: modelMeta, modelTargetHitAccuracy: modelTarget, stopRate, sampleCount },
+  );
+}
+
+function modelPerformanceAdjustmentFor(model, summary = {}) {
+  const stat = summary?.modelStats?.[model.name];
+  if (!stat || Number(stat.samples || 0) < 5) return { multiplier: 1, stat: null };
+  return {
+    multiplier: clampNumber(Number(stat.weightMultiplier || 1), 0.45, 1.35),
+    stat,
+  };
+}
+
+function regimeWeightAdjustmentForModel(model, profile = {}) {
+  const family = model.values?.family || "";
+  const name = String(model.name || "");
+  let multiplier = 1;
+  if (profile.regime === "uptrend") {
+    if (/技术|突破|freqtrade|backtrader|strategy-label/i.test(`${name} ${family}`)) multiplier += 0.08;
+    if (/risk|风险|hummingbot/i.test(`${name} ${family}`)) multiplier += 0.03;
+  } else if (profile.regime === "range") {
+    if (/突破|freqtrade/i.test(`${name} ${family}`)) multiplier -= 0.06;
+    if (/风险|hummingbot|lean/i.test(`${name} ${family}`)) multiplier += 0.05;
+  } else if (profile.regime === "volatile") {
+    if (/突破|技术|freqtrade|backtrader/i.test(`${name} ${family}`)) multiplier -= 0.1;
+    if (/风险|hummingbot|lean|market-regime/i.test(`${name} ${family}`)) multiplier += 0.1;
+  } else if (profile.regime === "downtrend") {
+    if (/突破|技术|freqtrade|backtrader|strategy-label/i.test(`${name} ${family}`)) multiplier -= 0.14;
+    if (/风险|hummingbot|lean|market-regime/i.test(`${name} ${family}`)) multiplier += 0.12;
+  }
+  return clampNumber(multiplier, 0.66, 1.25);
+}
+
+function applyPerformanceAndRegimeWeights(models = [], calibrationSummary = {}, profile = {}) {
+  let adjusted = 0;
+  for (const model of models) {
+    if (!model.available || model.weight <= 0) continue;
+    const perf = modelPerformanceAdjustmentFor(model, calibrationSummary);
+    const regimeMultiplier = regimeWeightAdjustmentForModel(model, profile);
+    const finalMultiplier = clampNumber(perf.multiplier * regimeMultiplier, 0.45, 1.45);
+    if (Math.abs(finalMultiplier - 1) > 0.015) {
+      model.weight = Number((model.weight * finalMultiplier).toFixed(4));
+      model.values = {
+        ...(model.values || {}),
+        performanceWeightMultiplier: Number(perf.multiplier.toFixed(2)),
+        regimeWeightMultiplier: Number(regimeMultiplier.toFixed(2)),
+        performanceSamples: perf.stat?.samples || 0,
+      };
+      adjusted += 1;
+    }
+  }
+  return adjusted;
+}
+
 function fundamentalsView(fundamentals) {
   if (!fundamentals) return ensembleModel("基本面估值", 0, 0, 0.09, false, "Fundamental provider returned no usable data.");
   const pe = finiteNumber(fundamentals.peRatio, NaN);
@@ -4472,7 +5096,8 @@ function rebalanceModelAgreementWeights(models = []) {
   return { majority, agreementRatio: Number((agreementRatio * 100).toFixed(0)), boosted };
 }
 
-function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, factor, fundamentals, strategy }) {
+function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, factor, factors, fundamentals, strategy, calibrationSummary }) {
+  const marketProfile = marketRegimeProfile(factors, technicals);
   const techScores = [
     technicals?.trendScore,
     technicals?.momentumScore,
@@ -4487,10 +5112,14 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   const analogDirectionHitRate = finiteNumber(analog?.directionalHitRate ?? analog?.winRate, 0);
   const analogStrategyHitProbability = finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate ?? analog?.winRate, 0);
   const analogRiskAdjustedReturn = finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0);
+  const analogMaxUpside = finiteNumber(analog?.averageMaxUpside, 0);
+  const analogMaxUpsideHitRate = finiteNumber(analog?.maxUpsideHitRate ?? analog?.targetHitRate ?? analog?.winRate, 0);
   const analogStopRate = finiteNumber(analog?.stopRate, 0);
   const modelTargetHitAccuracy = finiteNumber(analog?.model?.targetHitAccuracy ?? analog?.model?.directionalAccuracy, 0);
+  const modelMaxUpsideHitAccuracy = finiteNumber(analog?.model?.maxUpsideHitAccuracy ?? analog?.model?.oosMaxUpsideHitAccuracy ?? analog?.model?.targetHitAccuracy, 0);
   const modelDirectionalAccuracy = finiteNumber(analog?.model?.directionalAccuracy, 0);
   const modelPredictedReturn = finiteNumber(analog?.model?.predictedReturn, 0);
+  const modelPredictedMaxUpside = finiteNumber(analog?.model?.predictedMaxUpside, 0);
   const macroChecked = Number(macroSignal?.checkedItems || 0);
   const socialChecked = Number(socialSignal?.checkedItems || 0);
   const factorChecked = Number(factor?.checked || 0);
@@ -4519,12 +5148,16 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   const historySupportsUpside = (
     (analogReliable && analogStrategyHitProbability >= 52 && analogRiskAdjustedReturn > 0 && analogStopRate <= 42)
     || (modelReliable && modelTargetHitAccuracy >= 56 && modelPredictedReturn > targetUpside * 0.2)
+    || (analogReliable && analogMaxUpsideHitRate >= 56 && analogMaxUpside >= targetUpside * 0.45 && analogStopRate <= 45)
+    || (modelReliable && modelMaxUpsideHitAccuracy >= 58 && modelPredictedMaxUpside >= targetUpside * 0.5)
   );
   const historyWarnsUpside = (
     (analogReliable && (analogStrategyHitProbability < 38 || analogRiskAdjustedReturn < -0.45 || analogStopRate >= 48))
     || (modelReliable && modelTargetHitAccuracy < 52 && modelPredictedReturn < targetUpside * 0.2)
+    || (modelReliable && modelMaxUpsideHitAccuracy < 48 && modelPredictedMaxUpside < targetUpside * 0.35)
   );
   const models = [
+    strategyTargetModelView({ analog, strategy }),
     ensembleModel(
       "技术面模型",
       technicalScore,
@@ -4539,8 +5172,8 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
       finiteNumber(analog?.averageRiskAdjustedReturn ?? analog?.averageForwardReturn, 0),
       0.22,
       analogCount > 0,
-      analogCount ? `${analogCount} similar windows, directional hit rate ${analogDirectionHitRate.toFixed(0)}%, strategy target hit rate ${analogStrategyHitProbability.toFixed(0)}%, stop-first rate ${analogStopRate.toFixed(0)}%.` : "Not enough similar historical windows.",
-      { count: analogCount, winRate: finiteNumber(analog?.winRate, 0), directionalHitRate: analogDirectionHitRate, targetHitRate: analogHitRate, strategyHitProbability: analogStrategyHitProbability, stopRate: analogStopRate },
+      analogCount ? `${analogCount} similar windows, directional hit rate ${analogDirectionHitRate.toFixed(0)}%, strategy target hit rate ${analogStrategyHitProbability.toFixed(0)}%, max-upside touch hit ${analogMaxUpsideHitRate.toFixed(0)}%, stop-first rate ${analogStopRate.toFixed(0)}%.` : "Not enough similar historical windows.",
+      { count: analogCount, winRate: finiteNumber(analog?.winRate, 0), directionalHitRate: analogDirectionHitRate, targetHitRate: analogHitRate, strategyHitProbability: analogStrategyHitProbability, maxUpsideHitRate: analogMaxUpsideHitRate, averageMaxUpside: analogMaxUpside, stopRate: analogStopRate },
     ),
     ensembleModel(
       "自监督回测模型",
@@ -4548,8 +5181,8 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
       modelPredictedReturn,
       0.18,
       modelSampleCount > 0,
-      modelSampleCount ? `${modelSampleCount} walk-forward samples, target-hit accuracy ${modelTargetHitAccuracy.toFixed(0)}%, directional accuracy ${finiteNumber(analog?.model?.directionalAccuracy, 0).toFixed(0)}%, MAE ${finiteNumber(analog?.model?.mae, 0).toFixed(2)}%.` : "Self-supervised sample set is still too small.",
-      { sampleCount: modelSampleCount, targetHitAccuracy: modelTargetHitAccuracy, directionalAccuracy: finiteNumber(analog?.model?.directionalAccuracy, 0), mae: finiteNumber(analog?.model?.mae, 0) },
+      modelSampleCount ? `${modelSampleCount} walk-forward samples, target-hit accuracy ${modelTargetHitAccuracy.toFixed(0)}%, max-upside hit ${modelMaxUpsideHitAccuracy.toFixed(0)}%, directional accuracy ${finiteNumber(analog?.model?.directionalAccuracy, 0).toFixed(0)}%, MAE ${finiteNumber(analog?.model?.mae, 0).toFixed(2)}%.` : "Self-supervised sample set is still too small.",
+      { sampleCount: modelSampleCount, targetHitAccuracy: modelTargetHitAccuracy, maxUpsideHitAccuracy: modelMaxUpsideHitAccuracy, predictedMaxUpside: modelPredictedMaxUpside, directionalAccuracy: finiteNumber(analog?.model?.directionalAccuracy, 0), mae: finiteNumber(analog?.model?.mae, 0) },
     ),
     ensembleModel(
       "新闻社媒模型",
@@ -4569,6 +5202,7 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
       factorChecked ? `Factor stance ${factor?.stance || "mixed"}, score ${finiteNumber(factor?.score, 0).toFixed(1)}, groups ${factorChecked}.` : "No live factor groups available.",
       { score: finiteNumber(factor?.score, 0), checked: factorChecked },
     ),
+    marketRegimeModelView(marketProfile, strategy),
     freqtradeDistilledView({ technicals, analog, factor, strategy }),
     leanFrameworkDistilledView({ technicals, factor, strategy }),
     backtraderIndicatorDistilledView({ technicals, strategy }),
@@ -4580,6 +5214,7 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     riskRewardView(technicals, strategy),
     fundamentalsView(fundamentals),
   ];
+  const performanceWeightAdjusted = applyPerformanceAndRegimeWeights(models, calibrationSummary, marketProfile);
   const agreementWeighting = rebalanceModelAgreementWeights(models);
   const available = models.filter((model) => model.available && model.weight > 0);
   const totalWeight = available.reduce((sum, model) => sum + model.weight, 0) || 1;
@@ -4616,6 +5251,8 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     disagreementPenalty: Number(disagreementPenalty.toFixed(2)),
     evidenceBonus: Number(evidenceBonus.toFixed(2)),
     agreementWeighting,
+    marketRegime: marketProfile,
+    performanceWeightAdjusted,
     historyGate: {
       samplePower: Number(samplePower.toFixed(2)),
       reliability: Number(historyReliability.toFixed(1)),
@@ -4625,6 +5262,10 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
       analogStopRate: Number(analogStopRate.toFixed(1)),
       modelDirectionalAccuracy: Number(modelDirectionalAccuracy.toFixed(1)),
       modelTargetHitAccuracy: Number(modelTargetHitAccuracy.toFixed(1)),
+      analogMaxUpside: Number(analogMaxUpside.toFixed(2)),
+      analogMaxUpsideHitRate: Number(analogMaxUpsideHitRate.toFixed(1)),
+      modelPredictedMaxUpside: Number(modelPredictedMaxUpside.toFixed(2)),
+      modelMaxUpsideHitAccuracy: Number(modelMaxUpsideHitAccuracy.toFixed(1)),
       supportsUpside: historySupportsUpside,
       blocksUpside: historyWarnsUpside,
       modelPredictedReturn: Number(modelPredictedReturn.toFixed(2)),
@@ -4634,7 +5275,7 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   };
 }
 
-function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, targetUpside, targetConfidence, marketValidation, calibration }) {
+function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, targetUpside, targetConfidence, marketValidation, calibration, strategyCalibration, market }) {
   const availableModelCount = Number(ensemble.availableModelCount || 0);
   const consensus = Number(ensemble.consensusAgreement || 0);
   const upsideAgreement = Number(ensemble.upsideAgreement || 0);
@@ -4643,32 +5284,44 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   const historyGate = ensemble.historyGate || {};
   const target = Math.max(1, Number(targetUpside || 5));
   const minTradeConfidence = Math.max(Number(targetConfidence || 80), 72);
+  const marketRegime = ensemble.marketRegime || {};
+  const marketKey = safeMarket(market || ensemble.market || marketValidation?.market || "ASX");
+  const stricterMarket = marketKey === "ASX" || marketKey === "US";
+  const baseStrategyProbabilityTarget = stricterMarket ? Math.max(60, Number(targetConfidence || 80) - 7) : Math.max(55, Number(targetConfidence || 80) - 10);
+  const strategyProbabilityTarget = Math.max(stricterMarket ? 60 : 55, Math.min(stricterMarket ? 76 : 68, baseStrategyProbabilityTarget)) + Number(marketRegime.buyThresholdBonus || 0);
   const historySamplePower = Number(historyGate.samplePower || 0);
   const historyReliability = Number(historyGate.reliability || 0);
-  const strategyHitProbability = Number(historyGate.strategyHitProbability || 0);
-  const historyOkForBuy = historySamplePower >= 0.25 && strategyHitProbability >= 48 && historyReliability >= 52 && !historyGate.blocksUpside;
+  const rawStrategyHitProbability = Number(historyGate.strategyHitProbability || 0);
+  const strategyHitProbability = strategyCalibration?.sampleCount >= 5
+    ? Number(strategyCalibration.probability || rawStrategyHitProbability)
+    : rawStrategyHitProbability;
+  const historyOkForBuy = historySamplePower >= 0.25
+    && strategyHitProbability >= strategyProbabilityTarget
+    && historyReliability >= 52
+    && !historyGate.blocksUpside;
 
   let shrink = 0.68;
-  if (consensus >= 78) shrink += 0.14;
-  else if (consensus >= 68) shrink += 0.07;
-  else if (consensus < 60) shrink -= 0.16;
+  if (consensus >= 82 && upsideAgreement >= 70) shrink += 0.14;
+  else if (consensus >= 72 && upsideAgreement >= 62) shrink += 0.07;
+  else if (consensus < 64) shrink -= 0.18;
   if (availableModelCount >= 5) shrink += 0.07;
   else if (availableModelCount < 4) shrink -= 0.12;
   if (evidenceBonus >= 3) shrink += 0.05;
   if (disagreement > 5) shrink -= Math.min(0.18, (disagreement - 5) * 0.035);
   if (marketValidation?.degraded) shrink -= 0.1;
+  if (marketRegime.upsideShrink && Number(projectedUpsideRaw || 0) > 0) shrink *= Number(marketRegime.upsideShrink || 1);
   if (calibration?.sampleCount >= 5 && Number(calibration.confidence || 0) < Number(score || 0)) shrink -= 0.05;
   if (Number(projectedUpsideRaw || 0) > 0 && historySamplePower >= 0.25) {
-    if (historyOkForBuy) shrink += 0.06;
-    else shrink -= 0.18;
+    if (historyOkForBuy) shrink += 0.05;
+    else shrink -= stricterMarket ? 0.24 : 0.18;
   }
-  shrink = clampNumber(shrink, 0.42, 0.9);
+  shrink = clampNumber(shrink, stricterMarket ? 0.36 : 0.42, 0.9);
 
-  const positiveCap = consensus >= 78 && upsideAgreement >= 65
+  const positiveCap = consensus >= 82 && upsideAgreement >= 70
     ? target * 1.55
-    : consensus >= 65 && upsideAgreement >= 58
+    : consensus >= 70 && upsideAgreement >= 62
       ? target * 1.25
-      : target * 0.95;
+      : target * (stricterMarket ? 0.82 : 0.95);
   const negativeCap = Math.max(4, target * 1.25);
   let projectedUpside = Number(projectedUpsideRaw || 0) * shrink;
   projectedUpside = projectedUpside >= 0
@@ -4696,6 +5349,13 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     confidenceCap = Math.min(confidenceCap, 75);
     reasons.push("行情仅单源真实数据");
   }
+  if (marketRegime.regime === "downtrend") {
+    confidenceCap = Math.min(confidenceCap, 72);
+    reasons.push("市场环境为下跌趋势");
+  } else if (marketRegime.regime === "volatile") {
+    confidenceCap = Math.min(confidenceCap, 76);
+    reasons.push("市场环境高波动");
+  }
   if (!calibration || Number(calibration.sampleCount || 0) < 5) {
     confidenceCap = Math.min(confidenceCap, 84);
     reasons.push("历史校准样本仍在收集");
@@ -4704,7 +5364,7 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     reasons.push("样本外策略达标验证不足");
   } else if (Number(projectedUpsideRaw || 0) > 0 && !historyOkForBuy) {
     if (historyReliability > 0 && historyReliability < 45) confidenceCap = Math.min(confidenceCap, 58);
-    reasons.push(`策略达标概率不足 ${strategyHitProbability ? `${strategyHitProbability.toFixed(0)}%` : "样本不足"}`);
+    reasons.push(`策略达标概率不足 ${strategyHitProbability ? `${strategyHitProbability.toFixed(0)}%` : "样本不足"} / 目标 ${strategyProbabilityTarget.toFixed(0)}%`);
   }
 
   let confidenceBonus = 0;
@@ -4712,12 +5372,16 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   if (calibration?.sampleCount >= 5 && Number(calibration.confidence || 0) >= Number(score || 0)) confidenceBonus += 1.5;
   if (historyOkForBuy && consensus >= 66) confidenceBonus += 2;
   const confidence = Math.round(Math.min(confidenceCap, Number(score || 0) + confidenceBonus));
+  const minBuyConsensus = stricterMarket ? 66 : 62;
+  const minBuyUpsideAgreement = stricterMarket ? 62 : 58;
+  const maxBuyDisagreement = stricterMarket ? 6.8 : 7.5;
   const buyEligible = confidence >= minTradeConfidence
-    && projectedUpside >= target
-    && consensus >= 62
-    && upsideAgreement >= 58
+    && projectedUpside >= Math.max(0.8, target * 0.35)
+    && consensus >= minBuyConsensus
+    && upsideAgreement >= minBuyUpsideAgreement
     && availableModelCount >= 4
-    && disagreement <= 7.5
+    && disagreement <= maxBuyDisagreement
+    && strategyHitProbability >= strategyProbabilityTarget
     && historyOkForBuy;
 
   return {
@@ -4727,13 +5391,21 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     shrink: Number(shrink.toFixed(2)),
     confidenceCap,
     minTradeConfidence,
+    strategyProbabilityTarget: Number(strategyProbabilityTarget.toFixed(1)),
+    strategyHitProbability: Number(strategyHitProbability.toFixed(1)),
+    rawStrategyHitProbability: Number(rawStrategyHitProbability.toFixed(1)),
+    strategyCalibration,
     buyEligible,
     blocked: !buyEligible,
     reasons,
+    minBuyConsensus,
+    minBuyUpsideAgreement,
+    maxBuyDisagreement,
     historyGate: {
       ...historyGate,
       okForBuy: historyOkForBuy,
       strategyHitProbability: Number(strategyHitProbability.toFixed(1)),
+      rawStrategyHitProbability: Number(rawStrategyHitProbability.toFixed(1)),
     },
   };
 }
@@ -4763,6 +5435,127 @@ function directionalConfidenceMetrics(ensemble = {}, confidence = 0, projectedUp
   };
 }
 
+function projectedMoveConfidenceMetrics({ projectedUpside = 0, ensemble = {}, analog = {}, confidence = 0, strategy = {}, conservative = {} }) {
+  const projected = Number(projectedUpside || 0);
+  const expectedMove = Math.abs(projected);
+  const direction = projected < -0.35 ? "downside" : projected > 0.35 ? "upside" : "neutral";
+  const consensus = clampNumber(Number(ensemble.consensusAgreement || 0), 0, 100);
+  const directionAgreement = direction === "upside"
+    ? clampNumber(Number(ensemble.upsideAgreement || consensus || 50), 0, 100)
+    : direction === "downside"
+      ? clampNumber(Math.max(100 - Number(ensemble.upsideAgreement || 50), consensus), 0, 100)
+      : consensus || 50;
+  const examples = Array.isArray(analog?.examples) ? analog.examples : [];
+  const analogHits = expectedMove >= 0.25 && examples.length
+    ? examples.filter((row) => (
+      direction === "upside"
+        ? Number(row.maxUpside ?? row.forwardReturn ?? 0) >= expectedMove * 0.88
+        : direction === "downside"
+          ? Math.abs(Number(row.maxDrawdown ?? row.forwardReturn ?? 0)) >= expectedMove * 0.88
+          : Math.abs(Number(row.forwardReturn || 0)) <= Math.max(0.5, expectedMove)
+    )).length / examples.length * 100
+    : null;
+  const model = analog?.model || {};
+  const modelReturn = Number(model.predictedReturn || 0);
+  const modelSameDirection = direction === "neutral" || Math.sign(modelReturn) === Math.sign(projected);
+  const modelDistance = Math.abs(modelReturn - projected);
+  const modelUncertainty = Number(model.conformalP80Error ?? model.mae ?? 2.5);
+  const modelBase = Number(model.sampleCount || 0) > 0
+    ? clampNumber(
+      Number(model.confidence || 0) * 0.32
+        + Number(model.directionalAccuracy || model.oosDirectionalAccuracy || 0) * 0.24
+        + Number(model.targetHitAccuracy || model.oosTargetHitAccuracy || 0) * 0.12
+        + (modelSameDirection ? 14 : -12)
+        - modelDistance * 5.2
+        - modelUncertainty * 2.1
+        - Math.max(0, expectedMove - Math.abs(modelReturn)) * 2.8,
+      0,
+      92,
+    )
+    : null;
+  const target = Math.max(1, Number(strategy?.targetUpside || 5));
+  const strategyProbability = Number(conservative?.strategyHitProbability || ensemble.historyGate?.strategyHitProbability || analog?.strategyHitProbability || 0);
+  const strategyComparable = direction === "upside" && strategyProbability > 0
+    ? clampNumber(strategyProbability + (target - expectedMove) * 3.2, 0, 90)
+    : null;
+  const weightedInputs = [
+    analogHits != null ? { value: analogHits, weight: Math.min(0.45, Math.max(0.18, examples.length / 18)) } : null,
+    modelBase != null ? { value: modelBase, weight: Math.min(0.5, Math.max(0.22, Number(model.sampleCount || 0) / 420)) } : null,
+    strategyComparable != null ? { value: strategyComparable, weight: expectedMove <= target * 1.15 ? 0.18 : 0.08 } : null,
+    { value: Number(confidence || 0) * 0.45 + directionAgreement * 0.32, weight: 0.18 },
+  ].filter(Boolean);
+  const totalWeight = weightedInputs.reduce((sum, row) => sum + row.weight, 0) || 1;
+  let probability = weightedInputs.reduce((sum, row) => sum + row.value * row.weight, 0) / totalWeight;
+  if (expectedMove >= target * 1.2) probability -= Math.min(12, (expectedMove - target * 1.2) * 2.6);
+  if (Number(conservative?.shrink || 1) < 0.65 && expectedMove > 0) probability -= 4;
+  probability = clampNumber(probability, 0, 92);
+  return {
+    probability: Number(probability.toFixed(1)),
+    direction,
+    expectedMove: Number(expectedMove.toFixed(2)),
+    analogHitRate: analogHits == null ? null : Number(analogHits.toFixed(1)),
+    modelMagnitudeProbability: modelBase == null ? null : Number(modelBase.toFixed(1)),
+    modelUncertainty: Number((Number.isFinite(modelUncertainty) ? modelUncertainty : 0).toFixed(2)),
+    modelDistance: Number(modelDistance.toFixed(2)),
+    basis: examples.length ? "analog+model" : modelBase != null ? "model" : "ensemble",
+  };
+}
+
+function projectedMaxUpsideConfidenceMetrics({ projectedFinalReturn = 0, ensemble = {}, analog = {}, confidence = 0, strategy = {}, conservative = {} }) {
+  const target = Math.max(1, Number(strategy?.targetUpside || 5));
+  const consensus = clampNumber(Number(ensemble.consensusAgreement || 0), 0, 100);
+  const upsideAgreement = clampNumber(Number(ensemble.upsideAgreement || 0), 0, 100);
+  const examples = Array.isArray(analog?.examples) ? analog.examples : [];
+  const averageAnalogMax = finiteNumber(analog?.averageMaxUpside, examples.length ? mean(examples.map((row) => Math.max(0, Number(row.maxUpside || 0)))) : 0);
+  const model = analog?.model || {};
+  const modelMax = finiteNumber(model.predictedMaxUpside, 0);
+  const modelAccuracy = finiteNumber(model.maxUpsideHitAccuracy ?? model.oosMaxUpsideHitAccuracy ?? model.targetHitAccuracy, 0);
+  const modelUncertainty = finiteNumber(model.maxUpsideMae ?? model.conformalP80Error ?? model.mae, 2.8);
+  const baseMax = Math.max(
+    0,
+    Number(projectedFinalReturn || 0),
+    averageAnalogMax * (Number(model.sampleCount || 0) ? 0.58 : 0.75) + modelMax * (Number(model.sampleCount || 0) ? 0.42 : 0),
+    target * 0.35,
+  );
+  const cap = target * (consensus >= 82 && upsideAgreement >= 70 ? 1.85 : consensus >= 70 && upsideAgreement >= 62 ? 1.55 : 1.22);
+  const projectedMaxUpside = Number(clampNumber(baseMax, 0, Math.max(0.8, cap)).toFixed(2));
+  const analogHitRate = projectedMaxUpside >= 0.25 && examples.length
+    ? examples.filter((row) => Math.max(0, Number(row.maxUpside || 0)) >= projectedMaxUpside * 0.88).length / examples.length * 100
+    : null;
+  const modelProbability = Number(model.sampleCount || 0) > 0
+    ? clampNumber(
+      modelAccuracy * 0.42
+        + finiteNumber(model.metaMaxUpsideProbability, 0) * 0.18
+        + Number(model.confidence || 0) * 0.16
+        + upsideAgreement * 0.12
+        - Math.max(0, projectedMaxUpside - modelMax) * 3.2
+        - modelUncertainty * 1.6,
+      0,
+      92,
+    )
+    : null;
+  const strategyComparable = Number(conservative?.strategyHitProbability || ensemble.historyGate?.strategyHitProbability || analog?.strategyHitProbability || 0);
+  const weightedInputs = [
+    analogHitRate != null ? { value: analogHitRate, weight: Math.min(0.45, Math.max(0.18, examples.length / 18)) } : null,
+    modelProbability != null ? { value: modelProbability, weight: Math.min(0.5, Math.max(0.22, Number(model.sampleCount || 0) / 420)) } : null,
+    strategyComparable > 0 ? { value: clampNumber(strategyComparable + (target - projectedMaxUpside) * 2.4, 0, 90), weight: projectedMaxUpside <= target * 1.15 ? 0.18 : 0.09 } : null,
+    { value: Number(confidence || 0) * 0.34 + upsideAgreement * 0.34 + consensus * 0.12, weight: 0.2 },
+  ].filter(Boolean);
+  const totalWeight = weightedInputs.reduce((sum, row) => sum + row.weight, 0) || 1;
+  let probability = weightedInputs.reduce((sum, row) => sum + row.value * row.weight, 0) / totalWeight;
+  if (projectedMaxUpside >= target * 1.35) probability -= Math.min(10, (projectedMaxUpside - target * 1.35) * 2.5);
+  if (Number(conservative?.shrink || 1) < 0.65) probability -= 3;
+  probability = clampNumber(probability, 0, 92);
+  return {
+    projectedMaxUpside,
+    probability: Number(probability.toFixed(1)),
+    analogHitRate: analogHitRate == null ? null : Number(analogHitRate.toFixed(1)),
+    modelProbability: modelProbability == null ? null : Number(modelProbability.toFixed(1)),
+    modelUncertainty: Number(modelUncertainty.toFixed(2)),
+    basis: examples.length ? "analog-max+model" : modelProbability != null ? "model-max" : "ensemble",
+  };
+}
+
 function localAnalysis(input) {
   const { symbol, strategy, technicals, analog, fundamentals, xPosts = [], youtubeItems = [], news = [], factors, marketValidation, holding } = input;
   const market = safeMarket(input.market || "ASX");
@@ -4774,7 +5567,7 @@ function localAnalysis(input) {
   ];
   const socialSignal = newsSignal(socialItems, code, market);
   const factor = factorSignal(factors);
-  const ensemble = buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, factor, fundamentals, strategy });
+  const ensemble = buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, factor, factors, fundamentals, strategy, calibrationSummary: input.calibrationSummary });
   const confidencePenalty = marketValidation?.degraded ? Number(process.env.SINGLE_SOURCE_CONFIDENCE_PENALTY || 5) : 0;
   const targetConfidence = Number(strategy?.confidence || 80);
   const targetUpside = Number(strategy?.targetUpside || 5);
@@ -4811,6 +5604,7 @@ function localAnalysis(input) {
   const adaptivePenalty = Number(adaptive.confidencePenalty || 0);
   const score = Math.max(0, Math.min(99, Math.round(ensemble.confidence - confidencePenalty - adaptivePenalty)));
   const calibration = calibrateConfidenceValue(score, input.calibrationSummary);
+  const strategyCalibration = calibrateStrategyProbabilityValue(ensemble.historyGate?.strategyHitProbability || 0, input.calibrationSummary);
   const projectedUpsideRaw = ensemble.projectedUpside * Number(adaptive.upsideShrink || 1);
   const preConservativeScore = calibration.sampleCount >= 5 ? calibration.confidence : score;
   const conservative = conservativeForecastCalibration({
@@ -4821,11 +5615,16 @@ function localAnalysis(input) {
     targetConfidence,
     marketValidation,
     calibration,
+    strategyCalibration,
+    market,
   });
   const calibratedScore = conservative.confidence;
   const projectedUpside = conservative.projectedUpside;
   const directional = directionalConfidenceMetrics(ensemble, calibratedScore, projectedUpside);
-  const action = conservative.buyEligible && calibratedScore >= targetConfidence && projectedUpside >= targetUpside
+  const magnitude = projectedMoveConfidenceMetrics({ projectedUpside, ensemble, analog, confidence: calibratedScore, strategy, conservative });
+  const maxUpside = projectedMaxUpsideConfidenceMetrics({ projectedFinalReturn: projectedUpside, ensemble, analog, confidence: calibratedScore, strategy, conservative });
+  const cycleTargetMove = Math.max(0, projectedUpside, maxUpside.projectedMaxUpside * 0.72);
+  const action = conservative.buyEligible && calibratedScore >= targetConfidence && cycleTargetMove >= targetUpside
     ? "WATCH_BUY"
     : calibratedScore <= 42
       ? "AVOID_OR_REDUCE"
@@ -4836,12 +5635,25 @@ function localAnalysis(input) {
     action,
     confidence: calibratedScore,
     predictionConfidence: directional.predictionConfidence,
+    magnitudeConfidence: magnitude.probability,
+    magnitudeHitProbability: magnitude.probability,
+    moveHitProbability: magnitude.probability,
+    projectedMoveConfidence: magnitude.probability,
+    projectedFinalReturn: projectedUpside,
+    finalReturnConfidence: magnitude.probability,
+    finalReturnHitProbability: magnitude.probability,
+    projectedMaxUpside: maxUpside.projectedMaxUpside,
+    maxUpsideConfidence: maxUpside.probability,
+    maxUpsideHitProbability: maxUpside.probability,
+    strategyConfidence: Number(conservative.strategyHitProbability || 0),
+    strategyHitProbability: Number(conservative.strategyHitProbability || 0),
     upsideConfidence: directional.upsideConfidence,
     downsideConfidence: directional.downsideConfidence,
     direction: directional.direction,
     directionAgreement: directional.directionAgreement,
     rawConfidence: score,
     calibration,
+    strategyCalibration,
     ensemble: {
       ...ensemble,
       confidenceAfterDataPenalty: score,
@@ -4853,8 +5665,29 @@ function localAnalysis(input) {
       adaptiveUpsideShrink: adaptive.upsideShrink,
       adaptivePatternPenalty: adaptive.patternPenalty,
       adaptiveMatchedPatterns: adaptive.matchedPatterns,
+      strategyProbabilityTarget: conservative.strategyProbabilityTarget,
+      magnitudeHitProbability: magnitude.probability,
+      magnitudeBasis: magnitude.basis,
+      projectedMaxUpside: maxUpside.projectedMaxUpside,
+      maxUpsideHitProbability: maxUpside.probability,
+      maxUpsideBasis: maxUpside.basis,
     },
-    qualityGate: conservative,
+    qualityGate: {
+      ...conservative,
+      magnitudeHitProbability: magnitude.probability,
+      magnitudeExpectedMove: magnitude.expectedMove,
+      magnitudeAnalogHitRate: magnitude.analogHitRate,
+      magnitudeModelProbability: magnitude.modelMagnitudeProbability,
+      magnitudeModelUncertainty: magnitude.modelUncertainty,
+      magnitudeBasis: magnitude.basis,
+      finalReturnHitProbability: magnitude.probability,
+      projectedMaxUpside: maxUpside.projectedMaxUpside,
+      maxUpsideHitProbability: maxUpside.probability,
+      maxUpsideAnalogHitRate: maxUpside.analogHitRate,
+      maxUpsideModelProbability: maxUpside.modelProbability,
+      maxUpsideModelUncertainty: maxUpside.modelUncertainty,
+      maxUpsideBasis: maxUpside.basis,
+    },
     projectedUpside,
     horizonDays: Number(strategy?.horizonDays || 15),
     thesis: [
@@ -4865,10 +5698,14 @@ function localAnalysis(input) {
       `Model cross-check: evidence bonus ${finiteNumber(ensemble.evidenceBonus, 0).toFixed(1)}%, disagreement penalty ${finiteNumber(ensemble.disagreementPenalty, 0).toFixed(1)}%.`,
       adaptive.reasons.length ? `Adaptive learning: ${adaptive.reasons.join("；")}。旧预测会保留到周期结束并持续校准短/中/长期参数。` : "Adaptive learning: no material penalty from prior forecast outcomes yet.",
       `Conservative calibration: projected upside shrink ${conservative.shrink}x, confidence cap ${conservative.confidenceCap}%, ${conservative.buyEligible ? "high-conviction gate passed" : `high-conviction gate blocked (${conservative.reasons.join("、") || "证据仍不足"})`}.`,
+      `Final-return label: expected ${projectedUpside >= 0 ? "+" : ""}${projectedUpside.toFixed(2)}% by day ${Number(strategy?.horizonDays || 15)}, final-return hit probability ${magnitude.probability.toFixed(0)}% (${magnitude.basis}).`,
+      `Max-upside label: expected intraperiod high touch ${maxUpside.projectedMaxUpside.toFixed(2)}%, touch probability ${maxUpside.probability.toFixed(0)}% (${maxUpside.basis}, analog ${maxUpside.analogHitRate == null ? "n/a" : `${maxUpside.analogHitRate.toFixed(0)}%`}, model ${maxUpside.modelProbability == null ? "n/a" : `${maxUpside.modelProbability.toFixed(0)}%`}).`,
+      `Strategy target label: target-before-stop probability ${Number(conservative.strategyHitProbability || 0).toFixed(0)}% / required ${Number(conservative.strategyProbabilityTarget || 0).toFixed(0)}%; ${strategyCalibration?.sampleCount >= 5 ? strategyCalibration.message : "strategy probability calibration is still collecting resolved samples"}.`,
+      `Market regime model: ${ensemble.marketRegime?.regime || "range"} / ${ensemble.marketRegime?.riskLevel || "neutral"}, threshold bonus ${Number(ensemble.marketRegime?.buyThresholdBonus || 0).toFixed(0)}%, upside shrink ${Math.round(Number(ensemble.marketRegime?.upsideShrink || 1) * 100)}%.`,
       positiveAgreement ? "Most available models agree on upside direction." : negativeAgreement ? "Most available models agree on downside risk." : "Forecast engines are mixed; confidence is constrained.",
       analog?.count ? `Historical analogs: ${analog.count} similar windows, average ${Number(analog.averageForwardReturn || 0).toFixed(2)}% over the strategy horizon, win rate ${Number(analog.winRate || 0).toFixed(0)}%.` : "Not enough historical analog windows were available.",
       ensemble.historyGate?.samplePower >= 0.25
-        ? `Reliability split: directional reliability ${Number(ensemble.historyGate.reliability || 0).toFixed(0)}%, strategy-hit probability ${Number(ensemble.historyGate.strategyHitProbability || 0).toFixed(0)}%, analog target-hit ${Number(ensemble.historyGate.analogTargetHitRate || 0).toFixed(0)}%, self-supervised target-hit accuracy ${Number(ensemble.historyGate.modelTargetHitAccuracy || 0).toFixed(0)}%; ${ensemble.historyGate.supportsUpside ? "supports upside" : ensemble.historyGate.blocksUpside ? "blocks upside" : "neutral"}.`
+        ? `Reliability split: directional reliability ${Number(ensemble.historyGate.reliability || 0).toFixed(0)}%, strategy-hit probability ${Number(ensemble.historyGate.strategyHitProbability || 0).toFixed(0)}%, analog target-hit ${Number(ensemble.historyGate.analogTargetHitRate || 0).toFixed(0)}%, analog max-upside hit ${Number(ensemble.historyGate.analogMaxUpsideHitRate || 0).toFixed(0)}%, self-supervised max-upside hit ${Number(ensemble.historyGate.modelMaxUpsideHitAccuracy || 0).toFixed(0)}%; ${ensemble.historyGate.supportsUpside ? "supports upside" : ensemble.historyGate.blocksUpside ? "blocks upside" : "neutral"}.`
         : "Strategy hit validation: not enough out-of-sample history to lift confidence.",
       fundamentals ? `Fundamentals checked: PE ${fundamentals.peRatio || "n/a"}, dividend yield ${fundamentals.dividendYield || "n/a"}, beta ${fundamentals.beta || "n/a"}.` : "Fundamental data was not available from the configured provider.",
       news.length ? `Macro/industry/news signal: ${macroSignal.stance}, score ${macroSignal.score}, checked ${macroSignal.checkedItems} multi-source items across direct, peer, upstream, sector, macro, and global channels.` : "No fresh macro or company news was available from the configured provider.",
@@ -4895,6 +5732,9 @@ function strategyDecision(analysis, input) {
   const capital = input.capital || {};
   const confidence = Math.max(0, Math.min(99, Math.round(Number(analysis.confidence || 0))));
   const projectedUpside = Number(Number(analysis.projectedUpside || 0).toFixed(2));
+  const projectedFinalReturn = Number(Number(analysis.projectedFinalReturn ?? projectedUpside).toFixed(2));
+  const projectedMaxUpside = Math.max(0, Number(Number(analysis.projectedMaxUpside ?? analysis.qualityGate?.projectedMaxUpside ?? projectedUpside).toFixed(2)));
+  const cycleTargetMove = Math.max(0, projectedFinalReturn, projectedMaxUpside * 0.72);
   const targetConfidence = Number(strategy.confidence || 80);
   const targetUpside = Number(strategy.targetUpside || 5);
   const stopLoss = Number(strategy.stopLoss || 4);
@@ -4908,12 +5748,39 @@ function strategyDecision(analysis, input) {
   const hasCapacity = !totalCapital || suggestedTradeValue > 0;
   const qualityGate = analysis.qualityGate || {};
   const qualityBlocked = qualityGate.blocked === true || qualityGate.buyEligible === false;
+  const strategyProbability = Math.max(0, Math.min(99, Number(analysis.strategyHitProbability ?? analysis.strategyConfidence ?? qualityGate.strategyHitProbability ?? qualityGate.historyGate?.strategyHitProbability ?? 0)));
+  const finalReturnProbability = Math.max(0, Math.min(99, Number(analysis.finalReturnHitProbability ?? analysis.finalReturnConfidence ?? analysis.magnitudeHitProbability ?? qualityGate.finalReturnHitProbability ?? 0)));
+  const maxUpsideProbability = Math.max(0, Math.min(99, Number(analysis.maxUpsideHitProbability ?? analysis.maxUpsideConfidence ?? qualityGate.maxUpsideHitProbability ?? 0)));
+  const magnitudeProbability = Math.max(
+    Math.max(0, Math.min(99, Number(analysis.magnitudeHitProbability ?? analysis.magnitudeConfidence ?? analysis.moveHitProbability ?? analysis.projectedMoveConfidence ?? qualityGate.magnitudeHitProbability ?? 0))),
+    finalReturnProbability,
+    maxUpsideProbability,
+  );
+  const market = safeMarket(input.market || "ASX");
+  const strictMarket = market === "ASX" || market === "US";
+  const fallbackStrategyTarget = strictMarket ? Math.max(60, targetConfidence - 7) : Math.max(55, targetConfidence - 10);
+  const strategyProbabilityTarget = Math.max(strictMarket ? 60 : 55, Math.min(strictMarket ? 76 : 68, Number(qualityGate.strategyProbabilityTarget || fallbackStrategyTarget || 58)));
+  const magnitudeProbabilityTarget = Math.max(strictMarket ? 50 : 44, Math.min(70, targetConfidence - (strictMarket ? 24 : 30)));
+  const minBuyConsensus = Number(qualityGate.minBuyConsensus || (strictMarket ? 66 : 62));
+  const minBuyUpsideAgreement = Number(qualityGate.minBuyUpsideAgreement || (strictMarket ? 62 : 58));
+  const maxBuyDisagreement = Number(qualityGate.maxBuyDisagreement || (strictMarket ? 6.8 : 7.5));
+  const ensemble = analysis.ensemble || {};
+  const consensus = Number(ensemble.consensusAgreement || 0);
+  const upsideAgreement = Number(ensemble.upsideAgreement || 0);
+  const disagreement = Number(ensemble.disagreementPenalty || 0);
+  const marketAgreementOk = (!consensus || consensus >= minBuyConsensus)
+    && (!upsideAgreement || upsideAgreement >= minBuyUpsideAgreement)
+    && disagreement <= maxBuyDisagreement;
   const downsideConfidence = Math.max(0, Math.min(99, Number(analysis.downsideConfidence ?? (projectedUpside < 0 ? confidence : 0))));
-  const severeDownside = projectedUpside <= -Math.max(stopLoss, 4) || (downsideConfidence >= Math.max(70, targetConfidence - 5) && projectedUpside <= -Math.max(2.5, stopLoss * 0.65));
+  const severeDownside = projectedFinalReturn <= -Math.max(stopLoss, 4) || (downsideConfidence >= Math.max(70, targetConfidence - 5) && projectedFinalReturn <= -Math.max(2.5, stopLoss * 0.65));
   const held = Boolean(input.holding);
-  const matched = !qualityBlocked && confidence >= targetConfidence && projectedUpside >= targetUpside && !stopLossHit && hasCapacity;
-  const strongMatched = matched && confidence >= targetConfidence + 8 && projectedUpside >= targetUpside * 1.35 && Number(analysis.directionAgreement || 0) >= 72;
-  const lightMatched = !qualityBlocked && !matched && confidence >= Math.max(52, targetConfidence - 12) && projectedUpside >= Math.max(0.8, targetUpside * 0.45) && !stopLossHit;
+  const matched = !qualityBlocked && marketAgreementOk && confidence >= targetConfidence && magnitudeProbability >= magnitudeProbabilityTarget && strategyProbability >= strategyProbabilityTarget && cycleTargetMove >= targetUpside && !stopLossHit && hasCapacity;
+  const strongMatched = matched && confidence >= targetConfidence + 8 && magnitudeProbability >= magnitudeProbabilityTarget + 5 && strategyProbability >= strategyProbabilityTarget + 5 && cycleTargetMove >= targetUpside * 1.12 && Number(analysis.directionAgreement || 0) >= 72;
+  const lightConfidenceFloor = strictMarket ? Math.max(58, targetConfidence - 8) : Math.max(52, targetConfidence - 12);
+  const lightMagnitudeFloor = strictMarket ? Math.max(44, magnitudeProbabilityTarget - 8) : Math.max(38, magnitudeProbabilityTarget - 10);
+  const lightStrategyFloor = strictMarket ? Math.max(55, strategyProbabilityTarget - 6) : Math.max(45, strategyProbabilityTarget - 12);
+  const lightUpsideFloor = Math.max(0.8, targetUpside * (strictMarket ? 0.65 : 0.45));
+  const lightMatched = !qualityBlocked && marketAgreementOk && !matched && confidence >= lightConfidenceFloor && magnitudeProbability >= lightMagnitudeFloor && strategyProbability >= lightStrategyFloor && cycleTargetMove >= lightUpsideFloor && !stopLossHit;
   const action = held && (stopLossHit || severeDownside)
     ? "CRITICAL_SELL"
     : severeDownside
@@ -4924,18 +5791,18 @@ function strategyDecision(analysis, input) {
           ? "WATCH_BUY"
           : lightMatched
             ? "LIGHT_BUY"
-            : stopLossHit || confidence <= 42 || projectedUpside <= -1.2
+              : stopLossHit || confidence <= 42 || projectedFinalReturn <= -1.2
               ? "AVOID_OR_REDUCE"
               : "HOLD_WATCH";
   const thesis = Array.isArray(analysis.thesis) ? [...analysis.thesis] : [];
   if (strongMatched) {
-    thesis.unshift(`Strong buy tier: prediction reliability ${confidence}% and projected upside ${projectedUpside}% exceed your rule with stronger model agreement.`);
+    thesis.unshift(`Strong buy tier: direction confidence ${confidence}%, max-upside touch confidence ${maxUpsideProbability.toFixed(0)}%, final-return confidence ${finalReturnProbability.toFixed(0)}%, strategy target-hit probability ${strategyProbability.toFixed(0)}%, and cycle target move ${cycleTargetMove.toFixed(2)}% exceed your rule with stronger model agreement.`);
   } else if (matched) {
-    thesis.unshift(`Matches your rule: confidence ${confidence}% >= ${targetConfidence}% and projected upside ${projectedUpside}% >= ${targetUpside}%.`);
+    thesis.unshift(`Matches your rule: direction confidence ${confidence}% >= ${targetConfidence}%, max-upside touch confidence ${maxUpsideProbability.toFixed(0)}%, final-return confidence ${finalReturnProbability.toFixed(0)}%, strategy target-hit probability ${strategyProbability.toFixed(0)}% >= ${strategyProbabilityTarget.toFixed(0)}%, and cycle target move ${cycleTargetMove.toFixed(2)}% >= ${targetUpside}%.`);
   } else if (lightMatched) {
-    thesis.unshift(`Light buy/watch tier: setup is positive but does not fully meet your target rule yet.`);
+    thesis.unshift(`Light buy/watch tier: setup is positive but max-upside touch confidence ${maxUpsideProbability.toFixed(0)}% or strategy target-hit probability ${strategyProbability.toFixed(0)}% has not fully cleared the strict rule.`);
   } else {
-    thesis.unshift(`Does not fully match your rule yet: confidence ${confidence}% / target ${targetConfidence}%, projected upside ${projectedUpside}% / target ${targetUpside}%.`);
+    thesis.unshift(`Does not fully match your rule yet: direction confidence ${confidence}% / target ${targetConfidence}%, final-return confidence ${finalReturnProbability.toFixed(0)}%, max-upside confidence ${maxUpsideProbability.toFixed(0)}%, strategy target-hit ${strategyProbability.toFixed(0)}% / target ${strategyProbabilityTarget.toFixed(0)}%, cycle target move ${cycleTargetMove.toFixed(2)}% / target ${targetUpside}%.`);
   }
   if (action === "CRITICAL_SELL") thesis.unshift(`Critical sell alert: downside confidence ${downsideConfidence}% with projected move ${projectedUpside}% or stop-loss breach; review immediate sell/reduce action.`);
   if (action === "STRONG_AVOID") thesis.unshift(`Strong risk alert: downside confidence ${downsideConfidence}% and projected move ${projectedUpside}% are unfavorable.`);
@@ -4950,6 +5817,18 @@ function strategyDecision(analysis, input) {
     ...analysis,
     action,
     predictionConfidence: Number(analysis.predictionConfidence ?? confidence),
+    magnitudeConfidence: magnitudeProbability,
+    magnitudeHitProbability: magnitudeProbability,
+    moveHitProbability: magnitudeProbability,
+    projectedMoveConfidence: magnitudeProbability,
+    projectedFinalReturn,
+    finalReturnConfidence: finalReturnProbability,
+    finalReturnHitProbability: finalReturnProbability,
+    projectedMaxUpside,
+    maxUpsideConfidence: maxUpsideProbability,
+    maxUpsideHitProbability: maxUpsideProbability,
+    strategyConfidence: strategyProbability,
+    strategyHitProbability: strategyProbability,
     upsideConfidence: Number(analysis.upsideConfidence ?? (projectedUpside > 0 ? confidence : 0)),
     downsideConfidence,
     confidence,
@@ -5029,11 +5908,17 @@ function compactAiInput(input) {
       total: Number(input.calibrationSummary.total || 0),
       resolved: Number(input.calibrationSummary.resolved || 0),
       hitRate: input.calibrationSummary.hitRate == null ? null : compactNumber(input.calibrationSummary.hitRate),
+      magnitudeHitRate: input.calibrationSummary.magnitudeHitRate == null ? null : compactNumber(input.calibrationSummary.magnitudeHitRate),
+      finalReturnHitRate: input.calibrationSummary.finalReturnHitRate == null ? null : compactNumber(input.calibrationSummary.finalReturnHitRate),
+      maxUpsideHitRate: input.calibrationSummary.maxUpsideHitRate == null ? null : compactNumber(input.calibrationSummary.maxUpsideHitRate),
       buyHitRate: input.calibrationSummary.buyHitRate == null ? null : compactNumber(input.calibrationSummary.buyHitRate),
       avgForwardReturn: input.calibrationSummary.avgForwardReturn == null ? null : compactNumber(input.calibrationSummary.avgForwardReturn),
       adaptive: input.calibrationSummary.adaptive ? {
         confidencePenalty: compactNumber(input.calibrationSummary.adaptive.confidencePenalty || 0),
         upsideShrink: compactNumber(input.calibrationSummary.adaptive.upsideShrink || 1),
+        magnitudeHitRate: input.calibrationSummary.adaptive.magnitudeHitRate == null ? null : compactNumber(input.calibrationSummary.adaptive.magnitudeHitRate),
+        finalReturnHitRate: input.calibrationSummary.adaptive.finalReturnHitRate == null ? null : compactNumber(input.calibrationSummary.adaptive.finalReturnHitRate),
+        maxUpsideHitRate: input.calibrationSummary.adaptive.maxUpsideHitRate == null ? null : compactNumber(input.calibrationSummary.adaptive.maxUpsideHitRate),
         recentMisses: Number(input.calibrationSummary.adaptive.recentMisses || 0),
         recentAdverse: Number(input.calibrationSummary.adaptive.recentAdverse || 0),
         patternStats: Object.values(input.calibrationSummary.adaptive.patternStats || {}).slice(0, 5).map((row) => ({
@@ -5062,6 +5947,29 @@ function compactAiInput(input) {
         avgReturn: bucket.avgReturn == null ? null : compactNumber(bucket.avgReturn),
         brierScore: bucket.brierScore == null ? null : compactNumber(bucket.brierScore, 3),
       })),
+      strategyBuckets: (input.calibrationSummary.strategyBuckets || []).map((bucket) => ({
+        label: bucket.label,
+        count: Number(bucket.count || 0),
+        hitRate: bucket.hitRate == null ? null : compactNumber(bucket.hitRate),
+        brierScore: bucket.brierScore == null ? null : compactNumber(bucket.brierScore, 3),
+      })),
+      modelStats: Object.values(input.calibrationSummary.modelStats || {}).slice(0, 8).map((row) => ({
+        name: row.name,
+        samples: Number(row.samples || 0),
+        directionalHitRate: row.directionalHitRate == null ? null : compactNumber(row.directionalHitRate),
+        strategyHitRate: row.strategyHitRate == null ? null : compactNumber(row.strategyHitRate),
+        weightMultiplier: compactNumber(row.weightMultiplier || 1),
+      })),
+      regimeStats: Object.values(input.calibrationSummary.regimeStats || {}).slice(0, 5).map((row) => ({
+        regime: row.regime,
+        total: Number(row.total || 0),
+        buyHitRate: row.buyHitRate == null ? null : compactNumber(row.buyHitRate),
+      })),
+      errorTypes: Object.values(input.calibrationSummary.errorTypeStats || {}).slice(0, 6).map((row) => ({
+        label: row.label,
+        total: Number(row.total || 0),
+        buyHitRate: row.buyHitRate == null ? null : compactNumber(row.buyHitRate),
+      })),
     } : null,
     technicals: {
       close: compactNumber(technicals.close, 4),
@@ -5082,22 +5990,31 @@ function compactAiInput(input) {
       count: Number(analog.count || 0),
       confidence: compactNumber(analog.confidence),
       averageForwardReturn: compactNumber(analog.averageForwardReturn),
+      averageFinalReturn: compactNumber(analog.averageFinalReturn ?? analog.averageForwardReturn),
+      averageMaxUpside: compactNumber(analog.averageMaxUpside),
       winRate: compactNumber(analog.winRate),
       directionalHitRate: compactNumber(analog.directionalHitRate),
       strategyHitProbability: compactNumber(analog.strategyHitProbability),
       targetHitRate: compactNumber(analog.targetHitRate),
+      finalReturnHitRate: compactNumber(analog.finalReturnHitRate),
+      maxUpsideHitRate: compactNumber(analog.maxUpsideHitRate),
       stopRate: compactNumber(analog.stopRate),
       averageRiskAdjustedReturn: compactNumber(analog.averageRiskAdjustedReturn),
       modelPredictedReturn: compactNumber(model.predictedReturn),
+      modelPredictedMaxUpside: compactNumber(model.predictedMaxUpside),
       modelConfidence: compactNumber(model.confidence),
       modelMae: compactNumber(model.mae),
+      modelMaxUpsideMae: compactNumber(model.maxUpsideMae),
       modelDirectionalAccuracy: compactNumber(model.directionalAccuracy),
       modelTargetHitAccuracy: compactNumber(model.targetHitAccuracy),
+      modelMaxUpsideHitAccuracy: compactNumber(model.maxUpsideHitAccuracy),
       modelOosSamples: Number(model.oosSampleCount || 0),
       modelOosDirectionalAccuracy: compactNumber(model.oosDirectionalAccuracy),
       modelOosTargetHitAccuracy: compactNumber(model.oosTargetHitAccuracy),
+      modelOosMaxUpsideHitAccuracy: compactNumber(model.oosMaxUpsideHitAccuracy),
       metaLabelProbability: compactNumber(model.metaLabelProbability),
       metaDirectionalProbability: compactNumber(model.metaDirectionalProbability),
+      metaMaxUpsideProbability: compactNumber(model.metaMaxUpsideProbability),
       conformalP80Error: compactNumber(model.conformalP80Error),
       conformalP90Error: compactNumber(model.conformalP90Error),
       examples: (analog.examples || []).slice(0, 3).map((item) => ({
@@ -5225,6 +6142,27 @@ function blendAiWithBaseline(row, baseline) {
   const qualityGate = baseline.qualityGate || null;
   if (qualityGate?.confidenceCap != null) confidence = Math.min(confidence, Number(qualityGate.confidenceCap));
   if (qualityGate?.projectedUpsideCap != null && projectedUpside > 0) projectedUpside = Math.min(projectedUpside, Number(qualityGate.projectedUpsideCap));
+  const magnitudeDelta = Math.abs(projectedUpside - Number(baseline.projectedUpside || 0));
+  const magnitudeProbability = clampNumber(
+    Number(baseline.magnitudeHitProbability ?? baseline.magnitudeConfidence ?? baseline.moveHitProbability ?? baseline.projectedMoveConfidence ?? qualityGate?.magnitudeHitProbability ?? 0) - magnitudeDelta * 5.5,
+    0,
+    92,
+  );
+  const finalReturnProbability = clampNumber(
+    Number(baseline.finalReturnHitProbability ?? baseline.finalReturnConfidence ?? qualityGate?.finalReturnHitProbability ?? magnitudeProbability) - magnitudeDelta * 5.8,
+    0,
+    92,
+  );
+  const projectedMaxUpside = Math.max(
+    0,
+    Number(baseline.projectedMaxUpside ?? qualityGate?.projectedMaxUpside ?? 0),
+    projectedUpside > 0 ? projectedUpside : 0,
+  );
+  const maxUpsideProbability = clampNumber(
+    Number(baseline.maxUpsideHitProbability ?? baseline.maxUpsideConfidence ?? qualityGate?.maxUpsideHitProbability ?? magnitudeProbability) - Math.max(0, projectedMaxUpside - Number(baseline.projectedMaxUpside ?? projectedMaxUpside)) * 3.5,
+    0,
+    92,
+  );
   const aiOverlay = Number.isFinite(aiConfidence) || Number.isFinite(aiUpside)
     ? {
       name: "OpenAI文本复核",
@@ -5251,10 +6189,25 @@ function blendAiWithBaseline(row, baseline) {
   return {
     symbol: row.symbol || baseline.symbol,
     confidence,
+    predictionConfidence: baseline.predictionConfidence ?? confidence,
+    magnitudeConfidence: magnitudeProbability,
+    magnitudeHitProbability: magnitudeProbability,
+    moveHitProbability: magnitudeProbability,
+    projectedMoveConfidence: magnitudeProbability,
+    projectedFinalReturn: projectedUpside,
+    finalReturnConfidence: finalReturnProbability,
+    finalReturnHitProbability: finalReturnProbability,
+    projectedMaxUpside,
+    maxUpsideConfidence: maxUpsideProbability,
+    maxUpsideHitProbability: maxUpsideProbability,
+    strategyConfidence: baseline.strategyConfidence ?? baseline.strategyHitProbability ?? 0,
+    strategyHitProbability: baseline.strategyHitProbability ?? baseline.strategyConfidence ?? 0,
     projectedUpside,
     horizonDays: row.horizonDays ?? baseline.horizonDays,
     ensemble,
     qualityGate,
+    calibration: baseline.calibration,
+    strategyCalibration: baseline.strategyCalibration,
     thesis,
     risks: asList(row.risks, 4).length ? asList(row.risks, 4) : baseline.risks?.slice(0, 5) || [],
   };
@@ -5269,7 +6222,7 @@ async function openAiAnalysis(input) {
     const parsed = await callOpenAiJson([
       {
         role: "system",
-        content: "You are a cautious multi-market equity analyst covering ASX, US stocks, and China A-shares. Do not claim certainty. Respect the calibrationSummary, recent learning events, and adaptive penalties; avoid aggressive upside estimates after similar failed forecasts. Return compact JSON only with keys confidence, projectedUpside, horizonDays, thesis, risks. The app will apply the user's strategy and capital rules after your estimate.",
+        content: "You are a cautious multi-market equity analyst covering ASX, US stocks, and China A-shares. Do not claim certainty. Treat confidence as directional prediction reliability. Keep final-return magnitude reliability, intraperiod max-upside touch reliability, and strategy target-hit probability separate; never bypass the local strategy gate. Respect calibrationSummary, modelStats, regimeStats, recent learning events, and adaptive penalties; avoid aggressive upside estimates after similar failed forecasts. Return compact JSON only with keys confidence, projectedUpside, horizonDays, thesis, risks. The app will apply final-return, max-upside, and strategy calibration after your estimate.",
       },
       {
         role: "user",
@@ -5277,7 +6230,13 @@ async function openAiAnalysis(input) {
           ...compactAiInput(input),
           localRuleBaseline: {
             confidence: baseline.confidence,
+            magnitudeHitProbability: baseline.magnitudeHitProbability,
             projectedUpside: baseline.projectedUpside,
+            projectedFinalReturn: baseline.projectedFinalReturn,
+            finalReturnHitProbability: baseline.finalReturnHitProbability,
+            projectedMaxUpside: baseline.projectedMaxUpside,
+            maxUpsideHitProbability: baseline.maxUpsideHitProbability,
+            strategyHitProbability: baseline.strategyHitProbability,
             action: baseline.action,
             ensemble: baseline.ensemble ? {
               direction: baseline.ensemble.direction,
@@ -5343,7 +6302,7 @@ async function openAiBatchAnalysis(items) {
     const parsed = await callOpenAiJson([
       {
         role: "system",
-        content: "You are a fast cautious multi-market portfolio reviewer. Review only high-impact rows. Keep confidence as directional prediction reliability; keep strategy target-hit probability separate in reasoning. Respect local baselines, calibration, and adaptive penalties. Return JSON only: {\"results\":[{\"symbol\":\"BHP\",\"confidence\":0-99,\"projectedUpside\":number,\"horizonDays\":number,\"thesis\":[...],\"risks\":[...]}]}. Be concise.",
+        content: "You are a fast cautious multi-market portfolio reviewer. Review only high-impact rows. Keep confidence as directional prediction reliability; keep final-return magnitude reliability, intraperiod max-upside touch reliability, and strategy target-hit probability separate in reasoning. Respect local baselines, modelStats, market regime, strategy calibration, magnitude calibration, and adaptive penalties. Return JSON only: {\"results\":[{\"symbol\":\"BHP\",\"confidence\":0-99,\"projectedUpside\":number,\"horizonDays\":number,\"thesis\":[...],\"risks\":[...]}]}. Be concise.",
       },
       {
         role: "user",
@@ -5354,7 +6313,13 @@ async function openAiBatchAnalysis(items) {
             ...compactAiInput(input),
             localRuleBaseline: {
               confidence: local.analysis.confidence,
+              magnitudeHitProbability: local.analysis.magnitudeHitProbability,
               projectedUpside: local.analysis.projectedUpside,
+              projectedFinalReturn: local.analysis.projectedFinalReturn,
+              finalReturnHitProbability: local.analysis.finalReturnHitProbability,
+              projectedMaxUpside: local.analysis.projectedMaxUpside,
+              maxUpsideHitProbability: local.analysis.maxUpsideHitProbability,
+              strategyHitProbability: local.analysis.strategyHitProbability,
               action: local.analysis.action,
               ensemble: local.analysis.ensemble ? {
                 direction: local.analysis.ensemble.direction,
@@ -5414,7 +6379,7 @@ async function assistantChat(payload = {}) {
   const localMessage = [
     "本地建议：先确认当前市场、持仓和策略阈值是否一致。",
     "如果最近买入后马上下跌，优先复核：是否触发止损、是否出现单票错误迁移模式、是否大盘风险转弱、是否成交量与MACD没有同步确认。",
-    "提高可靠性的做法是减少低证据高置信交易，只接受预测可靠度、上涨倾向、成交量、历史相似样本和新闻因子同时支持的信号。",
+    "提高可靠性的做法是减少低证据高置信交易，只接受方向置信、幅度达成率、策略达标率、成交量、历史相似样本和新闻因子同时支持的信号。",
   ].join("\n");
   if (!process.env.OPENAI_API_KEY) {
     return { source: "local-rules-chat", message: localMessage, suggestions: ["补充交易周期和止损线", "刷新当前市场新闻和行情", "查看预测准确率中的错误行为模式"] };
