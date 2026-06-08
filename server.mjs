@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
@@ -24,7 +25,7 @@ loadLocalEnv();
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-06-03-final-max-confidence-v34";
+const APP_VERSION = "2026-06-08-python-quant-core-v36";
 const SERVER_STARTED_AT = new Date().toISOString();
 const providerBackoff = new Map();
 const marketResponseCache = new Map();
@@ -32,9 +33,63 @@ const marketCandlesCache = new Map();
 const quoteResponseCache = new Map();
 const factorResponseCache = new Map();
 const newsResponseCache = new Map();
+const macroResponseCache = new Map();
+const universeResponseCache = new Map();
 const secFilingsCache = new Map();
 const snapshotBasePath = join(root, ".cache");
 let alphaVantageNextRequestAt = 0;
+
+function runPythonQuantCore(operation, payload = {}, timeoutMs = Number(process.env.PYTHON_CORE_TIMEOUT_MS || 12000)) {
+  return new Promise((resolve, reject) => {
+    const localPython = join(root, ".venv", "bin", "python");
+    const python = process.env.PYTHON_BIN || (existsSync(localPython) ? localPython : "python3");
+    const child = spawn(python, [join(root, "quant_core", "worker.py")], {
+      cwd: root,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`Python quant core timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 12_000_000) {
+        child.kill("SIGKILL");
+        finish(new Error("Python quant core response exceeded the size limit."));
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => finish(new Error(`Unable to start Python quant core: ${error.message}`)));
+    child.on("close", (code) => {
+      if (settled) return;
+      let parsed;
+      try {
+        parsed = JSON.parse(stdout || "{}");
+      } catch {
+        finish(new Error(`Python quant core returned invalid JSON. ${stderr.slice(-600)}`));
+        return;
+      }
+      if (code !== 0 || parsed.ok !== true) {
+        finish(new Error(parsed.error || stderr.slice(-600) || `Python quant core exited with code ${code}.`));
+        return;
+      }
+      finish(null, parsed.result);
+    });
+    child.stdin.end(JSON.stringify({ operation, ...payload }));
+  });
+}
 
 const MARKET_CONFIG = {
   ASX: {
@@ -115,12 +170,606 @@ function predictionSamplesPathForMarket(market) {
   return join(snapshotBasePath, `prediction-samples-${safeMarket(market).toLowerCase()}.json`);
 }
 
+function researchConfigPathForMarket(market) {
+  return join(snapshotBasePath, `research-config-${safeMarket(market).toLowerCase()}.json`);
+}
+
 async function readServerSnapshotForMarket(market) {
   try {
     return sanitizeSnapshot(JSON.parse(await readFile(snapshotPathForMarket(market), "utf8")), market);
   } catch {
     return null;
   }
+}
+
+function sanitizeResearchConfig(payload = {}, market = "ASX") {
+  const key = safeMarket(payload.market || market);
+  const rawFactors = payload.factorConfig && typeof payload.factorConfig === "object" && !Array.isArray(payload.factorConfig)
+    ? payload.factorConfig
+    : {};
+  const factorConfig = Object.fromEntries(
+    Object.entries(rawFactors)
+      .filter(([name]) => /^[a-z0-9_]{1,64}$/i.test(name))
+      .slice(0, 120)
+      .map(([name, row]) => [
+        name,
+        {
+          enabled: row?.enabled !== false,
+          weightPct: Math.max(0, Math.min(100, Number(row?.weightPct || 0))),
+          note: String(row?.note || "").slice(0, 300),
+        },
+      ])
+  );
+  const strategyRevisions = (Array.isArray(payload.strategyRevisions) ? payload.strategyRevisions : [])
+    .slice(-100)
+    .map((row) => ({
+      id: String(row?.id || `${key}:${row?.createdAt || Date.now()}`).slice(0, 160),
+      createdAt: String(row?.createdAt || new Date().toISOString()).slice(0, 40),
+      source: String(row?.source || "manual").slice(0, 40),
+      note: String(row?.note || "").slice(0, 1200),
+      strategy: row?.strategy && typeof row.strategy === "object" && !Array.isArray(row.strategy)
+        ? {
+          horizonDays: Math.max(1, Math.min(60, Number(row.strategy.horizonDays || 15))),
+          confidence: Math.max(1, Math.min(99, Number(row.strategy.confidence || 80))),
+          targetUpside: Math.max(0.1, Math.min(100, Number(row.strategy.targetUpside || 5))),
+          maxPosition: Math.max(1, Math.min(100, Number(row.strategy.maxPosition || 20))),
+          reserveCashPct: Math.max(0, Math.min(100, Number(row.strategy.reserveCashPct || 15))),
+          stopLoss: Math.max(0.1, Math.min(100, Number(row.strategy.stopLoss || 4))),
+          text: String(row.strategy.text || "").slice(0, 4000),
+        }
+        : null,
+    }))
+    .filter((row) => row.strategy);
+  return {
+    market: key,
+    factorConfig,
+    strategyRevisions,
+    updatedAt: String(payload.updatedAt || new Date().toISOString()).slice(0, 40),
+  };
+}
+
+async function readResearchConfig(market = "ASX") {
+  try {
+    return sanitizeResearchConfig(JSON.parse(await readFile(researchConfigPathForMarket(market), "utf8")), market);
+  } catch {
+    return sanitizeResearchConfig({ market }, market);
+  }
+}
+
+async function writeResearchConfig(payload, market = "ASX") {
+  const config = sanitizeResearchConfig(payload, market);
+  await mkdir(snapshotBasePath, { recursive: true });
+  await writeFile(researchConfigPathForMarket(config.market), JSON.stringify(config), "utf8");
+  return config;
+}
+
+function universePathForMarket(market) {
+  return join(snapshotBasePath, `universe-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function splitCsvLine(line = "") {
+  const cells = [];
+  let value = "";
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (char === "\"" && quoted && next === "\"") {
+      value += "\"";
+      index += 1;
+    } else if (char === "\"") {
+      quoted = !quoted;
+    } else if (char === "," && !quoted) {
+      cells.push(value.trim());
+      value = "";
+    } else {
+      value += char;
+    }
+  }
+  cells.push(value.trim());
+  return cells;
+}
+
+function universeRow(symbol, name = "", market = "ASX", extra = {}) {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  if (!isValidMarketCode(code, key)) return null;
+  return {
+    symbol: normalizeMarketSymbol(code, key),
+    code,
+    name: String(name || code).trim().slice(0, 160),
+    market: key,
+    exchange: String(extra.exchange || key).slice(0, 40),
+    sector: String(extra.sector || "").slice(0, 120),
+    industry: String(extra.industry || "").slice(0, 160),
+    source: String(extra.source || "universe-provider").slice(0, 80),
+    type: String(extra.type || "stock").slice(0, 40),
+  };
+}
+
+function sanitizeUniverseRows(rows = [], market = "ASX") {
+  const key = safeMarket(market);
+  const byCode = new Map();
+  for (const raw of Array.isArray(rows) ? rows : []) {
+    const row = universeRow(raw?.symbol || raw?.code, raw?.name || raw?.description, key, raw);
+    if (row && !row.code.startsWith("^") && row.type !== "fund" && !byCode.has(row.code)) byCode.set(row.code, row);
+  }
+  return [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code));
+}
+
+async function readUniverseCache(market = "ASX", maxAgeMs = Number(process.env.UNIVERSE_CACHE_TTL_MS || 24 * 60 * 60 * 1000)) {
+  const key = safeMarket(market);
+  const memory = universeResponseCache.get(key);
+  if (memory && Date.now() - memory.time < maxAgeMs) return { ...memory.value, cache: "memory" };
+  try {
+    const payload = JSON.parse(await readFile(universePathForMarket(key), "utf8"));
+    const fetchedAt = new Date(payload.fetchedAt || 0).getTime();
+    if (fetchedAt && Date.now() - fetchedAt < maxAgeMs && Array.isArray(payload.rows) && payload.rows.length) {
+      const value = { ...payload, cache: "disk" };
+      universeResponseCache.set(key, { time: Date.now(), value });
+      return value;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function writeUniverseCache(payload) {
+  const key = safeMarket(payload.market);
+  const clean = {
+    market: key,
+    source: payload.source || "unknown",
+    fetchedAt: payload.fetchedAt || new Date().toISOString(),
+    count: Array.isArray(payload.rows) ? payload.rows.length : 0,
+    rows: sanitizeUniverseRows(payload.rows || [], key),
+  };
+  clean.count = clean.rows.length;
+  await mkdir(snapshotBasePath, { recursive: true });
+  await writeFile(universePathForMarket(key), JSON.stringify(clean), "utf8");
+  universeResponseCache.set(key, { time: Date.now(), value: clean });
+  return clean;
+}
+
+function parseNasdaqTraderRows(text = "", market = "US") {
+  return String(text).split(/\r?\n/)
+    .filter((line) => line && !/^Symbol\||^File Creation Time|^Nasdaq Traded\|/i.test(line))
+    .map((line) => {
+      const cells = line.split("|");
+      const symbol = cells[0];
+      const name = cells[1];
+      const testIssue = cells.includes("Y");
+      const etfIndex = line.startsWith("Symbol|") ? -1 : cells.length > 7 ? 6 : -1;
+      const isEtf = etfIndex >= 0 && cells[etfIndex] === "Y";
+      if (testIssue || isEtf) return null;
+      return universeRow(symbol, name, market, { source: "nasdaq-trader-symbol-directory", exchange: "US", type: "stock" });
+    })
+    .filter(Boolean);
+}
+
+async function fetchAsxUniverse() {
+  const errors = [];
+  try {
+    const csv = await fetchText("https://www.asx.com.au/asx/research/ASXListedCompanies.csv", 12000, {
+      accept: "text/csv,text/plain,*/*",
+    });
+    const lines = csv.split(/\r?\n/).filter(Boolean);
+    const rows = lines.slice(1).map((line) => {
+      const cells = splitCsvLine(line);
+      return universeRow(cells[1] || cells[0], cells[0], "ASX", {
+        exchange: "ASX",
+        industry: cells[2] || "",
+        source: "asx-official-listed-companies",
+      });
+    }).filter(Boolean);
+    if (rows.length) return writeUniverseCache({ market: "ASX", source: "asx-official-listed-companies", rows });
+    errors.push("ASX official CSV returned no rows.");
+  } catch (error) {
+    errors.push(`ASX official CSV: ${error.message || error}`);
+  }
+  if (process.env.EODHD_API_KEY) {
+    try {
+      const endpoint = new URL("https://eodhd.com/api/exchange-symbol-list/AU");
+      endpoint.searchParams.set("api_token", process.env.EODHD_API_KEY);
+      endpoint.searchParams.set("fmt", "json");
+      const payload = await fetchJson(endpoint, 12000);
+      const rows = (Array.isArray(payload) ? payload : []).map((row) => universeRow(row.Code || row.code, row.Name || row.name, "ASX", {
+        exchange: row.Exchange || "ASX",
+        source: "eodhd-exchange-symbol-list-au",
+        type: row.Type || "stock",
+      })).filter(Boolean);
+      if (rows.length) return writeUniverseCache({ market: "ASX", source: "eodhd-exchange-symbol-list-au", rows });
+      errors.push("EODHD AU symbol list returned no rows.");
+    } catch (error) {
+      errors.push(`EODHD AU symbol list: ${error.message || error}`);
+    }
+  }
+  throw new Error(errors.join(" | ") || "Unable to read ASX universe.");
+}
+
+async function fetchUsUniverse() {
+  const [nasdaq, other] = await Promise.all([
+    fetchText("https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt", 12000, { accept: "text/plain,*/*" }),
+    fetchText("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt", 12000, { accept: "text/plain,*/*" }),
+  ]);
+  const rows = [
+    ...parseNasdaqTraderRows(nasdaq, "US"),
+    ...parseNasdaqTraderRows(other, "US"),
+  ];
+  if (!rows.length) throw new Error("Nasdaq Trader symbol directories returned no stock rows.");
+  return writeUniverseCache({ market: "US", source: "nasdaq-trader-symbol-directory", rows });
+}
+
+async function fetchCnUniverseFromTushare() {
+  if (!process.env.TUSHARE_TOKEN) throw new Error("TUSHARE_TOKEN is not configured.");
+  const payload = await fetchJsonPost("https://api.tushare.pro", {
+    api_name: "stock_basic",
+    token: process.env.TUSHARE_TOKEN,
+    params: { list_status: "L" },
+    fields: "ts_code,symbol,name,area,industry,market,exchange,list_status",
+  }, 12000);
+  if (Number(payload?.code || 0) !== 0) throw new Error(payload?.msg || `Tushare error ${payload?.code}`);
+  const fields = payload?.data?.fields || [];
+  const rows = (payload?.data?.items || []).map((item) => {
+    const row = Object.fromEntries(fields.map((field, index) => [field, item[index]]));
+    return universeRow(row.symbol, row.name, "CN", {
+      exchange: row.exchange || "",
+      industry: row.industry || "",
+      source: "tushare-stock-basic",
+    });
+  }).filter(Boolean);
+  if (!rows.length) throw new Error("Tushare stock_basic returned no A-share rows.");
+  return writeUniverseCache({ market: "CN", source: "tushare-stock-basic", rows });
+}
+
+async function fetchCnUniverseFromEastmoney() {
+  const rows = [];
+  for (const fs of ["m:1+t:2,m:1+t:23", "m:0+t:6,m:0+t:80"]) {
+    for (let page = 1; page <= 50; page += 1) {
+      const endpoint = new URL("https://push2.eastmoney.com/api/qt/clist/get");
+      endpoint.searchParams.set("pn", String(page));
+      endpoint.searchParams.set("pz", "200");
+      endpoint.searchParams.set("po", "1");
+      endpoint.searchParams.set("np", "1");
+      endpoint.searchParams.set("fltt", "2");
+      endpoint.searchParams.set("invt", "2");
+      endpoint.searchParams.set("fid", "f3");
+      endpoint.searchParams.set("fs", fs);
+      endpoint.searchParams.set("fields", "f12,f14,f13,f100,f102");
+      const payload = await fetchJson(endpoint, 12000, {
+        referer: "https://quote.eastmoney.com/",
+      });
+      const pageRows = payload?.data?.diff || [];
+      if (!pageRows.length) break;
+      pageRows.forEach((row) => {
+        const symbol = String(row.f12 || "");
+        const item = universeRow(symbol, row.f14, "CN", {
+          exchange: String(row.f13 || "") === "1" ? "SH" : "SZ",
+          industry: row.f100 || "",
+          source: "eastmoney-a-share-clist",
+        });
+        if (item) rows.push(item);
+      });
+      const total = Number(payload?.data?.total || 0);
+      if (page * 200 >= total) break;
+    }
+  }
+  if (!rows.length) throw new Error("Eastmoney A-share list returned no rows.");
+  return writeUniverseCache({ market: "CN", source: "eastmoney-a-share-clist", rows });
+}
+
+async function fetchCnUniverse() {
+  const errors = [];
+  try {
+    return await fetchCnUniverseFromTushare();
+  } catch (error) {
+    errors.push(`Tushare: ${error.message || error}`);
+  }
+  try {
+    return await fetchCnUniverseFromEastmoney();
+  } catch (error) {
+    errors.push(`Eastmoney: ${error.message || error}`);
+  }
+  throw new Error(errors.join(" | ") || "Unable to read China A-share universe.");
+}
+
+async function fetchMarketUniverse(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const force = options.force === true;
+  if (!force) {
+    const cached = await readUniverseCache(key);
+    if (cached?.rows?.length) return cached;
+  }
+  if (key === "ASX") return fetchAsxUniverse();
+  if (key === "US") return fetchUsUniverse();
+  if (key === "CN") return fetchCnUniverse();
+  throw new Error(`Unsupported market universe: ${key}`);
+}
+
+function universePayload(payload = {}, options = {}) {
+  const market = safeMarket(payload.market || options.market || "ASX");
+  const search = String(options.search || "").trim().toUpperCase();
+  const offset = Math.max(0, Number(options.offset || 0));
+  const limit = Math.max(1, Math.min(20000, Number(options.limit || 500)));
+  const rows = sanitizeUniverseRows(payload.rows || [], market);
+  const filtered = search
+    ? rows.filter((row) => (
+      row.code.includes(search) ||
+      row.symbol.includes(search) ||
+      row.name.toUpperCase().includes(search) ||
+      row.industry.toUpperCase().includes(search) ||
+      row.sector.toUpperCase().includes(search)
+    ))
+    : rows;
+  return {
+    ok: true,
+    market,
+    source: payload.source || "unknown",
+    fetchedAt: payload.fetchedAt || null,
+    cache: payload.cache || "live",
+    count: rows.length,
+    filteredCount: filtered.length,
+    offset,
+    limit,
+    rows: filtered.slice(offset, offset + limit),
+  };
+}
+
+function parseMarketNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const raw = String(value).replace(/[%,$,¥,￥,\s]/g, "").replace(/,/g, "");
+  if (!raw || /^[-—N/A]+$/i.test(raw)) return null;
+  const multiplier = /B$/i.test(raw) ? 1_000_000_000 : /M$/i.test(raw) ? 1_000_000 : /K$/i.test(raw) ? 1_000 : 1;
+  const number = Number(raw.replace(/[BMK]$/i, ""));
+  return Number.isFinite(number) ? number * multiplier : null;
+}
+
+function marketMoverRow(row = {}, market = "ASX", source = "movers") {
+  const key = safeMarket(market);
+  const symbol = cleanCode(row.symbol || row.code || row.f12 || row.SECURITY_CODE || row.Symbol || "", key);
+  if (!isValidMarketCode(symbol, key) || symbol.startsWith("^")) return null;
+  const price = parseMarketNumber(row.price ?? row.last ?? row.lastSale ?? row.lastsale ?? row.f2 ?? row.CLOSE_PRICE);
+  const changePercent = parseMarketNumber(row.changePercent ?? row.change_pct ?? row.change_p ?? row.pctchange ?? row.f3 ?? row.CHANGE_RATE);
+  const change = parseMarketNumber(row.change ?? row.netChange ?? row.netchange ?? row.f4 ?? row.CHANGE);
+  const volume = parseMarketNumber(row.volume ?? row.f5 ?? row.VOLUME);
+  return {
+    symbol,
+    name: String(row.name || row.companyName || row.securityName || row.f14 || row.SECURITY_NAME_ABBR || row.Symbol || symbol).slice(0, 140),
+    price,
+    change,
+    changePercent,
+    volume,
+    turnoverRate: parseMarketNumber(row.turnoverRate ?? row.f8 ?? row.TURNOVERRATE),
+    amount: parseMarketNumber(row.amount ?? row.f6 ?? row.AMOUNT),
+    reason: String(row.reason || row.EXPLAIN || row.explain || "").slice(0, 240),
+    source,
+    market: key,
+    asOf: new Date().toISOString(),
+  };
+}
+
+function sortMoverRows(rows = [], direction = "gainers") {
+  return rows
+    .filter((row) => row && Number.isFinite(Number(row.changePercent)))
+    .sort((a, b) => direction === "losers"
+      ? Number(a.changePercent) - Number(b.changePercent)
+      : Number(b.changePercent) - Number(a.changePercent));
+}
+
+async function fetchEastmoneyCnMovers(limit = 30) {
+  const readSide = async (direction) => {
+    const pageSize = Math.max(20, Math.min(100, limit * 2));
+    const endpoint = new URL("https://datacenter-web.eastmoney.com/api/data/v1/get");
+    endpoint.searchParams.set("sortColumns", "CHANGE_RATE");
+    endpoint.searchParams.set("sortTypes", direction === "losers" ? "1" : "-1");
+    endpoint.searchParams.set("pageSize", String(pageSize));
+    endpoint.searchParams.set("pageNumber", "1");
+    endpoint.searchParams.set("reportName", "RPT_DMSK_TS_STOCKNEW");
+    endpoint.searchParams.set("quoteColumns", "f2~01~SECURITY_CODE~CLOSE_PRICE,f8~01~SECURITY_CODE~TURNOVERRATE,f3~01~SECURITY_CODE~CHANGE_RATE,f4~01~SECURITY_CODE~CHANGE,f5~01~SECURITY_CODE~VOLUME");
+    endpoint.searchParams.set("quoteType", "0");
+    endpoint.searchParams.set("columns", "ALL");
+    endpoint.searchParams.set("source", "WEB");
+    endpoint.searchParams.set("client", "WEB");
+    const payload = await fetchJson(endpoint, 12000, { referer: "https://data.eastmoney.com/" });
+    const rows = payload?.result?.data || [];
+    return sortMoverRows(rows.map((row) => marketMoverRow(row, "CN", "eastmoney-a-share-datacenter-ranking")), direction).slice(0, limit);
+  };
+  const [gainers, losers] = await Promise.all([readSide("gainers"), readSide("losers")]);
+  return {
+    market: "CN",
+    source: "eastmoney-a-share-datacenter-ranking",
+    coverage: "full-market-ranking",
+    scanned: Number(gainers.length || 0) + Number(losers.length || 0),
+    gainers,
+    losers,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchNasdaqUsMovers(limit = 30) {
+  const endpoint = new URL("https://api.nasdaq.com/api/screener/stocks");
+  endpoint.searchParams.set("tableonly", "true");
+  endpoint.searchParams.set("limit", "10000");
+  endpoint.searchParams.set("download", "true");
+  const payload = await fetchJson(endpoint, 18000, {
+    "user-agent": "Mozilla/5.0",
+    accept: "application/json,text/plain,*/*",
+    origin: "https://www.nasdaq.com",
+    referer: "https://www.nasdaq.com/market-activity/stocks/screener",
+  });
+  const rows = (payload?.data?.rows || [])
+    .map((row) => marketMoverRow({
+      symbol: row.symbol,
+      name: row.name,
+      price: row.lastsale,
+      change: row.netchange,
+      changePercent: row.pctchange,
+      volume: row.volume,
+    }, "US", "nasdaq-screener-stocks"))
+    .filter(Boolean);
+  return {
+    market: "US",
+    source: "nasdaq-screener-stocks",
+    coverage: "full-market-screener",
+    scanned: rows.length,
+    gainers: sortMoverRows(rows, "gainers").slice(0, limit),
+    losers: sortMoverRows(rows, "losers").slice(0, limit),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchEodhdScreenerMovers(market = "ASX", limit = 30) {
+  if (!process.env.EODHD_API_KEY) throw new Error("EODHD_API_KEY is not configured for screener movers.");
+  const key = safeMarket(market);
+  const exchange = key === "ASX" ? "AU" : key;
+  const endpoint = new URL(`https://eodhd.com/api/eod-bulk-last-day/${exchange}`);
+  endpoint.searchParams.set("api_token", process.env.EODHD_API_KEY);
+  endpoint.searchParams.set("fmt", "json");
+  const payload = await fetchJson(endpoint, 18000);
+  const rows = (Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [])
+    .map((row) => {
+      const close = parseMarketNumber(row.close ?? row.adjusted_close ?? row.price);
+      const previous = parseMarketNumber(row.previousClose ?? row.previous_close ?? row.prev_close);
+      const change = parseMarketNumber(row.change ?? (close != null && previous ? close - previous : null));
+      const changePercent = parseMarketNumber(row.change_p ?? row.changePercent ?? row.change_percent ?? (previous ? ((close - previous) / previous) * 100 : null));
+      return marketMoverRow({
+        symbol: row.code || row.symbol,
+        name: row.name,
+        price: close,
+        change,
+        changePercent,
+        volume: row.volume,
+      }, key, "eodhd-bulk-last-day");
+    })
+    .filter(Boolean);
+  if (!rows.length) throw new Error("EODHD bulk last-day returned no mover rows.");
+  return {
+    market: key,
+    source: "eodhd-bulk-last-day",
+    coverage: "full-exchange-bulk-last-day",
+    scanned: rows.length,
+    gainers: sortMoverRows(rows, "gainers").slice(0, limit),
+    losers: sortMoverRows(rows, "losers").slice(0, limit),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function scanQuoteMovers(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const limit = Math.max(5, Math.min(50, Number(options.limit || 30)));
+  const scanLimit = Math.max(limit * 4, Math.min(1200, Number(options.scanLimit || process.env.MOVERS_SCAN_LIMIT || (key === "ASX" ? 420 : 650))));
+  const universe = await fetchMarketUniverse(key, { force: options.force === true });
+  const rows = sanitizeUniverseRows(universe.rows || [], key).filter((row) => isValidMarketCode(row.symbol, key)).slice(0, scanLimit);
+  const results = [];
+  let index = 0;
+  const concurrency = Math.max(2, Math.min(12, Number(process.env.MOVERS_SCAN_CONCURRENCY || 8)));
+  async function worker() {
+    for (;;) {
+      const current = rows[index];
+      index += 1;
+      if (!current) return;
+      try {
+        const quote = await fetchRealtimeQuote(current.symbol, key);
+        if (quote && !quote.unavailable) {
+          results.push(marketMoverRow({
+            symbol: current.symbol,
+            name: current.name,
+            price: quote.price,
+            change: quote.change,
+            changePercent: quote.changePercent,
+            volume: quote.volume,
+          }, key, `${quote.source}-universe-quote-scan`));
+        }
+      } catch {
+        // Keep the scan moving; failures are reflected in coverage metadata.
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return {
+    market: key,
+    source: "realtime-quote-universe-scan",
+    coverage: rows.length >= (universe.rows || []).length ? "full-universe-quote-scan" : "partial-universe-quote-scan",
+    scanned: rows.length,
+    totalUniverse: (universe.rows || []).length,
+    gainers: sortMoverRows(results, "gainers").slice(0, limit),
+    losers: sortMoverRows(results, "losers").slice(0, limit),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchMarketMovers(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const limit = Math.max(5, Math.min(50, Number(options.limit || 30)));
+  const errors = [];
+  if (key === "CN") {
+    try {
+      return await fetchEastmoneyCnMovers(limit);
+    } catch (error) {
+      errors.push(`eastmoney movers: ${error.message || error}`);
+    }
+  }
+  if (key === "US") {
+    try {
+      return await fetchNasdaqUsMovers(limit);
+    } catch (error) {
+      errors.push(`nasdaq screener: ${error.message || error}`);
+    }
+  }
+  try {
+    return await fetchEodhdScreenerMovers(key, limit);
+  } catch (error) {
+    errors.push(`eodhd screener: ${error.message || error}`);
+  }
+  const scanned = await scanQuoteMovers(key, options);
+  return { ...scanned, warning: compactProviderErrors(errors).join(" | ") };
+}
+
+async function fetchCnDragonTiger(limit = 30) {
+  const endpoint = new URL("https://datacenter-web.eastmoney.com/api/data/v1/get");
+  endpoint.searchParams.set("sortColumns", "TRADE_DATE,SECURITY_CODE");
+  endpoint.searchParams.set("sortTypes", "-1,1");
+  endpoint.searchParams.set("pageSize", String(Math.max(20, Math.min(100, limit * 2))));
+  endpoint.searchParams.set("pageNumber", "1");
+  endpoint.searchParams.set("reportName", "RPT_DAILYBILLBOARD_DETAILS");
+  endpoint.searchParams.set("columns", "ALL");
+  endpoint.searchParams.set("source", "WEB");
+  endpoint.searchParams.set("client", "WEB");
+  const payload = await fetchJson(endpoint, 12000, { referer: "https://data.eastmoney.com/stock/lhb.html" });
+  const rows = (payload?.result?.data || [])
+    .map((row) => marketMoverRow({
+      symbol: row.SECURITY_CODE,
+      name: row.SECURITY_NAME_ABBR,
+      price: row.CLOSE_PRICE,
+      changePercent: row.CHANGE_RATE,
+      amount: row.BILLBOARD_NET_AMT || row.NET_BUY_AMT || row.ACCUM_AMOUNT,
+      reason: row.EXPLAIN || row.BILLBOARD_EXPLAIN,
+    }, "CN", "eastmoney-daily-billboard"))
+    .filter(Boolean)
+    .slice(0, limit);
+  return {
+    market: "CN",
+    available: rows.length > 0,
+    source: "eastmoney-daily-billboard",
+    rows,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchDragonTiger(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const limit = Math.max(5, Math.min(50, Number(options.limit || 30)));
+  if (key !== "CN") {
+    return {
+      market: key,
+      available: false,
+      source: "not-applicable",
+      rows: [],
+      warning: "Dragon Tiger ranking is an A-share market-specific disclosure list. ASX/US official equivalents are not exposed by the configured providers.",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return fetchCnDragonTiger(limit);
 }
 
 function normalizedCodeSet(symbols = [], market = "ASX") {
@@ -1613,6 +2262,70 @@ async function fetchJson(url, timeoutMs = 10000, extraHeaders = {}) {
   }
 }
 
+async function fetchJsonWithCurl(url, timeoutMs = 10000, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const args = ["-sL", "--max-time", String(Math.max(1, Math.ceil(timeoutMs / 1000)))];
+    Object.entries({
+      "user-agent": "Mozilla/5.0 Global Quant Watch",
+      accept: "application/json,text/plain,*/*",
+      ...extraHeaders,
+    }).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") args.push("-H", `${key}: ${value}`);
+    });
+    args.push(String(url));
+    const child = spawn("curl", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs + 1000);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 8_000_000) child.kill("SIGKILL");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(stderr.slice(-400) || `curl exited with code ${code}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout || "{}"));
+      } catch {
+        reject(new Error(`curl returned invalid JSON: ${stdout.slice(0, 180)}`));
+      }
+    });
+  });
+}
+
+async function fetchJsonPost(url, payload, timeoutMs = 10000, extraHeaders = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Mozilla/5.0 Global Quant Watch",
+        accept: "application/json,text/plain,*/*",
+        "content-type": "application/json",
+        ...extraHeaders,
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      const safeText = text.slice(0, 180).replace(/[A-Za-z0-9_-]{16,}/g, "[redacted]");
+      throw new Error(`HTTP ${response.status}: ${safeText}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function backoffProvider(key, ms, reason) {
   providerBackoff.set(key, { until: Date.now() + ms, reason });
 }
@@ -1758,6 +2471,32 @@ function eodhdIntradayRows(payload) {
   }), { preserveTimestamp: true });
 }
 
+function finnhubRows(payload, interval = "1d") {
+  const timestamps = Array.isArray(payload?.t) ? payload.t : [];
+  if (payload?.s && payload.s !== "ok") return [];
+  return sanitizeCandleRows(timestamps.map((timestamp, index) => ({
+    date: new Date(Number(timestamp || 0) * 1000).toISOString(),
+    open: Number(payload.o?.[index]),
+    high: Number(payload.h?.[index]),
+    low: Number(payload.l?.[index]),
+    close: Number(payload.c?.[index]),
+    adjClose: Number(payload.c?.[index]),
+    volume: Number(payload.v?.[index] || 0),
+  })), { preserveTimestamp: isIntradayInterval(interval) });
+}
+
+function tiingoRows(payload, interval = "1d") {
+  return sanitizeCandleRows((Array.isArray(payload) ? payload : []).map((row) => ({
+    date: String(row.date || row.timestamp || ""),
+    open: Number(row.open),
+    high: Number(row.high),
+    low: Number(row.low),
+    close: Number(row.close),
+    adjClose: Number(row.adjClose ?? row.close),
+    volume: Number(row.volume || 0),
+  })), { preserveTimestamp: isIntradayInterval(interval) });
+}
+
 function isIntradayInterval(interval) {
   return ["5m", "15m", "60m"].includes(interval);
 }
@@ -1821,11 +2560,11 @@ function yahooSymbolForMarket(symbol, market = "ASX") {
 function usIndexProviderSymbols(code) {
   const clean = String(code || "").trim().toUpperCase();
   return {
-    "^GSPC": { yahoo: "^GSPC", stooq: "^spx", stooqQuote: "^spx", twelve: "SPX", eodhd: "GSPC.INDX", label: "S&P 500" },
-    "^IXIC": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", twelve: "IXIC", eodhd: "IXIC.INDX", label: "Nasdaq Composite" },
-    "^DJI": { yahoo: "^DJI", stooq: "^dji", stooqQuote: "^dji", twelve: "DJI", eodhd: "DJI.INDX", label: "Dow Jones" },
-    "^SPX": { yahoo: "^GSPC", stooq: "^spx", twelve: "SPX", eodhd: "GSPC.INDX", label: "S&P 500" },
-    "^COMP": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", twelve: "IXIC", eodhd: "IXIC.INDX", label: "Nasdaq Composite" },
+    "^GSPC": { yahoo: "^GSPC", stooq: "^spx", stooqQuote: "^spx", twelve: "SPX", eodhd: "GSPC.INDX", finnhub: ["^GSPC", "SPX"], tiingo: ["^GSPC", "SPX"], label: "S&P 500" },
+    "^IXIC": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", twelve: "IXIC", eodhd: "IXIC.INDX", finnhub: ["^IXIC", "IXIC"], tiingo: ["^IXIC", "IXIC"], label: "Nasdaq Composite" },
+    "^DJI": { yahoo: "^DJI", stooq: "^dji", stooqQuote: "^dji", twelve: "DJI", eodhd: "DJI.INDX", finnhub: ["^DJI", "DJI"], tiingo: ["^DJI", "DJI"], label: "Dow Jones" },
+    "^SPX": { yahoo: "^GSPC", stooq: "^spx", twelve: "SPX", eodhd: "GSPC.INDX", finnhub: ["^GSPC", "SPX"], tiingo: ["^GSPC", "SPX"], label: "S&P 500" },
+    "^COMP": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", twelve: "IXIC", eodhd: "IXIC.INDX", finnhub: ["^IXIC", "IXIC"], tiingo: ["^IXIC", "IXIC"], label: "Nasdaq Composite" },
     "^AXJO": { yahoo: "^AXJO", stooq: "^axjo", twelve: "XJO", eodhd: "XJO.INDX", label: "S&P/ASX 200" },
     "^AORD": { yahoo: "^AORD", stooq: "^aord", twelve: "AORD", eodhd: "AORD.INDX", label: "All Ordinaries" },
     "^AXKO": { yahoo: "^AXKO", stooq: "^axko", twelve: "XKO", eodhd: "XKO.INDX", label: "S&P/ASX 300" },
@@ -1890,6 +2629,242 @@ function eastmoneyKlinesToRows(payload) {
       turnoverRate: Number(parts[10] || 0),
     };
   }), { preserveTimestamp: true });
+}
+
+function rangeStartIso(range = "9mo") {
+  const days = {
+    "5d": 8,
+    "1mo": 40,
+    "3mo": 110,
+    "6mo": 210,
+    "9mo": 310,
+    "1y": 390,
+    "2y": 760,
+  }[range] || 310;
+  return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+}
+
+function alpacaRows(payload, interval = "1d") {
+  return sanitizeCandleRows((payload?.bars || []).map((row) => ({
+    date: String(row.t || ""),
+    open: Number(row.o),
+    high: Number(row.h),
+    low: Number(row.l),
+    close: Number(row.c),
+    adjClose: Number(row.c),
+    volume: Number(row.v || 0),
+    tradeCount: Number(row.n || 0),
+    providerVwap: Number(row.vw || 0),
+  })), { preserveTimestamp: isIntradayInterval(interval) });
+}
+
+function alpacaTradeRows(payload) {
+  return (Array.isArray(payload?.trades) ? payload.trades : [])
+    .map((row) => ({
+      timestamp: String(row?.t || ""),
+      price: Number(row?.p),
+      size: Number(row?.s),
+      exchange: String(row?.x || ""),
+      conditions: Array.isArray(row?.c) ? row.c.map((item) => String(item)) : [],
+      trade_id: String(row?.i ?? ""),
+      tape: String(row?.z || ""),
+      sequence: Number(row?.q || 0),
+    }))
+    .filter((row) => row.timestamp && Number.isFinite(row.price) && row.price > 0 && Number.isFinite(row.size) && row.size > 0)
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.sequence - b.sequence);
+}
+
+function alpacaQuoteRows(payload) {
+  const rawRows = Array.isArray(payload?.quotes)
+    ? payload.quotes
+    : payload?.quote
+      ? [payload.quote]
+      : [];
+  return rawRows
+    .map((row) => ({
+      timestamp: String(row?.t || ""),
+      bid_price: Number(row?.bp || 0),
+      bid_size: Number(row?.bs || 0),
+      ask_price: Number(row?.ap || 0),
+      ask_size: Number(row?.as || 0),
+      bid_exchange: String(row?.bx || ""),
+      ask_exchange: String(row?.ax || ""),
+      conditions: Array.isArray(row?.c) ? row.c.map((item) => String(item)) : [],
+      tape: String(row?.z || ""),
+    }))
+    .filter((row) => row.timestamp && ((Number.isFinite(row.bid_price) && row.bid_price > 0) || (Number.isFinite(row.ask_price) && row.ask_price > 0)))
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+}
+
+function intervalMs(interval = "1d") {
+  return {
+    "1m": 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "60m": 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+  }[interval] || 24 * 60 * 60_000;
+}
+
+function tradeSideByTickRule(trade, previous = null, lastSide = "neutral") {
+  const price = Number(trade?.price || 0);
+  const previousPrice = Number(previous?.price || 0);
+  if (price > 0 && previousPrice > 0 && price > previousPrice) return "buy";
+  if (price > 0 && previousPrice > 0 && price < previousPrice) return "sell";
+  return lastSide === "buy" || lastSide === "sell" ? lastSide : "neutral";
+}
+
+function priceLevelKey(price) {
+  const value = Number(price);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const decimals = value < 1 ? 4 : value < 10 ? 3 : 2;
+  return value.toFixed(decimals);
+}
+
+function tradeFootprintRows(candles = [], trades = [], options = {}) {
+  const interval = options.interval || "1d";
+  const source = options.source || "provider-trades";
+  const sortedCandles = sanitizeCandleRows(candles, { preserveTimestamp: isIntradayInterval(interval) })
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const sortedTrades = (Array.isArray(trades) ? trades : [])
+    .filter((row) => row?.timestamp && Number(row.price) > 0 && Number(row.size) > 0)
+    .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)) || Number(a.sequence || 0) - Number(b.sequence || 0));
+  if (!sortedCandles.length || !sortedTrades.length) {
+    return {
+      candles: sortedCandles,
+      summary: {
+        enriched_candles: 0,
+        trade_rows_used: 0,
+        side_method: "tick_rule_estimate",
+        source,
+      },
+    };
+  }
+  const span = intervalMs(interval);
+  let tradeIndex = 0;
+  let previousTrade = null;
+  let lastSide = "neutral";
+  const enriched = sortedCandles.map((candle, candleIndex) => {
+    const start = Date.parse(candle.date);
+    const nextStart = candleIndex + 1 < sortedCandles.length ? Date.parse(sortedCandles[candleIndex + 1].date) : NaN;
+    const end = Number.isFinite(nextStart) && nextStart > start ? nextStart : start + span;
+    if (!Number.isFinite(start)) return candle;
+    while (tradeIndex < sortedTrades.length && Date.parse(sortedTrades[tradeIndex].timestamp) < start) {
+      previousTrade = sortedTrades[tradeIndex];
+      tradeIndex += 1;
+    }
+    const levels = new Map();
+    let buyVolume = 0;
+    let sellVolume = 0;
+    let neutralVolume = 0;
+    let buyTrades = 0;
+    let sellTrades = 0;
+    let neutralTrades = 0;
+    let used = 0;
+    let cursor = tradeIndex;
+    while (cursor < sortedTrades.length) {
+      const trade = sortedTrades[cursor];
+      const ts = Date.parse(trade.timestamp);
+      if (!Number.isFinite(ts) || ts >= end) break;
+      if (ts >= start) {
+        const side = tradeSideByTickRule(trade, previousTrade, lastSide);
+        if (side === "buy" || side === "sell") lastSide = side;
+        const size = Number(trade.size || 0);
+        const key = priceLevelKey(trade.price);
+        if (key) {
+          if (!levels.has(key)) {
+            levels.set(key, {
+              price: Number(key),
+              buyVolume: 0,
+              sellVolume: 0,
+              neutralVolume: 0,
+              buyTrades: 0,
+              sellTrades: 0,
+              neutralTrades: 0,
+              source,
+            });
+          }
+          const level = levels.get(key);
+          if (side === "buy") {
+            level.buyVolume += size;
+            level.buyTrades += 1;
+            buyVolume += size;
+            buyTrades += 1;
+          } else if (side === "sell") {
+            level.sellVolume += size;
+            level.sellTrades += 1;
+            sellVolume += size;
+            sellTrades += 1;
+          } else {
+            level.neutralVolume += size;
+            level.neutralTrades += 1;
+            neutralVolume += size;
+            neutralTrades += 1;
+          }
+        }
+        used += 1;
+      }
+      previousTrade = trade;
+      cursor += 1;
+    }
+    tradeIndex = cursor;
+    if (!used) return candle;
+    const priceLevels = [...levels.values()]
+      .sort((a, b) => b.price - a.price)
+      .map((level) => ({
+        price: level.price,
+        buyVolume: Number(level.buyVolume.toFixed(4)),
+        sellVolume: Number(level.sellVolume.toFixed(4)),
+        neutralVolume: Number(level.neutralVolume.toFixed(4)),
+        buyTrades: level.buyTrades,
+        sellTrades: level.sellTrades,
+        neutralTrades: level.neutralTrades,
+        source,
+        sideMethod: "tick_rule_estimate",
+      }));
+    return {
+      ...candle,
+      buyVolume: Number(buyVolume.toFixed(4)),
+      sellVolume: Number(sellVolume.toFixed(4)),
+      neutralVolume: Number(neutralVolume.toFixed(4)),
+      buyTrades,
+      sellTrades,
+      neutralTrades,
+      tradeCount: used,
+      priceLevels,
+      orderflowSource: source,
+      orderflowSideMethod: "tick_rule_estimate",
+      aggressorSideAvailable: false,
+    };
+  });
+  const enrichedRows = enriched.filter((row) => Array.isArray(row.priceLevels) && row.priceLevels.length);
+  return {
+    candles: enriched,
+    summary: {
+      enriched_candles: enrichedRows.length,
+      trade_rows_used: enrichedRows.reduce((sum, row) => sum + Number(row.tradeCount || 0), 0),
+      price_level_rows: enrichedRows.reduce((sum, row) => sum + row.priceLevels.length, 0),
+      side_method: "tick_rule_estimate",
+      aggressor_side_available: false,
+      true_l2: false,
+      source,
+    },
+  };
+}
+
+function tushareRows(payload) {
+  const fields = payload?.data?.fields || [];
+  const indexes = Object.fromEntries(fields.map((field, index) => [field, index]));
+  return sanitizeCandleRows((payload?.data?.items || []).map((row) => ({
+    date: String(row[indexes.trade_date] || "").replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3"),
+    open: Number(row[indexes.open]),
+    high: Number(row[indexes.high]),
+    low: Number(row[indexes.low]),
+    close: Number(row[indexes.close]),
+    adjClose: Number(row[indexes.close]),
+    volume: Number(row[indexes.vol] || 0) * 100,
+    amount: Number(row[indexes.amount] || 0) * 1000,
+  }))).sort((a, b) => a.date.localeCompare(b.date));
 }
 
 function tencentQuoteFundamentals(symbol, quote = []) {
@@ -2006,7 +2981,7 @@ function stooqRows(csv, range = "9mo") {
 
 function stockAnalysisHistoryRows(html, range = "9mo") {
   const text = String(html || "");
-  const block = text.match(/data:\[(\{a:[\s\S]*?\})\],created_at/)?.[1] || "";
+  const block = text.match(/data:\[([\s\S]*?)\],created_at/)?.[1] || "";
   const rows = sanitizeCandleRows([...block.matchAll(/\{a:([^,}]+),c:([^,}]+),h:([^,}]+),l:([^,}]+),o:([^,}]+),t:"([^"]+)",v:([^,}]+)/g)]
     .map((match) => ({
       date: match[6],
@@ -2689,26 +3664,118 @@ function pctChange(current, previous) {
   return ((value - prev) / Math.abs(prev)) * 100;
 }
 
-function factorSignal(factors = {}) {
+const FACTOR_LAYER_KEYS = [
+  "announcements",
+  "shortInterest",
+  "macro",
+  "sector",
+  "flowOptions",
+  "marketRegime",
+  "relativeStrength",
+  "liquidity",
+  "calibration",
+];
+
+function researchFactorValue(name, technicals = {}) {
+  const close = finiteNumber(technicals.close, 0);
+  const sma20 = finiteNumber(technicals.sma20, close);
+  const vwapDistance = Number(technicals.vwapDistancePct);
+  const rangePosition = Number(technicals.rangePosition);
+  return {
+    momentum_5: clampNumber(finiteNumber(technicals.change5d, 0), -10, 10),
+    momentum_20: clampNumber(finiteNumber(technicals.change20d, 0) * 0.5, -10, 10),
+    reversal_5: clampNumber(-finiteNumber(technicals.change5d, 0), -10, 10),
+    volatility_10: clampNumber(4 - finiteNumber(technicals.volatility, 0) * 2, -10, 10),
+    volume_ratio_20: clampNumber((finiteNumber(technicals.volumeRatio, 1) - 1) * 8, -10, 10),
+    trend_gap_20: clampNumber(close > 0 && sma20 > 0 ? pctChange(close, sma20) * 0.7 : 0, -10, 10),
+    vwap_gap: Number.isFinite(vwapDistance) ? clampNumber(vwapDistance, -10, 10) : undefined,
+    range_position: Number.isFinite(rangePosition) ? clampNumber((rangePosition - 0.5) * 20, -10, 10) : undefined,
+  }[name];
+}
+
+function factorSignal(factors = {}, factorConfig = {}, technicals = {}) {
   const safeFactors = factors || {};
-  const rows = [
-    safeFactors.announcements,
-    safeFactors.shortInterest,
-    safeFactors.macro,
-    safeFactors.sector,
-    safeFactors.flowOptions,
-    safeFactors.marketRegime,
-    safeFactors.relativeStrength,
-    safeFactors.liquidity,
-    safeFactors.calibration,
-  ].filter(Boolean);
-  const available = rows.filter((row) => row.available !== false);
-  const score = available.reduce((sum, row) => sum + Number(row.score || 0), 0);
+  const config = factorConfig && typeof factorConfig === "object" && !Array.isArray(factorConfig) ? factorConfig : {};
+  const configuredNames = Object.keys(config);
+  const layerRows = FACTOR_LAYER_KEYS
+    .map((name) => ({ name, factor: safeFactors[name], config: config[name] }))
+    .filter((row) => row.factor && row.factor.available !== false);
+  const activeLayerRows = layerRows.filter((row) => row.config?.enabled !== false);
+  const configuredLayerWeights = activeLayerRows
+    .filter((row) => row.config && Number(row.config.weightPct || 0) > 0)
+    .map((row) => Number(row.config.weightPct));
+  const configuredLayerWeightMean = configuredLayerWeights.length
+    ? configuredLayerWeights.reduce((sum, value) => sum + value, 0) / configuredLayerWeights.length
+    : 0;
+  const layerScore = activeLayerRows.reduce((sum, row) => {
+    const configuredWeight = Math.max(0, Number(row.config?.weightPct || 0));
+    const multiplier = configuredLayerWeightMean > 0 && configuredWeight > 0
+      ? configuredWeight / configuredLayerWeightMean
+      : 1;
+    return sum + Number(row.factor.score || 0) * multiplier;
+  }, 0);
+  const researchRows = configuredNames
+    .filter((name) => !FACTOR_LAYER_KEYS.includes(name) && config[name]?.enabled !== false)
+    .map((name) => ({ name, weight: Math.max(0, Number(config[name]?.weightPct || 0)), value: researchFactorValue(name, technicals) }))
+    .filter((row) => Number.isFinite(row.value));
+  const researchWeightTotal = researchRows.reduce((sum, row) => sum + row.weight, 0);
+  const researchScore = researchRows.length
+    ? researchRows.reduce((sum, row) => sum + row.value * (researchWeightTotal > 0 ? row.weight / researchWeightTotal : 1 / researchRows.length), 0)
+    : 0;
+  const configApplied = configuredNames.length > 0;
+  const score = layerScore + researchScore;
+  const enabledFactors = [...new Set([...activeLayerRows.map((row) => row.name), ...researchRows.map((row) => row.name)])];
+  const disabledFactors = configuredNames.filter((name) => config[name]?.enabled === false);
+  const unavailableConfiguredFactors = configuredNames.filter((name) => (
+    config[name]?.enabled !== false
+    && !enabledFactors.includes(name)
+  ));
+  const configuredWeightPct = Object.fromEntries(configuredNames.map((name) => [
+    name,
+    config[name]?.enabled === false ? 0 : Number(Number(config[name]?.weightPct || 0).toFixed(3)),
+  ]));
+  const factorContributions = [
+    ...activeLayerRows.map((row) => {
+      const configuredWeight = Math.max(0, Number(row.config?.weightPct || 0));
+      const multiplier = configuredLayerWeightMean > 0 && configuredWeight > 0
+        ? configuredWeight / configuredLayerWeightMean
+        : 1;
+      return {
+        name: row.name,
+        source: "live-factor-layer",
+        value: Number(row.factor.score || 0),
+        effectiveWeight: Number(multiplier.toFixed(4)),
+        contribution: Number((Number(row.factor.score || 0) * multiplier).toFixed(4)),
+      };
+    }),
+    ...researchRows.map((row) => {
+      const normalizedWeight = researchWeightTotal > 0 ? row.weight / researchWeightTotal : 1 / researchRows.length;
+      return {
+        name: row.name,
+        source: "saved-research-config",
+        value: Number(row.value.toFixed(4)),
+        effectiveWeight: Number(normalizedWeight.toFixed(4)),
+        contribution: Number((row.value * normalizedWeight).toFixed(4)),
+      };
+    }),
+  ];
   return {
     score: Math.max(-25, Math.min(25, score)),
-    checked: available.length,
+    checked: activeLayerRows.length + researchRows.length,
     stance: score > 6 ? "supportive" : score < -6 ? "risk-off" : "mixed",
-    notes: available.flatMap((row) => row.thesis || []).slice(0, 8),
+    notes: [
+      ...activeLayerRows.flatMap((row) => row.factor.thesis || []),
+      ...(configApplied ? [`Saved factor configuration applied: ${enabledFactors.join(", ") || "all configured factors disabled"}.`] : []),
+      ...(unavailableConfiguredFactors.length ? [`Configured factors unavailable for this analysis: ${unavailableConfiguredFactors.join(", ")}.`] : []),
+    ].slice(0, 8),
+    configApplied,
+    configScore: Number(researchScore.toFixed(3)),
+    layerScore: Number(layerScore.toFixed(3)),
+    enabledFactors,
+    disabledFactors,
+    unavailableConfiguredFactors,
+    configuredWeightPct,
+    factorContributions,
   };
 }
 
@@ -2831,6 +3898,253 @@ function compactProviderErrors(errors = []) {
     .replace(/HTTP 403[\s\S]*$/i, "Provider edge/permission block; fallback provider used.")
     .replace(/You may subscribe[\s\S]*$/i, "Provider plan/rate limit; fallback provider used.")
     .slice(0, 180));
+}
+
+async function fetchAlpacaUsCandles(code, range, interval) {
+  if (!alpacaConfigured()) {
+    throw new Error("ALPACA_API_KEY/ALPACA_API_SECRET or APCA_API_KEY_ID/APCA_API_SECRET_KEY are required");
+  }
+  const ticker = cleanCode(code, "US");
+  if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(ticker) || ticker.startsWith("^")) {
+    throw new Error(`Alpaca bars require a valid US stock ticker: ${ticker}`);
+  }
+  const endpoint = new URL(`https://data.alpaca.markets/v2/stocks/${encodeURIComponent(ticker)}/bars`);
+  endpoint.searchParams.set("timeframe", {
+    "5m": "5Min",
+    "15m": "15Min",
+    "60m": "1Hour",
+    "1wk": "1Week",
+  }[interval] || "1Day");
+  endpoint.searchParams.set("start", `${rangeStartIso(range)}T00:00:00Z`);
+  endpoint.searchParams.set("limit", "10000");
+  endpoint.searchParams.set("adjustment", "all");
+  endpoint.searchParams.set("feed", process.env.ALPACA_DATA_FEED || "iex");
+  endpoint.searchParams.set("sort", "asc");
+  const payload = await fetchJson(endpoint, 7000, alpacaAuthHeaders());
+  const candles = alpacaRows(payload, interval);
+  if (!candles.length) throw new Error(`Alpaca returned no real bars for ${ticker}.`);
+  return { candles, source: `alpaca-${process.env.ALPACA_DATA_FEED || "iex"}-us-${interval}` };
+}
+
+function alpacaAuthHeaders() {
+  return {
+    "APCA-API-KEY-ID": alpacaApiKey(),
+    "APCA-API-SECRET-KEY": alpacaApiSecret(),
+  };
+}
+
+function alpacaApiKey() {
+  return process.env.ALPACA_API_KEY || process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || "";
+}
+
+function alpacaApiSecret() {
+  return process.env.ALPACA_API_SECRET || process.env.APCA_API_SECRET_KEY || process.env.ALPACA_SECRET_KEY || "";
+}
+
+function alpacaConfigured() {
+  return Boolean(alpacaApiKey() && alpacaApiSecret());
+}
+
+async function fetchAlpacaUsTrades(code, windowMinutes = 30) {
+  if (!alpacaConfigured()) {
+    throw new Error("ALPACA_API_KEY/ALPACA_API_SECRET or APCA_API_KEY_ID/APCA_API_SECRET_KEY are required for real US trades.");
+  }
+  const ticker = cleanCode(code, "US");
+  if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(ticker) || ticker.startsWith("^")) {
+    throw new Error(`Alpaca trades require a valid US stock ticker: ${ticker}`);
+  }
+  const safeWindow = Math.max(1, Math.min(390, Number(windowMinutes) || 30));
+  const limit = Math.max(100, Math.min(10000, Number(process.env.ALPACA_TRADES_LIMIT || 1000)));
+  const feed = process.env.ALPACA_DATA_FEED || "iex";
+  const endpoint = new URL(`https://data.alpaca.markets/v2/stocks/${encodeURIComponent(ticker)}/trades`);
+  endpoint.searchParams.set("start", new Date(Date.now() - safeWindow * 60000).toISOString());
+  endpoint.searchParams.set("limit", String(limit));
+  endpoint.searchParams.set("feed", feed);
+  endpoint.searchParams.set("sort", "asc");
+  const payload = await fetchJson(endpoint, 7000, alpacaAuthHeaders());
+  return {
+    available: true,
+    trades: alpacaTradeRows(payload),
+    source: `alpaca-${feed}-us-trades`,
+    real_trades: true,
+    true_l2: false,
+    aggressor_side_available: false,
+    nextPageToken: payload?.next_page_token || null,
+  };
+}
+
+async function fetchAlpacaUsLatestQuote(code) {
+  if (!alpacaConfigured()) {
+    throw new Error("ALPACA_API_KEY/ALPACA_API_SECRET or APCA_API_KEY_ID/APCA_API_SECRET_KEY are required for real US L1 quotes.");
+  }
+  const ticker = cleanCode(code, "US");
+  if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(ticker) || ticker.startsWith("^")) {
+    throw new Error(`Alpaca quotes require a valid US stock ticker: ${ticker}`);
+  }
+  const feed = process.env.ALPACA_DATA_FEED || "iex";
+  const endpoint = new URL(`https://data.alpaca.markets/v2/stocks/${encodeURIComponent(ticker)}/quotes/latest`);
+  endpoint.searchParams.set("feed", feed);
+  const payload = await fetchJson(endpoint, 7000, alpacaAuthHeaders());
+  const quotes = alpacaQuoteRows(payload);
+  if (!quotes.length) throw new Error(`Alpaca returned no real L1 quote for ${ticker}.`);
+  return {
+    available: true,
+    quotes,
+    latest: quotes.at(-1),
+    source: `alpaca-${feed}-us-l1-quote`,
+    real_l1: true,
+    true_l2: false,
+  };
+}
+
+async function fetchTushareCnCandles(code, range, interval) {
+  if (!process.env.TUSHARE_TOKEN) throw new Error("TUSHARE_TOKEN is required");
+  if (interval !== "1d") throw new Error("Tushare adapter currently exposes daily A-share candles only.");
+  const clean = cleanCode(code, "CN");
+  if (!/^\d{6}$/.test(clean)) throw new Error(`Tushare daily bars require a six-digit A-share code: ${clean}`);
+  const tsCode = `${clean}.${/^6|^5|^9/.test(clean) ? "SH" : "SZ"}`;
+  const payload = await fetchJsonPost("https://api.tushare.pro", {
+    api_name: "daily",
+    token: process.env.TUSHARE_TOKEN,
+    params: {
+      ts_code: tsCode,
+      start_date: rangeStartIso(range).replace(/-/g, ""),
+      end_date: new Date().toISOString().slice(0, 10).replace(/-/g, ""),
+    },
+    fields: "ts_code,trade_date,open,high,low,close,vol,amount",
+  }, 7000);
+  if (Number(payload?.code || 0) !== 0) throw new Error(payload?.msg || `Tushare error ${payload?.code}`);
+  const candles = tushareRows(payload);
+  if (!candles.length) throw new Error(`Tushare returned no real daily bars for ${tsCode}.`);
+  return { candles, source: "tushare-cn-daily" };
+}
+
+function finnhubResolution(interval = "1d") {
+  return {
+    "5m": "5",
+    "15m": "15",
+    "60m": "60",
+    "1d": "D",
+    "1wk": "W",
+    "1mo": "M",
+  }[interval] || "D";
+}
+
+function finnhubSymbolsForCode(code, market = "US") {
+  const key = safeMarket(market);
+  const clean = cleanCode(code, key);
+  if (clean.startsWith("^")) {
+    const index = usIndexProviderSymbols(clean);
+    return Array.isArray(index?.finnhub) ? index.finnhub : [];
+  }
+  if (key === "ASX") return [`${clean}.AX`];
+  if (key === "US") return [clean];
+  return [];
+}
+
+function tiingoTickersForCode(code, market = "US") {
+  const key = safeMarket(market);
+  const clean = cleanCode(code, key);
+  if (clean.startsWith("^")) {
+    const index = usIndexProviderSymbols(clean);
+    return Array.isArray(index?.tiingo) ? index.tiingo : [];
+  }
+  if (key === "ASX") return [`${clean}.AX`, clean];
+  if (key === "US") return [clean];
+  return [];
+}
+
+async function fetchFinnhubCandles(code, range, interval, market = "US") {
+  if (!process.env.FINNHUB_API_KEY) throw new Error("FINNHUB_API_KEY is required");
+  const key = safeMarket(market);
+  const backoffKey = `finnhub-${key.toLowerCase()}`;
+  const backoff = providerBackoffReason(backoffKey);
+  if (backoff) throw new Error(backoff);
+  const symbols = finnhubSymbolsForCode(code, key);
+  if (!symbols.length) throw new Error(`Finnhub does not support ${key} symbol ${code} in this adapter.`);
+  const from = Math.floor(new Date(rangeStartIso(range)).getTime() / 1000);
+  const to = Math.floor(Date.now() / 1000);
+  const errors = [];
+  for (const symbol of symbols) {
+    const endpoint = new URL("https://finnhub.io/api/v1/stock/candle");
+    endpoint.searchParams.set("symbol", symbol);
+    endpoint.searchParams.set("resolution", finnhubResolution(interval));
+    endpoint.searchParams.set("from", String(from));
+    endpoint.searchParams.set("to", String(to));
+    endpoint.searchParams.set("token", process.env.FINNHUB_API_KEY);
+    try {
+      const payload = await fetchJson(endpoint, 7000);
+      if (payload?.s && payload.s !== "ok") throw new Error(payload?.s === "no_data" ? "no_data" : payload?.s);
+      const candles = finnhubRows(payload, interval);
+      if (candles.length) {
+        return {
+          candles,
+          source: `finnhub-${key.toLowerCase()}${cleanCode(code, key).startsWith("^") ? "-index" : ""}-${symbol}`,
+          unit: cleanCode(code, key).startsWith("^") ? "points" : undefined,
+        };
+      }
+      errors.push(`${symbol}: no rows`);
+    } catch (error) {
+      const message = String(error.message || error);
+      if (/429|limit|rate|token|Forbidden|unauthorized/i.test(message)) {
+        backoffProvider(backoffKey, 20 * 60 * 1000, `Finnhub ${key} skipped after rate/permission error; using another real source if available.`);
+      }
+      errors.push(`${symbol}: ${message}`);
+    }
+  }
+  throw new Error(errors.join(" | ") || "Finnhub returned no candles.");
+}
+
+async function fetchTiingoCandles(code, range, interval, market = "US") {
+  if (!process.env.TIINGO_API_KEY) throw new Error("TIINGO_API_KEY is required");
+  if (isIntradayInterval(interval)) throw new Error("Tiingo adapter currently exposes daily candles only.");
+  const key = safeMarket(market);
+  const backoffKey = `tiingo-${key.toLowerCase()}`;
+  const backoff = providerBackoffReason(backoffKey);
+  if (backoff) throw new Error(backoff);
+  const tickers = tiingoTickersForCode(code, key);
+  if (!tickers.length) throw new Error(`Tiingo does not support ${key} symbol ${code} in this adapter.`);
+  const errors = [];
+  for (const ticker of tickers) {
+    const endpoint = new URL(`https://api.tiingo.com/tiingo/daily/${encodeURIComponent(ticker)}/prices`);
+    endpoint.searchParams.set("startDate", rangeStartIso(range));
+    endpoint.searchParams.set("endDate", new Date().toISOString().slice(0, 10));
+    endpoint.searchParams.set("token", process.env.TIINGO_API_KEY);
+    try {
+      const payload = await fetchJson(endpoint, 7000);
+      const candles = tiingoRows(payload, interval);
+      if (candles.length) {
+        return {
+          candles,
+          source: `tiingo-${key.toLowerCase()}${cleanCode(code, key).startsWith("^") ? "-index" : ""}-${ticker}`,
+          unit: cleanCode(code, key).startsWith("^") ? "points" : undefined,
+        };
+      }
+      errors.push(`${ticker}: no rows`);
+    } catch (error) {
+      const message = String(error.message || error);
+      if (/429|limit|rate|token|Forbidden|unauthorized|Error 404/i.test(message)) {
+        backoffProvider(backoffKey, /404/.test(message) ? 45 * 60 * 1000 : 20 * 60 * 1000, `Tiingo ${key} skipped after rate/permission/symbol error; using another real source if available.`);
+      }
+      errors.push(`${ticker}: ${message}`);
+    }
+  }
+  throw new Error(errors.join(" | ") || "Tiingo returned no candles.");
+}
+
+async function fetchBaostockCnCandles(code, range, interval) {
+  const startDate = rangeStartIso(range);
+  const endDate = new Date().toISOString().slice(0, 10);
+  const result = await runPythonQuantCore("baostock-candles", {
+    market: "CN",
+    symbol: cleanCode(code, "CN"),
+    interval,
+    start_date: startDate,
+    end_date: endDate,
+  }, Number(process.env.PYTHON_CORE_TIMEOUT_MS || 16000));
+  const candles = sanitizeCandleRows(result.candles || [], { preserveTimestamp: isIntradayInterval(interval) });
+  if (!candles.length) throw new Error(`Baostock returned no real rows for ${code}.`);
+  return { candles, source: result.source || `baostock-cn-${interval}` };
 }
 
 async function fetchTwelveDataCandles(code, range, interval, market = "ASX") {
@@ -3233,9 +4547,9 @@ async function fetchStooqIndexCandles(code, range, interval, market = "US") {
   endpoint.searchParams.set("i", "d");
   if (process.env.STOOQ_API_KEY) endpoint.searchParams.set("apikey", process.env.STOOQ_API_KEY);
   const csv = await fetchText(endpoint, 5500);
-  if (/get your apikey|captcha/i.test(csv)) {
+  if (/get your apikey|captcha|requires JavaScript to verify your browser|__verify/i.test(csv)) {
     backoffProvider(backoffKey, 6 * 60 * 60 * 1000, `Stooq ${key} index skipped because CSV download now requires captcha/API key.`);
-    throw new Error("Stooq index CSV download requires captcha/API key.");
+    throw new Error("Stooq index CSV download requires browser verification/captcha/API key.");
   }
   const candles = stooqRows(csv, range);
   if (!candles.length) throw new Error(`Stooq returned no ${key} index candles.`);
@@ -3413,18 +4727,22 @@ function providerCandidates(market, code, range, interval) {
   }
   if (key === "US" && /^\^/.test(cleanCode(code, key))) {
     return [
+      ["yahoo-us-index", () => fetchYahooMarketCandles(code, range, interval, key)],
       ["nasdaq-us-index", () => fetchNasdaqUsIndexCandles(code, range, interval)],
+      ["finnhub-us-index", () => fetchFinnhubCandles(code, range, interval, key)],
+      ["tiingo-us-index", () => fetchTiingoCandles(code, range, interval, key)],
       ["twelvedata-us-index", () => fetchTwelveDataIndexCandles(code, range, interval, key)],
       ["eodhd-us-index", () => fetchEodhdCandles(code, range, interval, key)],
       ["stooq-us-index", () => fetchStooqIndexCandles(code, range, interval, key)],
-      ["yahoo-us-index", () => fetchYahooMarketCandles(code, range, interval, key)],
     ];
   }
   const cnFreeCandidates = [
     ["eastmoney-cn", () => fetchEastmoneyCnCandles(code, range, interval)],
     ["tencent-cn", () => fetchTencentCnCandles(code, range, interval)],
+    ["baostock-cn", () => fetchBaostockCnCandles(code, range, interval)],
     ["yahoo-cn", () => fetchYahooMarketCandles(code, range, interval, key)],
   ];
+  const cnTushareCandidate = ["tushare-cn", () => fetchTushareCnCandles(code, range, interval)];
   const cnAlphaCandidate = ["alphavantage-cn", () => fetchAlphaVantageCandles(code, range, interval, key)];
   const cnExtraKeyedCandidates = [
     ["alphavantage-cn", () => fetchAlphaVantageCandles(code, range, interval, key)],
@@ -3434,24 +4752,32 @@ function providerCandidates(market, code, range, interval) {
   const cnCandidates = /^(SH|SZ)\d{6}$/.test(cleanCode(code, key))
     ? cnFreeCandidates
     : [
+      ...(process.env.TUSHARE_TOKEN ? [cnTushareCandidate] : []),
       ...cnFreeCandidates,
       ...(cnKeyedFallbacksEnabled() ? [cnAlphaCandidate] : []),
       ...(cnExtraKeyedFallbacksEnabled() ? cnExtraKeyedCandidates.slice(1) : []),
     ];
   const candidates = {
     ASX: [
-      ["stockanalysis-asx", () => fetchStockAnalysisAsxCandles(code, range, interval)],
+      ...(interval === "1d" ? [["stockanalysis-asx", () => fetchStockAnalysisAsxCandles(code, range, interval)]] : []),
       ["yahoo-asx", () => fetchYahooMarketCandles(code, range, interval, key)],
+      ["finnhub-asx", () => fetchFinnhubCandles(code, range, interval, key)],
+      ["tiingo-asx", () => fetchTiingoCandles(code, range, interval, key)],
       ["eodhd-asx", () => fetchEodhdCandles(code, range, interval, key)],
       ["twelvedata-asx", () => fetchTwelveDataCandles(code, range, interval, key)],
     ],
     US: [
+      ...(alpacaConfigured()
+        ? [["alpaca-us-iex", () => fetchAlpacaUsCandles(code, range, interval)]]
+        : []),
       ["nasdaq-us", () => fetchNasdaqUsCandles(code, range, interval)],
       ["yahoo-us", () => fetchYahooMarketCandles(code, range, interval, key)],
-      ["eodhd-us", () => fetchEodhdCandles(code, range, interval, key)],
-      ["twelvedata-us", () => fetchTwelveDataCandles(code, range, interval, key)],
-      ["stooq-us", () => fetchStooqUsCandles(code, range, interval)],
+      ["finnhub-us", () => fetchFinnhubCandles(code, range, interval, key)],
+      ["tiingo-us", () => fetchTiingoCandles(code, range, interval, key)],
       ["alphavantage-us", () => fetchAlphaVantageCandles(code, range, interval, key)],
+      ["twelvedata-us", () => fetchTwelveDataCandles(code, range, interval, key)],
+      ["eodhd-us", () => fetchEodhdCandles(code, range, interval, key)],
+      ["stooq-us", () => fetchStooqUsCandles(code, range, interval)],
     ],
     CN: cnCandidates,
   }[key];
@@ -3522,12 +4848,23 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
     const candidates = providerCandidates(key, code, range, interval);
     const successful = [];
     const errors = [];
+    let limitedProviderCalls = 0;
+    const maxLimitedProviderCalls = key === "US" ? 4 : key === "ASX" ? 2 : 1;
     for (const [source, task] of candidates) {
       const skipError = providerSkipError(source);
       if (skipError) {
         errors.push(skipError);
         continue;
       }
+      if (isLimitedProvider(source) && !providerConfigured(source)) {
+        errors.push(`${source}: skipped because its API key is not configured`);
+        continue;
+      }
+      if (isLimitedProvider(source) && limitedProviderCalls >= maxLimitedProviderCalls) {
+        errors.push(`${source}: skipped by quota policy; ${maxLimitedProviderCalls} limited provider(s) already called for this task`);
+        continue;
+      }
+      if (isLimitedProvider(source)) limitedProviderCalls += 1;
       try {
         const value = await task();
         if (value.candles?.length) successful.push(value);
@@ -3574,6 +4911,16 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
     return remember(await fetchAlphaVantageCandles(code, range, interval, key));
   }
 
+  if (provider === "alpaca") {
+    if (key !== "US") throw new Error("Alpaca is only configured as a US stock bars source.");
+    return remember(await fetchAlpacaUsCandles(code, range, interval));
+  }
+
+  if (provider === "tushare") {
+    if (key !== "CN") throw new Error("Tushare is only configured as a China A-share daily source.");
+    return remember(await fetchTushareCnCandles(code, range, interval));
+  }
+
   if (provider === "yahoo") {
     return remember(await fetchYahooMarketCandles(code, range, interval, key));
   }
@@ -3583,7 +4930,323 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
     return remember(await fetchTencentCnCandles(code, range, interval));
   }
 
-  throw new Error("No real market provider configured. Set MARKET_PROVIDER or US_MARKET_PROVIDER/CN_MARKET_PROVIDER to dual, twelvedata, eodhd, alphavantage, yahoo, or tencent with the required API access.");
+  throw new Error("No real market provider configured. Set MARKET_PROVIDER or US_MARKET_PROVIDER/CN_MARKET_PROVIDER to dual, alpaca, tushare, twelvedata, eodhd, alphavantage, yahoo, or tencent with the required API access.");
+}
+
+async function quantLabMarketData(symbol, market = "ASX", range = "9mo", interval = "1d") {
+  const key = safeMarket(market);
+  const normalized = normalizeMarketSymbol(symbol, key);
+  let marketData;
+  let marketError = null;
+  try {
+    marketData = await fetchMarketCandles(normalized, range, interval, key);
+  } catch (error) {
+    marketError = error;
+  }
+  if (!marketData?.candles?.length) {
+    marketData = await fetchSnapshotMarketCandles(normalized, range, interval, key, marketError);
+  }
+  if (!marketData?.candles?.length) {
+    throw marketError || new Error(`No real market candles are available for ${normalized}.`);
+  }
+  return { market: key, symbol: normalized, ...marketData };
+}
+
+function providerConfigured(source) {
+  const name = String(source || "").toLowerCase();
+  if (name.includes("alpaca")) return alpacaConfigured();
+  const keyedProviders = [
+    ["eodhd", "EODHD_API_KEY"],
+    ["twelvedata", "TWELVEDATA_API_KEY"],
+    ["alphavantage", "ALPHAVANTAGE_API_KEY"],
+    ["tushare", "TUSHARE_TOKEN"],
+    ["alpaca", "ALPACA_API_KEY"],
+    ["finnhub", "FINNHUB_API_KEY"],
+    ["tiingo", "TIINGO_API_KEY"],
+    ["marketaux", "MARKETAUX_API_KEY"],
+  ];
+  const keyed = keyedProviders.find(([marker]) => name.includes(marker));
+  return keyed ? Boolean(process.env[keyed[1]]) : true;
+}
+
+function providerCapabilityRows(candidates = []) {
+  return candidates.map(([source]) => ({
+    source,
+    configured: providerConfigured(source),
+    limited: isLimitedProvider(source),
+    backoff: providerBackoffReason(source) || "",
+    status: !providerConfigured(source)
+      ? "missing_key"
+      : providerBackoffReason(source)
+        ? "backoff_or_limit"
+        : "candidate",
+  }));
+}
+
+function newsProviderStatus() {
+  const rows = [
+    { name: "marketaux", env: "MARKETAUX_API_KEY", tier: "limited-news", backoffKey: "marketaux-news" },
+    { name: "fred", env: "FRED_API_KEY", tier: "limited-macro", backoffKey: "fred" },
+    { name: "newsapi", env: "NEWSAPI_KEY", tier: "limited-news", backoffKey: "newsapi" },
+    { name: "newsdata", env: "NEWSDATA_API_KEY", tier: "limited-news", backoffKey: "newsdata" },
+    { name: "thenewsapi", env: "THENEWSAPI_KEY", tier: "limited-news", backoffKey: "thenewsapi" },
+    { name: "tianapi", env: "TIANAPI_KEY", tier: "limited-news-cn", backoffKey: "tianapi" },
+    { name: "google-rss", env: null, tier: "free-rss", backoffKey: "google-rss" },
+    { name: "gdelt", env: null, tier: "free-global", backoffKey: "gdelt" },
+    { name: "stockanalysis-asx-news", env: null, tier: "free-asx", backoffKey: "stockanalysis-asx-news" },
+    { name: "eastmoney-news", env: null, tier: "free-cn", backoffKey: "eastmoney-news" },
+  ];
+  const primary = String(process.env.NEWS_PRIMARY_PROVIDER || "").toLowerCase();
+  return {
+    primary: primary || "auto",
+    providers: rows.map((row) => {
+      const configured = row.env ? Boolean(process.env[row.env]) : true;
+      const backoff = providerBackoffReason(row.backoffKey) || providerBackoffReason(row.name) || "";
+      return {
+        name: row.name,
+        tier: row.tier,
+        configured,
+        backoff,
+        status: !configured ? "missing_key" : backoff ? "backoff_or_limit" : "ready",
+        primary: primary === row.name,
+      };
+    }),
+  };
+}
+
+async function dataCapabilities(market = "ASX", symbol = "") {
+  const key = safeMarket(market);
+  const sample = normalizeMarketSymbol(symbol || { ASX: "BHP", US: "AAPL", CN: "600519" }[key] || "", key);
+  const alpacaReady = key === "US" && alpacaConfigured();
+  const localMarketData = await runPythonQuantCore("market-data-summary", { market: key, symbol: sample }).catch((error) => ({
+    error: error.message || String(error),
+    true_tick_available: false,
+    true_l1_available: false,
+    true_l2_available: false,
+  }));
+  const intradayProviders = providerCapabilityRows(providerCandidates(key, sample, "5d", "5m"));
+  const dailyProviders = providerCapabilityRows(providerCandidates(key, sample, "9mo", "1d"));
+  return {
+    market: key,
+    symbol: sample,
+    intervals: [
+      { interval: "5m", granularity: "real_intraday_bar", providers: intradayProviders },
+      { interval: "15m", granularity: "real_intraday_bar", providers: providerCapabilityRows(providerCandidates(key, sample, "5d", "15m")) },
+      { interval: "60m", granularity: "real_intraday_bar", providers: providerCapabilityRows(providerCandidates(key, sample, "5d", "60m")) },
+      { interval: "1d", granularity: "real_daily_bar", providers: dailyProviders },
+    ],
+    tick: {
+      available: Boolean(localMarketData.true_tick_available) || alpacaReady,
+      localAvailable: Boolean(localMarketData.true_tick_available),
+      configured: alpacaReady,
+      configuredProvider: alpacaReady ? "alpaca-us-trades" : "",
+      note: key === "US"
+        ? alpacaReady
+          ? "Alpaca credentials are configured. The app will verify entitlement when /api/trades or intraday feature footprint is requested. This is tick/trade data, not L2."
+          : "US real trades require Alpaca credentials. This is tick/trade data, not L2."
+        : `${key} real tick/trade data requires a separately authorised exchange, broker, or vendor feed.`,
+    },
+    l1: {
+      available: Boolean(localMarketData.true_l1_available) || alpacaReady,
+      localAvailable: Boolean(localMarketData.true_l1_available),
+      configured: alpacaReady,
+      configuredProvider: alpacaReady ? "alpaca-us-l1-quotes" : "",
+      note: key === "US"
+        ? alpacaReady
+          ? "Alpaca credentials are configured. Latest quote entitlement is verified on demand and saved locally when returned; candle data is never promoted to L1."
+          : "US L1 quotes require Alpaca credentials; candle data is never promoted to L1."
+        : "L1 quotes are only marked available after authorised quote rows are recorded locally; candle data is never promoted to L1.",
+    },
+    l2: {
+      available: Boolean(localMarketData.true_l2_available),
+      note: key === "US"
+        ? "Alpaca trades/quotes are not treated as L2. True depth is available only after licensed order-book rows are recorded locally."
+        : "L2/depth requires a licensed order-book feed. The app will not infer L2 from OHLCV candles.",
+    },
+    localMarketData,
+  };
+}
+
+function isLimitedProvider(source) {
+  return ["eodhd", "twelvedata", "alphavantage", "tushare", "alpaca", "finnhub", "tiingo", "marketaux"]
+    .some((marker) => String(source || "").toLowerCase().includes(marker));
+}
+
+async function recordAuthorizedMarketRows({ market, symbol, dataType, source, rows }) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  try {
+    return await runPythonQuantCore("market-data-record", {
+      market,
+      symbol,
+      data_type: dataType,
+      source,
+      rows,
+    });
+  } catch (error) {
+    return {
+      inserted: 0,
+      error: String(error.message || error).slice(0, 240),
+      note: "Authorised market data was received but local persistence failed.",
+    };
+  }
+}
+
+async function listAuthorizedMarketRows({ market, symbol, dataType, limit = 1000 }) {
+  try {
+    return await runPythonQuantCore("market-data-list", {
+      market,
+      symbol,
+      data_type: dataType,
+      limit,
+    });
+  } catch (error) {
+    return {
+      market,
+      symbol,
+      data_type: dataType,
+      count: 0,
+      rows: [],
+      error: String(error.message || error).slice(0, 240),
+    };
+  }
+}
+
+function l1QuoteSummary(row = null, source = "", origin = "live", persistence = null) {
+  if (!row) return { available: false, true_l1: false, source, origin };
+  const bid = Number(row.bid_price ?? row.bidPrice ?? row.bp ?? 0);
+  const ask = Number(row.ask_price ?? row.askPrice ?? row.ap ?? 0);
+  const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : bid > 0 ? bid : ask;
+  return {
+    available: true,
+    true_l1: true,
+    true_l2: false,
+    source,
+    origin,
+    timestamp: row.timestamp || row.ts || row.t || "",
+    bid_price: Number.isFinite(bid) && bid > 0 ? bid : null,
+    bid_size: Number(row.bid_size ?? row.bidSize ?? row.bs ?? 0) || null,
+    ask_price: Number.isFinite(ask) && ask > 0 ? ask : null,
+    ask_size: Number(row.ask_size ?? row.askSize ?? row.as ?? 0) || null,
+    spread_pct: bid > 0 && ask > 0 && mid > 0 ? Number(((ask - bid) / mid * 100).toFixed(4)) : null,
+    persisted_rows: persistence?.inserted ?? null,
+    persistence_error: persistence?.error || "",
+  };
+}
+
+function localTickRowsAsTrades(rows = []) {
+  return rows.map((row) => ({
+    timestamp: row.timestamp || row.ts || row.t || "",
+    price: Number(row.price || 0),
+    size: Number(row.size || 0),
+    exchange: String(row.exchange || row.payload?.exchange || ""),
+    trade_id: String(row.trade_id || row.payload?.trade_id || ""),
+    conditions: Array.isArray(row.payload?.conditions) ? row.payload.conditions : [],
+    tape: String(row.payload?.tape || ""),
+    sequence: Number(row.payload?.sequence || 0),
+  })).filter((row) => row.timestamp && row.price > 0 && row.size > 0);
+}
+
+async function localMarketDataBoundary(market, symbol) {
+  const [summary, localL1, localL2] = await Promise.all([
+    runPythonQuantCore("market-data-summary", { market, symbol }).catch(() => null),
+    listAuthorizedMarketRows({ market, symbol, dataType: "l1", limit: 1 }),
+    listAuthorizedMarketRows({ market, symbol, dataType: "l2", limit: 20 }),
+  ]);
+  return {
+    summary,
+    l1: l1QuoteSummary(localL1.rows?.at(-1), localL1.rows?.at(-1)?.source || "local-authorized-market-data-store", "local-cache"),
+    l2: {
+      available: Boolean(localL2.rows?.length),
+      true_l2: Boolean(localL2.rows?.length),
+      source: localL2.rows?.at(-1)?.source || "",
+      origin: localL2.rows?.length ? "local-cache" : "unavailable",
+      row_count: localL2.rows?.length || 0,
+      latest: localL2.rows?.at(-1) || null,
+      note: localL2.rows?.length
+        ? "True L2 rows were replayed from the local authorised depth store."
+        : "No authorised L2/depth rows are stored locally; the app will not infer L2 from trades or candles.",
+    },
+  };
+}
+
+async function attachUsTradeFootprint({ market, symbol, interval, candles }) {
+  const key = safeMarket(market);
+  const normalized = normalizeMarketSymbol(symbol, key);
+  if (key !== "US" || !isIntradayInterval(interval) || !Array.isArray(candles) || !candles.length) {
+    return {
+      candles,
+      footprint: {
+        available: false,
+        source: "",
+        note: "Trade footprint enrichment is currently attempted only for US intraday bars.",
+      },
+    };
+  }
+  const windowMinutes = 390;
+  let liveError = "";
+  try {
+    if (!alpacaConfigured()) {
+      throw new Error("Configure ALPACA_API_KEY and ALPACA_API_SECRET to read real US trades.");
+    }
+    const tradeData = await fetchAlpacaUsTrades(normalized, windowMinutes);
+    await recordAuthorizedMarketRows({
+      market: key,
+      symbol: normalized,
+      dataType: "ticks",
+      source: tradeData.source,
+      rows: tradeData.trades,
+    });
+    const enriched = tradeFootprintRows(candles, tradeData.trades, { interval, source: `${tradeData.source}-tick-rule-footprint` });
+    return {
+      candles: enriched.candles,
+      footprint: {
+        available: enriched.summary.enriched_candles > 0,
+        live: true,
+        local_replay: false,
+        window_minutes: windowMinutes,
+        ...enriched.summary,
+        note: "Real Alpaca trade rows were bucketed into each intraday candle; buy/sell side is tick-rule estimated, not exchange-reported aggressor side.",
+      },
+    };
+  } catch (error) {
+    liveError = String(error.message || error).slice(0, 240);
+  }
+
+  const localTicks = await listAuthorizedMarketRows({
+    market: key,
+    symbol: normalized,
+    dataType: "ticks",
+    limit: Math.max(1000, Number(process.env.ALPACA_TRADES_LIMIT || 1000)),
+  });
+  const localTrades = localTickRowsAsTrades(localTicks.rows || []);
+  if (localTrades.length) {
+    const enriched = tradeFootprintRows(candles, localTrades, { interval, source: "local-authorized-us-tick-cache-tick-rule-footprint" });
+    return {
+      candles: enriched.candles,
+      footprint: {
+        available: enriched.summary.enriched_candles > 0,
+        live: false,
+        local_replay: true,
+        provider_error: liveError,
+        ...enriched.summary,
+        note: "Live Alpaca trades were unavailable; locally persisted real ticks were replayed and bucketed into intraday candles. Side is tick-rule estimated.",
+      },
+    };
+  }
+  return {
+    candles,
+    footprint: {
+      available: false,
+      live: false,
+      local_replay: false,
+      provider_error: liveError,
+      source: "us-trade-footprint-unavailable",
+      side_method: "tick_rule_estimate",
+      aggressor_side_available: false,
+      true_l2: false,
+      note: `No real US trade rows were available to build a price-level footprint: ${liveError || "no local tick cache"}`,
+    },
+  };
 }
 
 async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
@@ -3745,6 +5408,29 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
     return { source: "tianapi", news: results.flatMap((result) => result.status === "fulfilled" ? result.value : []) };
   };
 
+  const fetchMarketaux = async () => {
+    if (!process.env.MARKETAUX_API_KEY) return { source: "marketaux-disabled", news: [] };
+    const endpoint = new URL("https://api.marketaux.com/v1/news/all");
+    endpoint.searchParams.set("api_token", process.env.MARKETAUX_API_KEY);
+    endpoint.searchParams.set("language", "en");
+    endpoint.searchParams.set("filter_entities", "true");
+    endpoint.searchParams.set("limit", "10");
+    if (key === "US" && safeScope !== "macro" && code) endpoint.searchParams.set("symbols", code);
+    else endpoint.searchParams.set("search", impactQueries.slice(0, 2).map((item) => item.query).join(" OR "));
+    const payload = await fetchJson(endpoint, 4000);
+    return {
+      source: "marketaux",
+      news: addNewsMeta((payload.data || []).map((item) => ({
+        title: item.title,
+        publisher: item.source,
+        link: item.url,
+        publishedAt: item.published_at,
+        description: item.description || item.snippet,
+        channel: safeScope === "macro" ? "macro-global" : "direct-stock",
+      })), "marketaux", safeScope === "macro" ? "macro-global" : "direct-stock", key, code),
+    };
+  };
+
   const fetchEastmoney = async () => {
     if (key !== "CN" || safeScope === "macro") return { source: "eastmoney-announcements-disabled", news: [] };
     const rows = await fetchEastmoneyAnnouncements(code, 12);
@@ -3781,14 +5467,26 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
     };
   };
 
+  const newsProviderPreference = String(process.env.NEWS_PRIMARY_PROVIDER || (
+    key === "CN" ? "tianapi" : key === "US" ? "marketaux" : "newsapi"
+  )).toLowerCase();
+  const limitedNewsTasks = [
+    { name: "marketaux", configured: Boolean(process.env.MARKETAUX_API_KEY), task: fetchMarketaux },
+    { name: "newsapi", configured: Boolean(process.env.NEWSAPI_KEY), task: fetchNewsApi },
+    { name: "newsdata", configured: Boolean(process.env.NEWSDATA_API_KEY), task: fetchNewsData },
+    { name: "thenewsapi", configured: Boolean(process.env.THENEWSAPI_KEY), task: fetchTheNewsApi },
+    { name: "tianapi", configured: Boolean(process.env.TIANAPI_KEY), task: fetchTianApi },
+  ];
+  const selectedLimitedNews = limitedNewsTasks.find((provider) => provider.name === newsProviderPreference && provider.configured)
+    || limitedNewsTasks.find((provider) => provider.configured)
+    || null;
   const sourceResults = await Promise.allSettled([
     fetchStockAnalysisAsxNews(),
     fetchEastmoney(),
     fetchSec(),
-    fetchNewsApi(),
-    fetchNewsData(),
-    fetchTheNewsApi(),
-    fetchTianApi(),
+    selectedLimitedNews
+      ? selectedLimitedNews.task()
+      : Promise.resolve({ source: "limited-news-unconfigured", news: [] }),
     fetchGoogleRss(),
     fetchGdelt(),
   ]);
@@ -3796,6 +5494,7 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
   const value = {
     source: news.length ? "multi-news" : "multi-news-empty",
     providers: sourceResults.map((result) => result.status === "fulfilled" ? result.value.source : "provider-error"),
+    limitedProvider: selectedLimitedNews?.name || null,
     news,
     signal: newsSignal(news, code, key),
     scope: safeScope,
@@ -4180,6 +5879,72 @@ async function fetchFlowOptionsFactor(symbol, market = "ASX", candles = null) {
     };
 }
 
+async function fetchFredMacroFactor() {
+  if (!process.env.FRED_API_KEY) {
+    return { available: false, source: "fred-disabled", score: 0, thesis: ["FRED API key is not configured."] };
+  }
+  const cached = macroResponseCache.get("fred-us");
+  if (cached && Date.now() - cached.time < Number(process.env.MACRO_CACHE_TTL_MS || 30 * 60 * 1000)) return cached.value;
+  const fetchSeries = async (seriesId, limit = 14) => {
+    const endpoint = new URL("https://api.stlouisfed.org/fred/series/observations");
+    endpoint.searchParams.set("series_id", seriesId);
+    endpoint.searchParams.set("api_key", process.env.FRED_API_KEY);
+    endpoint.searchParams.set("file_type", "json");
+    endpoint.searchParams.set("sort_order", "desc");
+    endpoint.searchParams.set("limit", String(limit));
+    const payload = await fetchJson(endpoint, 4500);
+    return (payload.observations || [])
+      .map((row) => ({ date: row.date, value: Number(row.value) }))
+      .filter((row) => Number.isFinite(row.value));
+  };
+  const [rates, inflation, unemployment] = await Promise.all([
+    fetchSeries("FEDFUNDS", 4),
+    fetchSeries("CPIAUCSL", 14),
+    fetchSeries("UNRATE", 4),
+  ]);
+  const latestRate = rates[0]?.value;
+  const priorRate = rates[1]?.value;
+  const latestCpi = inflation[0]?.value;
+  const priorYearCpi = inflation[12]?.value;
+  const inflationYoy = latestCpi > 0 && priorYearCpi > 0 ? (latestCpi / priorYearCpi - 1) * 100 : null;
+  const latestUnemployment = unemployment[0]?.value;
+  const priorUnemployment = unemployment[1]?.value;
+  let score = 0;
+  const thesis = [];
+  if (Number.isFinite(latestRate) && Number.isFinite(priorRate)) {
+    const change = latestRate - priorRate;
+    score += change < -0.05 ? 4 : change > 0.05 ? -4 : 0;
+    thesis.push(`FRED Fed funds ${latestRate.toFixed(2)}%, monthly change ${change.toFixed(2)}pp.`);
+  }
+  if (Number.isFinite(inflationYoy)) {
+    score += inflationYoy <= 2.8 ? 3 : inflationYoy >= 3.8 ? -4 : 0;
+    thesis.push(`FRED CPI year-over-year ${inflationYoy.toFixed(2)}%.`);
+  }
+  if (Number.isFinite(latestUnemployment) && Number.isFinite(priorUnemployment)) {
+    const change = latestUnemployment - priorUnemployment;
+    score += change > 0.2 ? -3 : change < -0.1 ? 2 : 0;
+    thesis.push(`FRED unemployment ${latestUnemployment.toFixed(2)}%, monthly change ${change.toFixed(2)}pp.`);
+  }
+  const value = {
+    available: thesis.length > 0,
+    source: "fred-official-macro",
+    score: Math.max(-10, Math.min(10, score)),
+    thesis,
+    values: {
+      latestRate,
+      inflationYoy,
+      latestUnemployment,
+      observations: {
+        rateDate: rates[0]?.date || null,
+        cpiDate: inflation[0]?.date || null,
+        unemploymentDate: unemployment[0]?.date || null,
+      },
+    },
+  };
+  macroResponseCache.set("fred-us", { time: Date.now(), value });
+  return value;
+}
+
 async function fetchMacroFactor(symbol, market = "ASX") {
   const key = safeMarket(market);
   const code = cleanCode(symbol, key);
@@ -4201,12 +5966,24 @@ async function fetchMacroFactor(symbol, market = "ASX") {
       source = "multi-news-macro-fallback";
     }
     const signal = newsSignal(items, code, key);
+    const fred = key === "US"
+      ? await fetchFredMacroFactor().catch((error) => ({
+        available: false,
+        source: "fred-unavailable",
+        score: 0,
+        thesis: [`FRED macro factor unavailable: ${error.message || error}`],
+      }))
+      : null;
     return {
-      available: items.length > 0,
-      source,
-      score: Math.max(-12, Math.min(12, signal.score)),
-      thesis: items.length ? [`Macro feed checked ${items.length} items; stance ${signal.stance}.`] : ["Macro feed returned no items."],
+      available: items.length > 0 || Boolean(fred?.available),
+      source: fred?.available ? `${source}+${fred.source}` : source,
+      score: Math.max(-12, Math.min(12, signal.score + Number(fred?.score || 0))),
+      thesis: [
+        items.length ? `Macro feed checked ${items.length} items; stance ${signal.stance}.` : "Macro feed returned no items.",
+        ...(fred?.thesis || []),
+      ],
       items,
+      values: fred?.values || {},
     };
   }
   const feeds = await Promise.allSettled([
@@ -5243,6 +7020,9 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   return {
     confidence,
     projectedUpside: Number(weightedUpside.toFixed(2)),
+    configuredFactorScore: Number(finiteNumber(factor?.score, 0).toFixed(3)),
+    factorConfigApplied: Boolean(factor?.configApplied),
+    enabledFactors: factor?.enabledFactors || [],
     availableModelCount,
     upsideAgreement: Number((upsideAgreement * 100).toFixed(0)),
     consensusAgreement: Number((consensusAgreement * 100).toFixed(0)),
@@ -5566,7 +7346,7 @@ function localAnalysis(input) {
     ...youtubeItems.map((video) => ({ title: video.title, description: video.description, channel: video.channel })),
   ];
   const socialSignal = newsSignal(socialItems, code, market);
-  const factor = factorSignal(factors);
+  const factor = factorSignal(factors, input.researchConfig?.factorConfig, technicals);
   const ensemble = buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, factor, factors, fundamentals, strategy, calibrationSummary: input.calibrationSummary });
   const confidencePenalty = marketValidation?.degraded ? Number(process.env.SINGLE_SOURCE_CONFIDENCE_PENALTY || 5) : 0;
   const targetConfidence = Number(strategy?.confidence || 80);
@@ -5652,10 +7432,16 @@ function localAnalysis(input) {
     direction: directional.direction,
     directionAgreement: directional.directionAgreement,
     rawConfidence: score,
+    featureScores: adaptiveCandidate.featureScores,
+    factorSignal: factor,
     calibration,
     strategyCalibration,
     ensemble: {
       ...ensemble,
+      configuredFactorScore: Number(factor.score.toFixed(3)),
+      factorConfigApplied: factor.configApplied,
+      enabledFactors: factor.enabledFactors,
+      disabledFactors: factor.disabledFactors,
       confidenceAfterDataPenalty: score,
       calibratedConfidence: calibratedScore,
       dataPenalty: confidencePenalty,
@@ -5713,6 +7499,7 @@ function localAnalysis(input) {
       xPosts.length ? `X signal: ${socialSignal.stance}, checked ${xPosts.length} posts across leaders, macro, and sector queries.` : "X recent search is not configured or returned no posts.",
       youtubeItems.length ? `YouTube signal checked ${youtubeItems.length} trending/search videos.` : "YouTube Data API is not configured or returned no videos.",
       factor.checked ? `Factor layer: ${factor.stance}, score ${factor.score}, checked ${factor.checked} live factor groups.` : "Factor layer did not have enough available inputs.",
+      factor.configApplied ? `Research configuration evidence: configured score ${factor.configScore}, enabled ${factor.enabledFactors.join(", ") || "none"}, disabled ${factor.disabledFactors.join(", ") || "none"}.` : "Research factor configuration has not been applied.",
       ...factor.notes.slice(0, 3),
       calibration.sampleCount >= 5 ? `Calibration layer: raw confidence ${score}%, calibrated to ${calibratedScore}%. ${calibration.message}` : "Calibration layer is collecting resolved samples before it adjusts confidence.",
       holding ? `Portfolio focus: currently held ${holding.qty} shares at ${input.currency || MARKET_CONFIG[market].currency} ${Number(holding.avgPrice || 0).toFixed(2)}, held for ${holding.holdingDays || 0} days.` : "No current holding in this symbol.",
@@ -6040,7 +7827,7 @@ function compactAiInput(input) {
       beta: fundamentals.beta,
     } : null,
     factors: input.factors ? {
-      signal: factorSignal(input.factors),
+      signal: factorSignal(input.factors, input.researchConfig?.factorConfig, technicals),
       announcements: input.factors.announcements ? {
         score: compactNumber(input.factors.announcements.score),
         available: input.factors.announcements.available,
@@ -6092,7 +7879,96 @@ function compactAiInput(input) {
   };
 }
 
-async function callOpenAiJson(input, timeoutMs) {
+function envFlag(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(raw).toLowerCase());
+}
+
+function externalAiEnabled() {
+  return envFlag("ENABLE_OPENAI_ANALYSIS", false) || envFlag("ENABLE_DOMESTIC_AI_ANALYSIS", false);
+}
+
+function endpointFromBase(baseUrl, path = "/chat/completions") {
+  const base = String(baseUrl || "").replace(/\/+$/, "");
+  if (!base) return "";
+  if (/\/chat\/completions$/.test(base)) return base;
+  return `${base}${path}`;
+}
+
+function aiProviderCandidates() {
+  const providers = {
+    openai: {
+      id: "openai",
+      label: "OpenAI",
+      configured: Boolean(process.env.OPENAI_API_KEY),
+      type: "responses",
+      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+      apiKey: process.env.OPENAI_API_KEY,
+      endpoint: "https://api.openai.com/v1/responses",
+    },
+    siliconflow: {
+      id: "siliconflow",
+      label: "硅基流动",
+      configured: Boolean(process.env.SILICONFLOW_API_KEY),
+      type: "openai-compatible",
+      model: process.env.SILICONFLOW_MODEL || "deepseek-ai/DeepSeek-V3.2",
+      apiKey: process.env.SILICONFLOW_API_KEY,
+      endpoint: endpointFromBase(process.env.SILICONFLOW_BASE_URL || "https://api.siliconflow.cn/v1"),
+    },
+    hunyuan: {
+      id: "hunyuan",
+      label: "腾讯混元",
+      configured: Boolean(process.env.HUNYUAN_API_KEY || process.env.TENCENT_HUNYUAN_API_KEY),
+      type: "openai-compatible",
+      model: process.env.HUNYUAN_MODEL || process.env.TENCENT_HUNYUAN_MODEL || "deepseek-v3.2",
+      apiKey: process.env.HUNYUAN_API_KEY || process.env.TENCENT_HUNYUAN_API_KEY,
+      endpoint: endpointFromBase(process.env.HUNYUAN_BASE_URL || process.env.TENCENT_HUNYUAN_BASE_URL || "https://tokenhub.tencentmaas.com/v1"),
+    },
+  };
+  return String(process.env.AI_PROVIDER_ORDER || "openai,siliconflow,hunyuan")
+    .split(",")
+    .map((name) => providers[name.trim().toLowerCase()])
+    .filter((provider) => provider?.configured && provider.endpoint);
+}
+
+function aiProviderStatus() {
+  return aiProviderCandidates().map((provider) => ({
+    id: provider.id,
+    label: provider.label,
+    model: provider.model,
+    configured: true,
+    endpointConfigured: Boolean(provider.endpoint),
+  }));
+}
+
+function inputToChatMessages(input) {
+  return (Array.isArray(input) ? input : [{ role: "user", content: String(input || "") }]).map((message) => {
+    const role = ["system", "assistant", "user"].includes(message?.role) ? message.role : "user";
+    const raw = message?.content;
+    const content = Array.isArray(raw)
+      ? raw.map((part) => part?.text || part?.input_text || "").filter(Boolean).join("\n")
+      : String(raw ?? "");
+    return { role, content };
+  });
+}
+
+function parseJsonFromAiText(text, providerLabel = "AI") {
+  const raw = String(text || "").trim();
+  if (!raw) throw new Error(`${providerLabel} returned empty output`);
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : raw;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const first = candidate.indexOf("{");
+    const last = candidate.lastIndexOf("}");
+    if (first >= 0 && last > first) return JSON.parse(candidate.slice(first, last + 1));
+    throw new Error(`${providerLabel} returned non-JSON output`);
+  }
+}
+
+async function callOpenAiResponsesJson(input, timeoutMs) {
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -6115,10 +7991,107 @@ async function callOpenAiJson(input, timeoutMs) {
     if (!response.ok) throw new Error(`OpenAI HTTP ${response.status}: ${(await response.text()).slice(0, 240)}`);
     const payload = await response.json();
     const text = payload.output_text || payload.output?.flatMap((item) => item.content || []).map((item) => item.text || "").join("");
-    if (!text) throw new Error("OpenAI returned empty output");
-    return JSON.parse(text);
+    return { data: parseJsonFromAiText(text, "OpenAI"), provider: { id: "openai", label: "OpenAI", model } };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function callOpenAiCompatibleJson(input, timeoutMs, provider) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(provider.endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        authorization: `Bearer ${provider.apiKey}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: provider.model,
+        messages: inputToChatMessages(input),
+        temperature: 0.2,
+        max_tokens: 1800,
+        response_format: { type: "json_object" },
+      }),
+    });
+    if (!response.ok) throw new Error(`${provider.label} HTTP ${response.status}: ${(await response.text()).slice(0, 240)}`);
+    const payload = await response.json();
+    const text = payload.choices?.[0]?.message?.content || payload.output_text || "";
+    return { data: parseJsonFromAiText(text, provider.label), provider };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function callExternalAiJson(input, timeoutMs) {
+  if (!externalAiEnabled()) throw new Error("External AI analysis is disabled.");
+  const providers = aiProviderCandidates();
+  if (!providers.length) throw new Error("No external AI provider is configured.");
+  const errors = [];
+  for (const provider of providers) {
+    try {
+      if (provider.type === "responses") return await callOpenAiResponsesJson(input, timeoutMs);
+      return await callOpenAiCompatibleJson(input, timeoutMs, provider);
+    } catch (error) {
+      errors.push(`${provider.label}: ${error.message || error}`);
+    }
+  }
+  throw new Error(errors.join(" | "));
+}
+
+async function callOpenAiJson(input, timeoutMs) {
+  const result = await callExternalAiJson(input, timeoutMs);
+  return result.data;
+}
+
+async function fetchAtasFeatureExtraction({ market, symbol, interval, candles, result }) {
+  if (!process.env.ATAS_API_KEY) {
+    return {
+      available: false,
+      source: "atas-disabled",
+      reason: "ATAS_API_KEY is not configured.",
+    };
+  }
+  const endpoint = process.env.ATAS_FEATURE_ENDPOINT
+    || (process.env.ATAS_BASE_URL ? endpointFromBase(process.env.ATAS_BASE_URL, "/features") : "");
+  if (!endpoint) {
+    return {
+      available: false,
+      configured: true,
+      source: "atas-endpoint-missing",
+      reason: "ATAS key is configured, but ATAS_FEATURE_ENDPOINT or ATAS_BASE_URL is missing; no external feature request was sent.",
+      expected_payload: ["OHLCV/VWAP log", "volume profile", "order-flow proxy", "true trade rows when provider supplies them"],
+    };
+  }
+  try {
+    const payload = await fetchJsonPost(endpoint, {
+      market,
+      symbol,
+      interval,
+      candles,
+      summary: result?.summary || {},
+      volume_profile: result?.volume_profile || {},
+      data_log: Array.isArray(result?.data_log) ? result.data_log.slice(-5000) : [],
+      quality: result?.quality || {},
+    }, Number(process.env.ATAS_TIMEOUT_MS || 10000), {
+      authorization: `Bearer ${process.env.ATAS_API_KEY}`,
+      "x-api-key": process.env.ATAS_API_KEY,
+    });
+    return {
+      available: true,
+      source: "atas-feature-adapter",
+      payload,
+      note: "ATAS feature adapter returned external analysis; verify vendor schema before using it as a trading signal.",
+    };
+  } catch (error) {
+    return {
+      available: false,
+      configured: true,
+      source: "atas-feature-error",
+      reason: String(error.message || error).slice(0, 260),
+    };
   }
 }
 
@@ -6130,7 +8103,7 @@ function localAnalysisEnvelope(input, source = "local-rules") {
   };
 }
 
-function blendAiWithBaseline(row, baseline) {
+function blendAiWithBaseline(row, baseline, providerLabel = "AI文本复核") {
   const aiConfidence = Number(row.confidence);
   const aiUpside = Number(row.projectedUpside);
   let confidence = Number.isFinite(aiConfidence)
@@ -6165,13 +8138,13 @@ function blendAiWithBaseline(row, baseline) {
   );
   const aiOverlay = Number.isFinite(aiConfidence) || Number.isFinite(aiUpside)
     ? {
-      name: "OpenAI文本复核",
+      name: `${providerLabel}文本复核`,
       confidence: Math.round(Number.isFinite(aiConfidence) ? aiConfidence : confidence),
       projectedUpside: Number((Number.isFinite(aiUpside) ? aiUpside : projectedUpside).toFixed(2)),
       weight: 0,
       normalizedWeight: 0,
       available: true,
-      reason: "AI synthesis of compact news/factor/technical context; blended after local ensemble.",
+      reason: `${providerLabel} synthesis of compact news/factor/technical context; blended after local ensemble.`,
     }
     : null;
   const ensemble = baseline.ensemble ? {
@@ -6206,6 +8179,8 @@ function blendAiWithBaseline(row, baseline) {
     horizonDays: row.horizonDays ?? baseline.horizonDays,
     ensemble,
     qualityGate,
+    featureScores: baseline.featureScores,
+    factorSignal: baseline.factorSignal,
     calibration: baseline.calibration,
     strategyCalibration: baseline.strategyCalibration,
     thesis,
@@ -6215,11 +8190,11 @@ function blendAiWithBaseline(row, baseline) {
 
 async function openAiAnalysis(input) {
   const baseline = localAnalysisEnvelope(input).analysis;
-  if (!process.env.OPENAI_API_KEY || process.env.ENABLE_OPENAI_ANALYSIS !== "true") {
+  if (!externalAiEnabled() || !aiProviderCandidates().length) {
     return { analysis: baseline, source: "local-rules" };
   }
   try {
-    const parsed = await callOpenAiJson([
+    const parsed = await callExternalAiJson([
       {
         role: "system",
         content: "You are a cautious multi-market equity analyst covering ASX, US stocks, and China A-shares. Do not claim certainty. Treat confidence as directional prediction reliability. Keep final-return magnitude reliability, intraperiod max-upside touch reliability, and strategy target-hit probability separate; never bypass the local strategy gate. Respect calibrationSummary, modelStats, regimeStats, recent learning events, and adaptive penalties; avoid aggressive upside estimates after similar failed forecasts. Return compact JSON only with keys confidence, projectedUpside, horizonDays, thesis, risks. The app will apply final-return, max-upside, and strategy calibration after your estimate.",
@@ -6254,19 +8229,23 @@ async function openAiAnalysis(input) {
         }),
       },
     ], Number(process.env.OPENAI_TIMEOUT_MS || 8000));
-    return { analysis: strategyDecision(blendAiWithBaseline(parsed, baseline), input), source: "openai-ensemble" };
+    return { analysis: strategyDecision(blendAiWithBaseline(parsed.data, baseline, parsed.provider.label), input), source: `${parsed.provider.id}-ensemble` };
   } catch (error) {
     const fallback = localAnalysis(input);
-    fallback.risks = [`OpenAI analysis unavailable; local strategy engine used. ${error.message}`, ...(fallback.risks || [])];
-    return { analysis: strategyDecision(fallback, input), source: "local-rules-openai-fallback" };
+    fallback.risks = [`External AI analysis unavailable; local strategy engine used. ${error.message}`, ...(fallback.risks || [])];
+    return { analysis: strategyDecision(fallback, input), source: "local-rules-ai-fallback" };
   }
 }
 
+function analysisBatchLimit() {
+  return Math.max(20, Math.min(240, Number(process.env.ANALYZE_BATCH_LIMIT || 180)));
+}
+
 async function openAiBatchAnalysis(items) {
-  const inputs = Array.isArray(items) ? items.filter(Boolean).slice(0, 40) : [];
+  const inputs = Array.isArray(items) ? items.filter(Boolean).slice(0, analysisBatchLimit()) : [];
   const localResults = inputs.map((input) => localAnalysisEnvelope(input));
   if (!inputs.length) return { results: [], source: "empty" };
-  if (!process.env.OPENAI_API_KEY || process.env.ENABLE_OPENAI_ANALYSIS !== "true") {
+  if (!externalAiEnabled() || !aiProviderCandidates().length) {
     return { results: localResults, source: "local-rules" };
   }
 
@@ -6299,7 +8278,7 @@ async function openAiBatchAnalysis(items) {
   }
 
   try {
-    const parsed = await callOpenAiJson([
+    const parsed = await callExternalAiJson([
       {
         role: "system",
         content: "You are a fast cautious multi-market portfolio reviewer. Review only high-impact rows. Keep confidence as directional prediction reliability; keep final-return magnitude reliability, intraperiod max-upside touch reliability, and strategy target-hit probability separate in reasoning. Respect local baselines, modelStats, market regime, strategy calibration, magnitude calibration, and adaptive penalties. Return JSON only: {\"results\":[{\"symbol\":\"BHP\",\"confidence\":0-99,\"projectedUpside\":number,\"horizonDays\":number,\"thesis\":[...],\"risks\":[...]}]}. Be concise.",
@@ -6332,7 +8311,7 @@ async function openAiBatchAnalysis(items) {
         }),
       },
     ], Number(process.env.OPENAI_BATCH_TIMEOUT_MS || 5500));
-    const rows = Array.isArray(parsed.results) ? parsed.results : [];
+    const rows = Array.isArray(parsed.data.results) ? parsed.data.results : [];
     const batchMarket = safeMarket(inputs[0]?.market || "ASX");
     const bySymbol = new Map(rows.map((row) => [cleanCode(row.symbol, batchMarket), row]));
     const results = [...localResults];
@@ -6340,32 +8319,32 @@ async function openAiBatchAnalysis(items) {
       const row = bySymbol.get(cleanCode(input.symbol, input.market || batchMarket)) || rows[reviewIndex];
       if (!row) return;
       const baseline = local.analysis;
-      const aiEstimate = blendAiWithBaseline({ ...row, symbol: input.symbol }, baseline);
+      const aiEstimate = blendAiWithBaseline({ ...row, symbol: input.symbol }, baseline, parsed.provider.label);
       if (!aiEstimate.thesis.length) aiEstimate.thesis = baseline.thesis?.slice(0, 5) || [];
       if (!aiEstimate.risks.length) aiEstimate.risks = baseline.risks?.slice(0, 5) || [];
       results[index] = {
         symbol: input.symbol,
         analysis: strategyDecision(aiEstimate, input),
-        source: "openai-batch-ensemble",
+        source: `${parsed.provider.id}-batch-ensemble`,
       };
     });
-    return { results, source: `openai-batch-top-${reviewRows.length}` };
+    return { results, source: `${parsed.provider.id}-batch-top-${reviewRows.length}` };
   } catch (error) {
     const results = inputs.map((input) => {
       const fallback = localAnalysis(input);
-      fallback.risks = [`OpenAI batch analysis unavailable; local strategy engine used. ${error.message}`, ...(fallback.risks || [])];
+      fallback.risks = [`External AI batch analysis unavailable; local strategy engine used. ${error.message}`, ...(fallback.risks || [])];
       return {
         symbol: input.symbol,
         analysis: strategyDecision(fallback, input),
-        source: "local-rules-openai-fallback",
+        source: "local-rules-ai-fallback",
       };
     });
-    return { results, source: "local-rules-openai-fallback" };
+    return { results, source: "local-rules-ai-fallback" };
   }
 }
 
 function localBatchAnalysis(items) {
-  const inputs = Array.isArray(items) ? items.filter(Boolean).slice(0, 40) : [];
+  const inputs = Array.isArray(items) ? items.filter(Boolean).slice(0, analysisBatchLimit()) : [];
   return {
     results: inputs.map((input) => localAnalysisEnvelope(input, "local-rules-fast")),
     source: "local-rules-fast",
@@ -6381,11 +8360,11 @@ async function assistantChat(payload = {}) {
     "如果最近买入后马上下跌，优先复核：是否触发止损、是否出现单票错误迁移模式、是否大盘风险转弱、是否成交量与MACD没有同步确认。",
     "提高可靠性的做法是减少低证据高置信交易，只接受方向置信、幅度达成率、策略达标率、成交量、历史相似样本和新闻因子同时支持的信号。",
   ].join("\n");
-  if (!process.env.OPENAI_API_KEY) {
+  if (!externalAiEnabled() || !aiProviderCandidates().length) {
     return { source: "local-rules-chat", message: localMessage, suggestions: ["补充交易周期和止损线", "刷新当前市场新闻和行情", "查看预测准确率中的错误行为模式"] };
   }
   try {
-    const parsed = await callOpenAiJson([
+    const parsed = await callExternalAiJson([
       {
         role: "system",
         content: "You are a cautious Chinese-speaking trading strategy assistant inside a read-only quant dashboard. You do not place trades. Return JSON only: {\"message\":\"中文回答，具体但不过度承诺\",\"suggestions\":[\"...\"]}. Explain uncertainty and risk controls.",
@@ -6408,9 +8387,9 @@ async function assistantChat(payload = {}) {
       },
     ], Number(process.env.OPENAI_TIMEOUT_MS || 12000));
     return {
-      source: "openai-chat",
-      message: String(parsed.message || localMessage).slice(0, 4000),
-      suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.slice(0, 6).map((item) => String(item).slice(0, 180)) : [],
+      source: `${parsed.provider.id}-chat`,
+      message: String(parsed.data.message || localMessage).slice(0, 4000),
+      suggestions: Array.isArray(parsed.data.suggestions) ? parsed.data.suggestions.slice(0, 6).map((item) => String(item).slice(0, 180)) : [],
     };
   } catch (error) {
     return {
@@ -6429,7 +8408,7 @@ async function parsePortfolioImage(image, market = "ASX") {
   const dataUrl = String(image || "");
   if (!dataUrl.startsWith("data:image/")) throw new Error("Please upload an image file.");
   if (dataUrl.length > 7_000_000) throw new Error("Image is too large; crop the holdings table and try again.");
-  const parsed = await callOpenAiJson([
+  const parsed = await callOpenAiResponsesJson([
     {
       role: "system",
       content: `Extract ${MARKET_CONFIG[key].label} portfolio holdings from a broker screenshot. Return JSON only: {\"holdings\":[{\"symbol\":\"BHP\",\"qty\":120,\"avgPrice\":43.2,\"entryDate\":\"YYYY-MM-DD or null\"}]}. Use market-native stock codes only, no prose.`,
@@ -6443,7 +8422,7 @@ async function parsePortfolioImage(image, market = "ASX") {
     },
   ], Number(process.env.OPENAI_TIMEOUT_MS || 12000));
   return {
-    holdings: (Array.isArray(parsed.holdings) ? parsed.holdings : []).map((item) => ({
+    holdings: (Array.isArray(parsed.data.holdings) ? parsed.data.holdings : []).map((item) => ({
       symbol: cleanCode(item.symbol, key),
       market: key,
       qty: Number(item.qty || item.quantity || 0),
@@ -6464,15 +8443,390 @@ async function handleApi(req, res, url) {
       };
       return acc;
     }, {});
+    const pythonCore = await runPythonQuantCore("health").catch((error) => ({
+      ok: false,
+      service: "quant-core-python",
+      error: error.message || String(error),
+      order_execution_enabled: false,
+    }));
     sendJson(res, 200, {
       ok: true,
       version: APP_VERSION,
       startedAt: SERVER_STARTED_AT,
       markets,
+      pythonCore,
+      externalAi: {
+        enabled: externalAiEnabled(),
+        providers: aiProviderStatus(),
+      },
+      atas: {
+        configured: Boolean(process.env.ATAS_API_KEY),
+        endpointConfigured: Boolean(process.env.ATAS_FEATURE_ENDPOINT || process.env.ATAS_BASE_URL),
+      },
       cnKeyedFallbacksEnabled: cnKeyedFallbacksEnabled(),
       cnExtraKeyedFallbacksEnabled: cnExtraKeyedFallbacksEnabled(),
     });
     return;
+  }
+
+  if (url.pathname === "/api/provider-budget" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const sampleCode = { ASX: "BHP", US: "AAPL", CN: "600519" }[market];
+    const candidates = providerCandidates(market, sampleCode, "9mo", "1d").map(([source]) => source);
+    const configured = Object.fromEntries(candidates.map((source) => [source, providerConfigured(source)]));
+    sendJson(res, 200, await runPythonQuantCore("provider-budget", { market, candidates, configured }));
+    return;
+  }
+
+  if (url.pathname === "/api/news-provider-status" && req.method === "GET") {
+    sendJson(res, 200, newsProviderStatus());
+    return;
+  }
+
+  if (url.pathname === "/api/qlib-readiness" && req.method === "GET") {
+    sendJson(res, 200, await runPythonQuantCore("qlib-readiness"));
+    return;
+  }
+
+  if (url.pathname === "/api/data-capabilities" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    sendJson(res, 200, await dataCapabilities(market, symbol));
+    return;
+  }
+
+  if (url.pathname === "/api/universe" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const force = ["1", "true", "yes"].includes(String(url.searchParams.get("refresh") || "").toLowerCase());
+    const payload = await fetchMarketUniverse(market, { force });
+    sendJson(res, 200, universePayload(payload, {
+      market,
+      limit: url.searchParams.get("limit") || 500,
+      offset: url.searchParams.get("offset") || 0,
+      search: url.searchParams.get("search") || "",
+    }));
+    return;
+  }
+
+  if (url.pathname === "/api/market-movers" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const force = ["1", "true", "yes"].includes(String(url.searchParams.get("refresh") || "").toLowerCase());
+    const limit = Math.max(5, Math.min(50, Number(url.searchParams.get("limit") || 30)));
+    const requestedScanLimit = Number(url.searchParams.get("scanLimit") || process.env.MOVERS_SCAN_LIMIT || 0);
+    const scanLimit = Number.isFinite(requestedScanLimit) && requestedScanLimit > 0
+      ? Math.max(limit * 4, Math.min(2000, requestedScanLimit))
+      : undefined;
+    const [movers, dragonTiger] = await Promise.all([
+      fetchMarketMovers(market, { force, limit, scanLimit }),
+      fetchDragonTiger(market, { limit }).catch((error) => ({
+        market,
+        available: false,
+        source: "dragon-tiger-unavailable",
+        rows: [],
+        warning: error.message || String(error),
+        updatedAt: new Date().toISOString(),
+      })),
+    ]);
+    sendJson(res, 200, { ...movers, dragonTiger });
+    return;
+  }
+
+  if (url.pathname === "/api/features" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    const range = url.searchParams.get("range") || "9mo";
+    const interval = url.searchParams.get("interval") || "1d";
+    const marketData = await quantLabMarketData(symbol, market, range, interval);
+    const footprint = await attachUsTradeFootprint({
+      market,
+      symbol,
+      interval,
+      candles: marketData.candles,
+    });
+    const result = await runPythonQuantCore("feature-analysis", {
+      market,
+      symbol,
+      interval,
+      source: footprint.footprint?.available ? `${marketData.source}+${footprint.footprint.source}` : marketData.source,
+      candles: footprint.candles,
+    });
+    const atas = await fetchAtasFeatureExtraction({ market, symbol, interval, candles: footprint.candles, result });
+    sendJson(res, 200, {
+      ...result,
+      atas,
+      trade_footprint: footprint.footprint,
+      validation: marketData.validation || null,
+      warning: marketData.warning || "",
+      snapshotSavedAt: marketData.snapshotSavedAt || null,
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/trades" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    const windowMinutes = Math.max(1, Math.min(390, Number(url.searchParams.get("windowMinutes") || 30)));
+    if (market !== "US") {
+      sendJson(res, 200, {
+        available: false,
+        market,
+        symbol,
+        true_tick: false,
+        true_l2: false,
+        aggressor_side_available: false,
+        reason: `${market} real tick/trade data requires a separately authorised or licensed feed; candle proxies are not returned as trades.`,
+      });
+      return;
+    }
+    let liveError = null;
+    let l1 = { available: false, true_l1: false, true_l2: false, source: "", origin: "unavailable" };
+    let l2 = { available: false, true_l2: false, source: "", origin: "unavailable", note: "No authorised L2/depth rows are stored locally." };
+    try {
+      if (!alpacaConfigured()) {
+        throw new Error("Configure ALPACA_API_KEY and ALPACA_API_SECRET to read real US trades and L1 quotes.");
+      }
+      const quoteData = await fetchAlpacaUsLatestQuote(symbol).catch((error) => ({
+        available: false,
+        error: String(error.message || error).slice(0, 240),
+      }));
+      if (quoteData.available) {
+        const quotePersistence = await recordAuthorizedMarketRows({
+          market,
+          symbol,
+          dataType: "l1",
+          source: quoteData.source,
+          rows: quoteData.quotes,
+        });
+        l1 = l1QuoteSummary(quoteData.latest, quoteData.source, "live", quotePersistence);
+      }
+      const tradeData = await fetchAlpacaUsTrades(symbol, windowMinutes);
+      const tickPersistence = await recordAuthorizedMarketRows({
+        market,
+        symbol,
+        dataType: "ticks",
+        source: tradeData.source,
+        rows: tradeData.trades,
+      });
+      const localBoundary = await localMarketDataBoundary(market, symbol);
+      if (!l1.available && localBoundary.l1.available) l1 = localBoundary.l1;
+      l2 = localBoundary.l2;
+      const result = await runPythonQuantCore("trade-analysis", {
+        market,
+        symbol,
+        source: tradeData.source,
+        trades: tradeData.trades,
+      });
+      sendJson(res, 200, {
+        ...result,
+        window_minutes: windowMinutes,
+        next_page_token: tradeData.nextPageToken,
+        local_replay: false,
+        persistence: {
+          ticks: tickPersistence,
+          l1,
+        },
+        l1_quote: l1,
+        l2_depth: l2,
+        data_boundary: [
+          "Trades are real provider-reported ticks and are persisted locally for replay.",
+          "L1 quotes are persisted only when Alpaca returns bid/ask rows.",
+          "True L2/depth is not inferred from trades, quotes, or candles.",
+        ],
+      });
+      return;
+    } catch (error) {
+      liveError = String(error.message || error).slice(0, 240);
+    }
+
+    const [localTicks, localBoundary] = await Promise.all([
+      listAuthorizedMarketRows({ market, symbol, dataType: "ticks", limit: Math.max(200, Number(process.env.ALPACA_TRADES_LIMIT || 1000)) }),
+      localMarketDataBoundary(market, symbol),
+    ]);
+    const localTrades = localTickRowsAsTrades(localTicks.rows || []);
+    if (localTrades.length) {
+      const result = await runPythonQuantCore("trade-analysis", {
+        market,
+        symbol,
+        source: "local-authorized-us-tick-cache",
+        trades: localTrades,
+      });
+      sendJson(res, 200, {
+        ...result,
+        window_minutes: windowMinutes,
+        source: "local-authorized-us-tick-cache",
+        local_replay: true,
+        provider_error: liveError,
+        l1_quote: localBoundary.l1,
+        l2_depth: localBoundary.l2,
+        data_boundary: [
+          "Live Alpaca trades were unavailable; this analysis replays locally persisted real ticks.",
+          "Cached ticks remain real provider-reported trades, not simulated data.",
+          "True L2/depth is not inferred from trades, quotes, or candles.",
+        ],
+      });
+      return;
+    }
+
+    sendJson(res, 200, {
+      available: false,
+      market,
+      symbol,
+      true_tick: false,
+      true_l1: Boolean(localBoundary.l1?.available),
+      true_l2: Boolean(localBoundary.l2?.available),
+      aggressor_side_available: false,
+      local_replay: false,
+      l1_quote: localBoundary.l1,
+      l2_depth: localBoundary.l2,
+      reason: `Real US trade provider unavailable and no local authorised tick cache exists: ${liveError || "unknown provider error"}`,
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/factor-lab" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    const horizonDays = Math.max(1, Math.min(60, Number(url.searchParams.get("horizonDays") || 15)));
+    const marketData = await quantLabMarketData(symbol, market, "1y", "1d");
+    const result = await runPythonQuantCore("factor-lab", {
+      market,
+      symbol,
+      horizon_days: horizonDays,
+      candles: marketData.candles,
+    });
+    sendJson(res, 200, {
+      ...result,
+      source: marketData.source,
+      validation: marketData.validation || null,
+      warning: marketData.warning || "",
+      snapshotSavedAt: marketData.snapshotSavedAt || null,
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/ibkr/readiness" && req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body || "{}");
+    sendJson(res, 200, await runPythonQuantCore("ibkr-readiness", {
+      host: payload.host || process.env.IBKR_HOST || "127.0.0.1",
+      port: Number(payload.port || process.env.IBKR_PAPER_PORT || 7497),
+      client_id: Number(payload.clientId || process.env.IBKR_CLIENT_ID || 17),
+    }));
+    return;
+  }
+
+  if (url.pathname === "/api/risk-assessment" && req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body || "{}");
+    const market = safeMarket(payload.market || "ASX");
+    const result = await runPythonQuantCore("risk-assessment", { ...payload, market });
+    if (payload.persist !== false) {
+      await runPythonQuantCore("event-append", {
+        market,
+        event_type: "risk-assessment",
+        entity_id: `${market}:${result.evaluated_at}`,
+        payload: result,
+      }).catch(() => null);
+    }
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (url.pathname === "/api/order-intents") {
+    const market = marketFromUrl(url);
+    if (req.method === "GET") {
+      sendJson(res, 200, await runPythonQuantCore("order-intent-list", {
+        market,
+        limit: Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 50))),
+      }));
+      return;
+    }
+    if (req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const payload = JSON.parse(body || "{}");
+      sendJson(res, 200, await runPythonQuantCore("order-intent", { ...payload, market }));
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/control-plane" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    sendJson(res, 200, await runPythonQuantCore("control-plane-summary", { market }));
+    return;
+  }
+
+  if (url.pathname === "/api/market-data") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    if (req.method === "GET") {
+      const wantsRows = ["1", "true", "yes"].includes(String(url.searchParams.get("rows") || "").toLowerCase());
+      if (wantsRows) {
+        sendJson(res, 200, await runPythonQuantCore("market-data-list", {
+          market,
+          symbol,
+          data_type: url.searchParams.get("dataType") || url.searchParams.get("kind") || "ticks",
+          limit: Math.max(1, Math.min(10000, Number(url.searchParams.get("limit") || 1000))),
+        }));
+        return;
+      }
+      sendJson(res, 200, await runPythonQuantCore("market-data-summary", { market, symbol }));
+      return;
+    }
+    if (req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const payload = JSON.parse(body || "{}");
+      sendJson(res, 200, await runPythonQuantCore("market-data-record", {
+        ...payload,
+        market,
+        symbol: symbol || normalizeMarketSymbol(payload.symbol || "", market),
+      }));
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/events") {
+    const market = marketFromUrl(url);
+    if (req.method === "GET") {
+      sendJson(res, 200, await runPythonQuantCore("event-list", {
+        market,
+        event_type: url.searchParams.get("eventType") || "",
+        limit: Math.max(1, Math.min(500, Number(url.searchParams.get("limit") || 100))),
+      }));
+      return;
+    }
+    if (req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const payload = JSON.parse(body || "{}");
+      sendJson(res, 200, await runPythonQuantCore("event-append", { ...payload, market }));
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/research-config") {
+    const market = marketFromUrl(url);
+    if (req.method === "GET") {
+      sendJson(res, 200, await readResearchConfig(market));
+      return;
+    }
+    if (req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const payload = JSON.parse(body || "{}");
+      const config = await writeResearchConfig({ ...payload, market, updatedAt: new Date().toISOString() }, market);
+      await runPythonQuantCore("event-append", {
+        market,
+        event_type: "research-config",
+        entity_id: `${market}:${config.updatedAt}`,
+        payload: config,
+      }).catch(() => null);
+      sendJson(res, 200, config);
+      return;
+    }
   }
 
   if (url.pathname === "/api/accuracy") {
@@ -6719,6 +9073,27 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(port, host, () => {
-  console.log(`Global Quant Watch running at http://${host}:${port}`);
-});
+if (process.env.SERVER_DISABLE_LISTEN !== "true") {
+  server.listen(port, host, () => {
+    console.log(`Global Quant Watch running at http://${host}:${port}`);
+  });
+}
+
+export {
+  aiProviderStatus,
+  alpacaQuoteRows,
+  alpacaRows,
+  alpacaTradeRows,
+  factorSignal,
+  analysisBatchLimit,
+  isLimitedProvider,
+  localBatchAnalysis,
+  providerConfigured,
+  runPythonQuantCore,
+  sanitizeResearchConfig,
+  sanitizeUniverseRows,
+  stockAnalysisHistoryRows,
+  tradeFootprintRows,
+  tushareRows,
+  universePayload,
+};
