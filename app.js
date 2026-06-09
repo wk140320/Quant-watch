@@ -671,6 +671,7 @@ function normalizeCandles(candles) {
             ? row.orderflowLevels
             : [],
       orderflowSource: row?.orderflowSource || row?.tradeSource || null,
+      closeOnly: Boolean(row?.closeOnly),
     };
   }).filter(Boolean);
 }
@@ -1531,6 +1532,72 @@ function saveModelChangeLog() {
   localStorage.setItem("modelChangeLogByMarket", JSON.stringify(state.modelChangeLogByMarket));
 }
 
+function modelChangeLogEventToRow(event) {
+  const row = event?.payload && typeof event.payload === "object" ? event.payload : null;
+  if (!row?.id || !row?.createdAt) return null;
+  return {
+    ...row,
+    market: safeMarket(row.market || event.market || state.market),
+  };
+}
+
+function mergeModelChangeLogRows(...groups) {
+  const byId = new Map();
+  groups.flat().filter(Boolean).forEach((row) => {
+    if (!row?.id) return;
+    byId.set(row.id, row);
+  });
+  return [...byId.values()]
+    .sort((left, right) => new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime())
+    .slice(0, MODEL_CHANGE_LOG_LIMIT);
+}
+
+async function persistModelChangeLogEvent(row) {
+  try {
+    await requestJson(`/api/events?market=${encodeURIComponent(row.market || state.market)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        event_type: "model-change-log",
+        entity_id: row.id,
+        payload: row,
+      }),
+    });
+  } catch (error) {
+    console.warn("Model change log persisted locally; server event log unavailable", error);
+  }
+}
+
+async function recordModelChangeLogClear() {
+  try {
+    await requestJson(`/api/events?market=${encodeURIComponent(state.market)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        event_type: "model-change-log-clear",
+        entity_id: `${state.market}:${Date.now()}`,
+        payload: { market: state.market, clearedAt: new Date().toISOString() },
+      }),
+    });
+  } catch (error) {
+    console.warn("Model change log clear marker kept locally only", error);
+  }
+}
+
+async function loadModelChangeLogsFromServer() {
+  const payload = await requestJson(`/api/events?market=${encodeURIComponent(state.market)}&limit=500`);
+  const events = Array.isArray(payload.events) ? payload.events : [];
+  const clearTimes = events
+    .filter((event) => event.event_type === "model-change-log-clear")
+    .map((event) => new Date(event.payload?.clearedAt || event.created_at || 0).getTime())
+    .filter(Number.isFinite);
+  const lastClearAt = clearTimes.length ? Math.max(...clearTimes) : 0;
+  return events
+    .filter((event) => event.event_type === "model-change-log")
+    .map(modelChangeLogEventToRow)
+    .filter((row) => row && new Date(row.createdAt || 0).getTime() > lastClearAt);
+}
+
 function strategySnapshot(strategy = getStrategy()) {
   return {
     horizonDays: Number(strategy.horizonDays || 0),
@@ -1678,6 +1745,7 @@ function appendModelChangeLog(event) {
   rows.unshift(row);
   state.modelChangeLogByMarket[key] = rows.slice(0, MODEL_CHANGE_LOG_LIMIT);
   saveModelChangeLog();
+  persistModelChangeLogEvent(row);
   return row;
 }
 
@@ -1719,6 +1787,33 @@ function modelChangeLogCard(row) {
   `;
 }
 
+function modelChangeLogListHtml(rows) {
+  return rows.length
+    ? rows.map(modelChangeLogCard).join("")
+    : `<p class="muted">还没有模型修改日志。保存因子配置、记录策略版本、训练或重置 Agent 后会自动写入。</p>`;
+}
+
+function renderModelChangeLogModal(modal, rows, status = "") {
+  const subtitle = modal.querySelector("[data-model-log-subtitle]");
+  const list = modal.querySelector("[data-model-log-list]");
+  const clearButton = modal.querySelector("#clearModelChangeLog");
+  if (subtitle) subtitle.textContent = `本地/服务器事件库 · ${activeMarketConfig().label} ${rows.length} 条 · 每条都附带防过拟合检查${status ? ` · ${status}` : ""}`;
+  if (list) list.innerHTML = modelChangeLogListHtml(rows);
+  if (clearButton) clearButton.disabled = rows.length === 0;
+}
+
+async function refreshModelChangeLogModal(modal) {
+  try {
+    const serverRows = await loadModelChangeLogsFromServer();
+    const merged = mergeModelChangeLogRows(modelChangeLogForMarket(), serverRows);
+    state.modelChangeLogByMarket[state.market] = merged;
+    saveModelChangeLog();
+    renderModelChangeLogModal(modal, merged, "已同步");
+  } catch (error) {
+    renderModelChangeLogModal(modal, modelChangeLogForMarket(), "服务器事件库暂不可用，显示本地日志");
+  }
+}
+
 function openModelChangeLogModal() {
   const rows = modelChangeLogForMarket();
   const modal = document.createElement("div");
@@ -1728,19 +1823,21 @@ function openModelChangeLogModal() {
       <div class="chart-modal-head">
         <div>
           <h3>模型修改动线</h3>
-          <p class="muted">本地保存 · ${activeMarketConfig().label} ${rows.length} 条 · 每条都附带防过拟合检查</p>
+          <p class="muted" data-model-log-subtitle>正在读取本地服务器事件库...</p>
         </div>
         <div class="model-log-actions">
           <button id="clearModelChangeLog" class="danger-soft" type="button" ${rows.length ? "" : "disabled"}>清空日志</button>
           <button id="closeModelChangeLog" class="secondary" type="button">关闭</button>
         </div>
       </div>
-      <div class="model-log-list">
-        ${rows.length ? rows.map(modelChangeLogCard).join("") : `<p class="muted">还没有模型修改日志。保存因子配置、记录策略版本、训练或重置 Agent 后会自动写入。</p>`}
+      <div class="model-log-list" data-model-log-list>
+        ${modelChangeLogListHtml(rows)}
       </div>
     </div>
   `;
   document.body.appendChild(modal);
+  renderModelChangeLogModal(modal, rows, "同步中");
+  refreshModelChangeLogModal(modal);
   const close = () => modal.remove();
   modal.addEventListener("click", (event) => {
     if (event.target === modal) close();
@@ -1749,8 +1846,8 @@ function openModelChangeLogModal() {
   modal.querySelector("#clearModelChangeLog")?.addEventListener("click", () => {
     state.modelChangeLogByMarket[state.market] = [];
     saveModelChangeLog();
-    close();
-    openModelChangeLogModal();
+    recordModelChangeLogClear();
+    renderModelChangeLogModal(modal, [], "已清空");
     setStatus(`${activeMarketConfig().label} 模型修改日志已清空`);
   });
 }
@@ -4006,15 +4103,28 @@ function indexSignalFromRows(rows = []) {
   };
 }
 
+function indexRowMatchesConfig(row, index) {
+  const symbols = [row?.displaySymbol, row?.symbol].filter(Boolean).map((symbol) => normalizeSymbolForMarket(symbol, state.market));
+  const expected = normalizeSymbolForMarket(index?.symbol || "", state.market);
+  return expected && symbols.includes(expected);
+}
+
+function isUsableIndexRow(row) {
+  return !row?.error && Number(row?.close || row?.technicals?.close || 0) > 0;
+}
+
+function marketIndexRowsComplete(rows = []) {
+  const expected = activeMarketConfig().indexes || [];
+  if (!Array.isArray(rows) || !rows.length) return false;
+  if (["ASX", "US"].includes(state.market) && rows.some((row) => row?.proxyUsed)) return false;
+  if (!expected.length) return rows.some(isUsableIndexRow);
+  return expected.every((index) => rows.some((row) => indexRowMatchesConfig(row, index) && isUsableIndexRow(row)));
+}
+
 function loadMarketIndexSnapshot() {
   const payload = readJsonStorage(indexSnapshotKey(), null);
   if (!payload || payload.market !== state.market || !Array.isArray(payload.rows)) return false;
-  if (["ASX", "US"].includes(state.market) && payload.rows.some((row) => row?.proxyUsed)) {
-    localStorage.removeItem(indexSnapshotKey());
-    return false;
-  }
-  const hasUsableIndex = payload.rows.some((row) => !row?.error && Number(row?.close || row?.technicals?.close || 0) > 0);
-  if (!hasUsableIndex) {
+  if (!marketIndexRowsComplete(payload.rows)) {
     localStorage.removeItem(indexSnapshotKey());
     return false;
   }
@@ -4098,6 +4208,7 @@ function visibleIndexCandles(sourceCandles) {
 async function fetchIndexChartCandles(row, interval = state.indexChartInterval) {
   if (!row?.symbol) return [];
   const daily = normalizeCandles(row.candles || []);
+  if (row.closeOnly && daily.length) return daily;
   if (interval === "1d" && daily.length) return daily;
   const range = indexChartFetchRange(interval);
   const key = indexChartDataKey(row.symbol, interval);
@@ -4126,6 +4237,8 @@ async function fetchIndexChartCandles(row, interval = state.indexChartInterval) 
 
 function indexChartControlsHtml(rows = []) {
   const selected = selectedMarketIndexRow(rows);
+  const closeOnly = Boolean(selected?.closeOnly || normalizeCandles(selected?.candles).some((row) => row.closeOnly));
+  const effectiveInterval = closeOnly ? "1d" : state.indexChartInterval;
   const intervals = [
     ["5m", "5m"],
     ["15m", "15m"],
@@ -4141,7 +4254,10 @@ function indexChartControlsHtml(rows = []) {
         ${rows.map((row) => `<button class="range-btn ${selected?.symbol === row.symbol ? "active" : ""}" type="button" data-index-symbol="${escapeHtml(row.symbol)}">${escapeHtml(row.label || row.symbol)}</button>`).join("")}
       </div>
       <div class="chart-tabs">
-        ${intervals.map(([value, label]) => `<button class="range-btn ${state.indexChartInterval === value ? "active" : ""}" type="button" data-index-interval="${value}">${label}</button>`).join("")}
+        ${intervals.map(([value, label]) => {
+          const disabled = closeOnly && value !== "1d";
+          return `<button class="range-btn ${effectiveInterval === value ? "active" : ""}" type="button" data-index-interval="${value}" ${disabled ? "disabled title=\"该公开快照源仅提供日线收盘历史\"" : ""}>${label}</button>`;
+        }).join("")}
         ${ranges.map((range) => `<button class="range-btn ${state.indexChartRange === range ? "active" : ""}" type="button" data-index-range="${range}">${range}</button>`).join("")}
       </div>
       <div class="chart-tools">
@@ -4152,24 +4268,64 @@ function indexChartControlsHtml(rows = []) {
   `;
 }
 
+function indexPointSnapshotHtml(selected) {
+  const quote = selected.quote || {};
+  const price = Number(selected.close || quote.price || 0);
+  const previousClose = Number(quote.previousClose || 0);
+  const change = Number.isFinite(Number(selected.change1d))
+    ? Number(selected.change1d)
+    : previousClose > 0
+      ? pctChange(price, previousClose)
+      : 0;
+  const source = selected.source || quote.source || "real-index-quote";
+  return `
+    <div class="index-point-snapshot">
+      <div>
+        <span>现金指数点位</span>
+        <strong>${formatIndexValue(selected)}</strong>
+        <small>${escapeHtml(selected.latestDate || quote.date || "")} · ${escapeHtml(source)}</small>
+      </div>
+      <div class="index-point-meter ${change >= 0 ? "up" : "down"}">
+        <span>当日</span>
+        <strong>${formatPct(change)}</strong>
+        <small>历史 OHLC 源未返回，K线/MACD/成交量暂停</small>
+      </div>
+      <p>${escapeHtml(selected.warning || "当前仅显示真实现金指数点位；不会用 ETF 或模拟数据补成K线。")}</p>
+    </div>
+  `;
+}
+
 function marketIndexChartHtml(rows = []) {
   const selected = selectedMarketIndexRow(rows);
   if (!selected) return "";
+  const candles = normalizeCandles(selected.candles);
+  const closeOnly = Boolean(selected.closeOnly || candles.some((row) => row.closeOnly));
+  const hasHistoricalCandles = !selected.quoteOnly && !closeOnly && candles.length > 1;
+  const hasCloseLine = !selected.quoteOnly && closeOnly && candles.length > 1;
+  const title = hasHistoricalCandles ? "大盘K线" : hasCloseLine ? "收盘线/MACD" : "现金点位快照";
+  const subtitle = hasHistoricalCandles
+    ? "指数图使用真实指数/官方点位数据；分钟线源不可用时降级为真实日线，不用 ETF 价格冒充指数。"
+    : hasCloseLine
+      ? "当前使用无 API 公开现金指数收盘历史；只画收盘线和基于收盘价的 MACD，不推断 OHLC/成交量。"
+      : "当前仅有真实现金指数点位；历史K线源未返回时不会用 ETF 冒充，趋势预测暂停。";
+  const chartTag = hasHistoricalCandles ? "真实K线" : hasCloseLine ? "真实收盘线" : "点位快照";
   return `
     <div class="index-chart-card">
       <div class="quant-result-head">
         <div>
-          <h3>${escapeHtml(selected.label || selected.symbol)} · 大盘K线</h3>
-          <p class="muted small-text">指数图使用真实指数/官方点位数据；分钟线源不可用时降级为真实日线，不用 ETF 价格冒充指数。</p>
+          <h3>${escapeHtml(selected.label || selected.symbol)} · ${title}</h3>
+          <p class="muted small-text">${subtitle}</p>
         </div>
-        <span class="tag ${selected.quoteOnly ? "warn" : "good"}">${selected.quoteOnly ? "点位快照" : "真实K线"}</span>
+        <span class="tag ${hasHistoricalCandles || hasCloseLine ? "good" : "warn"}">${chartTag}</span>
       </div>
       ${indexChartControlsHtml(rows)}
-      <div class="index-chart-layer">
-        <canvas id="indexPriceChart" height="280"></canvas>
-        <canvas id="indexVolumeChart" height="80"></canvas>
-        <canvas id="indexMacdChart" height="110"></canvas>
-      </div>
+      ${hasHistoricalCandles || hasCloseLine ? `
+        <div class="index-chart-layer">
+          <canvas id="indexPriceChart" height="280"></canvas>
+          <canvas id="indexVolumeChart" height="80"></canvas>
+          <canvas id="indexMacdChart" height="110"></canvas>
+        </div>
+      ` : indexPointSnapshotHtml(selected)}
     </div>
   `;
 }
@@ -4181,7 +4337,8 @@ function drawIndexChart(row = selectedMarketIndexRow()) {
   if (!row || !priceCanvas || !volumeCanvas || !macdCanvas) return;
   const key = indexChartDataKey(row.symbol);
   const cached = state.chartDataCache.get(key);
-  let source = normalizeCandles(state.indexChartInterval === "1d" ? row.candles : cached?.candles);
+  const rowCloseOnly = Boolean(row.closeOnly);
+  let source = normalizeCandles(rowCloseOnly || state.indexChartInterval === "1d" ? row.candles : cached?.candles);
   if (!source.length) {
     drawLoading(priceCanvas, `正在读取 ${state.indexChartInterval} 指数K线...`);
     drawLoading(volumeCanvas, "等待指数成交量");
@@ -4202,42 +4359,48 @@ function drawIndexChart(row = selectedMarketIndexRow()) {
   const view = visibleIndexCandles(source);
   const candles = view.candles;
   if (!candles.length) return;
+  const closeOnly = Boolean(rowCloseOnly || candles.some((item) => item.closeOnly));
   const hoverIndex = state.indexChartHoverIndex == null ? null : clamp(state.indexChartHoverIndex, 0, candles.length - 1);
   const highs = candles.map((item) => item.high);
   const lows = candles.map((item) => item.low);
   const closes = candles.map((item) => item.close);
   const sma20 = sma(closes, 20);
   const sma50 = sma(closes, 50);
-  const vwap = cumulativeVwapSeries(candles);
+  const vwap = closeOnly ? [] : cumulativeVwapSeries(candles);
   const bollinger = bollingerChartSeries(candles);
   const priceBounds = chartBounds([...highs, ...lows, ...sma20, ...sma50, ...vwap, ...bollinger.upper, ...bollinger.lower], 0.06);
   const price = setupCanvas(priceCanvas);
   drawGrid(price.ctx, price.width, price.height);
   drawAxis(price.ctx, priceBounds, price.width, price.height, (value) => formatCompactNumber(value, row.unit === "points" ? 1 : 2));
   const candleWidth = Math.max(3, Math.min(12, (price.width - 62) / candles.length * 0.62));
-  candles.forEach((item, index) => {
-    const x = xFor(index, candles.length, price.width);
-    const yHigh = yFor(item.high, priceBounds.min, priceBounds.max, price.height);
-    const yLow = yFor(item.low, priceBounds.min, priceBounds.max, price.height);
-    const yOpen = yFor(item.open, priceBounds.min, priceBounds.max, price.height);
-    const yClose = yFor(item.close, priceBounds.min, priceBounds.max, price.height);
-    const up = item.close >= item.open;
-    price.ctx.strokeStyle = up ? "#43e08a" : "#ff657d";
-    price.ctx.fillStyle = up ? "rgba(67, 224, 138, 0.82)" : "rgba(255, 101, 125, 0.82)";
-    price.ctx.beginPath();
-    price.ctx.moveTo(x, yHigh);
-    price.ctx.lineTo(x, yLow);
-    price.ctx.stroke();
-    price.ctx.fillRect(x - candleWidth / 2, Math.min(yOpen, yClose), candleWidth, Math.max(2, Math.abs(yClose - yOpen)));
-  });
+  if (closeOnly) {
+    drawSeriesLine(price.ctx, closes, priceBounds, price.width, price.height, "#43e08a", 1.8);
+  } else {
+    candles.forEach((item, index) => {
+      const x = xFor(index, candles.length, price.width);
+      const yHigh = yFor(item.high, priceBounds.min, priceBounds.max, price.height);
+      const yLow = yFor(item.low, priceBounds.min, priceBounds.max, price.height);
+      const yOpen = yFor(item.open, priceBounds.min, priceBounds.max, price.height);
+      const yClose = yFor(item.close, priceBounds.min, priceBounds.max, price.height);
+      const up = item.close >= item.open;
+      price.ctx.strokeStyle = up ? "#43e08a" : "#ff657d";
+      price.ctx.fillStyle = up ? "rgba(67, 224, 138, 0.82)" : "rgba(255, 101, 125, 0.82)";
+      price.ctx.beginPath();
+      price.ctx.moveTo(x, yHigh);
+      price.ctx.lineTo(x, yLow);
+      price.ctx.stroke();
+      price.ctx.fillRect(x - candleWidth / 2, Math.min(yOpen, yClose), candleWidth, Math.max(2, Math.abs(yClose - yOpen)));
+    });
+  }
   drawSeriesLine(price.ctx, sma20, priceBounds, price.width, price.height, "#38bdf8", 1.35);
   drawSeriesLine(price.ctx, sma50, priceBounds, price.width, price.height, "#f59e0b", 1.35);
-  drawSeriesLine(price.ctx, vwap, priceBounds, price.width, price.height, "#2fd6c9", 1.35);
+  if (!closeOnly) drawSeriesLine(price.ctx, vwap, priceBounds, price.width, price.height, "#2fd6c9", 1.35);
   price.ctx.setLineDash([4, 4]);
   drawSeriesLine(price.ctx, bollinger.upper, priceBounds, price.width, price.height, "rgba(96, 165, 250, 0.76)", 1.1);
   drawSeriesLine(price.ctx, bollinger.lower, priceBounds, price.width, price.height, "rgba(96, 165, 250, 0.76)", 1.1);
   price.ctx.setLineDash([]);
-  drawLastPriceMarker(price.ctx, candles.at(-1)?.close, priceBounds, price.width, price.height, candles.at(-1)?.close >= candles.at(-1)?.open ? "#43e08a" : "#ff657d");
+  const latestCloseUp = candles.at(-1)?.close >= (closeOnly ? candles.at(-2)?.close || candles.at(-1)?.close : candles.at(-1)?.open);
+  drawLastPriceMarker(price.ctx, candles.at(-1)?.close, priceBounds, price.width, price.height, latestCloseUp ? "#43e08a" : "#ff657d");
   drawTimeAxis(price.ctx, candles, price.width, price.height);
   if (cached?.degraded) {
     price.ctx.fillStyle = "rgba(246, 196, 83, 0.92)";
@@ -4246,19 +4409,23 @@ function drawIndexChart(row = selectedMarketIndexRow()) {
   }
   price.ctx.fillStyle = "rgba(216, 231, 248, 0.92)";
   price.ctx.font = "10px Inter, system-ui, sans-serif";
-  price.ctx.fillText("SMA20 / SMA50 / VWAP / BOLL", 54, 16);
+  price.ctx.fillText(closeOnly ? "Close / SMA20 / SMA50 / BOLL" : "SMA20 / SMA50 / VWAP / BOLL", 54, 16);
 
   const volume = setupCanvas(volumeCanvas);
-  drawGrid(volume.ctx, volume.width, volume.height);
-  const maxVolume = Math.max(1, ...candles.map((item) => Number(item.volume || 0)));
-  drawAxis(volume.ctx, { min: 0, max: maxVolume }, volume.width, volume.height, (value) => formatCompactNumber(value, 1));
-  candles.forEach((item, index) => {
-    const x = xFor(index, candles.length, volume.width);
-    const barHeight = Number(item.volume || 0) / maxVolume * (volume.height - 28);
-    volume.ctx.fillStyle = item.close >= item.open ? "rgba(67, 224, 138, 0.62)" : "rgba(255, 101, 125, 0.62)";
-    volume.ctx.fillRect(x - candleWidth / 2, volume.height - 18 - barHeight, candleWidth, Math.max(1, barHeight));
-  });
-  drawTimeAxis(volume.ctx, candles, volume.width, volume.height);
+  if (closeOnly) {
+    drawLoading(volumeCanvas, "该公开快照源不含真实成交量；等待 Marketstack/交易所 OHLCV 源");
+  } else {
+    drawGrid(volume.ctx, volume.width, volume.height);
+    const maxVolume = Math.max(1, ...candles.map((item) => Number(item.volume || 0)));
+    drawAxis(volume.ctx, { min: 0, max: maxVolume }, volume.width, volume.height, (value) => formatCompactNumber(value, 1));
+    candles.forEach((item, index) => {
+      const x = xFor(index, candles.length, volume.width);
+      const barHeight = Number(item.volume || 0) / maxVolume * (volume.height - 28);
+      volume.ctx.fillStyle = item.close >= item.open ? "rgba(67, 224, 138, 0.62)" : "rgba(255, 101, 125, 0.62)";
+      volume.ctx.fillRect(x - candleWidth / 2, volume.height - 18 - barHeight, candleWidth, Math.max(1, barHeight));
+    });
+    drawTimeAxis(volume.ctx, candles, volume.width, volume.height);
+  }
 
   const macdSeries = computeMacdSeries(candles);
   const macd = setupCanvas(macdCanvas);
@@ -4284,10 +4451,18 @@ function drawIndexChart(row = selectedMarketIndexRow()) {
   if (hoverIndex !== null) {
     [price, volume, macd].forEach((chart) => drawCrosshair(chart.ctx, hoverIndex, candles.length, chart.width, chart.height));
     const item = candles[hoverIndex];
-    if (readout) readout.textContent = `${item.date} O ${formatCompactNumber(item.open, 2)} H ${formatCompactNumber(item.high, 2)} L ${formatCompactNumber(item.low, 2)} C ${formatCompactNumber(item.close, 2)} Vol ${formatCompactNumber(item.volume, 1)} MACD ${formatCompactNumber(macdSeries.macd[hoverIndex], 3)} / ${formatCompactNumber(macdSeries.signal[hoverIndex], 3)} · Zoom ${view.zoom.toFixed(2)}x`;
+    if (readout) {
+      readout.textContent = closeOnly
+        ? `${item.date} Close ${formatCompactNumber(item.close, 2)} MACD ${formatCompactNumber(macdSeries.macd[hoverIndex], 3)} / ${formatCompactNumber(macdSeries.signal[hoverIndex], 3)} · Zoom ${view.zoom.toFixed(2)}x`
+        : `${item.date} O ${formatCompactNumber(item.open, 2)} H ${formatCompactNumber(item.high, 2)} L ${formatCompactNumber(item.low, 2)} C ${formatCompactNumber(item.close, 2)} Vol ${formatCompactNumber(item.volume, 1)} MACD ${formatCompactNumber(macdSeries.macd[hoverIndex], 3)} / ${formatCompactNumber(macdSeries.signal[hoverIndex], 3)} · Zoom ${view.zoom.toFixed(2)}x`;
+    }
   } else if (readout) {
-    const note = cached?.degraded ? `当前显示 ${cached.actualInterval || "1d"} 真实K线；${cached.requestedInterval || state.indexChartInterval} 不可用 · ` : "";
-    readout.textContent = `${note}滚轮/触控板缩放 X 轴，拖拽平移，悬停查看指数 OHLC`;
+    const note = closeOnly
+      ? "当前显示真实日线收盘历史；该源不含 OHLC/成交量 · "
+      : cached?.degraded
+        ? `当前显示 ${cached.actualInterval || "1d"} 真实K线；${cached.requestedInterval || state.indexChartInterval} 不可用 · `
+        : "";
+    readout.textContent = `${note}滚轮/触控板缩放 X 轴，拖拽平移，悬停查看指数 ${closeOnly ? "Close/MACD" : "OHLC"}`;
   }
   bindIndexChartEvents(row, candles);
 }
@@ -4404,9 +4579,8 @@ async function fetchIndexMarket(index) {
 
 async function refreshMarketIndexes(force = false) {
   const cached = readJsonStorage(indexSnapshotKey(), null);
-  const cachedHasInvalidProxy = ["ASX", "US"].includes(state.market) && Array.isArray(cached?.rows) && cached.rows.some((row) => row?.proxyUsed);
-  const cachedHasUsableIndex = !cachedHasInvalidProxy && Array.isArray(cached?.rows) && cached.rows.some((row) => !row?.error && Number(row?.close || row?.technicals?.close || 0) > 0);
-  if (!force && cached?.market === state.market && cachedHasUsableIndex && Date.now() - new Date(cached.updatedAt || 0).getTime() < 3 * 60 * 1000) {
+  const cachedIsComplete = cached?.market === state.market && marketIndexRowsComplete(cached.rows);
+  if (!force && cachedIsComplete && Date.now() - new Date(cached.updatedAt || 0).getTime() < 3 * 60 * 1000) {
     state.marketIndexes = cached.rows;
     state.marketIndexSignal = cached.signal || indexSignalFromRows(cached.rows);
     renderMarketIndexPanel();
@@ -4420,7 +4594,8 @@ async function refreshMarketIndexes(force = false) {
     const market = indexMarket.market;
     const candles = normalizeCandles(market.candles);
     if (!candles.length) throw new Error(`${index.label} 无真实点位`);
-    const quoteOnly = Boolean(market.quoteOnly || candles.length < 25);
+    const closeOnly = Boolean(market.closeOnly || candles.some((row) => row.closeOnly));
+    const quoteOnly = Boolean(market.quoteOnly || (!closeOnly && candles.length < 25) || candles.length < 2);
     const technicals = computeTechnicals(candles);
     const indexTechnicals = quoteOnly
       ? { ...technicals, change5d: 0, change20d: 0, trendScore: 50, momentumScore: 50, riskScore: 50, projectedUpside: 0 }
@@ -4446,11 +4621,13 @@ async function refreshMarketIndexes(force = false) {
       warning: [
         indexMarket.fallbackUsed ? `${index.symbol} 暂不可用，已使用 ${indexMarket.usedSymbol} 真实代理` : "",
         quoteOnly ? "当前仅显示真实现金指数点位；历史K线源暂不可用，指数趋势预测已暂停。" : "",
+        closeOnly ? "当前指数历史来自无 API 公开收盘快照；趋势/MACD仅基于收盘价，未推断开高低和成交量。" : "",
         market.warning || "",
       ].filter(Boolean).join(" | "),
-      candles: candles.slice(-260),
+      candles: candles.slice(closeOnly ? -1300 : -260),
       quote: market.quote || null,
       quoteOnly,
+      closeOnly,
       technicals: indexTechnicals,
       analog: {
         count: analog.count || 0,

@@ -2979,6 +2979,62 @@ function stooqRows(csv, range = "9mo") {
   return rows.slice(-count);
 }
 
+const SATOSHIMACRO_YAHOO_MARKETS_URL = "https://satoshimacro.com/assets/data/yahoo-markets.json";
+
+function satoshiMacroSeriesForIndex(code, market = "ASX") {
+  const key = safeMarket(market);
+  const clean = cleanCode(code, key);
+  if (key === "ASX" && clean === "^AXJO") return { key: "asx200", label: "S&P/ASX 200" };
+  if (key === "US" && ["^GSPC", "^SPX"].includes(clean)) return { key: "sp500", label: "S&P 500" };
+  return null;
+}
+
+function closeOnlyLimitForRange(range = "9mo") {
+  if (range === "1mo") return 45;
+  if (range === "3mo") return 90;
+  if (range === "6mo") return 140;
+  if (range === "1y" || range === "9mo") return 260;
+  if (range === "2y") return 520;
+  return 1300;
+}
+
+function satoshiMacroCloseRows(payload, seriesKey, range = "9mo") {
+  const rows = payload?.series?.[seriesKey]?.data || [];
+  const normalized = sanitizeCandleRows((Array.isArray(rows) ? rows : []).map((row) => {
+    const close = Number(row?.close);
+    return {
+      date: String(row?.date || ""),
+      open: close,
+      high: close,
+      low: close,
+      close,
+      adjClose: close,
+      volume: 0,
+      closeOnly: true,
+    };
+  })).filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  return normalized.slice(-closeOnlyLimitForRange(range));
+}
+
+async function fetchSatoshiMacroIndexCloseCandles(code, range, interval, market = "ASX") {
+  if (interval !== "1d") throw new Error("SatoshiMacro public snapshot is daily close-only.");
+  const series = satoshiMacroSeriesForIndex(code, market);
+  if (!series) throw new Error(`SatoshiMacro has no close-only cash index series for ${code}.`);
+  const payload = await fetchJson(SATOSHIMACRO_YAHOO_MARKETS_URL, 8000, {
+    referer: `https://satoshimacro.com/tools/crypto/markets/${series.key === "asx200" ? "asx-200" : "sp-500"}/`,
+  });
+  const candles = satoshiMacroCloseRows(payload, series.key, range);
+  if (!candles.length) throw new Error(`SatoshiMacro returned no ${series.label} close rows.`);
+  return {
+    candles,
+    source: `satoshimacro-yahoo-snapshot-${series.key}-close-only`,
+    unit: "points",
+    closeOnly: true,
+    warning: `Public no-key ${series.label} close-only history; source metadata: ${payload?.source || "Yahoo Finance public chart snapshot"}${payload?.fetched_at ? `, fetched ${payload.fetched_at}` : ""}. No OHLC/volume is inferred.`,
+  };
+}
+
 function stockAnalysisHistoryRows(html, range = "9mo") {
   const text = String(html || "");
   const block = text.match(/data:\[([\s\S]*?)\],created_at/)?.[1] || "";
@@ -4719,21 +4775,23 @@ function providerCandidates(market, code, range, interval) {
   const key = safeMarket(market);
   if (key === "ASX" && /^\^/.test(cleanCode(code, key))) {
     return [
-      ["twelvedata-asx-index", () => fetchTwelveDataIndexCandles(code, range, interval, key)],
-      ["eodhd-asx-index", () => fetchEodhdCandles(code, range, interval, key)],
-      ["stooq-asx-index", () => fetchStooqIndexCandles(code, range, interval, key)],
       ["yahoo-asx-index", () => fetchYahooMarketCandles(code, range, interval, key)],
+      ["stooq-asx-index", () => fetchStooqIndexCandles(code, range, interval, key)],
+      ["satoshimacro-asx-index", () => fetchSatoshiMacroIndexCloseCandles(code, range, interval, key)],
+      ["eodhd-asx-index", () => fetchEodhdCandles(code, range, interval, key)],
+      ["twelvedata-asx-index", () => fetchTwelveDataIndexCandles(code, range, interval, key)],
     ];
   }
   if (key === "US" && /^\^/.test(cleanCode(code, key))) {
     return [
       ["yahoo-us-index", () => fetchYahooMarketCandles(code, range, interval, key)],
       ["nasdaq-us-index", () => fetchNasdaqUsIndexCandles(code, range, interval)],
+      ["stooq-us-index", () => fetchStooqIndexCandles(code, range, interval, key)],
+      ["satoshimacro-us-index", () => fetchSatoshiMacroIndexCloseCandles(code, range, interval, key)],
       ["finnhub-us-index", () => fetchFinnhubCandles(code, range, interval, key)],
       ["tiingo-us-index", () => fetchTiingoCandles(code, range, interval, key)],
       ["twelvedata-us-index", () => fetchTwelveDataIndexCandles(code, range, interval, key)],
       ["eodhd-us-index", () => fetchEodhdCandles(code, range, interval, key)],
-      ["stooq-us-index", () => fetchStooqIndexCandles(code, range, interval, key)],
     ];
   }
   const cnFreeCandidates = [
@@ -4848,6 +4906,14 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
     const candidates = providerCandidates(key, code, range, interval);
     const successful = [];
     const errors = [];
+    const degradedSingleSourcePayload = (source, extraErrors = []) => ({
+      ...source,
+      source: `${source.source}-single-source`,
+      validation: singleSourceValidation(source, [...errors, ...extraErrors]),
+      warning: compactProviderErrors([...errors, ...extraErrors]).length
+        ? `Dual-source cross-check degraded to single real source. ${compactProviderErrors([...errors, ...extraErrors]).join(" | ")}`
+        : "Dual-source cross-check degraded to single real source.",
+    });
     let limitedProviderCalls = 0;
     const maxLimitedProviderCalls = key === "US" ? 4 : key === "ASX" ? 2 : 1;
     for (const [source, task] of candidates) {
@@ -4882,19 +4948,23 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
     if (successful.length === 1) {
       const source = successful[0];
       if (!source.candles.length) throw new Error(`No real candles returned from ${source.source}. ${errors.join(" | ")}`);
-      return remember({
-        ...source,
-        source: `${source.source}-single-source`,
-        validation: singleSourceValidation(source, errors),
-        warning: compactProviderErrors(errors).length
-          ? `Dual-source cross-check degraded to single real source. ${compactProviderErrors(errors).join(" | ")}`
-          : "Dual-source cross-check degraded to single real source.",
-      });
+      return remember(degradedSingleSourcePayload(source));
     }
     const [primary, secondary] = successful;
     const validation = compareMarketSources(primary, secondary);
     if (!validation.ok && process.env.MARKET_ALLOW_CONFLICT !== "true") {
-      throw new Error(`${validation.message} Price diff: ${validation.priceDiffPct?.toFixed(2)}%. EODHD ${validation.primary?.date} ${validation.primary?.close}; Twelve Data ${validation.secondary?.date} ${validation.secondary?.close}.`);
+      const conflictError = `${validation.message} Price diff: ${validation.priceDiffPct?.toFixed(2)}%. ${validation.primary?.source} ${validation.primary?.date} ${validation.primary?.close}; ${validation.secondary?.source} ${validation.secondary?.date} ${validation.secondary?.close}.`;
+      const closeOnlySource = successful.find((source) => source.closeOnly);
+      if (closeOnlySource) {
+        return remember(degradedSingleSourcePayload(closeOnlySource, [conflictError]));
+      }
+      try {
+        const closeOnlyFallback = await fetchSatoshiMacroIndexCloseCandles(code, range, interval, key);
+        return remember(degradedSingleSourcePayload(closeOnlyFallback, [conflictError]));
+      } catch (fallbackError) {
+        errors.push(`satoshimacro-conflict-fallback: ${fallbackError.message || fallbackError}`);
+      }
+      throw new Error(conflictError);
     }
     return remember({ ...primary, source: `${primary.source}+${secondary.source}-crosscheck`, validation, secondary });
   }

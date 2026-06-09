@@ -74,6 +74,11 @@ button:disabled {
   opacity: 0.65;
 }
 
+.range-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;
@@ -1282,6 +1287,60 @@ select:focus {
   width: 100%;
   max-width: 100%;
   background: #050b13;
+}
+
+.index-point-snapshot {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.55fr);
+  gap: 10px;
+  min-height: 190px;
+  border: 1px solid rgba(104, 142, 170, 0.18);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(47, 214, 201, 0.08), transparent 44%),
+    #050b13;
+  padding: 16px;
+}
+
+.index-point-snapshot > div {
+  display: grid;
+  align-content: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.index-point-snapshot span,
+.index-point-snapshot small,
+.index-point-snapshot p {
+  color: #8ea3ba;
+}
+
+.index-point-snapshot strong {
+  color: #edf7ff;
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+.index-point-meter {
+  border: 1px solid rgba(104, 142, 170, 0.18);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(7, 16, 27, 0.82);
+}
+
+.index-point-meter.up strong {
+  color: #43e08a;
+}
+
+.index-point-meter.down strong {
+  color: #ff657d;
+}
+
+.index-point-snapshot p {
+  grid-column: 1 / -1;
+  align-self: end;
+  margin: 0;
+  line-height: 1.5;
 }
 
 #indexPriceChart {
