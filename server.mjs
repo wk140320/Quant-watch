@@ -2692,11 +2692,11 @@ function yahooSymbolForMarket(symbol, market = "ASX") {
 function usIndexProviderSymbols(code) {
   const clean = String(code || "").trim().toUpperCase();
   return {
-    "^GSPC": { yahoo: "^GSPC", stooq: "^spx", stooqQuote: "^spx", twelve: "SPX", eodhd: "GSPC.INDX", finnhub: ["^GSPC", "SPX"], tiingo: ["^GSPC", "SPX"], label: "S&P 500" },
-    "^IXIC": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", twelve: "IXIC", eodhd: "IXIC.INDX", finnhub: ["^IXIC", "IXIC"], tiingo: ["^IXIC", "IXIC"], label: "Nasdaq Composite" },
-    "^DJI": { yahoo: "^DJI", stooq: "^dji", stooqQuote: "^dji", twelve: "DJI", eodhd: "DJI.INDX", finnhub: ["^DJI", "DJI"], tiingo: ["^DJI", "DJI"], label: "Dow Jones" },
-    "^SPX": { yahoo: "^GSPC", stooq: "^spx", twelve: "SPX", eodhd: "GSPC.INDX", finnhub: ["^GSPC", "SPX"], tiingo: ["^GSPC", "SPX"], label: "S&P 500" },
-    "^COMP": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", twelve: "IXIC", eodhd: "IXIC.INDX", finnhub: ["^IXIC", "IXIC"], tiingo: ["^IXIC", "IXIC"], label: "Nasdaq Composite" },
+    "^GSPC": { yahoo: "^GSPC", stooq: "^spx", stooqQuote: "^spx", fred: "SP500", twelve: "SPX", eodhd: "GSPC.INDX", finnhub: ["^GSPC", "SPX"], tiingo: ["^GSPC", "SPX"], label: "S&P 500" },
+    "^IXIC": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", fred: "NASDAQCOM", twelve: "IXIC", eodhd: "IXIC.INDX", finnhub: ["^IXIC", "IXIC"], tiingo: ["^IXIC", "IXIC"], label: "Nasdaq Composite" },
+    "^DJI": { yahoo: "^DJI", stooq: "^dji", stooqQuote: "^dji", fred: "DJIA", twelve: "DJI", eodhd: "DJI.INDX", finnhub: ["^DJI", "DJI"], tiingo: ["^DJI", "DJI"], label: "Dow Jones" },
+    "^SPX": { yahoo: "^GSPC", stooq: "^spx", fred: "SP500", twelve: "SPX", eodhd: "GSPC.INDX", finnhub: ["^GSPC", "SPX"], tiingo: ["^GSPC", "SPX"], label: "S&P 500" },
+    "^COMP": { yahoo: "^IXIC", stooq: "^ixic", stooqQuote: "^ndq", fred: "NASDAQCOM", twelve: "IXIC", eodhd: "IXIC.INDX", finnhub: ["^IXIC", "IXIC"], tiingo: ["^IXIC", "IXIC"], label: "Nasdaq Composite" },
     "^AXJO": { yahoo: "^AXJO", stooq: "^axjo", twelve: "XJO", eodhd: "XJO.INDX", label: "S&P/ASX 200" },
     "^AORD": { yahoo: "^AORD", stooq: "^aord", twelve: "AORD", eodhd: "AORD.INDX", label: "All Ordinaries" },
     "^AXKO": { yahoo: "^AXKO", stooq: "^axko", twelve: "XKO", eodhd: "XKO.INDX", label: "S&P/ASX 300" },
@@ -3127,6 +3127,49 @@ function closeOnlyLimitForRange(range = "9mo") {
   if (range === "1y" || range === "9mo") return 260;
   if (range === "2y") return 520;
   return 1300;
+}
+
+function fredIndexCloseRows(csv, seriesId, range = "9mo") {
+  const lines = String(csv || "").trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) return [];
+  const headers = parseCsvLine(lines[0]).map((header) => String(header || "").trim());
+  const dateIndex = headers.findIndex((header) => /date/i.test(header));
+  const valueIndex = headers.findIndex((header) => header.toUpperCase() === String(seriesId || "").toUpperCase());
+  const normalized = sanitizeCandleRows(lines.slice(1).map((line) => {
+    const cells = parseCsvLine(line);
+    const date = String(cells[dateIndex] || "").trim();
+    const close = Number(String(cells[valueIndex] || "").replace(/,/g, ""));
+    return {
+      date,
+      open: close,
+      high: close,
+      low: close,
+      close,
+      adjClose: close,
+      volume: 0,
+      closeOnly: true,
+    };
+  })).filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  return normalized.slice(-closeOnlyLimitForRange(range));
+}
+
+async function fetchFredUsIndexCloseCandles(code, range, interval) {
+  if (interval !== "1d") throw new Error("FRED public cash index series is daily close-only.");
+  const index = usIndexProviderSymbols(code);
+  if (!index?.fred) throw new Error(`FRED has no public close-only cash index series for ${code}.`);
+  const endpoint = new URL("https://fred.stlouisfed.org/graph/fredgraph.csv");
+  endpoint.searchParams.set("id", index.fred);
+  const csv = await fetchText(endpoint, 8000, { accept: "text/csv,text/plain,*/*" });
+  const candles = fredIndexCloseRows(csv, index.fred, range);
+  if (!candles.length) throw new Error(`FRED returned no ${index.label} close rows.`);
+  return {
+    candles,
+    source: `fred-us-index-${index.fred.toLowerCase()}-daily-close`,
+    unit: "points",
+    closeOnly: true,
+    warning: `FRED public ${index.label} daily close cash-index series. No OHLC, volume, or intraday bars are inferred.`,
+  };
 }
 
 function satoshiMacroCloseRows(payload, seriesKey, range = "9mo") {
@@ -4989,6 +5032,7 @@ function providerCandidates(market, code, range, interval) {
     return [
       ["yahoo-us-index", () => fetchYahooMarketCandles(code, range, interval, key)],
       ["nasdaq-us-index", () => fetchNasdaqUsIndexCandles(code, range, interval)],
+      ...(interval === "1d" ? [["fred-us-index-close", () => fetchFredUsIndexCloseCandles(code, range, interval)]] : []),
       ["stooq-us-index", () => fetchStooqIndexCandles(code, range, interval, key)],
       ["finnhub-us-index", () => fetchFinnhubCandles(code, range, interval, key)],
       ["tiingo-us-index", () => fetchTiingoCandles(code, range, interval, key)],
@@ -5108,13 +5152,20 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
     const candidates = providerCandidates(key, code, range, interval);
     const successful = [];
     const errors = [];
+    const singleSourceAcceptedByPolicy = () => (
+      (key === "ASX" && process.env.ASX_REQUIRE_DUAL_SOURCE !== "true")
+      || (key === "US" && process.env.US_REQUIRE_DUAL_SOURCE !== "true")
+      || key === "CN"
+    );
     const degradedSingleSourcePayload = (source, extraErrors = []) => ({
       ...source,
       source: `${source.source}-single-source`,
       validation: singleSourceValidation(source, [...errors, ...extraErrors]),
       warning: compactProviderErrors([...errors, ...extraErrors]).length
-        ? `Dual-source cross-check degraded to single real source. ${compactProviderErrors([...errors, ...extraErrors]).join(" | ")}`
-        : "Dual-source cross-check degraded to single real source.",
+        ? `${singleSourceAcceptedByPolicy() ? "Single real source accepted by quota policy." : "Dual-source cross-check degraded to single real source."} ${compactProviderErrors([...errors, ...extraErrors]).join(" | ")}`
+        : singleSourceAcceptedByPolicy()
+          ? "Single real source accepted by quota policy."
+          : "Dual-source cross-check degraded to single real source.",
     });
     let limitedProviderCalls = 0;
     const maxLimitedProviderCalls = key === "US" ? 4 : key === "ASX" ? 2 : 1;
@@ -5143,6 +5194,7 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
       if (successful.length >= 2) break;
       if (key === "CN" && successful.length >= 1) break;
       if (key === "US" && process.env.US_REQUIRE_DUAL_SOURCE !== "true" && successful.length >= 1) break;
+      if (key === "ASX" && process.env.ASX_REQUIRE_DUAL_SOURCE !== "true" && successful.length >= 1) break;
     }
     if (successful.length === 0) {
       throw new Error(`Market provider failure. ${errors.join(" | ")}`);
@@ -8744,7 +8796,7 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/provider-budget" && req.method === "GET") {
     const market = marketFromUrl(url);
-    const sampleCode = { ASX: "BHP", US: "AAPL", CN: "600519" }[market];
+    const sampleCode = normalizeMarketSymbol(url.searchParams.get("symbol") || { ASX: "BHP", US: "AAPL", CN: "600519" }[market], market);
     const candidates = providerCandidates(market, sampleCode, "9mo", "1d").map(([source]) => source);
     const configured = Object.fromEntries(candidates.map((source) => [source, providerConfigured(source)]));
     sendJson(res, 200, await runPythonQuantCore("provider-budget", { market, candidates, configured }));

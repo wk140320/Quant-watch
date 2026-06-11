@@ -4,7 +4,7 @@ from typing import Any, Optional
 
 
 LIMITED_MARKERS = ("eodhd", "twelvedata", "alphavantage", "tushare", "alpaca", "finnhub", "tiingo", "marketaux")
-FREE_SUPPORT_MARKERS = ("stockanalysis", "yahoo", "nasdaq", "stooq", "satoshimacro", "eastmoney", "tencent", "asx-official", "gdelt", "baostock")
+FREE_SUPPORT_MARKERS = ("stockanalysis", "yahoo", "nasdaq", "fred", "stooq", "satoshimacro", "eastmoney", "tencent", "asx-official", "gdelt", "baostock")
 LICENSED_MARKERS = ("ibkr", "futu", "moomoo", "lseg", "market-source", "polygon", "massive")
 
 

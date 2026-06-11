@@ -332,6 +332,9 @@ const state = {
   indexChartHoverIndex: null,
   indexChartDragging: null,
   indexChartLoading: new Set(),
+  marketIndexUsedSnapshotFallback: false,
+  marketIndexRefreshing: false,
+  marketIndexHydrationTimer: null,
   stockPicker: { forecast: [], today: [], rejected: [], failures: [], updatedAt: null },
   marketMoversByMarket: readJsonStorage("marketMoversByMarket", {}),
   agentConfigByMarket: readJsonStorage("agentConfigByMarket", {}),
@@ -509,7 +512,9 @@ function updateSydneyClock() {
       ? `${config.code} 交易中，可刷新真实数据`
       : stateNow.canRefresh
         ? "收盘刷新窗口，可更新收盘数据"
-        : `休市中，仅使用本地快照`;
+        : getRuntimeSettings().allowOffHoursFetch
+          ? "休市中，优先快照；可手动刷新真实免费源"
+          : `休市中，仅使用本地快照`;
     session.className = stateNow.canRefresh ? "market-open" : "market-closed";
   }
   if (snapshot) snapshot.textContent = snapshotsEnabled() ? `本地快照：${formatSnapshotTime(state.snapshotUpdatedAt)}` : "本地快照：已关闭";
@@ -1468,10 +1473,31 @@ function formatCompactNumber(value, maximumFractionDigits = 2) {
   });
 }
 
+function localBackendOfflineMessage(url = "") {
+  return `本地后端未连接：${url || "API"}。请确认 8787 服务正在运行，然后刷新页面。`;
+}
+
+function normalizeApiErrorMessage(message, url = "", options = {}) {
+  const text = String(message || "读取失败");
+  if (options.network) return localBackendOfflineMessage(url);
+  if (/quota has been exceeded|quota exceeded|The quota has been exceeded/i.test(text)) {
+    return "外部数据源额度已用尽；已优先保留本地真实快照/缓存，稍后或更换数据源后再刷新。";
+  }
+  if (/Load failed|Failed to fetch|NetworkError|ERR_CONNECTION_REFUSED|ECONNREFUSED/i.test(text)) {
+    return `真实数据源请求失败：${text}`;
+  }
+  return text;
+}
+
 async function requestJson(url, options = {}) {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    throw new Error(normalizeApiErrorMessage(error.message || error, url, { network: true }));
+  }
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `请求失败：${response.status}`);
+  if (!response.ok) throw new Error(normalizeApiErrorMessage(payload.error || `请求失败：${response.status}`, url));
   return payload;
 }
 
@@ -3919,6 +3945,9 @@ function compactDisplayError(message) {
     .replace(/This operation was aborted/g, "请求超时")
     .replace(/Stooq CSV download requires captcha\/API key/g, "Stooq 需要 API key/captcha")
     .replace(/Stooq[\s\S]*?(captcha|verify your browser|__verify)[\s\S]*$/gi, "Stooq 需要浏览器验证/API key")
+    .replace(/quota has been exceeded|quota exceeded|The quota has been exceeded/gi, "外部数据源额度已用尽")
+    .replace(/Failed to fetch|NetworkError|ERR_CONNECTION_REFUSED|ECONNREFUSED/gi, "本地后端未连接")
+    .replace(/\bLoad failed\b/gi, "真实数据源请求失败")
     .slice(0, 260);
 }
 
@@ -4208,6 +4237,16 @@ function marketIndexRowsComplete(rows = []) {
   if (["ASX", "US"].includes(state.market) && rows.some((row) => row?.proxyUsed)) return false;
   if (!expected.length) return rows.some(isUsableIndexRow);
   return expected.every((index) => rows.some((row) => indexRowMatchesConfig(row, index) && isUsableIndexRow(row)));
+}
+
+function marketIndexStartupHint() {
+  const stateNow = marketState();
+  if (marketIndexRowsComplete(state.marketIndexes)) return "";
+  if (stateNow.canRefresh) return "点击“更新大盘”读取真实指数源。";
+  if (getRuntimeSettings().allowOffHoursFetch) {
+    return "休市保护已开启，启动时优先不消耗外部额度；点击“更新大盘”可手动读取真实免费源/现金点位。";
+  }
+  return "休市中仅使用本地快照；若快照不完整，请打开“休市也允许刷新免 API 源”后手动更新大盘。";
 }
 
 function loadMarketIndexSnapshot() {
@@ -4669,6 +4708,7 @@ async function fetchIndexMarket(index) {
 async function refreshMarketIndexes(force = false) {
   const cached = readJsonStorage(indexSnapshotKey(), null);
   const cachedIsComplete = cached?.market === state.market && marketIndexRowsComplete(cached.rows);
+  state.marketIndexUsedSnapshotFallback = false;
   if (!force && cachedIsComplete && Date.now() - new Date(cached.updatedAt || 0).getTime() < 3 * 60 * 1000) {
     state.marketIndexes = cached.rows;
     state.marketIndexSignal = cached.signal || indexSignalFromRows(cached.rows);
@@ -4730,14 +4770,78 @@ async function refreshMarketIndexes(force = false) {
       ? entry.value
       : {
         ...(config.indexes || [])[index],
-        error: entry.reason?.message || String(entry.reason || "读取失败"),
+        error: normalizeApiErrorMessage(entry.reason?.message || String(entry.reason || "读取失败")),
       }
   ));
+  if (!marketIndexRowsComplete(rows) && cachedIsComplete) {
+    const errors = rows
+      .filter((row) => row?.error)
+      .map((row) => `${row.label || row.symbol}: ${compactDisplayError(row.error)}`)
+      .slice(0, 3)
+      .join(" | ");
+    const fallbackRows = cached.rows.map((row) => ({
+      ...row,
+      warning: [
+        `实时指数刷新失败，继续使用本地完整真实快照${cached.updatedAt ? `（${new Date(cached.updatedAt).toLocaleString()}）` : ""}。${errors}`,
+        row.warning || "",
+      ].filter(Boolean).join(" | "),
+    }));
+    state.marketIndexes = fallbackRows;
+    state.marketIndexSignal = cached.signal || indexSignalFromRows(fallbackRows);
+    state.marketIndexUsedSnapshotFallback = true;
+    renderMarketIndexPanel();
+    return fallbackRows;
+  }
   state.marketIndexes = rows;
   state.marketIndexSignal = indexSignalFromRows(rows);
-  saveMarketIndexSnapshot(rows, state.marketIndexSignal);
+  if (marketIndexRowsComplete(rows)) {
+    saveMarketIndexSnapshot(rows, state.marketIndexSignal);
+  }
   renderMarketIndexPanel();
   return rows;
+}
+
+function shouldHydrateMarketIndexes() {
+  if (marketIndexRowsComplete(state.marketIndexes)) return false;
+  const session = marketState();
+  const runtime = getRuntimeSettings();
+  return session.canRefresh || runtime.allowOffHoursFetch;
+}
+
+async function hydrateMarketIndexesIfNeeded(reason = "大盘快照不完整") {
+  if (state.marketIndexRefreshing || !shouldHydrateMarketIndexes()) return false;
+  const marketAtStart = state.market;
+  state.marketIndexRefreshing = true;
+  setStatus(`${reason}，正在读取${activeMarketConfig().label}真实免费指数源...`);
+  try {
+    await refreshMarketIndexes(true);
+    if (state.market !== marketAtStart) return false;
+    renderCards();
+    renderDetail();
+    setStatus(state.marketIndexUsedSnapshotFallback
+      ? `${activeMarketConfig().label} 实时大盘源失败，已继续使用本地完整真实快照`
+      : `${activeMarketConfig().label} 大盘指数已用真实免费源补齐`);
+    return true;
+  } catch (error) {
+    console.warn("Unable to hydrate market indexes", error);
+    if (state.market === marketAtStart) {
+      loadMarketIndexSnapshot();
+      renderMarketIndexPanel();
+      setStatus(`${activeMarketConfig().label} 大盘指数自动补齐失败：${compactDisplayError(error.message || String(error))}`);
+    }
+    return false;
+  } finally {
+    state.marketIndexRefreshing = false;
+  }
+}
+
+function queueMarketIndexHydration(reason = "大盘快照不完整") {
+  if (!shouldHydrateMarketIndexes()) return;
+  if (state.marketIndexHydrationTimer) clearTimeout(state.marketIndexHydrationTimer);
+  state.marketIndexHydrationTimer = setTimeout(() => {
+    state.marketIndexHydrationTimer = null;
+    hydrateMarketIndexesIfNeeded(reason);
+  }, 80);
 }
 
 async function fetchNews(symbol) {
@@ -6296,17 +6400,18 @@ function renderMarketIndexPanel() {
   const chartRows = displayRows.filter((row) => !row?.error);
   if (!state.marketIndexChartSymbol && chartRows.length) state.marketIndexChartSymbol = chartRows[0].symbol;
   const signal = state.marketIndexSignal || indexSignalFromRows(rows);
-  const sourceNote = state.market === "ASX"
-    ? "澳股只显示现金指数点位；优先用 ASX 官方点位，历史K线源不可用时也不会用 STW/VAS/IOZ ETF 价格替代。"
-    : state.market === "US"
-      ? "美股只显示真实现金指数点位；S&P 500、Nasdaq、Dow Jones 不使用 SPY/QQQ/DIA ETF 代理。"
-      : "A股使用上证、深证、创业板官方指数代码。";
-  target.innerHTML = `
-    <div class="market-signal ${signal.stance}">
-      <strong>${signal.stance === "risk-on" ? "大盘偏强" : signal.stance === "risk-off" ? "大盘偏弱" : "大盘震荡"}</strong>
-      <span>综合分 ${Number(signal.score || 0).toFixed(1)} · 1日 ${formatPct(signal.avg1d || 0)} · 5日 ${formatPct(signal.avg5d || 0)} · 20日 ${formatPct(signal.avg20d || 0)}</span>
-      <small>${sourceNote}</small>
-    </div>
+	  const sourceNote = state.market === "ASX"
+	    ? "澳股只显示现金指数点位；优先用 ASX 官方点位，历史K线源不可用时也不会用 STW/VAS/IOZ ETF 价格替代。"
+	    : state.market === "US"
+	      ? "美股只显示真实现金指数点位；S&P 500、Nasdaq、Dow Jones 不使用 SPY/QQQ/DIA ETF 代理。"
+	      : "A股使用上证、深证、创业板官方指数代码。";
+	  const startupHint = marketIndexStartupHint();
+	  target.innerHTML = `
+	    <div class="market-signal ${signal.stance}">
+	      <strong>${signal.stance === "risk-on" ? "大盘偏强" : signal.stance === "risk-off" ? "大盘偏弱" : "大盘震荡"}</strong>
+	      <span>综合分 ${Number(signal.score || 0).toFixed(1)} · 1日 ${formatPct(signal.avg1d || 0)} · 5日 ${formatPct(signal.avg5d || 0)} · 20日 ${formatPct(signal.avg20d || 0)}</span>
+	      <small>${sourceNote}${startupHint ? ` ${startupHint}` : ""}</small>
+	    </div>
     ${displayRows.map((row) => row.error ? `
       <article class="index-card error">
         <div><strong>${row.label}</strong><span>${row.symbol}</span></div>
@@ -6316,14 +6421,14 @@ function renderMarketIndexPanel() {
       <article class="index-card">
         <div><strong>${row.label}</strong><span>${row.note || row.displaySymbol || row.symbol}${row.displaySymbol && row.displaySymbol !== row.symbol ? ` · 实际 ${row.symbol}` : ""}</span></div>
         <strong class="index-price">${formatIndexValue(row)}</strong>
-        <div class="tag-row">
-          <span class="tag ${tagClass(row.change1d || 0, 0.3, -0.3)}">当日 ${formatPct(row.change1d || 0)}</span>
-          <span class="tag ${row.quoteOnly ? "" : tagClass(row.projectedUpside || 0, 1.2, -0.5)}">预估 ${row.quoteOnly ? "K线不足" : formatPct(row.projectedUpside || 0)}</span>
-          <span class="tag ${row.quoteOnly ? "" : tagClass(row.confidence || 0, 62, 45)}">置信 ${row.quoteOnly ? "暂停" : `${Math.round(row.confidence || 0)}%`}</span>
-        </div>
-        <p>${row.latestDate || ""} · ${row.source || "等待行情源"}${row.warning ? ` · ${row.warning}` : ""}</p>
-      </article>
-    `).join("")}
+	        <div class="tag-row">
+	          <span class="tag ${tagClass(row.change1d || 0, 0.3, -0.3)}">当日 ${formatPct(row.change1d || 0)}</span>
+	          <span class="tag ${row.quoteOnly ? "" : tagClass(row.projectedUpside || 0, 1.2, -0.5)}">预估 ${row.quoteOnly ? "K线不足" : formatPct(row.projectedUpside || 0)}</span>
+	          <span class="tag ${row.quoteOnly ? "" : tagClass(row.confidence || 0, 62, 45)}">置信 ${row.quoteOnly ? "暂停" : `${Math.round(row.confidence || 0)}%`}</span>
+	        </div>
+	        <p>${row.latestDate || ""} · ${row.source || startupHint || "等待行情源"}${row.warning ? ` · ${row.warning}` : ""}</p>
+	      </article>
+	    `).join("")}
     ${marketIndexChartHtml(chartRows)}
   `;
   requestAnimationFrame(() => drawIndexChart(selectedMarketIndexRow()));
@@ -10402,6 +10507,7 @@ async function switchMarket(nextMarket) {
     runRiskAssessment(false);
     loadTradingAudit(false);
   }
+  queueMarketIndexHydration(`${activeMarketConfig().label} 大盘快照不完整`);
   if (state.autoRefreshEnabled) scheduleNextAutoRefresh();
 }
 
@@ -10481,6 +10587,7 @@ function boot() {
   startSydneyClock();
   setWorkspacePage(state.activePage, { silent: true });
   loadResearchConfig();
+  queueMarketIndexHydration("启动时大盘快照不完整");
 
   document.querySelectorAll("[data-page-target]").forEach((button) => {
     button.addEventListener("click", () => setWorkspacePage(button.dataset.pageTarget));
@@ -10551,10 +10658,12 @@ function boot() {
       await refreshMarketIndexes(true);
       renderCards();
       renderDetail();
-      setStatus("大盘指数已更新，并已纳入后续选股偏置");
+      setStatus(state.marketIndexUsedSnapshotFallback
+        ? "实时大盘指数源失败，已继续使用本地完整真实快照"
+        : "大盘指数已更新，并已纳入后续选股偏置");
     } catch (error) {
       console.error(error);
-      setStatus(`大盘指数更新失败：${error.message}`);
+      setStatus(`大盘指数更新失败：${compactDisplayError(error.message)}`);
     }
   });
 
