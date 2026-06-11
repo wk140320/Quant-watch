@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 
@@ -170,8 +170,131 @@ function predictionSamplesPathForMarket(market) {
   return join(snapshotBasePath, `prediction-samples-${safeMarket(market).toLowerCase()}.json`);
 }
 
+function safeCachePart(value) {
+  return String(value || "unknown").toUpperCase().replace(/[^A-Z0-9._-]+/g, "_").slice(0, 80);
+}
+
+function marketHistoryPathFor(market, symbol, interval = "1d") {
+  const key = safeMarket(market);
+  return join(snapshotBasePath, "market-history", key.toLowerCase(), `${safeCachePart(symbol)}-${safeCachePart(interval)}.json`);
+}
+
+function marketHistoryCacheLimit(interval = "1d") {
+  if (interval === "1mo") return 480;
+  if (interval === "1wk") return 1200;
+  return 6500;
+}
+
+async function writeMarketHistoryCache(market, symbol, interval, candles = [], meta = {}) {
+  if (!["1d", "1wk", "1mo"].includes(interval)) return;
+  const rows = sanitizeCandleRows(candles)
+    .filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-marketHistoryCacheLimit(interval));
+  if (rows.length < 2) return;
+  const payload = {
+    market: safeMarket(market),
+    symbol: cleanCode(symbol, market),
+    interval,
+    source: meta.source || "market-history-cache",
+    unit: meta.unit || undefined,
+    closeOnly: Boolean(meta.closeOnly),
+    savedAt: new Date().toISOString(),
+    candles: rows,
+  };
+  const body = JSON.stringify(payload);
+  if (body.length > Number(process.env.MARKET_HISTORY_CACHE_MAX_BYTES || 8_000_000)) return;
+  const path = marketHistoryPathFor(market, symbol, interval);
+  await mkdir(join(snapshotBasePath, "market-history", safeMarket(market).toLowerCase()), { recursive: true });
+  await writeFile(path, body, "utf8");
+}
+
+async function fetchCachedMarketHistory(symbol, range, interval, market = "ASX", marketError = null) {
+  if (!["1d", "1wk", "1mo"].includes(interval)) return null;
+  try {
+    const payload = JSON.parse(await readFile(marketHistoryPathFor(market, symbol, interval), "utf8"));
+    const rows = sanitizeCandleRows(payload.candles)
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .slice(-candleLimitForRange(range));
+    if (rows.length < 2) return null;
+    const latest = latestByDate(rows);
+    const providerError = marketError ? compactProviderErrors([marketError.message || marketError]).join(" | ") : "";
+    return {
+      candles: rows,
+      quote: null,
+      source: `local-history-${payload.source || "cache"}`,
+      unit: payload.unit || (cleanCode(symbol, market).startsWith("^") ? "points" : undefined),
+      closeOnly: Boolean(payload.closeOnly),
+      warning: [`Live providers unavailable; using persisted real market history${payload.savedAt ? ` from ${payload.savedAt}` : ""}.`, providerError].filter(Boolean).join(" "),
+      validation: {
+        ok: true,
+        status: "local_real_history_fallback",
+        degraded: true,
+        primary: latest ? { source: payload.source || "local-history-cache", date: latest.date, close: latest.close, volume: latest.volume } : null,
+        message: "Live providers were unavailable; using locally persisted real market history.",
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
 function researchConfigPathForMarket(market) {
   return join(snapshotBasePath, `research-config-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function modelChangeLogFilePath(market) {
+  return join(snapshotBasePath, "records", `model-change-log-${safeMarket(market).toLowerCase()}.jsonl`);
+}
+
+function modelCalibrationPathForMarket(market) {
+  return join(snapshotBasePath, `model-calibration-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function predictionRecordPathForMarket(market) {
+  return join(snapshotBasePath, "records", `prediction-record-${safeMarket(market).toLowerCase()}.jsonl`);
+}
+
+async function appendModelChangeLogFile(market, event = {}) {
+  await mkdir(join(snapshotBasePath, "records"), { recursive: true });
+  const row = {
+    market: safeMarket(market),
+    event_type: event.event_type || "model-change-log",
+    entity_id: event.entity_id || "",
+    created_at: new Date().toISOString(),
+    payload: event.payload || {},
+  };
+  await appendFile(modelChangeLogFilePath(market), `${JSON.stringify(row)}\n`, "utf8");
+}
+
+async function writeModelCalibrationSnapshot(market, summary = {}) {
+  await mkdir(snapshotBasePath, { recursive: true });
+  const payload = {
+    market: safeMarket(market),
+    savedAt: new Date().toISOString(),
+    total: summary.total || 0,
+    resolved: summary.resolved || 0,
+    pending: summary.pending || 0,
+    hitRate: summary.hitRate ?? summary.directionalHitRate ?? null,
+    strategyHitRate: summary.strategyHitRate ?? summary.buyHitRate ?? null,
+    magnitudeHitRate: summary.magnitudeHitRate ?? null,
+    finalReturnHitRate: summary.finalReturnHitRate ?? null,
+    maxUpsideHitRate: summary.maxUpsideHitRate ?? null,
+    brierScore: summary.brierScore ?? null,
+    adaptive: summary.adaptive || null,
+    improvement: summary.improvement || null,
+    modelStats: summary.modelStats || null,
+    horizonStats: summary.horizonStats || summary.adaptive?.horizonStats || null,
+  };
+  await writeFile(modelCalibrationPathForMarket(market), JSON.stringify(payload, null, 2), "utf8");
+}
+
+async function appendPredictionRecordFile(market, samples = []) {
+  const rows = (Array.isArray(samples) ? samples : []).map((sample) => normalizePredictionSample(sample, market)).filter(Boolean);
+  if (!rows.length) return;
+  await mkdir(join(snapshotBasePath, "records"), { recursive: true });
+  const body = rows.map((row) => JSON.stringify({ recordedAt: new Date().toISOString(), ...row })).join("\n") + "\n";
+  await appendFile(predictionRecordPathForMarket(market), body, "utf8");
 }
 
 async function readServerSnapshotForMarket(market) {
@@ -1197,10 +1320,11 @@ async function readPredictionSamples(market = "ASX") {
 
 async function writePredictionSamples(market, samples) {
   await mkdir(snapshotBasePath, { recursive: true });
-  const limit = Number(process.env.PREDICTION_SAMPLE_LIMIT || 3000);
-  const rows = [...samples]
-    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
-    .slice(0, limit);
+  const configuredLimit = Number(process.env.PREDICTION_SAMPLE_LIMIT || 0);
+  const limit = Number.isFinite(configuredLimit) && configuredLimit > 0 ? Math.floor(configuredLimit) : Infinity;
+  const sorted = [...samples]
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  const rows = Number.isFinite(limit) ? sorted.slice(0, limit) : sorted;
   await writeFile(predictionSamplesPathForMarket(market), JSON.stringify({ market: safeMarket(market), updatedAt: new Date().toISOString(), samples: rows }), "utf8");
 }
 
@@ -1310,13 +1434,21 @@ function evaluatePredictionOutcome(sample, candles = [], live = {}) {
   const enoughHorizon = !sameDayLiveOnly && future.length >= horizonDays;
   const resolved = hitTarget || hitStop || enoughHorizon;
   const last = future[Math.min(future.length, horizonDays) - 1] || future.at(-1);
+  const observedDays = sameDayLiveOnly ? 0.5 : future.length;
+  const forwardReturnPct = ((Number(last.close) - entry) / entry) * 100;
+  const maxUpsidePct = ((maxHigh - entry) / entry) * 100;
+  const maxDrawdownPct = ((minLow - entry) / entry) * 100;
+  const adverseReadyDays = Math.max(3, Math.ceil(horizonDays * 0.25));
+  const adverseCandidate = sampleWasPositive(sample) && (maxDrawdownPct <= -1.2 || forwardReturnPct <= -1.0);
   const interim = {
-    observedDays: sameDayLiveOnly ? 0.5 : future.length,
-    forwardReturnPct: ((Number(last.close) - entry) / entry) * 100,
-    maxUpsidePct: ((maxHigh - entry) / entry) * 100,
-    maxDrawdownPct: ((minLow - entry) / entry) * 100,
-    targetProgress: Number(sample.targetUpside || 5) > 0 ? (((maxHigh - entry) / entry) * 100) / Number(sample.targetUpside || 5) : 0,
-    adverse: sampleWasPositive(sample) && (((minLow - entry) / entry) * 100 <= -0.8 || ((Number(last.close) - entry) / entry) * 100 <= -0.6),
+    observedDays,
+    forwardReturnPct,
+    maxUpsidePct,
+    maxDrawdownPct,
+    targetProgress: Number(sample.targetUpside || 5) > 0 ? maxUpsidePct / Number(sample.targetUpside || 5) : 0,
+    adverse: adverseCandidate && observedDays >= adverseReadyDays,
+    earlyAdverseWatch: adverseCandidate && observedDays < adverseReadyDays,
+    adverseReadyDays,
   };
   if (!resolved) return { ...sample, interim, lastEvaluatedAt: new Date().toISOString() };
   const targetWins = hitTarget && (!hitStop || firstEvent === "target");
@@ -2985,7 +3117,6 @@ function satoshiMacroSeriesForIndex(code, market = "ASX") {
   const key = safeMarket(market);
   const clean = cleanCode(code, key);
   if (key === "ASX" && clean === "^AXJO") return { key: "asx200", label: "S&P/ASX 200" };
-  if (key === "US" && ["^GSPC", "^SPX"].includes(clean)) return { key: "sp500", label: "S&P 500" };
   return null;
 }
 
@@ -3022,7 +3153,7 @@ async function fetchSatoshiMacroIndexCloseCandles(code, range, interval, market 
   const series = satoshiMacroSeriesForIndex(code, market);
   if (!series) throw new Error(`SatoshiMacro has no close-only cash index series for ${code}.`);
   const payload = await fetchJson(SATOSHIMACRO_YAHOO_MARKETS_URL, 8000, {
-    referer: `https://satoshimacro.com/tools/crypto/markets/${series.key === "asx200" ? "asx-200" : "sp-500"}/`,
+    referer: "https://satoshimacro.com/tools/crypto/markets/asx-200/",
   });
   const candles = satoshiMacroCloseRows(payload, series.key, range);
   if (!candles.length) throw new Error(`SatoshiMacro returned no ${series.label} close rows.`);
@@ -3720,6 +3851,67 @@ function pctChange(current, previous) {
   return ((value - prev) / Math.abs(prev)) * 100;
 }
 
+function sanitizeIndexQuoteChange(symbol, market, candles = [], quote = null) {
+  if (!quote || quote.unavailable || !String(symbol || "").startsWith("^")) {
+    return { quote, warning: "" };
+  }
+  const rows = sanitizeCandleRows(candles);
+  if (rows.length < 2) return { quote, warning: "" };
+  const latest = rows.at(-1);
+  const previous = rows.at(-2);
+  const previousClose = Number(previous.close);
+  const latestClose = Number(latest.close);
+  if (!Number.isFinite(previousClose) || previousClose <= 0 || !Number.isFinite(latestClose) || latestClose <= 0) {
+    return { quote, warning: "" };
+  }
+  const candleChange = latestClose - previousClose;
+  const candleChangePercent = pctChange(latestClose, previousClose);
+  const quoteChangePercent = Number(quote.changePercent);
+  const quotePreviousClose = Number(quote.previousClose);
+  const previousCloseDiff = Number.isFinite(quotePreviousClose) && quotePreviousClose > 0
+    ? Math.abs(quotePreviousClose - previousClose) / previousClose * 100
+    : null;
+  const changePercentDiff = Number.isFinite(quoteChangePercent)
+    ? Math.abs(quoteChangePercent - candleChangePercent)
+    : null;
+  const quoteDate = String(quote.date || "").slice(0, 10);
+  const latestDate = String(latest.date || "").slice(0, 10);
+  const invalidChange = Number.isFinite(quoteChangePercent) && (
+    Math.abs(quoteChangePercent) > 8
+    || (quoteDate && latestDate && quoteDate !== latestDate)
+    || (previousCloseDiff != null && previousCloseDiff > 1.5)
+    || (changePercentDiff != null && changePercentDiff > 0.08)
+  );
+  const base = {
+    ...quote,
+    candleChange: Number(candleChange.toFixed(4)),
+    candleChangePercent: Number(candleChangePercent.toFixed(4)),
+  };
+  if (!invalidChange) return { quote: base, warning: "" };
+  const reason = previousCloseDiff != null && previousCloseDiff > 1.5
+    ? `provider previousClose differs from real candle previous close by ${previousCloseDiff.toFixed(2)}%`
+    : changePercentDiff != null && changePercentDiff > 0.08
+      ? `provider changePercent differs from real candle change by ${changePercentDiff.toFixed(2)} percentage points`
+    : quoteDate && latestDate && quoteDate !== latestDate
+      ? `provider quote date ${quoteDate} does not match latest candle date ${latestDate}`
+      : `provider quote changePercent ${quoteChangePercent.toFixed(4)}% is outside index sanity bounds`;
+  return {
+    quote: {
+      ...base,
+      rawPreviousClose: Number.isFinite(quotePreviousClose) ? quotePreviousClose : null,
+      rawChange: Number.isFinite(Number(quote.change)) ? Number(quote.change) : null,
+      rawChangePercent: Number.isFinite(quoteChangePercent) ? quoteChangePercent : null,
+      previousClose: Number(previousClose.toFixed(4)),
+      change: Number(candleChange.toFixed(4)),
+      changePercent: Number(candleChangePercent.toFixed(4)),
+      invalidChangePercent: true,
+      changeSource: "real-candles",
+      note: [quote.note, reason].filter(Boolean).join(" | "),
+    },
+    warning: `Index quote changePercent rejected: ${reason}; using adjacent real index candles for daily change.`,
+  };
+}
+
 const FACTOR_LAYER_KEYS = [
   "announcements",
   "shortInterest",
@@ -3949,9 +4141,20 @@ function singleSourceValidation(source, errors = []) {
 
 function compactProviderErrors(errors = []) {
   return errors.map((error) => String(error || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/<[^|]{0,220}(?=\s*\||$)/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
     .replace(/Thank you for using Alpha Vantage![\s\S]*$/i, "Alpha Vantage rate/daily limit; fallback provider used.")
     .replace(/Edge:\s*Too Many Requests|HTTP 429[\s\S]*$/i, "Yahoo Finance rate limit; fallback provider used.")
     .replace(/HTTP 403[\s\S]*$/i, "Provider edge/permission block; fallback provider used.")
+    .replace(/HTTP 404:\s*Stooq\s*/i, "Stooq HTTP 404/no rows")
+    .replace(/HTTP 404:\s*$/i, "HTTP 404/no rows")
+    .replace(/Stooq[\s\S]*?(?:captcha|verify your browser|__verify)[\s\S]*$/i, "Stooq requires browser verification/API key; fallback provider used.")
     .replace(/You may subscribe[\s\S]*$/i, "Provider plan/rate limit; fallback provider used.")
     .slice(0, 180));
 }
@@ -4777,7 +4980,7 @@ function providerCandidates(market, code, range, interval) {
     return [
       ["yahoo-asx-index", () => fetchYahooMarketCandles(code, range, interval, key)],
       ["stooq-asx-index", () => fetchStooqIndexCandles(code, range, interval, key)],
-      ["satoshimacro-asx-index", () => fetchSatoshiMacroIndexCloseCandles(code, range, interval, key)],
+      ...(satoshiMacroSeriesForIndex(code, key) ? [["satoshimacro-asx-index", () => fetchSatoshiMacroIndexCloseCandles(code, range, interval, key)]] : []),
       ["eodhd-asx-index", () => fetchEodhdCandles(code, range, interval, key)],
       ["twelvedata-asx-index", () => fetchTwelveDataIndexCandles(code, range, interval, key)],
     ];
@@ -4787,7 +4990,6 @@ function providerCandidates(market, code, range, interval) {
       ["yahoo-us-index", () => fetchYahooMarketCandles(code, range, interval, key)],
       ["nasdaq-us-index", () => fetchNasdaqUsIndexCandles(code, range, interval)],
       ["stooq-us-index", () => fetchStooqIndexCandles(code, range, interval, key)],
-      ["satoshimacro-us-index", () => fetchSatoshiMacroIndexCloseCandles(code, range, interval, key)],
       ["finnhub-us-index", () => fetchFinnhubCandles(code, range, interval, key)],
       ["tiingo-us-index", () => fetchTiingoCandles(code, range, interval, key)],
       ["twelvedata-us-index", () => fetchTwelveDataIndexCandles(code, range, interval, key)],
@@ -4959,6 +5161,7 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
         return remember(degradedSingleSourcePayload(closeOnlySource, [conflictError]));
       }
       try {
+        if (!satoshiMacroSeriesForIndex(code, key)) throw new Error(`No SatoshiMacro close-only fallback for ${code}.`);
         const closeOnlyFallback = await fetchSatoshiMacroIndexCloseCandles(code, range, interval, key);
         return remember(degradedSingleSourcePayload(closeOnlyFallback, [conflictError]));
       } catch (fallbackError) {
@@ -8872,7 +9075,11 @@ async function handleApi(req, res, url) {
       let body = "";
       for await (const chunk of req) body += chunk;
       const payload = JSON.parse(body || "{}");
-      sendJson(res, 200, await runPythonQuantCore("event-append", { ...payload, market }));
+      const result = await runPythonQuantCore("event-append", { ...payload, market });
+      if (/^model-change-log/.test(String(payload.event_type || ""))) {
+        await appendModelChangeLogFile(market, payload).catch(() => null);
+      }
+      sendJson(res, 200, result);
       return;
     }
   }
@@ -8910,16 +9117,19 @@ async function handleApi(req, res, url) {
       let body = "";
       for await (const chunk of req) body += chunk;
       const payload = JSON.parse(body || "{}");
+      await appendPredictionRecordFile(market, Array.isArray(payload.samples) ? payload.samples : []).catch(() => null);
       const summary = await updatePredictionSamples(market, Array.isArray(payload.samples) ? payload.samples : [], {
         activeSymbols: payload.activeSymbols,
         cancelSymbols: payload.cancelSymbols,
       });
+      await writeModelCalibrationSnapshot(market, summary).catch(() => null);
       sendJson(res, 200, summary);
       return;
     }
     if (req.method === "DELETE") {
       const symbols = url.searchParams.get("symbols") || url.searchParams.get("symbol") || "";
       const summary = await updatePredictionSamples(market, [], { cancelSymbols: symbols.split(",") });
+      await writeModelCalibrationSnapshot(market, summary).catch(() => null);
       sendJson(res, 200, summary);
       return;
     }
@@ -8978,6 +9188,9 @@ async function handleApi(req, res, url) {
     if (!marketData || !marketData.candles?.length) {
       marketData = await fetchSnapshotMarketCandles(symbol, range, interval, market, marketError);
     }
+    if (!marketData || !marketData.candles?.length) {
+      marketData = await fetchCachedMarketHistory(symbol, range, interval, market, marketError);
+    }
     if ((!marketData || !marketData.candles?.length) && isCashIndex) {
       const quoteFallback = await indexQuotePromise;
       const quoteCandles = quoteToCandles(quoteFallback);
@@ -9016,6 +9229,9 @@ async function handleApi(req, res, url) {
       realtimeQuote = { unavailable: true, warning: error.message || String(error) };
     }
     const candles = mergeQuoteIntoCandles(marketData.candles, realtimeQuote);
+    const quoteCheck = sanitizeIndexQuoteChange(symbol, market, candles, realtimeQuote);
+    realtimeQuote = quoteCheck.quote;
+    writeMarketHistoryCache(market, symbol, interval, candles, marketData).catch(() => {});
     const quoteWarning = realtimeQuote?.unavailable && realtimeQuote.warning ? `Realtime quote unavailable. ${realtimeQuote.warning}` : "";
     const payload = {
       symbol,
@@ -9024,7 +9240,7 @@ async function handleApi(req, res, url) {
       candles,
       quote: realtimeQuote?.unavailable ? null : realtimeQuote,
       quoteWarning,
-      warning: [marketData.warning, quoteWarning].filter(Boolean).join(" | "),
+      warning: [marketData.warning, quoteWarning, quoteCheck.warning].filter(Boolean).join(" | "),
     };
     marketResponseCache.set(cacheKey, { time: Date.now(), value: payload });
     if (marketResponseCache.size > 120) marketResponseCache.delete(marketResponseCache.keys().next().value);

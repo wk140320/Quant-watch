@@ -419,7 +419,7 @@ function snapshotTimeKey(market = state.market) {
 }
 
 function indexSnapshotKey(market = state.market) {
-  return `marketIndexSnapshot:${safeMarket(market)}`;
+  return `marketIndexSnapshot:v2:${safeMarket(market)}`;
 }
 
 function setStatus(message) {
@@ -880,35 +880,50 @@ function parsePortfolio(csv) {
   const lines = String(csv || "").trim().split(/\r?\n/).filter(Boolean);
   if (!lines.length) return [];
   const hasHeader = /symbol|code|股票|代码/i.test(lines[0]);
+  const headers = hasHeader ? lines[0].split(/,|\t/).map((item) => item.trim().toLowerCase()) : [];
+  const indexFor = (patterns, fallback) => {
+    const index = headers.findIndex((header) => patterns.some((pattern) => pattern.test(header)));
+    return index >= 0 ? index : fallback;
+  };
+  const symbolIndex = indexFor([/symbol|ticker|code|代码|证券代码|股票/], 0);
+  const qtyIndex = indexFor([/qty|quantity|shares|units|数量|持仓|可用/], 1);
+  const avgIndex = indexFor([/avg|average|cost|price|成本|均价|买入价|持仓成本/], 2);
+  const dateIndex = indexFor([/date|entry|buy|time|日期|买入日|建仓/], 3);
   const rows = hasHeader ? lines.slice(1) : lines;
+  const numberValue = (value) => asNumber(String(value ?? "").replace(/[,$，\s]|AUD|USD|CNY|RMB|人民币|澳元|美元|元/gi, ""), 0);
   return rows.map((line) => {
-    const parts = line.split(/,|\t|\s{2,}/).map((item) => item.trim()).filter(Boolean);
-    const [symbol, qty, avgPrice, entryDate] = parts;
+    const parts = line.includes(",") || line.includes("\t")
+      ? line.split(/,|\t/).map((item) => item.trim())
+      : line.split(/\s{2,}|\s+/).map((item) => item.trim()).filter(Boolean);
+    const symbol = parts[symbolIndex] ?? parts[0];
+    const qty = parts[qtyIndex] ?? parts[1];
+    const avgPrice = parts[avgIndex] ?? parts[2];
+    const entryDate = parts[dateIndex] ?? parts[3];
     return {
       symbol: normalizeSymbolForMarket(symbol, state.market),
       market: state.market,
-      qty: asNumber(qty),
-      avgPrice: asNumber(avgPrice),
+      qty: numberValue(qty),
+      avgPrice: numberValue(avgPrice),
       entryDate: /^\d{4}-\d{2}-\d{2}$/.test(entryDate || "") ? entryDate : todayIso(),
       source: "csv",
       marketLocked: true,
       explicitMarket: true,
       addedAt: new Date().toISOString(),
     };
-  }).filter((row) => row.symbol && row.qty > 0);
+  }).filter((row) => row.symbol && row.qty > 0 && row.avgPrice > 0);
 }
 
 function parsePortfolioText(text) {
   const holdings = parsePortfolio(text);
   if (holdings.length) return holdings;
   const rows = [];
-  const pattern = /\b([A-Z]{1,6}(?:\.[A-Z])?|\d{6})(?:\.A[UX]|\.SS|\.SH|\.SZ|\.SHH|\.SHZ|\.SHE)?\b[^\d]{0,20}([\d,]+(?:\.\d+)?)\D{1,20}(\d+(?:\.\d+)?)/g;
+  const pattern = /\b([A-Z]{1,6}(?:\.[A-Z])?|\d{6})(?:\.A[UX]|\.SS|\.SH|\.SZ|\.SHH|\.SHZ|\.SHE)?\b[^\d]{0,40}([\d,，,]+(?:\.\d+)?)\D{1,40}(?:AUD|USD|CNY|RMB|\$|A\$|￥|均价|成本|avg|average|price)?\s*(\d+(?:\.\d+)?)/gi;
   let match;
-  while ((match = pattern.exec(String(text || "").toUpperCase()))) {
+  while ((match = pattern.exec(String(text || "")))) {
     rows.push({
-      symbol: normalizeSymbolForMarket(match[1], state.market),
+      symbol: normalizeSymbolForMarket(String(match[1]).toUpperCase(), state.market),
       market: state.market,
-      qty: asNumber(match[2].replace(/,/g, "")),
+      qty: asNumber(match[2].replace(/,|，/g, "")),
       avgPrice: asNumber(match[3]),
       entryDate: todayIso(),
       source: "text",
@@ -3889,11 +3904,21 @@ async function submitPaperOrderIntent() {
 
 function compactDisplayError(message) {
   return String(message || "读取失败")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/<[^|]{0,220}(?=\s*\||$)/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
     .replace(/HTTP 403[\s\S]*?(?=\||$)/gi, "Provider 403/权限限制")
+    .replace(/HTTP 404:\s*Stooq\s*/gi, "Stooq HTTP 404/no rows")
     .replace(/Thank you for using Alpha Vantage![\s\S]*?(?=\||$)/gi, "Alpha Vantage 免费额度/端点限制")
     .replace(/You exceeded your daily API requests limit[\s\S]*?(?=\||$)/gi, "EODHD 日额度已用尽")
     .replace(/This operation was aborted/g, "请求超时")
     .replace(/Stooq CSV download requires captcha\/API key/g, "Stooq 需要 API key/captcha")
+    .replace(/Stooq[\s\S]*?(captcha|verify your browser|__verify)[\s\S]*$/gi, "Stooq 需要浏览器验证/API key")
     .slice(0, 260);
 }
 
@@ -3906,6 +3931,7 @@ function actionLabel(action) {
     AVOID_OR_REDUCE: "规避/减仓",
     STRONG_AVOID: "强风险规避",
     CRITICAL_SELL: "最严卖出警报",
+    BUY_ADD: "加仓记录",
     SELL_REDUCE: "减仓记录",
     SELL_EXIT: "清仓记录",
   }[action] || action || "待分析";
@@ -3965,14 +3991,38 @@ function factorTotal(factors) {
     .reduce((sum, key) => sum + Number(factors[key]?.available === false ? 0 : factors[key]?.score || 0), 0);
 }
 
+function factorCoverageForItem(item) {
+  const signal = item?.analysis?.factorSignal || item?.analysis?.ensemble;
+  const liveRows = factorRows(item?.factors).filter(([, factor]) => factor && factor.available !== false);
+  const checked = Number(item?.analysis?.factorSignal?.checked || item?.analysis?.factorSignal?.enabledFactors?.length || 0);
+  if (checked > 0 || liveRows.length) return checked || liveRows.length;
+  const technicals = normalizeTechnicals(item?.technicals);
+  const hasTechnicals = Number(technicals.close) > 0 && [technicals.trendScore, technicals.momentumScore, technicals.riskScore].some((value) => Number.isFinite(Number(value)));
+  return hasTechnicals || signal?.configuredFactorScore != null ? 1 : 0;
+}
+
+function technicalFactorProxy(item) {
+  const technicals = normalizeTechnicals(item?.technicals);
+  if (!technicals.close) return NaN;
+  const trend = clamp((technicals.trendScore - 50) * 0.18, -9, 9);
+  const momentum = clamp((technicals.momentumScore - 50) * 0.14, -7, 7);
+  const risk = clamp((technicals.riskScore - 50) * 0.1, -5, 5);
+  const volume = clamp((technicals.volumeRatio - 1) * 3.2, -4, 5);
+  const macd = clamp(technicals.macdHistogram * 12, -4, 4);
+  const analog = clamp((Number(item?.analog?.strategyHitProbability ?? item?.analog?.targetHitRate ?? 50) - 50) * 0.08, -4, 4);
+  return clamp(trend + momentum + risk + volume + macd + analog, -25, 25);
+}
+
 function factorScoreForItem(item) {
   const analysis = normalizeAnalysis(item?.analysis);
-  const configured = Number(
-    analysis.factorSignal?.score
-    ?? analysis.featureScores?.factor
-    ?? analysis.ensemble?.configuredFactorScore
-  );
-  return Number.isFinite(configured) ? configured : factorTotal(item?.factors);
+  const liveTotal = factorTotal(item?.factors);
+  const signalScore = Number(analysis.factorSignal?.score);
+  if (Number.isFinite(signalScore) && (Math.abs(signalScore) > 0.001 || Number(analysis.factorSignal?.checked || 0) > 0)) return signalScore;
+  const configured = Number(analysis.featureScores?.factor ?? analysis.ensemble?.configuredFactorScore);
+  if (Number.isFinite(configured) && Math.abs(configured) > 0.001) return configured;
+  if (Number.isFinite(liveTotal) && Math.abs(liveTotal) > 0.001) return clamp(liveTotal, -25, 25);
+  const proxy = technicalFactorProxy(item);
+  return Number.isFinite(proxy) ? proxy : 0;
 }
 
 function factorRows(factors) {
@@ -4100,6 +4150,45 @@ function indexSignalFromRows(rows = []) {
     stance: score > 3 ? "risk-on" : score < -3 ? "risk-off" : "mixed",
     confidenceBias: clamp(score * 0.35, -4, 4),
     projectedBias: clamp(score * 0.08, -0.9, 0.9),
+  };
+}
+
+function reliableIndexChangePercent(marketPayload = {}, candles = []) {
+  const rows = normalizeCandles(candles);
+  const latest = rows.at(-1) || {};
+  const previous = rows.at(-2) || {};
+  const candleChange = pctChange(latest.close, previous.close);
+  const quote = marketPayload.quote || {};
+  const quoteChange = Number(quote.changePercent);
+  const quotePrev = Number(quote.previousClose);
+  const previousCloseDiff = Number.isFinite(quotePrev) && Number(previous.close) > 0
+    ? Math.abs(quotePrev - Number(previous.close)) / Number(previous.close) * 100
+    : null;
+  const quoteDate = String(quote.date || "").slice(0, 10);
+  const latestDate = String(latest.date || "").slice(0, 10);
+  const quotePlausible = Number.isFinite(quoteChange)
+    && Math.abs(quoteChange) <= 8
+    && (!latestDate || !quoteDate || quoteDate === latestDate)
+    && (previousCloseDiff == null || previousCloseDiff <= 1.5);
+  if (quotePlausible) {
+    return {
+      value: quoteChange,
+      source: "quote",
+      rejected: false,
+      rejectedValue: null,
+      reason: "",
+    };
+  }
+  return {
+    value: candleChange,
+    source: "candles",
+    rejected: Number.isFinite(quoteChange),
+    rejectedValue: quoteChange,
+    reason: Number.isFinite(quoteChange)
+      ? previousCloseDiff != null && previousCloseDiff > 1.5
+        ? `quote previousClose 与历史前收盘差异 ${previousCloseDiff.toFixed(2)}%`
+        : `quote 涨跌幅异常 ${formatPct(quoteChange)}`
+      : "",
   };
 }
 
@@ -4602,9 +4691,8 @@ async function refreshMarketIndexes(force = false) {
       : technicals;
     const analog = quoteOnly ? { count: 0, winRate: 0, averageForwardReturn: 0 } : computeHistoricalAnalog(candles, 15, getStrategy().horizonDays);
     const latest = candles.at(-1) || {};
-    const previous = candles.at(-2) || {};
-    const quoteChange = Number(market.quote?.changePercent);
-    const change1d = Number.isFinite(quoteChange) ? quoteChange : pctChange(latest.close, previous.close);
+    const changeModel = reliableIndexChangePercent(market, candles);
+    const change1d = changeModel.value;
     const projectedUpside = quoteOnly ? 0 : clamp(technicals.projectedUpside * 0.72 + Number(analog.averageForwardReturn || 0) * 0.28, -8, 10);
     const confidence = quoteOnly ? 0 : clamp((technicals.trendScore + technicals.momentumScore + technicals.riskScore) / 3 + (analog.winRate ? (analog.winRate - 50) * 0.12 : 0), 0, 95);
     return {
@@ -4622,6 +4710,7 @@ async function refreshMarketIndexes(force = false) {
         indexMarket.fallbackUsed ? `${index.symbol} 暂不可用，已使用 ${indexMarket.usedSymbol} 真实代理` : "",
         quoteOnly ? "当前仅显示真实现金指数点位；历史K线源暂不可用，指数趋势预测已暂停。" : "",
         closeOnly ? "当前指数历史来自无 API 公开收盘快照；趋势/MACD仅基于收盘价，未推断开高低和成交量。" : "",
+        changeModel.rejected ? `指数 quote 百分比已拒绝：${changeModel.reason}，改用相邻真实点位计算当日涨跌。` : "",
         market.warning || "",
       ].filter(Boolean).join(" | "),
       candles: candles.slice(closeOnly ? -1300 : -260),
@@ -4716,9 +4805,45 @@ async function fetchFactors(symbol) {
       10 * 60 * 1000
     );
     return payload.factors || null;
-  } catch {
+  } catch (error) {
+    console.warn(`Factor layer unavailable for ${symbol}`, error);
     return null;
   }
+}
+
+function proxyFactorsForItem(item, reason = "factor-provider-unavailable") {
+  const technicals = normalizeTechnicals(item?.technicals);
+  const analog = item?.analog || {};
+  const techScore = technicalFactorProxy(item);
+  const trendScore = clamp((technicals.trendScore - 50) * 0.22 + (technicals.momentumScore - 50) * 0.18, -18, 18);
+  const liquidityScore = clamp((technicals.volumeRatio - 1) * 6 + (technicals.riskScore - 50) * 0.05, -12, 12);
+  const historyScore = clamp((Number(analog.strategyHitProbability ?? analog.targetHitRate ?? analog.winRate ?? 50) - 50) * 0.16, -12, 12);
+  return {
+    marketRegime: {
+      source: "technical-proxy",
+      score: Number(trendScore.toFixed(2)),
+      thesis: [`趋势/动量代理：trend ${technicals.trendScore.toFixed(0)}，momentum ${technicals.momentumScore.toFixed(0)}。`],
+      values: { proxy: true, reason },
+    },
+    liquidity: {
+      source: "technical-proxy",
+      score: Number(liquidityScore.toFixed(2)),
+      thesis: [`流动性代理：量比 ${technicals.volumeRatio.toFixed(2)}，风险分 ${technicals.riskScore.toFixed(0)}。`],
+      values: { proxy: true, reason },
+    },
+    calibration: {
+      source: "history-proxy",
+      score: Number(historyScore.toFixed(2)),
+      thesis: [`历史/模型代理：策略达标样本 ${analog.count || 0}，命中 ${formatPct(analog.strategyHitProbability ?? analog.targetHitRate ?? analog.winRate ?? 0)}。`],
+      values: { proxy: true, reason },
+    },
+    relativeStrength: {
+      source: "technical-proxy",
+      score: Number(techScore.toFixed(2)),
+      thesis: [`综合技术代理因子 ${techScore.toFixed(1)}；真实因子源不可用时临时参与排序。`],
+      values: { proxy: true, reason },
+    },
+  };
 }
 
 async function fetchAccuracySummary(force = false) {
@@ -5206,7 +5331,7 @@ async function prepareSymbol(symbol, options = {}) {
   const analog = computeHistoricalAnalog(candles, getStrategy().horizonDays, getStrategy().horizonDays);
   const factorKey = `factors:${state.market}:${symbol}:${getStrategy().horizonDays}:${getStrategy().targetUpside}`;
   const timeouts = signalTimeouts(options);
-  const [news, fundamentals, xPosts, youtubeItems, factors] = includeSignals
+  const [news, fundamentals, xPosts, youtubeItems, fetchedFactors] = includeSignals
     ? await Promise.all([
       optionalWithin(fetchNews(symbol), timeouts.news, cachedNewsValue(symbol)),
       optionalWithin(fetchFundamentals(symbol), timeouts.fundamentals, cachedSignalValue(`fundamentals:${state.market}:${symbol}`, { fundamentals: null }).fundamentals || null),
@@ -5221,6 +5346,8 @@ async function prepareSymbol(symbol, options = {}) {
       cachedSignalValue(`youtube:${state.market}:${symbol}`, { videos: [] }).videos || [],
       cachedSignalValue(factorKey, { factors: null }).factors || null,
     ];
+  const baseItemForFactors = { symbol, technicals, analog };
+  const factors = fetchedFactors || proxyFactorsForItem(baseItemForFactors, includeSignals ? "provider-timeout-or-error" : "cached-provider-empty");
   const input = buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, youtubeItems, news, factors, market);
   return {
     symbol,
@@ -5707,21 +5834,98 @@ function renderPortfolioTable() {
           <span>${formatMoney(close)}</span>
           <span class="${pnlPct >= 0 ? "good-text" : "danger-text"}">${formatPct(pnlPct)}</span>
           <span>${holdingDays(holding)} 天</span>
-          <button class="secondary mini-btn" type="button" data-reduce-holding="${holding.symbol}">减仓</button>
+          <span class="holding-actions">
+            <button class="secondary mini-btn" type="button" data-add-holding="${holding.symbol}">加仓</button>
+            <button class="danger-soft mini-btn" type="button" data-reduce-holding="${holding.symbol}">减仓</button>
+          </span>
         </div>
       `;
     }).join("")}
   `;
-  target.querySelectorAll("[data-reduce-holding]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const symbol = button.dataset.reduceHolding;
-      state.selected = symbol;
-      if (!state.analyses.has(symbol)) {
-        setStatus(`${symbol} 已选中，请刷新后在详情里设置减仓数量和成交价`);
-      }
-      renderDetail();
-    });
+  target.querySelectorAll("[data-add-holding]").forEach((button) => {
+    button.addEventListener("click", () => promptHoldingAdjustment(button.dataset.addHolding, "BUY"));
   });
+  target.querySelectorAll("[data-reduce-holding]").forEach((button) => {
+    button.addEventListener("click", () => promptHoldingAdjustment(button.dataset.reduceHolding, "SELL"));
+  });
+}
+
+function promptHoldingAdjustment(symbol, side = "BUY") {
+  const holding = findHolding(symbol);
+  if (!holding) {
+    setStatus(`${symbol} 当前没有持仓`);
+    return;
+  }
+  const item = state.analyses.get(holding.symbol);
+  const defaultPrice = Number(item?.technicals?.close || holding.avgPrice || 0);
+  const qtyPrompt = side === "SELL" ? `卖出数量，当前最多 ${holding.qty}` : "买入数量";
+  const rawQty = window.prompt(qtyPrompt, side === "SELL" ? String(Math.max(1, Math.floor(holding.qty * 0.5))) : "1");
+  if (rawQty == null) return;
+  const qty = side === "SELL" ? Math.min(holding.qty, asNumber(rawQty, 0)) : asNumber(rawQty, 0);
+  const rawPrice = window.prompt(side === "SELL" ? "卖出成交价" : "买入成交价", defaultPrice ? defaultPrice.toFixed(2) : "");
+  if (rawPrice == null) return;
+  const price = asNumber(rawPrice, 0);
+  if (qty <= 0 || price <= 0) {
+    setStatus("请输入有效数量和成交价");
+    return;
+  }
+  if (side === "SELL") applyHoldingSell(holding, qty, price, "portfolio-table");
+  else applyHoldingBuy(holding.symbol, qty, price, "portfolio-table");
+}
+
+function applyHoldingBuy(symbol, qty, price, source = "manual-buy") {
+  const existing = findHolding(symbol);
+  if (existing) {
+    const totalQty = existing.qty + qty;
+    upsertHolding({
+      ...existing,
+      qty: totalQty,
+      avgPrice: ((existing.avgPrice * existing.qty) + (price * qty)) / totalQty,
+      entryDate: existing.entryDate,
+      source: `${existing.source || "manual"}+${source}`,
+    });
+  } else {
+    upsertHolding({ symbol, qty, avgPrice: price, entryDate: todayIso(), source });
+  }
+  recordTradeHistory({ symbol: normalizeSymbol(symbol), action: "BUY_ADD", price, expectedPrice: price, qty });
+  evaluateAlerts();
+  renderPortfolioSummary();
+  renderCards();
+  renderDetail();
+  setStatus(`${normalizeSymbol(symbol)} 已加仓 ${qty} 股，成交价 ${formatMoney(price)}`);
+}
+
+function applyHoldingSell(holding, qty, price, source = "manual-sell") {
+  const sellQty = Math.min(holding.qty, Math.max(0, qty));
+  if (sellQty <= 0 || price <= 0) return;
+  const realizedPnl = (price - holding.avgPrice) * sellQty;
+  const remainingQty = Number((holding.qty - sellQty).toFixed(6));
+  const baseCapital = asNumber($("totalCapital").value, 0);
+  $("totalCapital").value = Math.max(0, baseCapital + realizedPnl).toFixed(2);
+  if (remainingQty <= 0) {
+    state.portfolio = state.portfolio.filter((row) => !(row.symbol === holding.symbol && row.market === holding.market));
+  } else {
+    state.portfolio = state.portfolio.map((row) => (
+      row.symbol === holding.symbol && row.market === holding.market
+        ? { ...row, qty: remainingQty, avgPrice: holding.avgPrice, source: `${row.source || "manual"}+${source}` }
+        : row
+    ));
+  }
+  savePortfolio();
+  recordTradeHistory({
+    market: holding.market,
+    symbol: holding.symbol,
+    action: remainingQty <= 0 ? "SELL_EXIT" : "SELL_REDUCE",
+    price,
+    expectedPrice: price,
+    qty: sellQty,
+    realizedPnl,
+  });
+  evaluateAlerts();
+  renderPortfolioSummary();
+  renderCards();
+  renderDetail();
+  setStatus(`${holding.symbol} 已减仓 ${sellQty} 股，成交价 ${formatMoney(price)}，剩余 ${Math.max(0, remainingQty)} 股`);
 }
 
 function renderAllocationAdvice() {
@@ -8677,30 +8881,8 @@ function buyFromSignal(item) {
     setStatus("请输入有效买入数量和均价");
     return;
   }
-  const existing = findHolding(item.symbol);
-  if (existing) {
-    const totalQty = existing.qty + qty;
-    upsertHolding({
-      ...existing,
-      qty: totalQty,
-      avgPrice: ((existing.avgPrice * existing.qty) + (price * qty)) / totalQty,
-      entryDate: existing.entryDate,
-      source: "app-buy",
-    });
-  } else {
-    upsertHolding({
-      symbol: item.symbol,
-      qty,
-      avgPrice: price,
-      entryDate: todayIso(),
-      source: "app-buy",
-    });
-  }
+  applyHoldingBuy(item.symbol, qty, price, "app-buy");
   saveDecision(item);
-  evaluateAlerts();
-  renderPortfolioSummary();
-  renderCards();
-  renderDetail();
   notifyUser(`${item.symbol} 已加入持仓`, `${MARKET_CONFIG[state.market].label} · ${qty} 股，均价 ${formatMoney(price)}。`, `buy-confirm:${Date.now()}:${state.market}:${item.symbol}`);
   setStatus(`${item.symbol} 已写入持仓：${qty} 股，均价 ${formatMoney(price)}`);
 }
@@ -8733,33 +8915,9 @@ function reduceFromSignal(item) {
     setStatus("请输入有效卖出数量和成交价");
     return;
   }
-  const realizedPnl = (price - holding.avgPrice) * qty;
   const remainingQty = Number((holding.qty - qty).toFixed(6));
-  const baseCapital = asNumber($("totalCapital").value, 0);
-  $("totalCapital").value = Math.max(0, baseCapital + realizedPnl).toFixed(2);
-  if (remainingQty <= 0) {
-    state.portfolio = state.portfolio.filter((row) => !(row.symbol === holding.symbol && row.market === holding.market));
-  } else {
-    state.portfolio = state.portfolio.map((row) => (
-      row.symbol === holding.symbol && row.market === holding.market
-        ? { ...row, qty: remainingQty, avgPrice: holding.avgPrice, source: `${row.source || "manual"}+reduce` }
-        : row
-    ));
-  }
-  savePortfolio();
-  recordTradeHistory({
-    market: holding.market,
-    symbol: holding.symbol,
-    action: remainingQty <= 0 ? "SELL_EXIT" : "SELL_REDUCE",
-    price,
-    expectedPrice: price,
-    qty,
-    realizedPnl,
-  });
-  evaluateAlerts();
-  renderPortfolioSummary();
-  renderCards();
-  renderDetail();
+  const realizedPnl = (price - holding.avgPrice) * qty;
+  applyHoldingSell(holding, qty, price, "reduce");
   notifyUser(`${holding.symbol} 已减仓`, `${MARKET_CONFIG[state.market].label} · ${qty} 股，成交价 ${formatMoney(price)}，实现盈亏 ${formatMoney(realizedPnl)}。`, `sell-confirm:${Date.now()}:${state.market}:${holding.symbol}`);
   setStatus(`${holding.symbol} 已减仓 ${qty} 股，实现盈亏 ${formatMoney(realizedPnl)}，剩余 ${Math.max(0, remainingQty)} 股`);
 }
@@ -10528,16 +10686,23 @@ function boot() {
     setStatus("持仓已添加/更新");
   });
 
-  bind("loadPortfolio", "click", () => {
+  const importPortfolioCsv = () => {
+    const rows = parsePortfolio($("portfolioCsv").value);
+    if (!rows.length) {
+      setStatus("未从 CSV 中识别到持仓，请确认包含代码、数量、均价");
+      return;
+    }
     state.portfolio = mergeHoldings([
       ...state.portfolio.filter((holding) => holding.market !== state.market),
-      ...parsePortfolio($("portfolioCsv").value),
+      ...rows,
     ]);
     savePortfolio();
     renderCards();
     renderPortfolioSummary();
-    setStatus("持仓已导入");
-  });
+    setStatus(`已从 CSV 保存 ${rows.length} 条持仓`);
+  };
+  bind("loadPortfolio", "click", importPortfolioCsv);
+  bind("loadPortfolioCsv", "click", importPortfolioCsv);
 
   bind("applyPortfolioText", "click", () => {
     const rows = parsePortfolioText($("portfolioOcrText").value);
