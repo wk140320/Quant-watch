@@ -152,8 +152,8 @@ button:disabled {
 
 .workspace-nav {
   display: grid;
-  grid-template-columns: repeat(7, minmax(80px, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
   margin-bottom: 0;
 }
 
@@ -169,12 +169,12 @@ button:disabled {
 }
 
 .workspace-nav button {
-  min-height: 34px;
-  padding: 6px 8px;
+  min-height: 30px;
+  padding: 5px 6px;
   background: rgba(13, 27, 45, 0.84);
   border: 1px solid var(--line);
   color: var(--muted);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .workspace-nav button.active {
@@ -427,7 +427,8 @@ select:focus {
 }
 
 .quant-metric-grid,
-.provider-plan {
+.provider-plan,
+.data-health-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(130px, 1fr));
   gap: 8px;
@@ -435,7 +436,8 @@ select:focus {
 }
 
 .quant-metric-grid > div,
-.provider-plan > div {
+.provider-plan > div,
+.data-health-grid > div {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -480,18 +482,99 @@ select:focus {
 }
 
 .quant-metric-grid span,
-.provider-plan span {
+.provider-plan span,
+.data-health-grid span {
   display: block;
   color: var(--muted);
   font-size: 11px;
 }
 
 .quant-metric-grid strong,
-.provider-plan strong {
+.provider-plan strong,
+.data-health-grid strong {
   display: block;
   margin-top: 4px;
   overflow-wrap: anywhere;
   font-size: 14px;
+}
+
+.data-health-grid small {
+  display: block;
+  margin-top: 6px;
+  min-height: 28px;
+  color: #8ba9bd;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.health-details {
+  border: 1px solid rgba(104, 142, 170, 0.18);
+  border-radius: 8px;
+  background: rgba(8, 20, 33, 0.48);
+  margin-top: 10px;
+  padding: 10px;
+}
+
+.health-details summary {
+  cursor: pointer;
+  color: #e0f2fe;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.health-details .api-status-scroll {
+  margin-top: 10px;
+}
+
+.news-cache-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+  margin-top: 10px;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(47, 214, 201, 0.38) transparent;
+}
+
+.news-cache-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, auto);
+  gap: 4px 10px;
+  border: 1px solid rgba(104, 142, 170, 0.16);
+  border-radius: 7px;
+  background: rgba(5, 16, 27, 0.64);
+  padding: 9px;
+}
+
+.news-cache-list strong,
+.news-cache-list span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.news-cache-list strong {
+  color: #ecfeff;
+  font-size: 12px;
+}
+
+.news-cache-list span {
+  color: #8ba9bd;
+  font-size: 11px;
+}
+
+.news-cache-list em {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  align-self: center;
+  border-radius: 999px;
+  background: rgba(47, 214, 201, 0.1);
+  color: #a7f3d0;
+  font-style: normal;
+  padding: 4px 7px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .quant-split {
@@ -2452,6 +2535,93 @@ canvas {
   margin: 12px 0 0;
 }
 
+.decision-explain-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(47, 214, 201, 0.22);
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(8, 20, 33, 0.92), rgba(12, 31, 50, 0.78));
+  margin-top: 12px;
+  padding: 12px;
+}
+
+.decision-explain-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.decision-explain-head strong {
+  color: #ecfeff;
+  font-size: 14px;
+}
+
+.decision-explain-head span,
+.decision-explain-card p {
+  color: #8ba9bd;
+  font-size: 12px;
+}
+
+.decision-explain-card p {
+  margin: 0;
+  line-height: 1.55;
+}
+
+.decision-check-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.decision-check-grid > div {
+  min-width: 0;
+  border: 1px solid rgba(104, 142, 170, 0.18);
+  border-radius: 7px;
+  background: rgba(5, 16, 27, 0.72);
+  padding: 9px;
+}
+
+.decision-check-grid > div.pass {
+  border-color: rgba(67, 224, 138, 0.32);
+}
+
+.decision-check-grid > div.block {
+  border-color: rgba(246, 196, 83, 0.36);
+}
+
+.decision-check-grid strong,
+.decision-check-grid span,
+.decision-check-grid em {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.decision-check-grid strong {
+  color: #e0f2fe;
+  font-size: 12px;
+}
+
+.decision-check-grid span {
+  min-height: 32px;
+  margin-top: 4px;
+  color: #8ba9bd;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.decision-check-grid em {
+  margin-top: 7px;
+  color: #a7f3d0;
+  font-style: normal;
+  font-size: 11px;
+}
+
+.decision-check-grid .block em {
+  color: #f6c453;
+}
+
 .trade-ticket {
   display: grid;
   grid-template-columns: minmax(180px, 1fr) 110px 120px auto;
@@ -2646,6 +2816,8 @@ li {
   .quant-metric-grid,
   .structure-lab-grid,
   .provider-plan,
+  .data-health-grid,
+  .decision-check-grid,
   .market-breadth-grid,
   .regime-lab-grid,
   .regime-evidence-grid,
@@ -2655,8 +2827,15 @@ li {
 
   .holding-row,
   .trade-ticket,
+  .news-cache-list > div,
   .audit-row {
     grid-template-columns: 1fr;
+  }
+
+  .news-cache-list em {
+    grid-row: auto;
+    grid-column: auto;
+    justify-self: start;
   }
 
   .audit-row > div:last-child {
@@ -5206,6 +5385,11 @@ button.danger-soft {
     grid-template-columns: 1fr;
   }
 
+  .data-health-grid,
+  .decision-check-grid {
+    grid-template-columns: 1fr;
+  }
+
   .stock-card .card-top {
     grid-template-columns: 1fr;
     row-gap: 8px;
@@ -5698,10 +5882,10 @@ button.danger-soft,
 .terminal-header .side-workspace-nav {
   grid-column: auto;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   align-items: stretch;
-  gap: 6px;
-  padding: 6px;
+  gap: 4px;
+  padding: 5px;
   border: 1px solid rgba(104, 142, 170, 0.2);
   border-radius: 12px;
   background:
@@ -5712,12 +5896,12 @@ button.danger-soft,
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 36px;
+  min-height: 32px;
   min-width: 0;
-  padding: 7px 8px;
+  padding: 5px 6px;
   overflow: hidden;
   border-radius: 8px;
-  font-size: 11.5px;
+  font-size: 10.8px;
   line-height: 1.15;
   text-align: center;
   text-overflow: ellipsis;
@@ -5729,7 +5913,7 @@ button.danger-soft,
   }
 
   .terminal-header .side-workspace-nav {
-    grid-template-columns: repeat(auto-fit, minmax(94px, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
   }
 }
 

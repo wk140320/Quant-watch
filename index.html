@@ -24,7 +24,7 @@
           <button data-page-target="regime" type="button">市场状态</button>
           <button data-page-target="strategy" type="button">策略/Agent</button>
           <button data-page-target="simulation" type="button">模拟持仓</button>
-          <button data-page-target="trading" type="button">账户与交易</button>
+          <button data-page-target="sources" type="button">数据源</button>
         </nav>
       </header>
 
@@ -103,15 +103,25 @@
           <div id="tradeAnalysisPanel" class="quant-lab-panel compact-panel">
             <p class="muted">点击读取逐笔后显示真实成交、成交所分布、逐分钟 VWAP 与大单占比。</p>
           </div>
-          <div class="section-head quant-subhead">
+        </section>
+
+        <section class="quant-page-section quant-lab-page" data-quant-page="sources" hidden>
+          <div class="section-head">
             <div>
-              <h2>数据源预算</h2>
-              <p class="muted small-text">每类任务最多使用一个有限额接口，并优先搭配免费支撑源。</p>
+              <h2>数据源中心</h2>
+              <p class="muted small-text">集中查看行情源、新闻源、缓存、授权、单源/双源和降级状态；普通分析优先读本地缓存，必要时再请求外部接口。</p>
             </div>
-            <button id="refreshProviderBudget" class="secondary" type="button">检查数据源</button>
+            <div class="section-actions">
+              <button id="refreshProviderBudget" class="secondary" type="button">检查数据源</button>
+              <button id="refreshDataHealth" class="secondary" type="button">检查健康</button>
+              <button id="refreshNewsNow" type="button">刷新新闻</button>
+            </div>
           </div>
           <div id="providerBudgetPanel" class="quant-lab-panel compact-panel">
             <p class="muted">打开此页面或点击检查后显示当前市场的数据源调用策略。</p>
+          </div>
+          <div id="dataHealthPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">打开此页面或点击检查后显示数据健康状态。</p>
           </div>
         </section>
 

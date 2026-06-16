@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { appendFile, mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, writeFile, unlink } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 
@@ -37,6 +37,9 @@ const macroResponseCache = new Map();
 const universeResponseCache = new Map();
 const secFilingsCache = new Map();
 const snapshotBasePath = join(root, ".cache");
+const NEWS_DISK_CACHE_TTL_MS = Number(process.env.NEWS_DISK_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const NEWS_DISK_CACHE_CLEANUP_MS = Number(process.env.NEWS_DISK_CACHE_CLEANUP_MS || 7 * 24 * 60 * 60 * 1000);
+let lastNewsDiskCleanupAt = 0;
 let alphaVantageNextRequestAt = 0;
 
 function runPythonQuantCore(operation, payload = {}, timeoutMs = Number(process.env.PYTHON_CORE_TIMEOUT_MS || 12000)) {
@@ -172,6 +175,238 @@ function predictionSamplesPathForMarket(market) {
 
 function safeCachePart(value) {
   return String(value || "unknown").toUpperCase().replace(/[^A-Z0-9._-]+/g, "_").slice(0, 80);
+}
+
+function newsLiveCacheTtlMs() {
+  return Number(process.env.NEWS_CACHE_TTL_MS || 10 * 60 * 1000);
+}
+
+function newsDiskCachePathFor(market, scope, symbol) {
+  const key = safeMarket(market);
+  const safeScope = ["macro", "stock", "all"].includes(String(scope || "").toLowerCase())
+    ? String(scope || "").toLowerCase()
+    : "all";
+  const subject = safeScope === "macro" ? "MARKET" : symbol;
+  return join(snapshotBasePath, "news", key.toLowerCase(), `${safeCachePart(safeScope)}-${safeCachePart(subject)}.json`);
+}
+
+function marketDateTimeParts(market = "ASX", date = new Date()) {
+  const timeZone = {
+    ASX: "Australia/Sydney",
+    US: "America/New_York",
+    CN: "Asia/Shanghai",
+  }[safeMarket(market)] || "Australia/Sydney";
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    weekday: "short",
+  }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return {
+    timeZone,
+    dateKey: `${parts.year}-${parts.month}-${parts.day}`,
+    weekday: parts.weekday,
+    hour: Number(parts.hour || 0),
+    minute: Number(parts.minute || 0),
+    second: Number(parts.second || 0),
+    minuteOfDay: Number(parts.hour || 0) * 60 + Number(parts.minute || 0),
+  };
+}
+
+function newsRefreshSlotsForMarket(market = "ASX") {
+  const key = safeMarket(market);
+  if (key === "CN") {
+    return [
+      { id: "preopen", label: "开盘前 1 小时", minute: 8 * 60 + 30 },
+      { id: "midday", label: "午间开盘前", minute: 13 * 60 },
+      { id: "preclose", label: "收盘前 30 分钟", minute: 14 * 60 + 30 },
+    ];
+  }
+  if (key === "US") {
+    return [
+      { id: "preopen", label: "开盘前 1 小时", minute: 8 * 60 + 30 },
+      { id: "preclose", label: "收盘前 30 分钟", minute: 15 * 60 + 30 },
+    ];
+  }
+  return [
+    { id: "preopen", label: "开盘前 1 小时", minute: 9 * 60 },
+    { id: "preclose", label: "收盘前 30 分钟", minute: 15 * 60 + 30 },
+  ];
+}
+
+function newsRefreshDecision(market = "ASX", cachedAt = null) {
+  const key = safeMarket(market);
+  const now = marketDateTimeParts(key);
+  const cached = cachedAt ? marketDateTimeParts(key, new Date(cachedAt)) : null;
+  const slots = newsRefreshSlotsForMarket(key);
+  const isWeekday = !["Sat", "Sun"].includes(now.weekday);
+  const dueSlots = isWeekday ? slots.filter((slot) => {
+    if (now.minuteOfDay < slot.minute) return false;
+    if (!cached?.dateKey || cached.dateKey < now.dateKey) return true;
+    if (cached.dateKey > now.dateKey) return false;
+    return cached.minuteOfDay < slot.minute;
+  }) : [];
+  const next = slots.find((slot) => slot.minute > now.minuteOfDay) || null;
+  return {
+    market: key,
+    localDate: now.dateKey,
+    localMinute: now.minuteOfDay,
+    timeZone: now.timeZone,
+    cachedAt: cachedAt || null,
+    due: dueSlots.length > 0,
+    dueSlots,
+    nextSlot: next,
+    schedule: slots,
+    reason: dueSlots.length
+      ? `missed ${dueSlots.map((slot) => slot.label).join(" / ")} news refresh window`
+      : cachedAt
+        ? "local news cache is current for scheduled refresh windows"
+        : "no local news cache exists",
+  };
+}
+
+async function readNewsDiskCache(market, scope, symbol) {
+  try {
+    const path = newsDiskCachePathFor(market, scope, symbol);
+    const payload = JSON.parse(await readFile(path, "utf8"));
+    const cachedAtMs = Date.parse(payload.cachedAt || payload.value?.cachedAt || "");
+    if (!Number.isFinite(cachedAtMs) || Date.now() - cachedAtMs > NEWS_DISK_CACHE_TTL_MS) {
+      await unlink(path).catch(() => {});
+      return null;
+    }
+    const value = payload.value || payload;
+    if (!Array.isArray(value.news)) return null;
+    return {
+      value: {
+        ...value,
+        cache: "disk",
+        cachedAt: payload.cachedAt || value.cachedAt,
+        refreshDecision: newsRefreshDecision(market, payload.cachedAt || value.cachedAt),
+      },
+      cachedAtMs,
+      ageMs: Date.now() - cachedAtMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function newsDiskCacheSummary(market = "ASX") {
+  const key = safeMarket(market);
+  const dir = join(snapshotBasePath, "news", key.toLowerCase());
+  const rows = [];
+  try {
+    const files = await readdir(dir, { withFileTypes: true });
+    await Promise.all(files
+      .filter((file) => file.isFile() && file.name.endsWith(".json"))
+      .map(async (file) => {
+        const path = join(dir, file.name);
+        try {
+          const payload = JSON.parse(await readFile(path, "utf8"));
+          const value = payload.value || payload;
+          const cachedAt = payload.cachedAt || value.cachedAt || null;
+          const ageMs = Date.now() - (Date.parse(cachedAt || "") || 0);
+          rows.push({
+            file: file.name,
+            market: key,
+            scope: value.scope || payload.scope || file.name.split("-")[0]?.toLowerCase() || "all",
+            symbol: value.symbol || payload.symbol || "",
+            cachedAt,
+            ageMs: Number.isFinite(ageMs) ? ageMs : null,
+            newsCount: Array.isArray(value.news) ? value.news.length : 0,
+            cache: value.cache || payload.cache || "disk",
+            source: value.source || "unknown",
+            refreshDecision: newsRefreshDecision(key, cachedAt),
+          });
+        } catch {
+          rows.push({ file: file.name, market: key, invalid: true });
+        }
+      }));
+  } catch {
+    return {
+      market: key,
+      available: false,
+      rows: [],
+      summary: { totalFiles: 0, newsCount: 0, latestCachedAt: null, dueCount: 0 },
+    };
+  }
+  rows.sort((a, b) => String(b.cachedAt || "").localeCompare(String(a.cachedAt || "")));
+  return {
+    market: key,
+    available: rows.length > 0,
+    rows: rows.slice(0, 80),
+    summary: {
+      totalFiles: rows.length,
+      newsCount: rows.reduce((sum, row) => sum + Number(row.newsCount || 0), 0),
+      latestCachedAt: rows[0]?.cachedAt || null,
+      dueCount: rows.filter((row) => row.refreshDecision?.due).length,
+      schedule: newsRefreshSlotsForMarket(key),
+    },
+  };
+}
+
+async function writeNewsDiskCache(market, scope, symbol, value) {
+  if (!Array.isArray(value?.news)) return;
+  const key = safeMarket(market);
+  const dir = join(snapshotBasePath, "news", key.toLowerCase());
+  const cachedAt = new Date().toISOString();
+  await mkdir(dir, { recursive: true });
+  await writeFile(newsDiskCachePathFor(key, scope, symbol), JSON.stringify({
+    cachedAt,
+    market: key,
+    scope,
+    symbol,
+    value: {
+      ...value,
+      cache: "live",
+      cachedAt,
+      market: key,
+      scope,
+      symbol,
+    },
+  }, null, 2), "utf8");
+}
+
+async function cleanupNewsDiskCache(force = false) {
+  const now = Date.now();
+  if (!force && now - lastNewsDiskCleanupAt < NEWS_DISK_CACHE_CLEANUP_MS) return { checked: 0, removed: 0 };
+  lastNewsDiskCleanupAt = now;
+  const base = join(snapshotBasePath, "news");
+  let checked = 0;
+  let removed = 0;
+  try {
+    const marketDirs = await readdir(base, { withFileTypes: true });
+    for (const marketDir of marketDirs) {
+      if (!marketDir.isDirectory()) continue;
+      const dir = join(base, marketDir.name);
+      const files = await readdir(dir, { withFileTypes: true }).catch(() => []);
+      await Promise.all(files
+        .filter((file) => file.isFile() && file.name.endsWith(".json"))
+        .map(async (file) => {
+          checked += 1;
+          const path = join(dir, file.name);
+          try {
+            const payload = JSON.parse(await readFile(path, "utf8"));
+            const cachedAtMs = Date.parse(payload.cachedAt || payload.value?.cachedAt || "");
+            if (!Number.isFinite(cachedAtMs) || now - cachedAtMs > NEWS_DISK_CACHE_TTL_MS) {
+              await unlink(path);
+              removed += 1;
+            }
+          } catch {
+            await unlink(path).catch(() => {});
+            removed += 1;
+          }
+        }));
+    }
+  } catch {
+    return { checked, removed };
+  }
+  return { checked, removed };
 }
 
 function marketHistoryPathFor(market, symbol, interval = "1d") {
@@ -1371,6 +1606,7 @@ function normalizePredictionSample(sample, market = "ASX") {
     strategyCalibration: sample?.strategyCalibration || null,
     marketRegime: sample?.marketRegime || sample?.ensemble?.marketRegime?.regime || null,
     regimeBucket: sampleRegimeKey(sample),
+    sector: sample?.sector || sample?.fundamentals?.sector || sample?.featureScores?.sector || null,
     errorTypes: Array.isArray(sample?.errorTypes) ? sample.errorTypes : [],
     outcome: sample?.outcome || null,
     interim: sample?.interim || null,
@@ -1717,6 +1953,64 @@ function buildRegimeStats(scoped = []) {
       ...stat,
     }];
   }).filter(([, stat]) => stat.total > 0));
+}
+
+function sampleSectorKey(sample = {}) {
+  if (sample.sector) return String(sample.sector).slice(0, 80);
+  const code = cleanCode(sample.symbol, sample.market || "ASX");
+  return sectorContext(code, sample.market || "ASX").sector || "unknown";
+}
+
+function buildSectorStats(scoped = []) {
+  const bySector = new Map();
+  scoped.forEach((sample) => {
+    const sector = sampleSectorKey(sample);
+    const rows = bySector.get(sector) || [];
+    rows.push(sample);
+    bySector.set(sector, rows);
+  });
+  return Object.fromEntries([...bySector.entries()]
+    .map(([sector, rows]) => [sector, { sector, ...summarizeSampleGroup(rows) }])
+    .filter(([, stat]) => stat.total > 0)
+    .sort(([, a], [, b]) => Number(b.resolved || 0) - Number(a.resolved || 0) || Number(b.total || 0) - Number(a.total || 0))
+    .slice(0, 24));
+}
+
+function benchmarkHitRate(rows = [], predictor) {
+  const resolved = rows.filter((item) => item.outcome?.resolved);
+  if (!resolved.length) return null;
+  return resolved.filter((item) => predictor(item)).length / resolved.length * 100;
+}
+
+function buildBenchmarkComparisons(scoped = []) {
+  const resolved = scoped.filter((item) => item.outcome?.resolved);
+  const buyResolved = resolved.filter(sampleWasPositive);
+  const randomDirection = resolved.length ? 50 : null;
+  const buyHoldDirection = benchmarkHitRate(resolved, (item) => Number(item.outcome?.forwardReturnPct || 0) > 0);
+  const simpleMomentumDirection = benchmarkHitRate(resolved, (item) => {
+    const momentum = Number(item.featureScores?.momentum ?? item.featureScores?.change5d ?? 50);
+    const predictsUp = momentum >= 50;
+    const actual = Number(item.outcome?.forwardReturnPct || 0);
+    return predictsUp ? actual > 0 : actual <= 0;
+  });
+  const modelDirection = benchmarkHitRate(resolved, directionalOutcomeHit);
+  const modelTarget = buyResolved.length ? buyResolved.filter(positiveTargetOutcomeHit).length / buyResolved.length * 100 : null;
+  const buyHoldTarget = buyResolved.length ? buyResolved.filter((item) => Number(item.outcome?.maxUpsidePct || 0) >= Number(item.targetUpside || 5)).length / buyResolved.length * 100 : null;
+  const simpleMomentumTargetRows = buyResolved.filter((item) => Number(item.featureScores?.momentum ?? 50) >= 50);
+  const simpleMomentumTarget = simpleMomentumTargetRows.length
+    ? simpleMomentumTargetRows.filter(positiveTargetOutcomeHit).length / simpleMomentumTargetRows.length * 100
+    : null;
+  const rows = [
+    { id: "model", label: "当前模型", directionHitRate: modelDirection, targetHitRate: modelTarget, samples: resolved.length, note: "多模型/新闻/因子/Agent 校准后结果" },
+    { id: "random", label: "随机猜测", directionHitRate: randomDirection, targetHitRate: null, samples: resolved.length, note: "方向基准固定 50%" },
+    { id: "buy_hold", label: "买入持有", directionHitRate: buyHoldDirection, targetHitRate: buyHoldTarget, samples: resolved.length, note: "不择时，统计周期内自然涨跌" },
+    { id: "simple_momentum", label: "简单动量", directionHitRate: simpleMomentumDirection, targetHitRate: simpleMomentumTarget, samples: resolved.length, note: "仅用动量分>=50 作为看多" },
+  ];
+  return rows.map((row) => ({
+    ...row,
+    edgeVsRandom: row.directionHitRate == null ? null : Number((row.directionHitRate - 50).toFixed(2)),
+    edgeVsBuyHold: row.directionHitRate == null || buyHoldDirection == null ? null : Number((row.directionHitRate - buyHoldDirection).toFixed(2)),
+  }));
 }
 
 function buildStrategyProbabilityBuckets(buyResolved = []) {
@@ -2164,7 +2458,9 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
   const strategyBuckets = buildStrategyProbabilityBuckets(buyResolved);
   const modelStats = buildModelPerformanceStats(scoped);
   const regimeStats = buildRegimeStats(scoped);
+  const sectorStats = buildSectorStats(scoped);
   const errorTypeStats = buildErrorTypeStats(scoped);
+  const benchmarkComparisons = buildBenchmarkComparisons(scoped);
   const summaryBase = {
     total: scoped.length,
     pending: scoped.length - resolved.length,
@@ -2214,6 +2510,8 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     strategyBuckets,
     modelStats,
     regimeStats,
+    sectorStats,
+    benchmarkComparisons,
     errorTypeStats,
     horizonStats: adaptive.horizonStats,
     adaptive,
@@ -2761,6 +3059,37 @@ function eastmoneyKlinesToRows(payload) {
       turnoverRate: Number(parts[10] || 0),
     };
   }), { preserveTimestamp: true });
+}
+
+function quoteFromCandleRows(symbol, market, candles = [], source = "candle-derived-quote") {
+  const key = safeMarket(market);
+  const rows = sanitizeCandleRows(candles).sort((a, b) => candleDate(a).localeCompare(candleDate(b)));
+  const latest = rows.at(-1);
+  if (!latest?.close) return null;
+  const previous = rows.length > 1 ? rows.at(-2) : null;
+  const previousClose = positiveMarketNumber(previous?.close);
+  const price = positiveMarketNumber(latest.close);
+  const change = previousClose ? price - previousClose : null;
+  return normalizeQuote({
+    symbol,
+    price,
+    previousClose,
+    change,
+    changePercent: previousClose ? pctChange(price, previousClose) : null,
+    open: latest.open,
+    high: latest.high,
+    low: latest.low,
+    volume: latest.volume,
+    currency: MARKET_CONFIG[key].currency,
+    exchange: key === "CN" ? (/^SH|^6|^5|^9/.test(cleanCode(symbol, key)) ? "SSE" : "SZSE") : key,
+    asOf: /^\d{4}-\d{2}-\d{2}T/.test(candleDate(latest))
+      ? new Date(candleDate(latest)).toISOString()
+      : `${candleDate(latest)}T00:00:00.000Z`,
+    date: candleDate(latest),
+    source,
+    delayed: true,
+    note: "Quote derived from latest real provider candle to keep point and change in the same source family.",
+  }, key);
 }
 
 function rangeStartIso(range = "9mo") {
@@ -3345,10 +3674,13 @@ function yahooQuoteFromPayload(payload, requestedYahooSymbol, market = "ASX") {
   }
   const timestamp = lastIndex >= 0 ? Number(timestamps[lastIndex]) : Number(meta.regularMarketTime);
   const price = Number(meta.regularMarketPrice || (lastIndex >= 0 ? quote.close[lastIndex] : 0));
+  const previousClose = positiveMarketNumber(meta.previousClose)
+    || positiveMarketNumber(meta.regularMarketPreviousClose)
+    || positiveMarketNumber(meta.chartPreviousClose);
   return normalizeQuote({
     symbol: requestedYahooSymbol,
     price,
-    previousClose: meta.chartPreviousClose || meta.previousClose,
+    previousClose,
     open: lastIndex >= 0 ? quote.open?.[lastIndex] : null,
     high: lastIndex >= 0 ? quote.high?.[lastIndex] : null,
     low: lastIndex >= 0 ? quote.low?.[lastIndex] : null,
@@ -3763,16 +4095,54 @@ function channelWeight(channel = "") {
   return 0.4;
 }
 
+function newsCategoryMeta(item = {}, channel = "") {
+  const text = `${item.title || ""} ${item.description || ""} ${item.publisher || ""} ${channel}`.toLowerCase();
+  const tests = [
+    ["earnings", "财报/公告", 1.05, /earnings|revenue|profit|guidance|dividend|buyback|sec filing|annual report|quarterly|财报|业绩|利润|营收|分红|回购|公告|减持|增持|年报|季报/],
+    ["politics-policy", "政治/政策", 0.86, /government|minister|president|election|policy|regulation|regulator|congress|parliament|政府|总统|总理|部长|选举|政策|监管|改革|财政|产业政策/],
+    ["geopolitics", "国际局势", 0.82, /war|missile|sanction|tariff|trade war|middle east|ukraine|russia|taiwan|south china sea|战争|制裁|关税|冲突|导弹|地缘|俄乌|中东|台海|南海/],
+    ["rates-macro", "利率/宏观", 0.9, /central bank|federal reserve|fed|rba|pboc|interest rate|inflation|cpi|jobs|unemployment|yield|bond|央行|美联储|澳联储|降息|加息|利率|通胀|就业|失业|债券|收益率|汇率/],
+    ["finance-credit", "金融/信用", 0.78, /bank|credit|loan|mortgage|liquidity|debt|default|property|real estate|银行|信贷|贷款|按揭|流动性|债务|违约|房地产|地产/],
+    ["technology", "科技/AI", 0.74, /ai|artificial intelligence|chip|semiconductor|nvidia|data center|cloud|software|robot|人工智能|芯片|半导体|英伟达|数据中心|云计算|软件|机器人/],
+    ["commodity-energy", "大宗/能源", 0.76, /oil|gas|lng|opec|coal|iron ore|copper|gold|lithium|commodity|原油|天然气|煤炭|铁矿|铜|黄金|锂|大宗|能源/],
+    ["supply-chain", "上下游/供应链", 0.72, /supply chain|supplier|demand|inventory|shipping|logistics|raw material|upstream|downstream|供应链|上游|下游|需求|库存|航运|物流|原材料/],
+    ["consumer-social", "消费/社会", 0.58, /consumer|retail|sales|confidence|strike|social unrest|spending|消费|零售|销售|信心|罢工|舆情|居民|收入/],
+  ];
+  const matched = tests.find(([, , , pattern]) => pattern.test(text));
+  const channelBonus = /direct|stock|company/.test(channel) ? 0.12 : /macro|policy/.test(channel) ? 0.06 : 0;
+  if (!matched) {
+    return {
+      category: /peer|competitor/.test(channel) ? "peer-competitor" : /sector|industry/.test(channel) ? "sector-industry" : "market-news",
+      categoryLabel: /peer|competitor/.test(channel) ? "竞品/同业" : /sector|industry/.test(channel) ? "行业新闻" : "市场新闻",
+      categoryScore: Number((0.42 + channelBonus).toFixed(2)),
+    };
+  }
+  return {
+    category: matched[0],
+    categoryLabel: matched[1],
+    categoryScore: Number(Math.min(1.2, matched[2] + channelBonus).toFixed(2)),
+  };
+}
+
 function addNewsMeta(items, source, channel, market, code) {
-  return (items || []).map((item) => ({
-    ...item,
-    source,
-    channel: item.channel || channel,
-    impactScope: item.impactScope || channel,
-    impactWeight: Number(channelWeight(item.channel || channel).toFixed(2)),
-    market,
-    relatedSymbol: code,
-  }));
+  return (items || []).map((item) => {
+    const itemChannel = item.channel || channel;
+    const category = newsCategoryMeta(item, itemChannel);
+    const baseWeight = channelWeight(itemChannel);
+    const impactWeight = Math.max(0.15, Math.min(1.35, baseWeight * category.categoryScore));
+    return {
+      ...item,
+      source,
+      channel: itemChannel,
+      impactScope: item.impactScope || itemChannel,
+      impactWeight: Number(impactWeight.toFixed(2)),
+      category: item.category || category.category,
+      categoryLabel: item.categoryLabel || category.categoryLabel,
+      categoryScore: category.categoryScore,
+      market,
+      relatedSymbol: code,
+    };
+  });
 }
 
 async function fetchEastmoneyAnnouncements(code, limit = 12) {
@@ -3922,8 +4292,6 @@ function sanitizeIndexQuoteChange(symbol, market, candles = [], quote = null) {
   const invalidChange = Number.isFinite(quoteChangePercent) && (
     Math.abs(quoteChangePercent) > 8
     || (quoteDate && latestDate && quoteDate !== latestDate)
-    || (previousCloseDiff != null && previousCloseDiff > 1.5)
-    || (changePercentDiff != null && changePercentDiff > 0.08)
   );
   const base = {
     ...quote,
@@ -3931,11 +4299,7 @@ function sanitizeIndexQuoteChange(symbol, market, candles = [], quote = null) {
     candleChangePercent: Number(candleChangePercent.toFixed(4)),
   };
   if (!invalidChange) return { quote: base, warning: "" };
-  const reason = previousCloseDiff != null && previousCloseDiff > 1.5
-    ? `provider previousClose differs from real candle previous close by ${previousCloseDiff.toFixed(2)}%`
-    : changePercentDiff != null && changePercentDiff > 0.08
-      ? `provider changePercent differs from real candle change by ${changePercentDiff.toFixed(2)} percentage points`
-    : quoteDate && latestDate && quoteDate !== latestDate
+  const reason = quoteDate && latestDate && quoteDate !== latestDate
       ? `provider quote date ${quoteDate} does not match latest candle date ${latestDate}`
       : `provider quote changePercent ${quoteChangePercent.toFixed(4)}% is outside index sanity bounds`;
   return {
@@ -4891,6 +5255,13 @@ async function fetchEastmoneyCnCandles(code, range, interval) {
   return { candles: eastmoneyKlinesToRows(payload), source: `eastmoney-cn-${interval}` };
 }
 
+async function fetchEastmoneyCnQuote(code) {
+  const marketData = await fetchEastmoneyCnCandles(code, "1mo", "1d");
+  const quote = quoteFromCandleRows(code, "CN", marketData.candles, "eastmoney-cn-daily-quote");
+  if (!quote) throw new Error("Eastmoney CN quote had no usable latest candle.");
+  return quote;
+}
+
 function cnKeyedFallbacksEnabled() {
   return String(process.env.CN_ENABLE_KEYED_FALLBACKS || "true").toLowerCase() !== "false";
 }
@@ -4936,6 +5307,7 @@ function quoteCandidates(market, code) {
       ["twelvedata-us-quote", () => fetchTwelveDataQuote(code, key)],
     ],
     CN: [
+      ["eastmoney-cn-quote", () => fetchEastmoneyCnQuote(code)],
       ["yahoo-cn-quote", () => fetchYahooQuote(code, key)],
       ["twelvedata-cn-quote", () => fetchTwelveDataQuote(code, key)],
     ],
@@ -5040,7 +5412,13 @@ function providerCandidates(market, code, range, interval) {
       ["eodhd-us-index", () => fetchEodhdCandles(code, range, interval, key)],
     ];
   }
-  const cnFreeCandidates = [
+  const isCnBroadIndex = /^(SH000|SZ399)\d{3}$/.test(cleanCode(code, key));
+  const cnFreeCandidates = isCnBroadIndex ? [
+    ["tencent-cn", () => fetchTencentCnCandles(code, range, interval)],
+    ["eastmoney-cn", () => fetchEastmoneyCnCandles(code, range, interval)],
+    ["baostock-cn", () => fetchBaostockCnCandles(code, range, interval)],
+    ["yahoo-cn", () => fetchYahooMarketCandles(code, range, interval, key)],
+  ] : [
     ["eastmoney-cn", () => fetchEastmoneyCnCandles(code, range, interval)],
     ["tencent-cn", () => fetchTencentCnCandles(code, range, interval)],
     ["baostock-cn", () => fetchBaostockCnCandles(code, range, interval)],
@@ -5162,9 +5540,9 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
       source: `${source.source}-single-source`,
       validation: singleSourceValidation(source, [...errors, ...extraErrors]),
       warning: compactProviderErrors([...errors, ...extraErrors]).length
-        ? `${singleSourceAcceptedByPolicy() ? "Single real source accepted by quota policy." : "Dual-source cross-check degraded to single real source."} ${compactProviderErrors([...errors, ...extraErrors]).join(" | ")}`
+        ? `${singleSourceAcceptedByPolicy() ? "已按数据源保护策略接受单一真实源。" : "Dual-source cross-check degraded to single real source."} ${compactProviderErrors([...errors, ...extraErrors]).join(" | ")}`
         : singleSourceAcceptedByPolicy()
-          ? "Single real source accepted by quota policy."
+          ? "已按数据源保护策略接受单一真实源。"
           : "Dual-source cross-check degraded to single real source.",
     });
     let limitedProviderCalls = 0;
@@ -5574,13 +5952,57 @@ async function attachUsTradeFootprint({ market, symbol, interval, candles }) {
   };
 }
 
-async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
+async function fetchNewsItems(symbol, market = "ASX", scope = "all", options = {}) {
   const key = safeMarket(market);
   const code = cleanCode(symbol, key);
   const safeScope = ["macro", "stock", "all"].includes(String(scope || "").toLowerCase()) ? String(scope || "").toLowerCase() : "all";
-  const cacheKey = `${key}:${safeScope}:${safeScope === "macro" ? "MARKET" : code}`;
+  const mode = ["local", "auto", "refresh", "live"].includes(String(options.mode || "").toLowerCase())
+    ? String(options.mode || "").toLowerCase()
+    : "auto";
+  const cacheKey = `${key}:${safeScope}:${safeScope === "macro" ? "MARKET" : code}:${mode === "local" ? "local" : "auto"}`;
+  const forceLive = mode === "refresh" || mode === "live";
   const cached = newsResponseCache.get(cacheKey);
-  if (cached && Date.now() - cached.time < Number(process.env.NEWS_CACHE_TTL_MS || 10 * 60 * 1000)) return cached.value;
+  if (!forceLive && cached && Date.now() - cached.time < Number(process.env.NEWS_CACHE_TTL_MS || 10 * 60 * 1000)) return cached.value;
+  cleanupNewsDiskCache().catch(() => {});
+  const diskCache = await readNewsDiskCache(key, safeScope, safeScope === "macro" ? "MARKET" : code);
+  const refreshDecision = newsRefreshDecision(key, diskCache?.value?.cachedAt || null);
+  if (mode === "local") {
+    const value = diskCache?.value
+      ? {
+        ...diskCache.value,
+        cache: "disk-local",
+        refreshDecision,
+        warning: diskCache.value.warning || "",
+      }
+      : {
+        source: "local-news-cache-miss",
+        providers: [],
+        limitedProvider: null,
+        news: [],
+        signal: newsSignal([], code, key),
+        scope: safeScope,
+        cache: "disk-miss",
+        refreshDecision,
+        warning: "No local news cache exists for this symbol/scope.",
+      };
+    newsResponseCache.set(cacheKey, { time: Date.now(), value });
+    return value;
+  }
+  if (diskCache?.value && mode === "auto" && !refreshDecision.due) {
+    const value = {
+      ...diskCache.value,
+      cache: "disk-scheduled",
+      refreshDecision,
+      warning: diskCache.value.warning || "Using local persisted news until the next scheduled refresh window.",
+    };
+    newsResponseCache.set(cacheKey, { time: Date.now(), value });
+    return value;
+  }
+  if (diskCache?.value && !forceLive && diskCache.ageMs < newsLiveCacheTtlMs()) {
+    const value = { ...diskCache.value, refreshDecision };
+    newsResponseCache.set(cacheKey, { time: Date.now(), value });
+    return value;
+  }
   const context = sectorContext(code, key);
   const marketName = MARKET_CONFIG[key].newsName;
   const locale = marketNewsLocale(key);
@@ -5816,6 +6238,16 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
     fetchGdelt(),
   ]);
   const news = dedupeNews(sourceResults.flatMap((result) => result.status === "fulfilled" ? result.value.news : []));
+  if (!news.length && diskCache?.value?.news?.length) {
+    const fallbackValue = {
+      ...diskCache.value,
+      cache: "disk-stale-fallback",
+      refreshDecision,
+      warning: "Live news providers returned no rows; using locally persisted real news cache from the last 7 days.",
+    };
+    newsResponseCache.set(cacheKey, { time: Date.now(), value: fallbackValue });
+    return fallbackValue;
+  }
   const value = {
     source: news.length ? "multi-news" : "multi-news-empty",
     providers: sourceResults.map((result) => result.status === "fulfilled" ? result.value.source : "provider-error"),
@@ -5823,8 +6255,13 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all") {
     news,
     signal: newsSignal(news, code, key),
     scope: safeScope,
+    cache: "live",
+    cachedAt: new Date().toISOString(),
+    refreshDecision: newsRefreshDecision(key, new Date().toISOString()),
+    refreshMode: mode,
   };
   newsResponseCache.set(cacheKey, { time: Date.now(), value });
+  if (news.length) writeNewsDiskCache(key, safeScope, safeScope === "macro" ? "MARKET" : code, value).catch(() => {});
   if (newsResponseCache.size > 100) newsResponseCache.delete(newsResponseCache.keys().next().value);
   return value;
 }
@@ -8808,6 +9245,38 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/data-health" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const sampleCode = normalizeMarketSymbol(url.searchParams.get("symbol") || { ASX: "BHP", US: "AAPL", CN: "600519" }[market], market);
+    const candidates = providerCandidates(market, sampleCode, "9mo", "1d").map(([source]) => source);
+    const configured = Object.fromEntries(candidates.map((source) => [source, providerConfigured(source)]));
+    const [budget, capabilities, newsCache] = await Promise.all([
+      runPythonQuantCore("provider-budget", { market, candidates, configured }).catch((error) => ({ error: error.message, providers: [], policy: {} })),
+      dataCapabilities(market, sampleCode).catch((error) => ({ error: error.message })),
+      newsDiskCacheSummary(market),
+    ]);
+    sendJson(res, 200, {
+      ok: true,
+      market,
+      symbol: sampleCode,
+      updatedAt: new Date().toISOString(),
+      marketProviders: budget.providers || [],
+      providerPolicy: budget.policy || {},
+      capabilities,
+      newsProviders: newsProviderStatus().providers || [],
+      newsPrimary: newsProviderStatus().primary || process.env.NEWS_PRIMARY_PROVIDER || "auto",
+      newsCache,
+      refreshSchedule: newsRefreshDecision(market, newsCache.summary?.latestCachedAt || null),
+      cachePolicy: {
+        localFirst: true,
+        diskTtlDays: Math.round(NEWS_DISK_CACHE_TTL_MS / 86400000),
+        cleanupEveryDays: Math.round(NEWS_DISK_CACHE_CLEANUP_MS / 86400000),
+        autoRefreshWindows: newsRefreshSlotsForMarket(market),
+      },
+    });
+    return;
+  }
+
   if (url.pathname === "/api/qlib-readiness" && req.method === "GET") {
     sendJson(res, 200, await runPythonQuantCore("qlib-readiness"));
     return;
@@ -9272,11 +9741,16 @@ async function handleApi(req, res, url) {
     const latest = latestByDate(marketData.candles);
     let realtimeQuote;
     try {
-      realtimeQuote = marketData.quote && !marketData.quote.unavailable
-        ? normalizeQuote(marketData.quote, market, latest?.close)
-        : indexQuotePromise
+      const sameSourceCandleQuote = market === "CN"
+        ? quoteFromCandleRows(symbol, market, marketData.candles, `${marketData.source || "cn-real"}-latest-quote`)
+        : null;
+      realtimeQuote = sameSourceCandleQuote
+        || (isCashIndex && indexQuotePromise
           ? await indexQuotePromise
-          : await fetchRealtimeQuote(symbol, market, latest?.close);
+          : null)
+        || (marketData.quote && !marketData.quote.unavailable
+        ? normalizeQuote(marketData.quote, market, latest?.close)
+        : await fetchRealtimeQuote(symbol, market, latest?.close));
     } catch (error) {
       realtimeQuote = { unavailable: true, warning: error.message || String(error) };
     }
@@ -9304,7 +9778,8 @@ async function handleApi(req, res, url) {
     const market = marketFromUrl(url);
     const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
     const scope = url.searchParams.get("scope") || "all";
-    const news = await fetchNewsItems(symbol, market, scope);
+    const mode = url.searchParams.get("mode") || "auto";
+    const news = await fetchNewsItems(symbol, market, scope, { mode });
     sendJson(res, 200, { symbol, market, ...news });
     return;
   }
@@ -9410,6 +9885,16 @@ const server = createServer(async (req, res) => {
     sendJson(res, 500, { error: error.message || "Server error." });
   }
 });
+
+cleanupNewsDiskCache(true).catch((error) => {
+  console.warn(`News disk cache cleanup skipped: ${error.message}`);
+});
+const newsCleanupTimer = setInterval(() => {
+  cleanupNewsDiskCache(true).catch((error) => {
+    console.warn(`News disk cache cleanup skipped: ${error.message}`);
+  });
+}, NEWS_DISK_CACHE_CLEANUP_MS);
+newsCleanupTimer.unref?.();
 
 if (process.env.SERVER_DISABLE_LISTEN !== "true") {
   server.listen(port, host, () => {

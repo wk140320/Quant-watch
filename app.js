@@ -422,7 +422,7 @@ function snapshotTimeKey(market = state.market) {
 }
 
 function indexSnapshotKey(market = state.market) {
-  return `marketIndexSnapshot:v2:${safeMarket(market)}`;
+  return `marketIndexSnapshot:v3:${safeMarket(market)}`;
 }
 
 function setStatus(message) {
@@ -2416,7 +2416,7 @@ function volumeProfileMiniChart(buckets, profile = {}) {
 }
 
 function setWorkspacePage(page, options = {}) {
-  const validPages = new Set(["dashboard", "features", "factors", "regime", "strategy", "simulation", "trading"]);
+  const validPages = new Set(["dashboard", "features", "factors", "regime", "strategy", "simulation", "sources"]);
   const next = validPages.has(page) ? page : "dashboard";
   state.activePage = next;
   localStorage.setItem("activeQuantPage", next);
@@ -2440,11 +2440,14 @@ function setWorkspacePage(page, options = {}) {
       regime: "市场状态",
       strategy: "策略/Agent",
       simulation: "模拟持仓",
-      trading: "账户与交易",
+      sources: "数据源",
     };
     setStatus(`已打开 ${activeMarketConfig().label} · ${labels[next]}`);
   }
-  if (next === "features") refreshProviderBudget(false);
+  if (next === "sources") {
+    refreshProviderBudget(false);
+    refreshDataHealth(false);
+  }
   if (next === "regime") renderMarketMoversPanel();
   if (next === "simulation") {
     runRiskAssessment(false);
@@ -3583,6 +3586,132 @@ async function refreshProviderBudget(showStatus = true) {
   }
 }
 
+function formatAge(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return "未知";
+  const minutes = Math.round(value / 60000);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours} 小时前`;
+  return `${Math.round(hours / 24)} 天前`;
+}
+
+function renderDataHealth(payload) {
+  const panel = $("dataHealthPanel");
+  if (!panel) return;
+  if (!payload) {
+    panel.innerHTML = `<p class="muted">尚未读取数据健康状态。</p>`;
+    return;
+  }
+  const marketProviders = Array.isArray(payload.marketProviders) ? payload.marketProviders : [];
+  const newsProviders = Array.isArray(payload.newsProviders) ? payload.newsProviders : [];
+  const cacheRows = Array.isArray(payload.newsCache?.rows) ? payload.newsCache.rows : [];
+  const cacheSummary = payload.newsCache?.summary || {};
+  const schedule = payload.refreshSchedule || {};
+  const monitoredRows = [...state.analyses.values()];
+  const validation = monitoredRows.reduce((acc, item) => {
+    if (item?.analysis?.action === "ERROR") acc.error += 1;
+    else if (item?.marketValidation?.degraded) acc.single += 1;
+    else if (item?.marketValidation?.ok) acc.dual += 1;
+    else acc.unknown += 1;
+    return acc;
+  }, { dual: 0, single: 0, error: 0, unknown: 0 });
+  const providerPill = (provider) => {
+    const health = providerHealth(provider);
+    const text = !provider.configured ? "未接入" : health === "warn" ? "额度/权限" : "可用";
+    return `<span class="api-pill ${health}"><i></i><b>${escapeHtml(provider.name || provider.source || "provider")}</b><em>${escapeHtml(text)}</em></span>`;
+  };
+  panel.innerHTML = `
+    <div class="data-health-grid">
+      <div>
+        <span>新闻读取策略</span>
+        <strong>${payload.cachePolicy?.localFirst ? "本地优先" : "实时优先"}</strong>
+        <small>自动窗口：${(payload.cachePolicy?.autoRefreshWindows || []).map((slot) => `${slot.label} ${String(Math.floor(slot.minute / 60)).padStart(2, "0")}:${String(slot.minute % 60).padStart(2, "0")}`).join(" / ") || "未配置"}</small>
+      </div>
+      <div>
+        <span>新闻缓存</span>
+        <strong>${cacheSummary.totalFiles || 0} 文件 · ${cacheSummary.newsCount || 0} 条</strong>
+        <small>最近 ${cacheSummary.latestCachedAt ? `${new Date(cacheSummary.latestCachedAt).toLocaleString()} · ${formatAge(Date.now() - Date.parse(cacheSummary.latestCachedAt))}` : "暂无"}</small>
+      </div>
+      <div>
+        <span>刷新状态</span>
+        <strong>${schedule.due ? "需要抓新" : "缓存可用"}</strong>
+        <small>${escapeHtml(schedule.reason || "")}</small>
+      </div>
+      <div>
+        <span>真实逐笔/L1/L2</span>
+        <strong>${payload.capabilities?.tick?.available ? "逐笔可用" : "逐笔未授权"} / ${payload.capabilities?.l1?.available ? "L1可用" : "L1未授权"} / ${payload.capabilities?.l2?.available ? "L2可用" : "L2未授权"}</strong>
+        <small>${escapeHtml(payload.capabilities?.tick?.note || payload.capabilities?.tick?.reason || "")}</small>
+      </div>
+      <div>
+        <span>当前监控池行情</span>
+        <strong>双源 ${validation.dual} · 单源 ${validation.single} · 失败 ${validation.error}</strong>
+        <small>${monitoredRows.length ? `共 ${monitoredRows.length} 个分析对象，未知 ${validation.unknown}` : "当前页面还没有行情分析结果"}</small>
+      </div>
+    </div>
+    <details class="health-details" open>
+      <summary>行情源状态</summary>
+      <div class="api-status-scroll">${marketProviders.slice(0, 14).map(providerPill).join("") || "<span class=\"muted\">暂无行情源状态</span>"}</div>
+    </details>
+    <details class="health-details" open>
+      <summary>新闻源状态</summary>
+      <div class="api-status-scroll">${newsProviders.slice(0, 14).map(providerPill).join("") || "<span class=\"muted\">暂无新闻源状态</span>"}</div>
+    </details>
+    <details class="health-details">
+      <summary>本地新闻缓存明细</summary>
+      <div class="news-cache-list">
+        ${cacheRows.length ? cacheRows.slice(0, 24).map((row) => `
+          <div>
+            <strong>${escapeHtml(row.symbol || row.file || "MARKET")} · ${escapeHtml(row.scope || "all")}</strong>
+            <span>${row.newsCount || 0} 条 · ${escapeHtml(row.source || row.cache || "disk")} · ${row.cachedAt ? formatAge(Date.now() - Date.parse(row.cachedAt)) : "未知时间"}</span>
+            <em>${row.refreshDecision?.due ? "到刷新窗口" : "本地可用"}</em>
+          </div>
+        `).join("") : `<p class="muted">当前市场还没有本地新闻缓存。</p>`}
+      </div>
+    </details>
+  `;
+}
+
+async function refreshDataHealth(showStatus = true) {
+  const panel = $("dataHealthPanel");
+  try {
+    if (panel) panel.innerHTML = `<p class="muted">正在读取 ${escapeHtml(activeMarketConfig().label)} 数据健康中心...</p>`;
+    const symbol = state.selected || state.watchlist[0] || activeMarketConfig().defaultSymbols[0] || "";
+    const payload = await requestJson(`/api/data-health?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`);
+    renderDataHealth(payload);
+    if (showStatus) setStatus(`${activeMarketConfig().label}数据健康中心已更新`);
+  } catch (error) {
+    if (panel) panel.innerHTML = `<p class="quant-error">${escapeHtml(compactDisplayError(error.message))}</p>`;
+    if (showStatus) setStatus(`数据健康中心读取失败：${compactDisplayError(error.message)}`);
+  }
+}
+
+async function refreshNewsNow() {
+  const symbols = newsRefreshSymbolsForMarket(40);
+  if (!symbols.length) {
+    setStatus("当前没有可刷新新闻的股票，请先加入监控或刷新行情");
+    return;
+  }
+  setStatus(`正在手动刷新 ${symbols.length} 只股票新闻；本操作会请求新闻源但不消耗 AI token...`);
+  const results = await Promise.allSettled(symbols.map(async (symbol) => {
+    const news = await fetchNews(symbol, "refresh");
+    const item = state.analyses.get(symbol);
+    if (item) {
+      item.news = news;
+      item.signalRefreshedAt = new Date().toISOString();
+      state.analyses.set(symbol, item);
+    }
+    return { symbol, count: news.length };
+  }));
+  const ok = results.filter((row) => row.status === "fulfilled").length;
+  const totalNews = results.reduce((sum, row) => sum + (row.status === "fulfilled" ? row.value.count : 0), 0);
+  persistAnalysisSnapshot("manual-news-refresh");
+  renderCards();
+  renderDetail();
+  await refreshDataHealth(false);
+  setStatus(`新闻刷新完成：${ok}/${symbols.length} 只股票，写入 ${totalNews} 条本地新闻；如需重算买卖结论，请再点“刷新”。`);
+}
+
 function saveApiStatusState() {
   localStorage.setItem("apiStatusByMarket", JSON.stringify(state.apiStatusByMarket));
 }
@@ -3942,6 +4071,10 @@ function compactDisplayError(message) {
     .replace(/HTTP 404:\s*Stooq\s*/gi, "Stooq HTTP 404/no rows")
     .replace(/Thank you for using Alpha Vantage![\s\S]*?(?=\||$)/gi, "Alpha Vantage 免费额度/端点限制")
     .replace(/You exceeded your daily API requests limit[\s\S]*?(?=\||$)/gi, "EODHD 日额度已用尽")
+    .replace(/Single real source accepted by quota policy\.?/gi, "已按数据源保护策略接受单一真实源。")
+    .replace(/Only one real market provider was available; analysis is allowed with reduced confidence\.?/gi, "仅有一个真实行情源可用，分析会降低权重。")
+    .replace(/Index quote changePercent rejected:\s*/gi, "指数 quote 百分比已拒绝：")
+    .replace(/provider previousClose differs from real candle previous close by ([\d.]+)%; using adjacent real index candles for daily change\.?/gi, "provider 前收盘与真实K线前收盘差异 $1%，已用相邻真实指数K线计算当日涨跌。")
     .replace(/This operation was aborted/g, "请求超时")
     .replace(/Stooq CSV download requires captcha\/API key/g, "Stooq 需要 API key/captcha")
     .replace(/Stooq[\s\S]*?(captcha|verify your browser|__verify)[\s\S]*$/gi, "Stooq 需要浏览器验证/API key")
@@ -4189,16 +4322,13 @@ function reliableIndexChangePercent(marketPayload = {}, candles = []) {
   const candleChange = pctChange(latest.close, previous.close);
   const quote = marketPayload.quote || {};
   const quoteChange = Number(quote.changePercent);
-  const quotePrev = Number(quote.previousClose);
-  const previousCloseDiff = Number.isFinite(quotePrev) && Number(previous.close) > 0
-    ? Math.abs(quotePrev - Number(previous.close)) / Number(previous.close) * 100
-    : null;
   const quoteDate = String(quote.date || "").slice(0, 10);
   const latestDate = String(latest.date || "").slice(0, 10);
   const quotePlausible = Number.isFinite(quoteChange)
-    && Math.abs(quoteChange) <= 8
+    && Math.abs(quoteChange) <= 12
+    && quote.invalidChangePercent !== true
     && (!latestDate || !quoteDate || quoteDate === latestDate)
-    && (previousCloseDiff == null || previousCloseDiff <= 1.5);
+    && !quote.unavailable;
   if (quotePlausible) {
     return {
       value: quoteChange,
@@ -4214,8 +4344,8 @@ function reliableIndexChangePercent(marketPayload = {}, candles = []) {
     rejected: Number.isFinite(quoteChange),
     rejectedValue: quoteChange,
     reason: Number.isFinite(quoteChange)
-      ? previousCloseDiff != null && previousCloseDiff > 1.5
-        ? `quote previousClose 与历史前收盘差异 ${previousCloseDiff.toFixed(2)}%`
+      ? quote.invalidChangePercent === true
+        ? quote.note || `quote 涨跌幅异常 ${formatPct(quoteChange)}`
         : `quote 涨跌幅异常 ${formatPct(quoteChange)}`
       : "",
   };
@@ -4239,9 +4369,34 @@ function marketIndexRowsComplete(rows = []) {
   return expected.every((index) => rows.some((row) => indexRowMatchesConfig(row, index) && isUsableIndexRow(row)));
 }
 
+function marketIndexRowLatestDate(row) {
+  const direct = String(row?.latestDate || row?.quote?.date || "").slice(0, 10);
+  if (direct) return direct;
+  const candles = normalizeCandles(row?.candles);
+  return String(candles.at(-1)?.date || "").slice(0, 10);
+}
+
+function marketIndexRowsCurrentForSession(rows = [], session = marketState()) {
+  if (!marketIndexRowsComplete(rows) || !session?.dateKey) return false;
+  const expected = activeMarketConfig().indexes || [];
+  if (!expected.length) {
+    return rows.some((row) => isUsableIndexRow(row) && marketIndexRowLatestDate(row) >= session.dateKey);
+  }
+  return expected.every((index) => {
+    const row = rows.find((item) => indexRowMatchesConfig(item, index) && isUsableIndexRow(item));
+    const latestDate = marketIndexRowLatestDate(row);
+    return latestDate && latestDate >= session.dateKey;
+  });
+}
+
 function marketIndexStartupHint() {
   const stateNow = marketState();
-  if (marketIndexRowsComplete(state.marketIndexes)) return "";
+  if (marketIndexRowsComplete(state.marketIndexes)) {
+    if (stateNow.canRefresh && !marketIndexRowsCurrentForSession(state.marketIndexes, stateNow)) {
+      return "本地大盘快照不是当前交易日，正在读取真实指数源。";
+    }
+    return "";
+  }
   if (stateNow.canRefresh) return "点击“更新大盘”读取真实指数源。";
   if (getRuntimeSettings().allowOffHoursFetch) {
     return "休市保护已开启，启动时优先不消耗外部额度；点击“更新大盘”可手动读取真实免费源/现金点位。";
@@ -4418,7 +4573,7 @@ function indexPointSnapshotHtml(selected) {
         <strong>${formatPct(change)}</strong>
         <small>历史 OHLC 源未返回，K线/MACD/成交量暂停</small>
       </div>
-      <p>${escapeHtml(selected.warning || "当前仅显示真实现金指数点位；不会用 ETF 或模拟数据补成K线。")}</p>
+      <p>${escapeHtml(compactDisplayError(selected.warning || "当前仅显示真实现金指数点位；不会用 ETF 或模拟数据补成K线。"))}</p>
     </div>
   `;
 }
@@ -4708,6 +4863,9 @@ async function fetchIndexMarket(index) {
 async function refreshMarketIndexes(force = false) {
   const cached = readJsonStorage(indexSnapshotKey(), null);
   const cachedIsComplete = cached?.market === state.market && marketIndexRowsComplete(cached.rows);
+  const previousRows = Array.isArray(state.marketIndexes) ? state.marketIndexes : [];
+  const previousIsComplete = marketIndexRowsComplete(previousRows);
+  const previousSignal = state.marketIndexSignal || indexSignalFromRows(previousRows);
   state.marketIndexUsedSnapshotFallback = false;
   if (!force && cachedIsComplete && Date.now() - new Date(cached.updatedAt || 0).getTime() < 3 * 60 * 1000) {
     state.marketIndexes = cached.rows;
@@ -4773,21 +4931,24 @@ async function refreshMarketIndexes(force = false) {
         error: normalizeApiErrorMessage(entry.reason?.message || String(entry.reason || "读取失败")),
       }
   ));
-  if (!marketIndexRowsComplete(rows) && cachedIsComplete) {
+  if (!marketIndexRowsComplete(rows) && (previousIsComplete || cachedIsComplete)) {
     const errors = rows
       .filter((row) => row?.error)
       .map((row) => `${row.label || row.symbol}: ${compactDisplayError(row.error)}`)
       .slice(0, 3)
       .join(" | ");
-    const fallbackRows = cached.rows.map((row) => ({
+    const fallbackSourceRows = previousIsComplete ? previousRows : cached.rows;
+    const fallbackRows = fallbackSourceRows.map((row) => ({
       ...row,
       warning: [
-        `实时指数刷新失败，继续使用本地完整真实快照${cached.updatedAt ? `（${new Date(cached.updatedAt).toLocaleString()}）` : ""}。${errors}`,
+        previousIsComplete
+          ? `实时指数刷新未完整返回，已保留当前页面完整真实数据。${errors}`
+          : `实时指数刷新失败，继续使用本地完整真实快照${cached.updatedAt ? `（${new Date(cached.updatedAt).toLocaleString()}）` : ""}。${errors}`,
         row.warning || "",
       ].filter(Boolean).join(" | "),
     }));
     state.marketIndexes = fallbackRows;
-    state.marketIndexSignal = cached.signal || indexSignalFromRows(fallbackRows);
+    state.marketIndexSignal = previousIsComplete ? previousSignal : cached.signal || indexSignalFromRows(fallbackRows);
     state.marketIndexUsedSnapshotFallback = true;
     renderMarketIndexPanel();
     return fallbackRows;
@@ -4802,10 +4963,11 @@ async function refreshMarketIndexes(force = false) {
 }
 
 function shouldHydrateMarketIndexes() {
-  if (marketIndexRowsComplete(state.marketIndexes)) return false;
   const session = marketState();
   const runtime = getRuntimeSettings();
-  return session.canRefresh || runtime.allowOffHoursFetch;
+  if (!session.canRefresh && !runtime.allowOffHoursFetch) return false;
+  if (!marketIndexRowsComplete(state.marketIndexes)) return true;
+  return session.canRefresh && !marketIndexRowsCurrentForSession(state.marketIndexes, session);
 }
 
 async function hydrateMarketIndexesIfNeeded(reason = "大盘快照不完整") {
@@ -4813,15 +4975,9 @@ async function hydrateMarketIndexesIfNeeded(reason = "大盘快照不完整") {
   const marketAtStart = state.market;
   state.marketIndexRefreshing = true;
   setStatus(`${reason}，正在读取${activeMarketConfig().label}真实免费指数源...`);
+  let rows = [];
   try {
-    await refreshMarketIndexes(true);
-    if (state.market !== marketAtStart) return false;
-    renderCards();
-    renderDetail();
-    setStatus(state.marketIndexUsedSnapshotFallback
-      ? `${activeMarketConfig().label} 实时大盘源失败，已继续使用本地完整真实快照`
-      : `${activeMarketConfig().label} 大盘指数已用真实免费源补齐`);
-    return true;
+    rows = await refreshMarketIndexes(true);
   } catch (error) {
     console.warn("Unable to hydrate market indexes", error);
     if (state.market === marketAtStart) {
@@ -4833,6 +4989,29 @@ async function hydrateMarketIndexesIfNeeded(reason = "大盘快照不完整") {
   } finally {
     state.marketIndexRefreshing = false;
   }
+  if (state.market !== marketAtStart) return false;
+  const complete = marketIndexRowsComplete(rows);
+  try {
+    renderCards();
+    renderDetail();
+  } catch (error) {
+    console.warn("Market index hydration succeeded but a dependent panel failed to render", error);
+  }
+  if (state.marketIndexUsedSnapshotFallback) {
+    setStatus(`${activeMarketConfig().label} 实时大盘源失败，已继续使用本地完整真实快照`);
+    return true;
+  }
+  if (complete) {
+    setStatus(`${activeMarketConfig().label} 大盘指数已用真实免费源补齐`);
+    return true;
+  }
+  const failed = (rows || [])
+    .filter((row) => row?.error)
+    .map((row) => `${row.label || row.symbol}: ${compactDisplayError(row.error)}`)
+    .slice(0, 2)
+    .join("；");
+  setStatus(`${activeMarketConfig().label} 大盘指数部分返回；${failed || "等待更多真实源"}`);
+  return false;
 }
 
 function queueMarketIndexHydration(reason = "大盘快照不完整") {
@@ -4844,33 +5023,100 @@ function queueMarketIndexHydration(reason = "大盘快照不完整") {
   }, 80);
 }
 
-async function fetchNews(symbol) {
+function dedupeNewsClient(items = []) {
+  const seen = new Set();
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    const key = `${item?.title || ""}|${item?.link || ""}`;
+    if (!item?.title || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function fetchNews(symbol, mode = "auto") {
+  const encodedMarket = encodeURIComponent(state.market);
+  const encodedSymbol = encodeURIComponent(symbol);
+  const safeMode = ["local", "auto", "refresh", "live"].includes(String(mode || "").toLowerCase()) ? String(mode || "auto").toLowerCase() : "auto";
+  const cacheKey = `news:${state.market}:${symbol}:all`;
+  const url = `/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=all&mode=${encodeURIComponent(safeMode)}`;
   try {
-    const [macro, stock] = await Promise.all([
-      cachedJson(`news:${state.market}:__macro__`, `/api/news?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}&scope=macro`, 10 * 60 * 1000),
-      cachedJson(`news:${state.market}:${symbol}:stock`, `/api/news?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}&scope=stock`, 10 * 60 * 1000),
-    ]);
-    const seen = new Set();
-    return [...(macro.news || []), ...(stock.news || [])].filter((item) => {
-      const key = `${item.title || ""}|${item.link || ""}`;
-      if (!item.title || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const payload = await requestJson(url);
+    state.apiCache.set(cacheKey, { time: Date.now(), value: payload });
+    if (payload.scope === "macro") state.apiCache.set(`news:${state.market}:__macro__`, { time: Date.now(), value: payload });
+    localStorage.setItem(`lastNewsOpen:${state.market}`, new Date().toISOString());
+    return dedupeNewsClient(payload.news || []);
   } catch {
     try {
-      const payload = await cachedJson(`news:${state.market}:${symbol}`, `/api/news?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}&scope=stock`, 10 * 60 * 1000);
-      return payload.news || [];
+      const [macro, stock] = await Promise.all([
+        requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=macro&mode=${encodeURIComponent(safeMode)}`),
+        requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=stock&mode=${encodeURIComponent(safeMode)}`),
+      ]);
+      state.apiCache.set(`news:${state.market}:__macro__`, { time: Date.now(), value: macro });
+      state.apiCache.set(`news:${state.market}:${symbol}:stock`, { time: Date.now(), value: stock });
+      return dedupeNewsClient([...(macro.news || []), ...(stock.news || [])]);
     } catch {
-      return [];
+      try {
+        const payload = await requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=stock&mode=local`);
+        state.apiCache.set(`news:${state.market}:${symbol}`, { time: Date.now(), value: payload });
+        return dedupeNewsClient(payload.news || []);
+      } catch {
+        return [];
+      }
     }
   }
 }
 
+function newsRefreshSymbolsForMarket(limit = 40) {
+  return [...new Set([
+    state.selected,
+    ...[...state.analyses.keys()],
+    ...state.watchlist,
+  ].map((symbol) => normalizeSymbolForMarket(symbol, state.market)).filter(Boolean))].slice(0, limit);
+}
+
+async function refreshDueNewsOnOpen() {
+  const symbol = state.selected || state.watchlist[0] || activeMarketConfig().defaultSymbols[0] || "";
+  let health = null;
+  try {
+    health = await requestJson(`/api/data-health?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`);
+  } catch (error) {
+    console.warn("Unable to check news refresh schedule", error);
+    return false;
+  }
+  const scheduleDue = Boolean(health?.refreshSchedule?.due);
+  const cacheDue = Number(health?.newsCache?.summary?.dueCount || 0) > 0;
+  if (!scheduleDue && !cacheDue) return false;
+  const symbols = newsRefreshSymbolsForMarket(40);
+  if (!symbols.length) return false;
+  setStatus(`检测到错过新闻刷新窗口，后台补抓 ${symbols.length} 只股票新闻，不运行 AI 推理...`);
+  const results = await Promise.allSettled(symbols.map(async (code) => {
+    const news = await fetchNews(code, "auto");
+    const item = state.analyses.get(code);
+    if (item) {
+      item.news = news;
+      item.signalRefreshedAt = new Date().toISOString();
+      state.analyses.set(code, item);
+    }
+    return news.length;
+  }));
+  const ok = results.filter((row) => row.status === "fulfilled").length;
+  const count = results.reduce((sum, row) => sum + (row.status === "fulfilled" ? row.value : 0), 0);
+  persistAnalysisSnapshot("scheduled-news-refresh");
+  renderCards();
+  renderDetail();
+  if (state.activePage === "sources") await refreshDataHealth(false);
+  setStatus(`新闻后台补抓完成：${ok}/${symbols.length} 只股票，当前可用新闻 ${count} 条；交易结论会在下一次刷新时重算。`);
+  return true;
+}
+
 function cachedNewsValue(symbol) {
+  const all = cachedSignalValue(`news:${state.market}:${symbol}:all`, { news: [] }).news || [];
+  if (all.length) return dedupeNewsClient(all);
+  const legacyStock = cachedSignalValue(`news:${state.market}:${symbol}`, { news: [] }).news || [];
+  if (legacyStock.length) return dedupeNewsClient(legacyStock);
   const macro = cachedSignalValue(`news:${state.market}:__macro__`, { news: [] }).news || [];
   const stock = cachedSignalValue(`news:${state.market}:${symbol}:stock`, { news: [] }).news || [];
-  return [...macro, ...stock];
+  return dedupeNewsClient([...macro, ...stock]);
 }
 
 async function fetchFundamentals(symbol) {
@@ -5030,6 +5276,7 @@ function predictionSampleFromResult(item) {
     direction: analysis.direction || "mixed",
     action: analysis.action,
     source: item.source || "unknown",
+    sector: item?.fundamentals?.sector || sectorOf(item.symbol),
     calibration: analysis.calibration || null,
     strategyCalibration: analysis.strategyCalibration || null,
     marketRegime: analysis.ensemble?.marketRegime?.regime || item.factors?.marketRegime?.values?.regime || null,
@@ -5050,6 +5297,10 @@ function predictionSampleFromResult(item) {
     featureScores: {
       trend: technicals.trendScore,
       momentum: technicals.momentumScore,
+      change5d: technicals.change5d,
+      change20d: technicals.change20d,
+      volumeRatio: technicals.volumeRatio,
+      rsi: technicals.rsi,
       volume: technicals.volumeScore,
       risk: technicals.riskScore,
       factor: factorScoreForItem(item),
@@ -5218,7 +5469,9 @@ function cachedSignalValue(key, fallback) {
 }
 
 function preparedHasSignals(item) {
-  return Boolean(item?.result && (item.result.news?.length || item.result.factors));
+  const result = item?.result || {};
+  const factorEvidence = factorRows(result.factors).some(([, factor]) => factor?.values?.proxy !== true && factor?.available !== false);
+  return Boolean(result.news?.length && (factorEvidence || result.fundamentals || result.xPosts?.length || result.youtubeItems?.length));
 }
 
 function compactAnalysisForSnapshot(item) {
@@ -5421,9 +5674,9 @@ function buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, yo
 
 function signalTimeouts(options = {}) {
   if (options.backgroundSignals) {
-    return { news: 4200, fundamentals: 1800, x: 1800, youtube: 1800, factors: 4600 };
+    return { news: 9000, fundamentals: 2500, x: 2200, youtube: 2200, factors: 6500 };
   }
-  return { news: 1800, fundamentals: 1000, x: 900, youtube: 900, factors: 2400 };
+  return { news: 6500, fundamentals: 1200, x: 1000, youtube: 1000, factors: 2800 };
 }
 
 async function prepareSymbol(symbol, options = {}) {
@@ -5603,13 +5856,53 @@ function orderedSymbolsForRefresh() {
   return [...new Set([...portfolioSymbols, ...state.watchlist])];
 }
 
+function mergePreparedSignalsIntoAnalysis(prepared) {
+  const result = prepared?.result || prepared;
+  const symbol = normalizeSymbolForMarket(result?.symbol, state.market);
+  if (!symbol) return null;
+  const existing = state.analyses.get(symbol);
+  if (!existing || normalizeAnalysis(existing.analysis).action === "ERROR") return null;
+  const incomingNews = dedupeNewsClient(result.news || []);
+  const incomingX = Array.isArray(result.xPosts) ? result.xPosts : [];
+  const incomingYouTube = Array.isArray(result.youtubeItems) ? result.youtubeItems : [];
+  const merged = {
+    ...existing,
+    fundamentals: result.fundamentals || existing.fundamentals || null,
+    news: incomingNews.length ? incomingNews : (Array.isArray(existing.news) ? existing.news : []),
+    xPosts: incomingX.length ? incomingX : (Array.isArray(existing.xPosts) ? existing.xPosts : []),
+    youtubeItems: incomingYouTube.length ? incomingYouTube : (Array.isArray(existing.youtubeItems) ? existing.youtubeItems : []),
+    factors: result.factors || existing.factors || null,
+    signalRefreshedAt: new Date().toISOString(),
+  };
+  state.analyses.set(symbol, merged);
+  state.analysesByMarket.set(state.market, new Map(state.analyses));
+  return merged;
+}
+
 async function runBackgroundSignalAi(preparedItems, token) {
   const enrichedSettled = await Promise.allSettled(preparedItems.map((item) => (
     preparedHasSignals(item) ? item : prepareSymbol(item.symbol, { includeSignals: true, backgroundSignals: true })
   )));
   if (state.aiRefreshToken !== token) return;
   const enriched = enrichedSettled.map((entry, index) => entry.status === "fulfilled" ? entry.value : preparedItems[index]);
-  const results = await requestBatchAnalysis(enriched, { commit: false });
+  const signalMerged = enriched.map(mergePreparedSignalsIntoAnalysis).filter(Boolean);
+  if (signalMerged.length) {
+    persistAnalysisSnapshot("background-signal-merge");
+    renderCards();
+    renderPortfolioSummary();
+    renderDetail();
+    const newsCount = signalMerged.reduce((sum, item) => sum + Number(item.news?.length || 0), 0);
+    setStatus(`后台新闻/因子已写入：${newsCount} 条新闻证据，AI 复核继续进行`);
+  }
+  let results = [];
+  try {
+    results = await requestBatchAnalysis(enriched, { commit: false });
+  } catch (error) {
+    if (state.aiRefreshToken !== token) return;
+    console.error(error);
+    setStatus(`后台新闻/因子已更新；AI 复核未完成：${error.message}`);
+    return;
+  }
   if (state.aiRefreshToken !== token) return;
   const adjusted = commitAnalysisResults(results, { agentStep: false });
   const buyAlerts = adjusted.filter((item) => isBuyAction(item.analysis?.action)).length;
@@ -6200,6 +6493,11 @@ function renderAccuracyPanel() {
     .sort((a, b) => Number(b.samples || 0) - Number(a.samples || 0))
     .slice(0, 10);
   const regimeRows = Object.values(summary.regimeStats || {}).filter((row) => row.total > 0);
+  const benchmarkRows = Array.isArray(summary.benchmarkComparisons) ? summary.benchmarkComparisons : [];
+  const sectorRows = Object.values(summary.sectorStats || {})
+    .filter((row) => row.total > 0)
+    .sort((a, b) => Number(b.resolved || 0) - Number(a.resolved || 0) || Number(b.total || 0) - Number(a.total || 0))
+    .slice(0, 12);
   const errorRows = Object.values(summary.errorTypeStats || {})
     .filter((row) => row.total > 0)
     .sort((a, b) => Number(b.total || 0) - Number(a.total || 0))
@@ -6238,6 +6536,22 @@ function renderAccuracyPanel() {
       <div class="accuracy-metric"><span>盈亏比</span><strong>${ratioOrPending(summary.payoffRatio)}</strong></div>
       <div class="accuracy-metric"><span>最大不利回撤</span><strong>${summary.maxAdverseDrawdown == null ? "样本不足" : formatPct(summary.maxAdverseDrawdown)}</strong></div>
       <div class="accuracy-metric"><span>平均最大回撤</span><strong>${summary.avgMaxDrawdown == null ? "样本不足" : formatPct(summary.avgMaxDrawdown)}</strong></div>
+    </div>
+    <div class="learning-section">
+      <h4>基准对照</h4>
+      <div class="bucket-list">
+        ${benchmarkRows.length ? benchmarkRows.map((row) => `
+          <div class="bucket-row">
+            <strong>${escapeHtml(row.label)}</strong>
+            <span>方向 ${pctOrPending(row.directionHitRate)}</span>
+            <span>达标 ${pctOrPending(row.targetHitRate)}</span>
+            <span>vs随机 ${row.edgeVsRandom == null ? "n/a" : `${row.edgeVsRandom >= 0 ? "+" : ""}${row.edgeVsRandom.toFixed(1)}%`}</span>
+            <span>vs买入持有 ${row.edgeVsBuyHold == null ? "n/a" : `${row.edgeVsBuyHold >= 0 ? "+" : ""}${row.edgeVsBuyHold.toFixed(1)}%`}</span>
+            <span>样本 ${row.samples || 0}</span>
+            <span>${escapeHtml(row.note || "")}</span>
+          </div>
+        `).join("") : `<p class="muted">基准样本仍在收集中。</p>`}
+      </div>
     </div>
   `;
   const adjustmentsHtml = `
@@ -6346,6 +6660,21 @@ function renderAccuracyPanel() {
       </div>
     </div>
     <div class="learning-section">
+      <h4>行业表现</h4>
+      <div class="bucket-list">
+        ${sectorRows.length ? sectorRows.map((row) => `
+          <div class="bucket-row">
+            <strong>${escapeHtml(row.sector || "unknown")}</strong>
+            <span>样本 ${row.total}</span>
+            <span>已验 ${row.resolved}</span>
+            <span>方向 ${pctOrPending(row.hitRate)}</span>
+            <span>达标 ${pctOrPending(row.buyHitRate)}</span>
+            <span>平均收益 ${row.avgForwardReturn == null ? "n/a" : formatPct(row.avgForwardReturn)}</span>
+          </div>
+        `).join("") : `<p class="muted">行业样本仍在收集中。</p>`}
+      </div>
+    </div>
+    <div class="learning-section">
       <h4>错误类型归档</h4>
       <div class="bucket-list">
         ${errorRows.length ? errorRows.map((row) => `
@@ -6426,7 +6755,7 @@ function renderMarketIndexPanel() {
 	          <span class="tag ${row.quoteOnly ? "" : tagClass(row.projectedUpside || 0, 1.2, -0.5)}">预估 ${row.quoteOnly ? "K线不足" : formatPct(row.projectedUpside || 0)}</span>
 	          <span class="tag ${row.quoteOnly ? "" : tagClass(row.confidence || 0, 62, 45)}">置信 ${row.quoteOnly ? "暂停" : `${Math.round(row.confidence || 0)}%`}</span>
 	        </div>
-	        <p>${row.latestDate || ""} · ${row.source || startupHint || "等待行情源"}${row.warning ? ` · ${row.warning}` : ""}</p>
+	        <p>${row.latestDate || ""} · ${row.source || startupHint || "等待行情源"}${row.warning ? ` · ${compactDisplayError(row.warning)}` : ""}</p>
 	      </article>
 	    `).join("")}
     ${marketIndexChartHtml(chartRows)}
@@ -7107,6 +7436,121 @@ function strategyProbabilityTarget(analysis) {
   return Math.max(55, Math.min(76, Number(analysis.qualityGate?.strategyProbabilityTarget || (Number(strategy.confidence || 80) - 10))));
 }
 
+function decisionExplanation(item) {
+  const analysis = normalizeAnalysis(item.analysis);
+  const technicals = normalizeTechnicals(item.technicals);
+  const strategy = getStrategy();
+  const targetProb = strategyProbability(analysis);
+  const targetRequired = strategyProbabilityTarget(analysis);
+  const confidenceRequired = Number(strategy.confidence || 80);
+  const trendRequired = 54;
+  const volumeRequired = 0.8;
+  const factorScore = factorScoreForItem(item);
+  const liveFactorCount = factorRows(item.factors).filter(([, factor]) => factor?.available !== false && factor?.values?.proxy !== true).length;
+  const newsCount = Number(item.news?.length || 0);
+  const riskLimit = Math.max(42, Math.min(68, confidenceRequired - 18));
+  const capital = getCapital();
+  const suggested = Number(analysis.suggestedTradeValue || 0);
+  const checks = [
+    {
+      key: "confidence",
+      label: "综合置信",
+      value: Number(analysis.confidence || 0),
+      required: confidenceRequired,
+      pass: Number(analysis.confidence || 0) >= confidenceRequired,
+      note: `${Math.round(Number(analysis.confidence || 0))}% / ${Math.round(confidenceRequired)}%`,
+    },
+    {
+      key: "target",
+      label: "策略达标",
+      value: targetProb,
+      required: targetRequired,
+      pass: targetProb >= targetRequired,
+      note: `${Math.round(targetProb)}% / ${Math.round(targetRequired)}%`,
+    },
+    {
+      key: "upside",
+      label: "目标涨幅",
+      value: projectedMaxUpside(analysis),
+      required: Number(strategy.targetUpside || 5),
+      pass: projectedMaxUpside(analysis) >= Number(strategy.targetUpside || 5) || projectedFinalReturn(analysis) >= Number(strategy.targetUpside || 5) * 0.62,
+      note: `最高 ${formatPct(projectedMaxUpside(analysis))} / 目标 ${formatPct(strategy.targetUpside)}`,
+    },
+    {
+      key: "trend",
+      label: "趋势",
+      value: technicals.trendScore,
+      required: trendRequired,
+      pass: technicals.trendScore >= trendRequired && technicals.macdHistogram > -0.02,
+      note: `趋势 ${technicals.trendScore.toFixed(0)} · MACD ${technicals.macdHistogram.toFixed(4)}`,
+    },
+    {
+      key: "volume",
+      label: "量能",
+      value: technicals.volumeRatio,
+      required: volumeRequired,
+      pass: technicals.volumeRatio >= volumeRequired,
+      note: `量比 ${technicals.volumeRatio.toFixed(2)}x`,
+    },
+    {
+      key: "news",
+      label: "新闻",
+      value: newsCount,
+      required: 1,
+      pass: newsCount >= 1,
+      note: newsCount ? `${newsCount} 条，最高权重 ${Math.max(...item.news.map((row) => Number(row.impactWeight || 0))).toFixed(2)}` : "本地/实时新闻为空",
+    },
+    {
+      key: "factor",
+      label: "因子",
+      value: factorScore,
+      required: 0,
+      pass: liveFactorCount >= 2 || factorScore >= 0,
+      note: `真实因子 ${liveFactorCount} 个 · 分数 ${factorScore.toFixed(1)}`,
+    },
+    {
+      key: "risk",
+      label: "风险",
+      value: Number(analysis.downsideConfidence || 0),
+      required: riskLimit,
+      pass: !isRiskAction(analysis.action) && Number(analysis.downsideConfidence || 0) <= riskLimit,
+      note: `下跌倾向 ${Math.round(Number(analysis.downsideConfidence || 0))}% / 上限 ${Math.round(riskLimit)}%`,
+    },
+    {
+      key: "capital",
+      label: "仓位",
+      value: capital.availableForNewTrades,
+      required: suggested,
+      pass: suggested <= 0 || capital.availableForNewTrades >= Math.min(suggested, technicals.close || suggested),
+      note: `可新买 ${formatMoney(capital.availableForNewTrades)} · 建议 ${formatMoney(suggested)}`,
+    },
+  ];
+  const blockers = checks.filter((row) => !row.pass);
+  const buyScore = clamp(
+    Number(analysis.confidence || 0) * 0.24
+      + targetProb * 0.24
+      + maxUpsideProbability(analysis) * 0.12
+      + technicals.trendScore * 0.12
+      + Math.min(100, technicals.volumeRatio * 45) * 0.08
+      + Math.max(0, factorScore + 20) * 0.12
+      + Math.min(100, newsCount * 16) * 0.08
+      - Math.max(0, Number(analysis.downsideConfidence || 0) - 35) * 0.18,
+    0,
+    100
+  );
+  return {
+    buyScore,
+    threshold: targetRequired,
+    checks,
+    blockers,
+    summary: blockers.length
+      ? `未买入主要卡在：${blockers.slice(0, 3).map((row) => row.label).join("、")}。`
+      : isBuyAction(analysis.action)
+        ? "买入条件已通过，仍需遵守仓位和止损。"
+        : "核心条件接近通过，但动作仍偏观察，等待更强确认。",
+  };
+}
+
 function pickQualityGrade(item, mode = "forecast") {
   const analysis = normalizeAnalysis(item.analysis);
   const ensemble = analysis.ensemble || {};
@@ -7453,6 +7897,51 @@ function defaultAgentRows(market = state.market) {
       learning: { aggressiveness: 0.85, confidenceBias: 0, symbolBias: {} },
       stats: { wins: 0, losses: 0, trades: 0, closedTrades: 0 },
     },
+    {
+      id: "breakout",
+      name: `${MARKET_CONFIG[key].label}突破实盘训练 Agent`,
+      style: "breakout",
+      cash: capital,
+      initialCapital: capital,
+      equity: capital,
+      previousEquity: capital,
+      positions: {},
+      trades: [],
+      strategyBook: {},
+      bestStrategyId: "",
+      learning: { aggressiveness: 1.12, confidenceBias: 0, symbolBias: {} },
+      stats: { wins: 0, losses: 0, trades: 0, closedTrades: 0 },
+    },
+    {
+      id: "news-flow",
+      name: `${MARKET_CONFIG[key].label}新闻资金流 Agent`,
+      style: "news-flow",
+      cash: capital,
+      initialCapital: capital,
+      equity: capital,
+      previousEquity: capital,
+      positions: {},
+      trades: [],
+      strategyBook: {},
+      bestStrategyId: "",
+      learning: { aggressiveness: 0.95, confidenceBias: 0, symbolBias: {} },
+      stats: { wins: 0, losses: 0, trades: 0, closedTrades: 0 },
+    },
+    {
+      id: "risk-balanced",
+      name: `${MARKET_CONFIG[key].label}稳健配置 Agent`,
+      style: "risk-balanced",
+      cash: capital,
+      initialCapital: capital,
+      equity: capital,
+      previousEquity: capital,
+      positions: {},
+      trades: [],
+      strategyBook: {},
+      bestStrategyId: "",
+      learning: { aggressiveness: 0.72, confidenceBias: 0, symbolBias: {} },
+      stats: { wins: 0, losses: 0, trades: 0, closedTrades: 0 },
+    },
   ];
 }
 
@@ -7524,6 +8013,7 @@ function emptyAgentMemory(market = state.market) {
     strategyBook: {},
     symbolBias: {},
     transferCandidates: [],
+    lossLessons: [],
     totalReplayTrades: 0,
     totalPaperTrades: 0,
   };
@@ -7540,10 +8030,23 @@ function getAgentMemory(market = state.market) {
   memory.strategyBook = memory.strategyBook && typeof memory.strategyBook === "object" && !Array.isArray(memory.strategyBook) ? memory.strategyBook : {};
   memory.symbolBias = memory.symbolBias && typeof memory.symbolBias === "object" && !Array.isArray(memory.symbolBias) ? memory.symbolBias : {};
   memory.transferCandidates = Array.isArray(memory.transferCandidates) ? memory.transferCandidates : [];
+  memory.lossLessons = Array.isArray(memory.lossLessons) ? memory.lossLessons : [];
   memory.totalReplayTrades = asNumber(memory.totalReplayTrades, 0);
   memory.totalPaperTrades = asNumber(memory.totalPaperTrades, 0);
   state.agentMemoryByMarket[key] = memory;
   return memory;
+}
+
+function mergeLossLessons(existing = [], incoming = []) {
+  const byKey = new Map();
+  [...existing, ...incoming].forEach((row) => {
+    if (!row?.symbol || !row?.lesson) return;
+    const key = `${row.agentId || row.agentName || "agent"}:${row.symbol}:${row.time || ""}:${Number(row.pnlPct || 0).toFixed(3)}:${row.reason || ""}`;
+    byKey.set(key, row);
+  });
+  return [...byKey.values()]
+    .sort((a, b) => String(b.time || "").localeCompare(String(a.time || "")))
+    .slice(0, 80);
 }
 
 function mergePersistentStrategyBook(target, source) {
@@ -7672,6 +8175,19 @@ function persistAgentMemoryFromLedger(ledger = getAgentLedger(), reason = "train
     Object.entries(agent.learning?.symbolBias || {}).forEach(([symbol, bias]) => {
       memory.symbolBias[symbol] = clamp((Number(memory.symbolBias[symbol] || 0) * 0.65) + Number(bias || 0) * 0.35, -8, 8);
     });
+    const losses = (agent.trades || [])
+      .filter((trade) => trade.side === "SELL" && Number(trade.pnlPct || 0) < 0 && trade.lesson)
+      .map((trade) => ({
+        time: trade.time || new Date().toISOString(),
+        agentId: agent.id,
+        agentName: agent.name,
+        style: agent.style,
+        symbol: trade.symbol,
+        pnlPct: Number(trade.pnlPct || 0),
+        reason: trade.reason || "",
+        lesson: trade.lesson,
+      }));
+    memory.lossLessons = mergeLossLessons(memory.lossLessons || [], losses);
   });
   memory.totalReplayTrades = Object.values(memory.strategyBook || {}).reduce((sum, row) => sum + Number(row.trades || 0), 0);
   memory.totalPaperTrades = Object.values(memory.agents || {}).reduce((sum, agent) => sum + Number(agent.stats?.trades || 0), 0);
@@ -7727,9 +8243,36 @@ const AGENT_STRATEGY_CANDIDATES = [
   { id: "volume-breakout", name: "放量突破快进快出", style: "momentum", entry: "20日新高附近且量比>=1.15", minTrend: 62, minMomentum: 55, minVolume: 1.15, breakout: true, takeProfitScale: 0.62, stopScale: 0.82, holdScale: 0.55 },
   { id: "rsi-reversion", name: "超跌反弹轻仓", style: "reversion", entry: "RSI<=39且5日跌幅后企稳", rsiMax: 39, maxChange5d: 1.2, takeProfitScale: 0.5, stopScale: 0.72, holdScale: 0.45 },
   { id: "quality-trend", name: "稳态趋势持有", style: "momentum", entry: "趋势分>=65、风险分>=58、量能不过度异常", minTrend: 65, minRisk: 58, minVolume: 0.75, maxVolume: 2.8, takeProfitScale: 0.95, stopScale: 1, holdScale: 1 },
+  { id: "opening-strength", name: "开盘强势延续", style: "breakout", entry: "趋势>=56、5日不弱、量比>=1.05，偏高频试错", minTrend: 56, minMomentum: 50, minVolume: 1.05, minChange5d: -1.8, takeProfitScale: 0.42, stopScale: 0.58, holdScale: 0.32 },
+  { id: "volatility-squeeze", name: "低波动挤压突破", style: "breakout", entry: "风险分>=55、量能温和、MACD不弱，等待波动扩张", minRisk: 55, minVolume: 0.65, maxVolume: 1.8, macdFloor: -0.01, takeProfitScale: 0.56, stopScale: 0.62, holdScale: 0.46 },
+  { id: "news-confirmed-momentum", name: "新闻确认趋势", style: "news-flow", entry: "新闻/因子证据不薄，趋势>=54，量能不失真", minTrend: 54, minVolume: 0.75, minEvidence: 54, takeProfitScale: 0.68, stopScale: 0.76, holdScale: 0.62 },
+  { id: "factor-news-reversal", name: "利好修复反弹", style: "news-flow", entry: "短线回撤但新闻/因子评分改善，轻仓验证", maxChange5d: 0.6, minEvidence: 50, rsiMax: 56, takeProfitScale: 0.48, stopScale: 0.66, holdScale: 0.42 },
+  { id: "risk-balanced-carry", name: "稳健低回撤持有", style: "risk-balanced", entry: "风险分>=62、趋势>=54、量能不过热", minRisk: 62, minTrend: 54, minVolume: 0.65, maxVolume: 2.1, takeProfitScale: 0.7, stopScale: 0.78, holdScale: 0.72 },
+  { id: "cash-protected-entry", name: "现金保护低频买入", style: "risk-balanced", entry: "趋势>=58、模型共识高，单票更小、止损更紧", minTrend: 58, minMomentum: 48, minEvidence: 58, takeProfitScale: 0.62, stopScale: 0.62, holdScale: 0.56 },
 ];
 
-function strategyEntryMatches(candidate, candles, end) {
+function trainingEvidenceScore(item = {}, technicals = normalizeTechnicals(item.technicals), analysis = normalizeAnalysis(item.analysis)) {
+  const newsCount = Number(item.news?.length || 0) + Number(item.xPosts?.length || 0) + Number(item.youtubeItems?.length || 0);
+  const factorLiveCount = factorRows(item.factors).filter(([, factor]) => factor?.available !== false && factor?.values?.proxy !== true).length;
+  const factorScore = factorScoreForItem(item);
+  const consensus = Number(analysis.ensemble?.consensusAgreement || 0);
+  const upsideAgreement = Number(analysis.ensemble?.upsideAgreement || 0);
+  const analogConfidence = Number(item.analog?.confidence || item.analog?.model?.confidence || 0);
+  return clamp(
+    34
+      + Math.min(16, newsCount * 2.2)
+      + Math.min(14, factorLiveCount * 3.2)
+      + Math.max(-10, Math.min(12, factorScore * 0.22))
+      + Math.max(0, consensus - 55) * 0.22
+      + Math.max(0, upsideAgreement - 52) * 0.18
+      + Math.max(0, analogConfidence - 45) * 0.14
+      + Math.max(0, technicals.volumeRatio - 1) * 4,
+    0,
+    100
+  );
+}
+
+function strategyEntryMatches(candidate, candles, end, item = null) {
   if (end < 55) return false;
   const slice = candles.slice(0, end + 1);
   const technicals = computeTechnicals(slice);
@@ -7742,12 +8285,15 @@ function strategyEntryMatches(candidate, candles, end) {
   if (candidate.minVolume && technicals.volumeRatio < candidate.minVolume) return false;
   if (candidate.maxVolume && technicals.volumeRatio > candidate.maxVolume) return false;
   if (candidate.rsiMax && technicals.rsi > candidate.rsiMax) return false;
+  if (candidate.minChange5d != null && technicals.change5d < candidate.minChange5d) return false;
   if (candidate.maxChange5d != null && technicals.change5d > candidate.maxChange5d) return false;
-  if (candidate.style === "momentum" && technicals.macdHistogram < -0.02) return false;
+  if (candidate.macdFloor != null && technicals.macdHistogram < candidate.macdFloor) return false;
+  if (candidate.minEvidence != null && item && trainingEvidenceScore(item, technicals) < candidate.minEvidence) return false;
+  if (["momentum", "breakout", "risk-balanced"].includes(candidate.style) && technicals.macdHistogram < -0.02) return false;
   return true;
 }
 
-function simulateStrategyCandidate(candles, candidate, strategy) {
+function simulateStrategyCandidate(candles, candidate, strategy, item = null) {
   const rows = normalizeCandles(candles).slice(-220);
   if (rows.length < 75) return { trades: 0, wins: 0, avgReturn: 0, maxDrawdown: 0, score: -99 };
   const target = Math.max(1.2, Number(strategy.targetUpside || 5) * candidate.takeProfitScale);
@@ -7757,7 +8303,8 @@ function simulateStrategyCandidate(candles, candidate, strategy) {
   let wins = 0;
   let maxDrawdown = 0;
   for (let end = 55; end < rows.length - maxHold - 1; end += 1) {
-    if (!strategyEntryMatches(candidate, rows, end)) continue;
+    if (!strategyEntryMatches(candidate, rows, end, item)) continue;
+    const entryTechnicals = computeTechnicals(rows.slice(0, end + 1));
     const entry = rows[end].close;
     let exit = rows[Math.min(rows.length - 1, end + maxHold)].close;
     let tradeDrawdown = 0;
@@ -7776,7 +8323,7 @@ function simulateStrategyCandidate(candles, candidate, strategy) {
       }
       exit = row.close;
     }
-    const tradeReturn = pctChange(exit, entry);
+    const tradeReturn = pctChange(exit, entry) - estimatedRoundTripCostPct(item, entryTechnicals);
     if (tradeReturn > 0) wins += 1;
     maxDrawdown = Math.min(maxDrawdown, tradeDrawdown);
     returns.push(tradeReturn);
@@ -7820,6 +8367,15 @@ function mergeStrategyResult(book, candidate, sim, symbol) {
   book[candidate.id] = existing;
 }
 
+function candidateEligibleForAgent(candidate, agent) {
+  if (candidate.style === agent.style) return true;
+  if (agent.style === "momentum" && ["momentum", "breakout"].includes(candidate.style)) return true;
+  if (agent.style === "breakout" && ["breakout", "momentum"].includes(candidate.style)) return true;
+  if (agent.style === "news-flow" && ["news-flow", "momentum", "breakout"].includes(candidate.style)) return true;
+  if (agent.style === "risk-balanced" && ["risk-balanced", "momentum"].includes(candidate.style)) return true;
+  return false;
+}
+
 function trainAgentsWithHistoricalReplay(ledger, results = []) {
   const strategy = getStrategy();
   ledger.agents.forEach((agent) => {
@@ -7827,8 +8383,8 @@ function trainAgentsWithHistoricalReplay(ledger, results = []) {
     results.forEach((item) => {
       if (!Array.isArray(item.candles) || item.candles.length < 75) return;
       AGENT_STRATEGY_CANDIDATES
-        .filter((candidate) => candidate.style === agent.style || agent.style === "momentum")
-        .forEach((candidate) => mergeStrategyResult(agent.strategyBook, candidate, simulateStrategyCandidate(item.candles, candidate, strategy), item.symbol));
+        .filter((candidate) => candidateEligibleForAgent(candidate, agent))
+        .forEach((candidate) => mergeStrategyResult(agent.strategyBook, candidate, simulateStrategyCandidate(item.candles, candidate, strategy, item), item.symbol));
     });
     const best = bestStrategyForAgent(agent);
     if (best) {
@@ -7869,20 +8425,106 @@ function markAgentToMarket(agent) {
   return agent.equity;
 }
 
+function agentStyleLabel(style) {
+  return {
+    momentum: "趋势追踪",
+    reversion: "回撤反弹",
+    breakout: "突破高频训练",
+    "news-flow": "新闻/资金流",
+    "risk-balanced": "稳健配置",
+  }[style] || style || "训练";
+}
+
+function agentTradeThreshold(agent) {
+  const best = bestStrategyForAgent(agent);
+  const scoreBonus = best ? clamp(Number(best.score || 0) / 12, -4, 4) : 0;
+  const bias = Number(agent.learning?.confidenceBias || 0) * 0.35;
+  const base = {
+    momentum: 60,
+    reversion: 56,
+    breakout: 53,
+    "news-flow": 55,
+    "risk-balanced": 62,
+  }[agent.style] ?? 58;
+  return clamp(base - scoreBonus - bias, 49, 68);
+}
+
+function agentExitScoreFloor(agent) {
+  return {
+    momentum: 46,
+    reversion: 43,
+    breakout: 47,
+    "news-flow": 45,
+    "risk-balanced": 52,
+  }[agent.style] ?? 46;
+}
+
+function agentPositionSizing(agent) {
+  return {
+    momentum: { cashPct: 0.18, equityPct: 0.045, maxPct: 0.16 },
+    reversion: { cashPct: 0.14, equityPct: 0.034, maxPct: 0.12 },
+    breakout: { cashPct: 0.12, equityPct: 0.028, maxPct: 0.09 },
+    "news-flow": { cashPct: 0.15, equityPct: 0.036, maxPct: 0.13 },
+    "risk-balanced": { cashPct: 0.1, equityPct: 0.026, maxPct: 0.08 },
+  }[agent.style] || { cashPct: 0.14, equityPct: 0.035, maxPct: 0.12 };
+}
+
+function estimatedOneWayCostPct(item = null, technicals = normalizeTechnicals(item?.technicals)) {
+  const base = {
+    ASX: 0.08,
+    US: 0.045,
+    CN: 0.07,
+  }[state.market] ?? 0.08;
+  const volumeRatio = Number(technicals?.volumeRatio || 1);
+  const illiquidity = volumeRatio < 0.65 ? 0.09 : volumeRatio < 0.9 ? 0.045 : 0;
+  const sourcePenalty = item?.marketValidation?.degraded ? 0.025 : 0;
+  return Number((base + illiquidity + sourcePenalty).toFixed(4));
+}
+
+function estimatedRoundTripCostPct(item = null, technicals = normalizeTechnicals(item?.technicals)) {
+  return Number((estimatedOneWayCostPct(item, technicals) * 2).toFixed(4));
+}
+
 function agentDecisionScore(agent, item) {
   const analysis = normalizeAnalysis(item.analysis);
   const technicals = normalizeTechnicals(item.technicals);
   const marketBias = Number(state.marketIndexSignal?.score || 0);
   const learnedBias = Number(agent.learning?.symbolBias?.[item.symbol] || 0) + Number(agent.learning?.confidenceBias || 0);
+  const evidence = trainingEvidenceScore(item, technicals, analysis);
+  const factorScore = factorScoreForItem(item);
+  const targetProb = strategyProbability(analysis);
+  const finalProb = finalReturnProbability(analysis);
+  const maxProb = maxUpsideProbability(analysis);
   if (agent.style === "reversion") {
     return clamp(
-      46 + (50 - technicals.rsi) * 0.75 + analysis.projectedUpside * 3.2 + (analysis.confidence - 55) * 0.28 + marketBias * 0.8 + learnedBias,
+      46 + (50 - technicals.rsi) * 0.75 + projectedMaxUpside(analysis) * 2.4 + (analysis.confidence - 55) * 0.22 + marketBias * 0.55 + evidence * 0.08 + learnedBias,
+      0,
+      100
+    );
+  }
+  if (agent.style === "breakout") {
+    return clamp(
+      35 + (analysis.confidence - 48) * 0.42 + projectedMaxUpside(analysis) * 3.1 + (technicals.trendScore - 48) * 0.22 + (technicals.volumeRatio - 1) * 11 + Math.max(0, technicals.change5d) * 0.45 + maxProb * 0.08 + marketBias * 0.7 + learnedBias,
+      0,
+      100
+    );
+  }
+  if (agent.style === "news-flow") {
+    return clamp(
+      34 + evidence * 0.34 + factorScore * 0.2 + targetProb * 0.12 + projectedFinalReturn(analysis) * 2.6 + (technicals.trendScore - 50) * 0.12 + marketBias * 0.55 + learnedBias,
+      0,
+      100
+    );
+  }
+  if (agent.style === "risk-balanced") {
+    return clamp(
+      28 + analysis.confidence * 0.24 + targetProb * 0.18 + finalProb * 0.1 + (technicals.riskScore - 45) * 0.28 + Math.max(0, technicals.trendScore - 50) * 0.14 + evidence * 0.08 - Math.max(0, Number(analysis.downsideConfidence || 0) - 45) * 0.18 + learnedBias * 0.6,
       0,
       100
     );
   }
   return clamp(
-    38 + (analysis.confidence - 50) * 0.58 + analysis.projectedUpside * 4.2 + (technicals.trendScore - 50) * 0.24 + (technicals.volumeRatio - 1) * 8 + marketBias * 0.9 + learnedBias,
+    38 + (analysis.confidence - 50) * 0.5 + projectedFinalReturn(analysis) * 3.2 + projectedMaxUpside(analysis) * 1.1 + (technicals.trendScore - 50) * 0.24 + (technicals.volumeRatio - 1) * 8 + evidence * 0.08 + marketBias * 0.9 + learnedBias,
     0,
     100
   );
@@ -7904,11 +8546,18 @@ function sellAgentPosition(agent, symbol, price, reason) {
   if (!position || price <= 0) return;
   agent.learning = agent.learning || { aggressiveness: 1, confidenceBias: 0, symbolBias: {} };
   agent.learning.symbolBias = agent.learning.symbolBias || {};
+  const item = state.analyses.get(symbol);
+  const exitCostPct = estimatedOneWayCostPct(item);
   const value = position.qty * price;
-  const pnlPct = pctChange(price, position.avgPrice);
-  agent.cash += value;
+  const exitCost = value * exitCostPct / 100;
+  const netValue = value - exitCost;
+  const costBasis = Number(position.costBasis || (position.qty * position.avgPrice));
+  const pnlPct = costBasis > 0 ? ((netValue - costBasis) / costBasis) * 100 : pctChange(price, position.avgPrice) - exitCostPct;
+  const heldDays = Math.max(0, (Date.now() - new Date(position.openedAt || Date.now()).getTime()) / 86400000);
+  const lesson = agentTradeLesson(agent, symbol, pnlPct, reason, heldDays);
+  agent.cash += netValue;
   delete agent.positions[symbol];
-  agent.learning.symbolBias[symbol] = clamp(Number(agent.learning.symbolBias[symbol] || 0) + (pnlPct > 0 ? 0.9 : -1.1), -6, 6);
+  agent.learning.symbolBias[symbol] = clamp(Number(agent.learning.symbolBias[symbol] || 0) + (pnlPct > 0 ? 0.9 : -1.25), -6, 6);
   pushAgentTrade(agent, {
     time: new Date().toISOString(),
     side: "SELL",
@@ -7917,29 +8566,64 @@ function sellAgentPosition(agent, symbol, price, reason) {
     price,
     pnlPct,
     reason,
+    lesson,
+    heldDays,
+    costPct: exitCostPct,
+    cost: exitCost,
   });
+}
+
+function agentTradeLesson(agent, symbol, pnlPct, reason, heldDays = 0) {
+  if (pnlPct >= 0) {
+    if (reason === "take-profit/time") return "盈利退出：该策略可保留，但后续比较是否过早止盈。";
+    return "正收益退出：记录为有效样本，继续观察同类入场的稳定性。";
+  }
+  if (reason === "stop") return "亏损复盘：价格先触及止损，后续同类入场需要更高量能/新闻/因子确认，且降低该票偏置。";
+  if (reason === "signal-exit") return "亏损复盘：模型信号转弱才退出，说明入场后确认不足；同类交易下调入场频率或提高共识门槛。";
+  if (heldDays > getStrategy().horizonDays * 0.7) return "亏损复盘：持有接近周期仍未兑现，后续缩短该策略最长持有或提前复核。";
+  return `亏损复盘：${symbol} 本次 ${formatPct(pnlPct)}，作为失败交易保留，后续降低该形态信心。`;
 }
 
 function buyAgentPosition(agent, item, score) {
   const technicals = normalizeTechnicals(item.technicals);
   const price = technicals.close;
-  if (!price || price <= 0 || agent.cash < price) return;
-  const maxPositionValue = Math.max(agent.equity * 0.16, agent.initialCapital * 0.06);
+  const entryCostPct = estimatedOneWayCostPct(item, technicals);
+  const grossPerShare = price * (1 + entryCostPct / 100);
+  if (!price || price <= 0 || agent.cash < grossPerShare) return;
+  const sizing = agentPositionSizing(agent);
+  const maxPositionValue = Math.max(agent.equity * sizing.maxPct, agent.initialCapital * Math.min(0.06, sizing.maxPct));
   const currentValue = (agent.positions[item.symbol]?.qty || 0) * price;
   if (currentValue >= maxPositionValue) return;
-  const ticket = Math.min(agent.cash * 0.18, agent.equity * 0.045 * Number(agent.learning?.aggressiveness || 1), maxPositionValue - currentValue);
-  const qty = Math.floor(ticket / price);
+  const ticket = Math.min(
+    agent.cash * sizing.cashPct,
+    agent.equity * sizing.equityPct * Number(agent.learning?.aggressiveness || 1),
+    maxPositionValue - currentValue
+  );
+  const qty = Math.floor(ticket / grossPerShare);
   if (qty <= 0) return;
   const existing = agent.positions[item.symbol];
+  const grossValue = qty * price;
+  const entryCost = grossValue * entryCostPct / 100;
   if (existing) {
     const totalQty = existing.qty + qty;
-    existing.avgPrice = ((existing.avgPrice * existing.qty) + (price * qty)) / totalQty;
+    const previousCostBasis = Number(existing.costBasis || (existing.avgPrice * existing.qty));
+    existing.costBasis = previousCostBasis + grossValue + entryCost;
+    existing.avgPrice = existing.costBasis / totalQty;
     existing.qty = totalQty;
     existing.lastPrice = price;
+    existing.costPaid = Number(existing.costPaid || 0) + entryCost;
   } else {
-    agent.positions[item.symbol] = { qty, avgPrice: price, lastPrice: price, openedAt: new Date().toISOString() };
+    agent.positions[item.symbol] = {
+      qty,
+      avgPrice: (grossValue + entryCost) / qty,
+      lastPrice: price,
+      openedAt: new Date().toISOString(),
+      costBasis: grossValue + entryCost,
+      costPaid: entryCost,
+      entryCostPct,
+    };
   }
-  agent.cash -= qty * price;
+  agent.cash -= grossValue + entryCost;
   pushAgentTrade(agent, {
     time: new Date().toISOString(),
     side: "BUY",
@@ -7947,7 +8631,9 @@ function buyAgentPosition(agent, item, score) {
     qty,
     price,
     pnlPct: 0,
-    reason: `score ${score.toFixed(1)}`,
+    reason: `score ${score.toFixed(1)} / threshold ${agentTradeThreshold(agent).toFixed(1)} · one-way cost ${entryCostPct.toFixed(3)}%`,
+    costPct: entryCostPct,
+    cost: entryCost,
   });
 }
 
@@ -7971,14 +8657,19 @@ function trainAgentsWithResults(results = []) {
       const pnlPct = pctChange(price, position.avgPrice);
       const heldDays = Math.max(0, (Date.now() - new Date(position.openedAt || Date.now()).getTime()) / 86400000);
       const score = agentDecisionScore(agent, item);
-      if (pnlPct <= -Math.abs(getStrategy().stopLoss || 4) || pnlPct >= Math.max(1.5, getStrategy().targetUpside * 0.55) || score < 46 || heldDays > getStrategy().horizonDays * 0.85) {
-        sellAgentPosition(agent, symbol, price, pnlPct <= -Math.abs(getStrategy().stopLoss || 4) ? "stop" : score < 46 ? "signal-exit" : "take-profit/time");
+      const styleStopScale = { breakout: 0.72, "news-flow": 0.85, "risk-balanced": 0.68, reversion: 0.78, momentum: 1 };
+      const styleTakeProfitScale = { breakout: 0.42, "news-flow": 0.55, "risk-balanced": 0.7, reversion: 0.48, momentum: 0.55 };
+      const stopLine = Math.abs(getStrategy().stopLoss || 4) * (styleStopScale[agent.style] || 1);
+      const takeLine = Math.max(0.9, getStrategy().targetUpside * (styleTakeProfitScale[agent.style] || 0.55));
+      const maxHoldScale = { breakout: 0.42, "news-flow": 0.62, "risk-balanced": 0.82, reversion: 0.52, momentum: 0.85 }[agent.style] || 0.75;
+      if (pnlPct <= -stopLine || pnlPct >= takeLine || score < agentExitScoreFloor(agent) || heldDays > getStrategy().horizonDays * maxHoldScale) {
+        sellAgentPosition(agent, symbol, price, pnlPct <= -stopLine ? "stop" : score < agentExitScoreFloor(agent) ? "signal-exit" : "take-profit/time");
       }
     });
     results.forEach((item) => {
       if (item.analysis?.action === "ERROR") return;
       const score = agentDecisionScore(agent, item);
-      if (score >= (agent.style === "momentum" ? 60 : 56)) buyAgentPosition(agent, item, score);
+      if (score >= agentTradeThreshold(agent)) buyAgentPosition(agent, item, score);
     });
     markAgentToMarket(agent);
     agent.previousEquity = agent.equity;
@@ -8419,6 +9110,79 @@ function applyForecastStability(result, analysis) {
   return adjusted;
 }
 
+function evidenceQualityCalibration(result, analysis) {
+  const technicals = normalizeTechnicals(result.technicals);
+  const evidence = trainingEvidenceScore(result, technicals, analysis);
+  const newsCount = Number(result.news?.length || 0) + Number(result.xPosts?.length || 0) + Number(result.youtubeItems?.length || 0);
+  const liveFactors = factorRows(result.factors).filter(([, factor]) => factor?.available !== false && factor?.values?.proxy !== true).length;
+  const ensemble = analysis.ensemble || {};
+  const consensus = Number(ensemble.consensusAgreement || 0);
+  const upsideAgreement = Number(ensemble.upsideAgreement || 0);
+  const summary = state.accuracySummary || {};
+  const enoughAccuracy = Number(summary.resolved || 0) >= 8;
+  const recentDirectionOk = !enoughAccuracy || summary.hitRate == null || Number(summary.hitRate) >= 50;
+  const recentBuyOk = !enoughAccuracy || summary.buyHitRate == null || Number(summary.buyHitRate) >= 54;
+  const degraded = Boolean(result.marketValidation?.degraded);
+  let confidenceDelta = 0;
+  let upsideScale = 1;
+  const reasons = [];
+
+  if (evidence >= 72 && consensus >= 66 && upsideAgreement >= 58 && recentDirectionOk && recentBuyOk && !degraded) {
+    confidenceDelta += Math.min(4.5, (evidence - 68) * 0.12 + (consensus - 64) * 0.035);
+    upsideScale += Math.min(0.06, (evidence - 70) * 0.002);
+    reasons.push(`证据质量强 ${evidence.toFixed(0)}：新闻/因子/共识一致，允许小幅提高置信`);
+  }
+  if (evidence < 45) {
+    const penalty = Math.min(7, (45 - evidence) * 0.18 + (newsCount <= 1 ? 1.6 : 0) + (liveFactors <= 1 ? 1.3 : 0));
+    confidenceDelta -= penalty;
+    upsideScale -= Math.min(0.18, penalty * 0.018);
+    reasons.push(`证据质量弱 ${evidence.toFixed(0)}：新闻或真实因子偏薄，压低置信和涨幅`);
+  }
+  if (degraded) {
+    confidenceDelta -= 1.8;
+    upsideScale -= 0.03;
+    reasons.push("行情仅单源/降级验证，避免把数据源不确定性转成高置信");
+  }
+  if (enoughAccuracy && !recentBuyOk && projectedFinalReturn(analysis) > 0) {
+    confidenceDelta -= 2.5;
+    upsideScale -= 0.06;
+    reasons.push("近期买入达标率不足，正向信号继续保守校准");
+  }
+  if (!reasons.length) return analysis;
+
+  const projected = Number(analysis.projectedUpside || 0);
+  const projectedFinal = Number(projectedFinalReturn(analysis));
+  const projectedMax = Number(projectedMaxUpside(analysis));
+  const scaledProjected = projected > 0 ? projected * upsideScale : projected;
+  const scaledFinal = projectedFinal > 0 ? projectedFinal * upsideScale : projectedFinal;
+  const scaledMax = projectedMax > 0 ? projectedMax * Math.max(0.62, upsideScale * 0.96) : projectedMax;
+  const magnitudeDelta = confidenceDelta * 0.62;
+  return {
+    ...analysis,
+    confidence: clamp(Math.round(Number(analysis.confidence || 0) + confidenceDelta), 0, 99),
+    predictionConfidence: clamp(Math.round(Number(analysis.predictionConfidence ?? analysis.confidence ?? 0) + confidenceDelta), 0, 99),
+    projectedUpside: Number(scaledProjected.toFixed(2)),
+    projectedFinalReturn: Number(scaledFinal.toFixed(2)),
+    projectedMaxUpside: Number(Math.max(0, scaledMax).toFixed(2)),
+    magnitudeConfidence: clamp(Math.round(magnitudeProbability(analysis) + magnitudeDelta), 0, 92),
+    magnitudeHitProbability: clamp(Math.round(magnitudeProbability(analysis) + magnitudeDelta), 0, 92),
+    finalReturnConfidence: clamp(Math.round(finalReturnProbability(analysis) + magnitudeDelta * 0.9), 0, 92),
+    finalReturnHitProbability: clamp(Math.round(finalReturnProbability(analysis) + magnitudeDelta * 0.9), 0, 92),
+    maxUpsideConfidence: clamp(Math.round(maxUpsideProbability(analysis) + magnitudeDelta * 0.72), 0, 92),
+    maxUpsideHitProbability: clamp(Math.round(maxUpsideProbability(analysis) + magnitudeDelta * 0.72), 0, 92),
+    qualityGate: {
+      ...(analysis.qualityGate || {}),
+      evidenceQualityScore: Number(evidence.toFixed(1)),
+      evidenceNewsCount: newsCount,
+      evidenceLiveFactorCount: liveFactors,
+    },
+    thesis: [
+      `Evidence calibration: ${reasons.join("；")}。`,
+      ...(analysis.thesis || []),
+    ],
+  };
+}
+
 function applyPostModelAdjustments(result) {
   if (!result?.analysis || result.analysis.action === "ERROR") return result;
   const analysis = normalizeAnalysis(result.analysis);
@@ -8437,6 +9201,7 @@ function applyPostModelAdjustments(result) {
       ...(analysis.thesis || []),
     ],
   };
+  adjusted = evidenceQualityCalibration(result, adjusted);
   adjusted = adaptiveClientLearningAdjustment(result, adjusted);
   adjusted = conservativeClientForecast(adjusted);
   adjusted = applyForecastStability(result, adjusted);
@@ -8456,6 +9221,7 @@ function renderAgentPanel() {
       <strong>长期策略记忆</strong>
       <span>策略 ${Object.keys(memory.strategyBook || {}).length} 个 · 归档 ${memory.archives?.length || 0} 个周期 · 回放交易 ${Math.round(memory.totalReplayTrades || 0)} · 纸面成交 ${Math.round(memory.totalPaperTrades || 0)}</span>
       <p>重置训练只会把当前周期归档；下一轮 agent 会继续继承长期胜率、策略评分和个股偏置。</p>
+      ${(memory.lossLessons || []).length ? `<p>最近亏损经验：${memory.lossLessons.slice(0, 3).map((row) => `${escapeHtml(row.symbol)} ${formatPct(row.pnlPct)}：${escapeHtml(row.lesson)}`).join(" / ")}</p>` : ""}
     </div>
   `;
   target.innerHTML = memorySummary + ledger.agents.map((agent) => {
@@ -8464,7 +9230,7 @@ function renderAgentPanel() {
     return `
       <article class="agent-card">
         <div class="agent-top">
-          <div><strong>${agent.name}</strong><span>${agent.style === "momentum" ? "趋势追踪" : "回撤反弹"} · 攻击性 ${Number(agent.learning?.aggressiveness || 1).toFixed(2)}</span></div>
+          <div><strong>${agent.name}</strong><span>${agentStyleLabel(agent.style)} · 入场阈值 ${agentTradeThreshold(agent).toFixed(1)} · 攻击性 ${Number(agent.learning?.aggressiveness || 1).toFixed(2)}</span></div>
           <strong class="${Number(agent.returnPct || 0) >= 0 ? "good-text" : "danger-text"}">${formatPct(agent.returnPct || 0)}</strong>
         </div>
         <div class="agent-metrics">
@@ -8475,7 +9241,7 @@ function renderAgentPanel() {
         </div>
         <p>${positions.length ? positions.map(([symbol, position]) => `${symbol} ${position.qty}股 @ ${formatMoney(position.avgPrice)}`).join(" · ") : "当前空仓，等待符合策略的高频模拟入场。"}</p>
         <div class="agent-trades">
-          ${lastTrades.length ? lastTrades.map((trade) => `<span>${trade.side} ${trade.symbol} ${trade.qty} @ ${formatMoney(trade.price)} ${trade.pnlPct ? formatPct(trade.pnlPct) : ""}</span>`).join("") : "<span>暂无模拟成交</span>"}
+          ${lastTrades.length ? lastTrades.map((trade) => `<span title="${escapeHtml(trade.lesson || trade.reason || "")}">${trade.side} ${trade.symbol} ${trade.qty} @ ${formatMoney(trade.price)} ${trade.pnlPct ? formatPct(trade.pnlPct) : ""}${trade.lesson ? ` · ${escapeHtml(trade.lesson)}` : ""}</span>`).join("") : "<span>暂无模拟成交</span>"}
         </div>
         <p>${bestStrategyForAgent(agent) ? `当前最优：${bestStrategyForAgent(agent).name}，回测交易 ${bestStrategyForAgent(agent).trades} 次，均值 ${formatPct(bestStrategyForAgent(agent).avgReturn)}。` : "策略草稿收集中，至少需要几次历史叠加交易。"}</p>
       </article>
@@ -8832,6 +9598,9 @@ function renderDetail() {
   const technicals = normalizeTechnicals(item.technicals);
   const analysis = normalizeAnalysis(item.analysis);
   const news = Array.isArray(item.news) ? item.news : [];
+  const newsEmptyText = item.signalRefreshedAt
+    ? "当前真实新闻源本轮未返回新闻。"
+    : "新闻后台读取中；完成后会自动写入。";
   const source = item.source || "unknown";
   const quoteText = item.quote?.source ? ` · 报价：${item.quote.source}${item.quote.delayed ? "（延迟）" : "（实时）"}` : "";
   $("analysisSource").textContent = `分析：${source} · 行情：${item.marketSource || "unknown"}${quoteText}`;
@@ -8858,6 +9627,7 @@ function renderDetail() {
   const finalProb = finalReturnProbability(analysis);
   const maxMove = projectedMaxUpside(analysis);
   const maxProb = maxUpsideProbability(analysis);
+  const decision = decisionExplanation(item);
   $("detailPanel").innerHTML = `
     <h3>${symbol} · ${actionLabel(analysis.action)}</h3>
     <p class="muted">周期 ${analysis.horizonDays || getStrategy().horizonDays} 日 · 结束预估 ${formatPct(projectedFinalReturn(analysis))}/${Math.round(finalProb)}% · 最高触达 ${formatPct(maxMove)}/${Math.round(maxProb)}% · 方向 ${directionText} ${Math.round(directionProb)}% · 策略达标 ${Math.round(targetProb)}% / ${Math.round(targetProbRequired)}% · 综合 ${Math.round(analysis.confidence)}%${analysis.rawConfidence !== analysis.confidence ? `（原始 ${Math.round(analysis.rawConfidence)}%）` : ""}</p>
@@ -8874,6 +9644,22 @@ function renderDetail() {
     <div class="decision-actions">
       <button id="acceptDecision" type="button">接受并记录决策</button>
       <button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button>
+    </div>
+    <div class="decision-explain-card">
+      <div class="decision-explain-head">
+        <strong>为什么${isBuyAction(analysis.action) ? "买/关注" : "暂不买"}</strong>
+        <span>买入分数 ${decision.buyScore.toFixed(1)} / 阈值 ${decision.threshold.toFixed(1)}</span>
+      </div>
+      <p>${escapeHtml(decision.summary)}</p>
+      <div class="decision-check-grid">
+        ${decision.checks.map((check) => `
+          <div class="${check.pass ? "pass" : "block"}">
+            <strong>${escapeHtml(check.label)}</strong>
+            <span>${escapeHtml(check.note)}</span>
+            <em>${check.pass ? "通过" : `差 ${Math.max(0, Number(check.required || 0) - Number(check.value || 0)).toFixed(check.key === "volume" ? 2 : 1)}`}</em>
+          </div>
+        `).join("")}
+      </div>
     </div>
     <div class="trade-ticket">
       <div>
@@ -8964,7 +9750,7 @@ function renderDetail() {
     <h4>风险</h4>
     <ul>${(analysis.risks || []).map((itemText) => `<li>${itemText}</li>`).join("")}</ul>
     <h4>新闻</h4>
-    <ul>${(news || []).slice(0, 8).map((itemNews) => `<li><a href="${itemNews.link}" target="_blank" rel="noreferrer">${itemNews.title}</a> <span class="muted">${itemNews.publisher || itemNews.source || ""} · ${itemNews.channel || "news"} · 权重 ${asNumber(itemNews.impactWeight, 0.4).toFixed(2)}</span></li>`).join("") || "<li>当前 provider 未返回新闻。</li>"}</ul>
+    <ul>${(news || []).slice(0, 8).map((itemNews) => `<li><a href="${itemNews.link}" target="_blank" rel="noreferrer">${itemNews.title}</a> <span class="muted">${itemNews.publisher || itemNews.source || ""} · ${itemNews.categoryLabel || itemNews.category || itemNews.channel || "news"} · ${itemNews.channel || "news"} · 权重 ${asNumber(itemNews.impactWeight, 0.4).toFixed(2)}</span></li>`).join("") || `<li>${newsEmptyText}</li>`}</ul>
     <h4>X / 一手消息</h4>
     <ul>${(item.xPosts || []).slice(0, 5).map((post) => `<li>${post.text}</li>`).join("") || "<li>未配置 X_BEARER_TOKEN，暂不读取 X。</li>"}</ul>
     <h4>YouTube 热门/搜索</h4>
@@ -10501,12 +11287,11 @@ async function switchMarket(nextMarket) {
   renderOptimalStrategyPanel();
   renderDetail();
   setStatus(`已切换到${activeMarketConfig().label}；刷新后读取该市场真实行情`);
-  if (state.activePage === "features") refreshProviderBudget(false);
-  refreshApiStatusBar(false);
-  if (state.activePage === "trading") {
-    runRiskAssessment(false);
-    loadTradingAudit(false);
+  if (state.activePage === "sources") {
+    refreshProviderBudget(false);
+    refreshDataHealth(false);
   }
+  refreshApiStatusBar(false);
   queueMarketIndexHydration(`${activeMarketConfig().label} 大盘快照不完整`);
   if (state.autoRefreshEnabled) scheduleNextAutoRefresh();
 }
@@ -10561,6 +11346,13 @@ async function importPortfolioImage(event) {
 }
 
 function boot() {
+  localStorage.setItem(`lastAppOpen:${state.market}`, new Date().toISOString());
+  window.addEventListener("pagehide", () => {
+    localStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
+  });
+  window.addEventListener("beforeunload", () => {
+    localStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
+  });
   loadSavedInputs();
   sanitizeActiveMarketState();
   updateMarketUi();
@@ -10588,6 +11380,9 @@ function boot() {
   setWorkspacePage(state.activePage, { silent: true });
   loadResearchConfig();
   queueMarketIndexHydration("启动时大盘快照不完整");
+  setTimeout(() => {
+    refreshDueNewsOnOpen().catch((error) => console.warn("Scheduled news refresh failed", error));
+  }, 900);
 
   document.querySelectorAll("[data-page-target]").forEach((button) => {
     button.addEventListener("click", () => setWorkspacePage(button.dataset.pageTarget));
@@ -10601,6 +11396,8 @@ function boot() {
   bind("saveFactorConfig", "click", saveFactorConfig);
   bind("openModelChangeLog", "click", openModelChangeLogModal);
   bind("refreshProviderBudget", "click", () => refreshProviderBudget(true));
+  bind("refreshDataHealth", "click", () => refreshDataHealth(true));
+  bind("refreshNewsNow", "click", refreshNewsNow);
   bind("checkIbkrReadiness", "click", checkIbkrReadiness);
   bind("runRiskAssessment", "click", () => runRiskAssessment(true));
   bind("submitPaperIntent", "click", submitPaperOrderIntent);
@@ -10653,16 +11450,36 @@ function boot() {
   });
 
   bind("refreshIndexes", "click", async () => {
+    const hadCompleteRows = marketIndexRowsComplete(state.marketIndexes);
+    const fallbackRows = hadCompleteRows ? state.marketIndexes.slice() : [];
+    const fallbackSignal = state.marketIndexSignal || indexSignalFromRows(fallbackRows);
     try {
       setStatus("正在更新大盘指数...");
       await refreshMarketIndexes(true);
-      renderCards();
-      renderDetail();
+      try {
+        renderCards();
+        renderDetail();
+      } catch (renderError) {
+        console.warn("Market index refresh succeeded but dependent render failed", renderError);
+      }
       setStatus(state.marketIndexUsedSnapshotFallback
-        ? "实时大盘指数源失败，已继续使用本地完整真实快照"
+        ? "实时大盘指数源未完整返回，已保留当前完整真实数据"
         : "大盘指数已更新，并已纳入后续选股偏置");
     } catch (error) {
       console.error(error);
+      if (hadCompleteRows) {
+        state.marketIndexes = fallbackRows;
+        state.marketIndexSignal = fallbackSignal;
+        state.marketIndexUsedSnapshotFallback = true;
+        renderMarketIndexPanel();
+        setStatus("实时大盘指数源暂未完整返回，已保留当前完整真实数据");
+        return;
+      }
+      if (loadMarketIndexSnapshot()) {
+        state.marketIndexUsedSnapshotFallback = true;
+        setStatus("实时大盘指数源暂未完整返回，已使用本地完整真实快照");
+        return;
+      }
       setStatus(`大盘指数更新失败：${compactDisplayError(error.message)}`);
     }
   });
