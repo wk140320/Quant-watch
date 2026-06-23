@@ -5,9 +5,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 
 const root = new URL(".", import.meta.url).pathname;
+const DEFAULT_REDDIT_ENV_PATH = "/Users/wukai/Documents/9900/client-base-eclair/.env";
+const envLoadSources = new Map();
 
-function loadLocalEnv() {
-  const envPath = join(root, ".env.local");
+function parseEnvFile(envPath, options = {}) {
   if (!existsSync(envPath)) return;
   const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
   for (const line of lines) {
@@ -17,8 +18,19 @@ function loadLocalEnv() {
     if (separator === -1) continue;
     const key = trimmed.slice(0, separator).trim();
     const value = trimmed.slice(separator + 1).trim().replace(/^["']|["']$/g, "");
-    if (key && process.env[key] === undefined) process.env[key] = value;
+    if (options.onlyPrefix && !key.startsWith(options.onlyPrefix)) continue;
+    if (key && process.env[key] === undefined) {
+      process.env[key] = value;
+      envLoadSources.set(key, envPath);
+    }
   }
+}
+
+function loadLocalEnv() {
+  parseEnvFile(join(root, ".env.local"));
+  parseEnvFile(join(root, ".env"));
+  const redditEnvPath = process.env.REDDIT_ENV_PATH || DEFAULT_REDDIT_ENV_PATH;
+  if (redditEnvPath) parseEnvFile(redditEnvPath, { onlyPrefix: "REDDIT_" });
 }
 
 loadLocalEnv();
@@ -407,6 +419,945 @@ async function cleanupNewsDiskCache(force = false) {
     return { checked, removed };
   }
   return { checked, removed };
+}
+
+const DEFAULT_REDDIT_PACKAGE_PATH = "/Users/wukai/Documents/9900/client-base-eclair/packages/reddit-data-access";
+const REDDIT_CACHE_HIGH_MS = 3 * 24 * 60 * 60 * 1000;
+const REDDIT_CACHE_MEDIUM_MS = 24 * 60 * 60 * 1000;
+const REDDIT_CACHE_LOW_MS = 12 * 60 * 60 * 1000;
+const REDDIT_MARKET_POOL_MEMORY_TTL_MS = 10 * 60 * 1000;
+const redditResponseCache = new Map();
+const redditMarketPoolCache = new Map();
+const redditBackgroundQueue = [];
+const redditBackgroundQueued = new Set();
+const redditBackgroundState = {
+  running: false,
+  active: null,
+  processed: 0,
+  failed: 0,
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastError: "",
+};
+
+const REDDIT_SUBREDDIT_SUBSCRIBER_PROXY = {
+  wallstreetbets: 18000000,
+  investing: 3500000,
+  stocks: 7000000,
+  StockMarket: 3000000,
+  SecurityAnalysis: 300000,
+  ValueInvesting: 250000,
+  options: 1200000,
+  finance: 2500000,
+  AusFinance: 700000,
+  ASX_Bets: 120000,
+  AusStocks: 45000,
+  fiaustralia: 250000,
+  Australia: 1200000,
+  ChinaStocks: 50000,
+  China: 700000,
+  CryptoCurrency: 9000000,
+  technology: 17000000,
+  economics: 450000,
+};
+
+function redditPackagePath() {
+  return process.env.REDDIT_PACKAGE_PATH || DEFAULT_REDDIT_PACKAGE_PATH;
+}
+
+function redditPackageSrcPath() {
+  return join(redditPackagePath(), "src");
+}
+
+function redditPythonBin() {
+  const configured = process.env.REDDIT_PYTHON_BIN;
+  if (configured) return configured;
+  const packagePython = join(redditPackagePath(), ".venv", "bin", "python");
+  if (existsSync(packagePython)) return packagePython;
+  const localPython = join(root, ".venv", "bin", "python");
+  return process.env.PYTHON_BIN || (existsSync(localPython) ? localPython : "python3");
+}
+
+function redditEnabled() {
+  return String(process.env.REDDIT_ENABLED || "true").toLowerCase() !== "false";
+}
+
+function redditProviderConfigured() {
+  return Boolean(
+    redditEnabled()
+    && process.env.REDDIT_CLIENT_ID
+    && process.env.REDDIT_CLIENT_SECRET
+    && process.env.REDDIT_USER_AGENT
+    && existsSync(redditPackageSrcPath())
+  );
+}
+
+function redditStatusBase() {
+  const packagePath = redditPackagePath();
+  const packageSrcPath = redditPackageSrcPath();
+  const envPath = process.env.REDDIT_ENV_PATH || DEFAULT_REDDIT_ENV_PATH;
+  const redditEnvKeys = ["REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET", "REDDIT_USER_AGENT"];
+  const redditSources = redditEnvKeys.map((key) => envLoadSources.get(key)).filter(Boolean);
+  const projectEnvPaths = new Set([join(root, ".env.local"), join(root, ".env")]);
+  const envSource = redditSources.length === 0
+    ? "process-env"
+    : redditSources.every((source) => projectEnvPaths.has(source))
+      ? "current-project-env"
+      : redditSources.every((source) => source === envPath)
+        ? "reddit-env-path"
+        : "mixed-env";
+  const missing = [
+    !process.env.REDDIT_CLIENT_ID ? "REDDIT_CLIENT_ID" : null,
+    !process.env.REDDIT_CLIENT_SECRET ? "REDDIT_CLIENT_SECRET" : null,
+    !process.env.REDDIT_USER_AGENT ? "REDDIT_USER_AGENT" : null,
+    !existsSync(packageSrcPath) ? "reddit-data-access package src" : null,
+  ].filter(Boolean);
+  return {
+    name: "reddit",
+    configured: redditProviderConfigured(),
+    enabled: redditEnabled(),
+    packagePath,
+    packageSrcPath,
+    packageAvailable: existsSync(packageSrcPath),
+    envSource,
+    envPathConfigured: Boolean(process.env.REDDIT_ENV_PATH || existsSync(DEFAULT_REDDIT_ENV_PATH)),
+    refreshMs: Number(process.env.REDDIT_REFRESH_MS || 60 * 60 * 1000),
+    missing,
+  };
+}
+
+function redditCachePath(market, symbol) {
+  const key = safeMarket(market);
+  return join(snapshotBasePath, "social", "reddit", key.toLowerCase(), `${safeCachePart(cleanCode(symbol, key))}.json`);
+}
+
+function redditMarketPoolPath(market) {
+  return join(snapshotBasePath, "social", "reddit", safeMarket(market).toLowerCase(), "_market-pool.json");
+}
+
+async function readRedditMarketPoolCache(market, maxAgeMs = Number(process.env.REDDIT_REFRESH_MS || 60 * 60 * 1000)) {
+  const key = safeMarket(market);
+  const memory = redditMarketPoolCache.get(key);
+  if (memory && Date.now() - memory.time < Math.min(maxAgeMs, REDDIT_MARKET_POOL_MEMORY_TTL_MS)) return memory.value;
+  try {
+    const payload = JSON.parse(await readFile(redditMarketPoolPath(key), "utf8"));
+    const cachedAt = Date.parse(payload.cachedAt || payload.cache?.cachedAt || "");
+    if (!cachedAt || Date.now() - cachedAt > maxAgeMs) return null;
+    const value = {
+      ...payload,
+      posts: Array.isArray(payload.posts) ? payload.posts.slice(0, 500) : [],
+      cache: {
+        ...(payload.cache || {}),
+        cache: "market-pool-disk",
+        cachedAt: payload.cachedAt || payload.cache?.cachedAt || null,
+        ageMs: Date.now() - cachedAt,
+      },
+    };
+    redditMarketPoolCache.set(key, { time: Date.now(), value });
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+async function writeRedditMarketPoolCache(market, value = {}) {
+  const key = safeMarket(market);
+  const dir = join(snapshotBasePath, "social", "reddit", key.toLowerCase());
+  await mkdir(dir, { recursive: true });
+  const cachedAt = new Date().toISOString();
+  const posts = Array.isArray(value.posts) ? value.posts.map(normalizeRedditPost).filter((post) => post.id && post.title).slice(0, 500) : [];
+  const payload = {
+    market: key,
+    source: value.source || "reddit-market-pool",
+    cachedAt,
+    posts,
+    queries: value.queries || {},
+    errors: Array.isArray(value.errors) ? value.errors.slice(0, 40) : [],
+    cache: {
+      ...(value.cache || {}),
+      cache: "market-pool-live",
+      cachedAt,
+    },
+  };
+  await writeFile(redditMarketPoolPath(key), JSON.stringify(payload, null, 2), "utf8");
+  redditMarketPoolCache.set(key, { time: Date.now(), value: payload });
+  return payload;
+}
+
+async function readRedditCache(market, symbol) {
+  try {
+    const payload = JSON.parse(await readFile(redditCachePath(market, symbol), "utf8"));
+    const now = Date.now();
+    const items = Array.isArray(payload.items)
+      ? payload.items.filter((item) => {
+        const retainUntil = Date.parse(item.retainUntil || "");
+        return !Number.isFinite(retainUntil) || retainUntil >= now;
+      })
+      : [];
+    const visibleLimit = Math.max(10, Math.min(80, Number(process.env.REDDIT_API_ITEMS_LIMIT || 20)));
+    const visibleItems = items.slice(0, visibleLimit).map(compactRedditItemForApi);
+    return {
+      ...payload,
+      itemCount: items.length,
+      items: visibleItems,
+      topItems: visibleItems.slice(0, 10),
+      cache: {
+        ...(payload.cache || {}),
+        cache: "disk",
+        cachedAt: payload.cachedAt || payload.cache?.cachedAt || null,
+        ageMs: now - (Date.parse(payload.cachedAt || payload.cache?.cachedAt || "") || now),
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeRedditCache(market, symbol, value) {
+  const key = safeMarket(market);
+  const dir = join(snapshotBasePath, "social", "reddit", key.toLowerCase());
+  await mkdir(dir, { recursive: true });
+  const cachedAt = new Date().toISOString();
+  const payload = {
+    ...value,
+    market: key,
+    symbol: cleanCode(symbol, key),
+    cachedAt,
+    cache: {
+      ...(value.cache || {}),
+      cache: "live",
+      cachedAt,
+    },
+  };
+  await writeFile(redditCachePath(key, symbol), JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+async function deleteRedditCache(market, symbol) {
+  await unlink(redditCachePath(market, symbol)).catch(() => {});
+  return { ok: true, market: safeMarket(market), symbol: cleanCode(symbol, market) };
+}
+
+async function redditCacheSummary(market = null) {
+  const base = join(snapshotBasePath, "social", "reddit");
+  const rows = [];
+  const markets = market ? [safeMarket(market).toLowerCase()] : Object.keys(MARKET_CONFIG).map((key) => key.toLowerCase());
+  await Promise.all(markets.map(async (marketDir) => {
+    const dir = join(base, marketDir);
+    const files = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    await Promise.all(files.filter((file) => file.isFile() && file.name.endsWith(".json")).map(async (file) => {
+      if (file.name === "_market-pool.json") return;
+      try {
+        const payload = JSON.parse(await readFile(join(dir, file.name), "utf8"));
+        rows.push({
+          market: String(payload.market || marketDir).toUpperCase(),
+          symbol: payload.symbol || file.name.replace(/\.json$/i, ""),
+          cachedAt: payload.cachedAt || payload.cache?.cachedAt || null,
+          count: Array.isArray(payload.items) ? payload.items.length : 0,
+          topCount: Array.isArray(payload.topItems) ? payload.topItems.length : 0,
+          source: payload.source || "reddit-social",
+          lastError: payload.warning || "",
+        });
+      } catch {
+        rows.push({ market: marketDir.toUpperCase(), file: file.name, invalid: true });
+      }
+    }));
+  }));
+  rows.sort((a, b) => String(b.cachedAt || "").localeCompare(String(a.cachedAt || "")));
+  return {
+    available: rows.length > 0,
+    rows: rows.slice(0, 80),
+    summary: {
+      totalFiles: rows.length,
+      itemCount: rows.reduce((sum, row) => sum + Number(row.count || 0), 0),
+      latestCachedAt: rows[0]?.cachedAt || null,
+    },
+  };
+}
+
+async function redditProviderStatus(market = null) {
+  const status = redditStatusBase();
+  const cache = await redditCacheSummary(market).catch(() => ({ rows: [], summary: { totalFiles: 0, itemCount: 0, latestCachedAt: null } }));
+  return {
+    ...status,
+    cacheCount: cache.summary?.totalFiles || 0,
+    itemCount: cache.summary?.itemCount || 0,
+    lastCachedAt: cache.summary?.latestCachedAt || null,
+    cache,
+    background: redditBackgroundStatus(),
+  };
+}
+
+function redditSubredditsForMarket(market = "ASX") {
+  const envKey = `REDDIT_SUBREDDITS_${safeMarket(market)}`;
+  const configured = process.env[envKey] || process.env.REDDIT_SUBREDDITS;
+  if (configured) return configured.split(",").map((item) => item.trim()).filter(Boolean).slice(0, 12);
+  if (safeMarket(market) === "US") return ["stocks", "investing", "wallstreetbets", "StockMarket", "SecurityAnalysis", "ValueInvesting"];
+  if (safeMarket(market) === "CN") return ["stocks", "investing", "ChinaStocks", "China", "economics", "technology"];
+  return ["AusFinance", "ASX_Bets", "AusStocks", "fiaustralia", "stocks", "investing"];
+}
+
+function redditPoolKeywordsForMarket(market = "ASX", symbols = []) {
+  const key = safeMarket(market);
+  const base = {
+    ASX: [
+      "ASX shares",
+      "Australia stock market",
+      "RBA rates",
+      "iron ore",
+      "China steel demand",
+      "lithium miners",
+      "LNG prices",
+      "Australian banks",
+      "commodity prices",
+      "AUD USD",
+    ],
+    US: [
+      "US stock market",
+      "Federal Reserve rates",
+      "S&P 500",
+      "Nasdaq stocks",
+      "AI semiconductors",
+      "earnings guidance",
+      "Treasury yields",
+      "oil prices",
+      "tariffs",
+      "geopolitics stocks",
+    ],
+    CN: [
+      "China A shares",
+      "Shanghai Composite",
+      "China stimulus",
+      "PBOC rates",
+      "property market China",
+      "EV batteries China",
+      "semiconductors China",
+      "consumer stocks China",
+      "US China tariffs",
+      "RMB exchange rate",
+    ],
+  }[key] || [];
+  const symbolTerms = (Array.isArray(symbols) ? symbols : [])
+    .flatMap((symbol) => redditKeywordsForSymbol(symbol, key).slice(0, 5));
+  const maxKeywords = Math.max(6, Math.min(30, Number(process.env.REDDIT_POOL_KEYWORDS_MAX || 18)));
+  return [...new Set([...symbolTerms, ...base]
+    .map((item) => String(item || "").replace(/["()]/g, "").trim())
+    .filter((item) => item.length >= 2))]
+    .slice(0, maxKeywords);
+}
+
+function redditKeywordsForSymbol(symbol, market = "ASX") {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const context = sectorContext(code, key);
+  const aliases = {
+    ASX: {
+      BHP: "BHP Group iron ore copper mining",
+      CBA: "Commonwealth Bank Australia mortgage RBA",
+      NAB: "National Australia Bank mortgage RBA",
+      WBC: "Westpac bank mortgage RBA",
+      ANZ: "ANZ bank mortgage RBA",
+      RIO: "Rio Tinto iron ore copper mining",
+      FMG: "Fortescue iron ore green hydrogen",
+      WDS: "Woodside Energy LNG oil gas",
+      TLS: "Telstra telecom Australia",
+      WOW: "Woolworths Australia supermarket",
+      COL: "Coles Australia supermarket",
+    },
+    US: {
+      NVDA: "Nvidia AI GPU data center Jensen Huang",
+      AAPL: "Apple iPhone services China sales",
+      MSFT: "Microsoft Azure OpenAI cloud",
+      TSLA: "Tesla EV robotaxi Elon Musk",
+      AMZN: "Amazon AWS ecommerce cloud",
+      GOOGL: "Google Alphabet search ads Gemini AI",
+      META: "Meta Facebook Instagram AI ads",
+      AMD: "AMD AI GPU data center",
+      JPM: "JPMorgan bank Jamie Dimon rates",
+      XOM: "Exxon oil gas energy",
+    },
+    CN: {
+      "600519": "Kweichow Moutai baijiu China consumption",
+      "000858": "Wuliangye baijiu China consumption",
+      "300750": "CATL battery EV lithium",
+      "002594": "BYD EV battery China auto",
+      "000001": "Ping An Bank China bank LPR",
+      "601318": "Ping An Insurance China insurer",
+    },
+  }[key] || {};
+  const bareCode = cleanAsxCode(code);
+  const raw = [
+    code,
+    bareCode,
+    `${code} stock`,
+    `${bareCode} stock`,
+    aliases[code] || aliases[bareCode],
+    context.sector,
+    context.peers,
+    context.upstream,
+    context.macro,
+    MARKET_CONFIG[key].newsName,
+  ];
+  return [...new Set(raw
+    .flatMap((item) => String(item || "").split(/\s+OR\s+/i))
+    .map((item) => item.replace(/["()]/g, "").trim())
+    .filter((item) => item.length >= 2)
+    .slice(0, 14))];
+}
+
+function runRedditPython(payload, timeoutMs = Number(process.env.REDDIT_TIMEOUT_MS || 6500)) {
+  return new Promise((resolve, reject) => {
+    const python = redditPythonBin();
+    const packageSrc = redditPackageSrcPath();
+    const script = `
+import asyncio, json, os, sys
+payload = json.loads(sys.stdin.read() or "{}")
+package_src = payload.get("packageSrc")
+if package_src and package_src not in sys.path:
+    sys.path.insert(0, package_src)
+from reddit_data_access import RedditReadClient
+
+async def main():
+    async with RedditReadClient() as client:
+        fetch_mode = payload.get("fetchMode") or "batch"
+        if fetch_mode == "pool":
+            subreddits = (payload.get("subreddits") or [])[:8]
+            keywords = (payload.get("keywords") or [])[:int(payload.get("maxKeywords") or 18)]
+            posts_per_source = max(1, min(25, int(payload.get("postsPerSubreddit") or 8)))
+            tasks = []
+
+            async def guarded(kind, label, coro):
+                try:
+                    return {"ok": True, "kind": kind, "label": label, "payload": await coro}
+                except Exception as exc:
+                    return {"ok": False, "kind": kind, "label": label, "error": str(exc)}
+
+            for subreddit in subreddits:
+                tasks.append(guarded("subreddit-hot", subreddit, client.get_subreddit_posts(
+                    subreddit,
+                    sort="hot",
+                    limit=posts_per_source,
+                    timeframe="day",
+                )))
+            for keyword in keywords:
+                tasks.append(guarded("search", keyword, client.search_posts(
+                    keyword,
+                    subreddit="all",
+                    sort="new",
+                    limit=max(2, min(12, posts_per_source)),
+                    timeframe="week",
+                )))
+
+            results = await asyncio.gather(*tasks)
+            posts = []
+            errors = []
+            seen = set()
+            for item in results:
+                if not item.get("ok"):
+                    errors.append({"kind": item.get("kind"), "label": item.get("label"), "error": item.get("error")})
+                    continue
+                for post in (item.get("payload") or {}).get("posts") or []:
+                    post_id = str(post.get("id") or post.get("permalink") or post.get("title") or "")
+                    if post_id and post_id in seen:
+                        continue
+                    if post_id:
+                        seen.add(post_id)
+                    post["source_query"] = item.get("label")
+                    post["source_kind"] = item.get("kind")
+                    posts.append(post)
+            result = {
+                "success": True,
+                "function": "MARKET_POOL",
+                "count": len(posts),
+                "subreddits": subreddits,
+                "keywords": keywords,
+                "posts_per_source": posts_per_source,
+                "errors": errors,
+                "posts": posts,
+            }
+        else:
+            result = await client.get_multiple_posts(
+                subreddits=payload.get("subreddits") or [],
+                keywords=payload.get("keywords") or [],
+                posts_per_subreddit=int(payload.get("postsPerSubreddit") or 5),
+            )
+        print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+
+asyncio.run(main())
+`;
+    const child = spawn(python, ["-c", script], {
+      cwd: root,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        PYTHONPATH: [packageSrc, process.env.PYTHONPATH].filter(Boolean).join(":"),
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`Reddit data access timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.length > 4_000_000) {
+        child.kill("SIGKILL");
+        finish(new Error("Reddit data access response exceeded the size limit."));
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => finish(new Error(`Unable to start Reddit data access: ${error.message}`)));
+    child.on("close", (code) => {
+      if (settled) return;
+      let parsed;
+      try {
+        parsed = JSON.parse(stdout.trim().split(/\n/).at(-1) || "{}");
+      } catch {
+        finish(new Error(`Reddit data access returned invalid JSON. ${stderr.slice(-600)}`));
+        return;
+      }
+      if (code !== 0 || parsed.ok !== true) {
+        finish(new Error(parsed.error || stderr.slice(-600) || `Reddit data access exited with code ${code}.`));
+        return;
+      }
+      finish(null, parsed.result);
+    });
+    child.stdin.end(JSON.stringify({ ...payload, packageSrc }));
+  });
+}
+
+async function fetchRedditMarketPool(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const refreshMs = Number(process.env.REDDIT_REFRESH_MS || 60 * 60 * 1000);
+  if (!options.force) {
+    const cached = await readRedditMarketPoolCache(key, refreshMs);
+    if (cached?.posts?.length) return cached;
+  }
+  const subreddits = redditSubredditsForMarket(key);
+  const symbols = Array.isArray(options.symbols) ? options.symbols : [];
+  const keywords = redditPoolKeywordsForMarket(key, symbols);
+  const raw = await runRedditPython({
+    fetchMode: "pool",
+    market: key,
+    subreddits,
+    keywords,
+    maxKeywords: Math.max(6, Math.min(30, Number(process.env.REDDIT_POOL_KEYWORDS_MAX || 18))),
+    postsPerSubreddit: Math.max(3, Math.min(25, Number(options.postsPerSubreddit || process.env.REDDIT_POOL_POSTS_PER_SOURCE || 8))),
+    background: true,
+  }, Number(options.timeoutMs || process.env.REDDIT_BACKGROUND_TIMEOUT_MS || 20000));
+  return writeRedditMarketPoolCache(key, {
+    source: "reddit-market-pool",
+    posts: raw.posts || [],
+    queries: { subreddits, keywords },
+    errors: raw.errors || [],
+    cache: { refreshMs },
+  });
+}
+
+function truncateRedditText(value, maxLength = 1600) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
+}
+
+function redditPostText(post = {}) {
+  return truncateRedditText(`${post.title || ""} ${post.content || ""}`, 2200);
+}
+
+function normalizeRedditPost(post = {}) {
+  const permalink = post.permalink
+    ? String(post.permalink).startsWith("http")
+      ? post.permalink
+      : `https://www.reddit.com${post.permalink}`
+    : "";
+  return {
+    id: String(post.id || post.name || ""),
+    title: truncateRedditText(post.title || "", 260),
+    content: truncateRedditText(post.content || post.selftext || "", 1600),
+    author: String(post.author || "[unknown]"),
+    subreddit: String(post.subreddit || "").replace(/^r\//i, ""),
+    created_utc: Number(post.created_utc || 0),
+    score: Number(post.score || 0),
+    upvote_ratio: Number(post.upvote_ratio ?? 0.7),
+    num_comments: Number(post.num_comments || 0),
+    url: post.url || permalink,
+    permalink,
+    is_self: Boolean(post.is_self),
+    over_18: Boolean(post.over_18),
+    source_query: String(post.source_query || post.query || "").slice(0, 160),
+    source_kind: String(post.source_kind || "").slice(0, 60),
+  };
+}
+
+function compactRedditItemForApi(item = {}) {
+  return {
+    ...item,
+    title: truncateRedditText(item.title || "", 220),
+    content: truncateRedditText(item.content || "", 900),
+    text: truncateRedditText(item.text || redditPostText(item), 1100),
+  };
+}
+
+function redditSentimentScore(text) {
+  const raw = String(text || "").toLowerCase();
+  const positives = ["beat", "upgrade", "record", "buyback", "guidance raise", "demand", "growth", "approval", "partnership", "contract", "undervalued", "bullish", "surge", "rally", "利润增长", "订单", "回购", "增持"];
+  const negatives = ["downgrade", "miss", "lawsuit", "investigation", "dilution", "offering", "default", "fraud", "ban", "recession", "bearish", "crash", "plunge", "scam", "亏损", "减持", "处罚", "暴跌"];
+  let score = 0;
+  positives.forEach((term) => { if (raw.includes(term)) score += 1; });
+  negatives.forEach((term) => { if (raw.includes(term)) score -= 1; });
+  return Math.max(-1, Math.min(1, score / 4));
+}
+
+function redditCacheTtlForItem(item = {}) {
+  const impact = Number(item.impactScore || 0);
+  const relevance = Number(item.relevanceScore ?? item.relevance ?? 0);
+  if (impact >= 70 || relevance >= 76) return REDDIT_CACHE_HIGH_MS;
+  if (impact >= 42 || relevance >= 45) return REDDIT_CACHE_MEDIUM_MS;
+  return REDDIT_CACHE_LOW_MS;
+}
+
+function scoreRedditSocialPosts(posts = [], { symbol = "", market = "ASX", limit = 10 } = {}) {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const context = sectorContext(code, key);
+  const directTerms = [code, `${code} stock`, cleanAsxCode(code)].filter(Boolean).map((term) => term.toLowerCase());
+  const sectorTerms = String(context.sector || "").toLowerCase().split(/[^a-z0-9\u4e00-\u9fa5]+/).filter((term) => term.length >= 3);
+  const peerTerms = String(context.peers || "").toLowerCase().split(/\s+or\s+|[^a-z0-9\u4e00-\u9fa5]+/i).filter((term) => term.length >= 2);
+  const upstreamTerms = String(context.upstream || "").toLowerCase().split(/\s+or\s+|[^a-z0-9\u4e00-\u9fa5]+/i).filter((term) => term.length >= 3);
+  const macroTerms = String(context.macro || "").toLowerCase().split(/\s+or\s+|[^a-z0-9\u4e00-\u9fa5]+/i).filter((term) => term.length >= 3);
+  const keywordTerms = redditKeywordsForSymbol(code, key)
+    .join(" ")
+    .toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fa5]+/)
+    .filter((term) => term.length >= 3 && !["stock", "shares", "market"].includes(term));
+  const now = Date.now();
+  const normalized = posts.map(normalizeRedditPost).filter((post) => post.id && post.title && !post.over_18);
+  const seen = new Set();
+  const items = normalized.map((post) => {
+    const text = redditPostText(post);
+    const lower = text.toLowerCase();
+    const sourceQuery = String(post.source_query || "").toLowerCase();
+    const directHits = directTerms.filter((term) => term && lower.includes(term)).length;
+    const sectorHits = sectorTerms.filter((term) => lower.includes(term)).length;
+    const peerHits = peerTerms.filter((term) => lower.includes(term)).length;
+    const upstreamHits = upstreamTerms.filter((term) => lower.includes(term)).length;
+    const macroHits = macroTerms.filter((term) => lower.includes(term)).length;
+    const keywordHits = keywordTerms.filter((term) => lower.includes(term)).length;
+    const sourceQueryHits = [...sectorTerms, ...peerTerms, ...upstreamTerms, ...macroTerms, ...keywordTerms]
+      .filter((term) => term && sourceQuery.includes(term)).length;
+    const relevanceScore = Math.min(100, directHits * 42 + sectorHits * 10 + peerHits * 8 + upstreamHits * 7 + macroHits * 5 + keywordHits * 4 + Math.min(22, sourceQueryHits * 5));
+    const subredditSubscribers = REDDIT_SUBREDDIT_SUBSCRIBER_PROXY[post.subreddit] || REDDIT_SUBREDDIT_SUBSCRIBER_PROXY[post.subreddit?.replace(/\s+/g, "")] || 50000;
+    const influenceScore = Math.min(100,
+      Math.log10(Math.max(1, post.score + 10)) * 18
+      + Math.log10(Math.max(1, post.num_comments + 5)) * 16
+      + Math.log10(Math.max(1, subredditSubscribers)) * 7
+      + Math.max(0, Math.min(1, post.upvote_ratio || 0.7)) * 14
+    );
+    const hasExternalLink = Boolean(post.url && !/reddit\.com/i.test(post.url));
+    const factSignals = [
+      /\b\d+(\.\d+)?%?\b/.test(text),
+      /\b(according to|reported|filing|earnings|guidance|revenue|margin|contract|regulator|source|link)\b/i.test(text),
+      /财报|公告|营收|利润|订单|监管|来源|链接/.test(text),
+      hasExternalLink,
+    ].filter(Boolean).length;
+    const hypeTerms = ["guaranteed", "moon", "100x", "pump", "short squeeze", "trust me", "insider", "can't lose", "all in", "yolo"];
+    const hypeTermHits = hypeTerms.filter((term) => lower.includes(term)).length;
+    const hypeSignals = Math.min(5, hypeTermHits)
+      + (/稳赚|翻倍|内幕|无脑|梭哈|必涨|拉盘/.test(text) ? 1 : 0)
+      + (post.upvote_ratio < 0.55 ? 1 : 0);
+    const validityScore = Math.max(0, Math.min(100, 28 + Math.min(45, text.length / 5) + factSignals * 12 - hypeSignals * 15));
+    const manipulationRisk = Math.max(0, Math.min(100, hypeSignals * 18 + (post.score > 800 && factSignals === 0 ? 20 : 0) + (relevanceScore < 28 && influenceScore > 68 ? 18 : 0)));
+    const truthScore = Math.max(0, Math.min(100, validityScore + factSignals * 6 - manipulationRisk * 0.55));
+    const sentiment = redditSentimentScore(text);
+    const channel = directHits ? "direct-stock" : sectorHits || keywordHits ? "sector-industry" : upstreamHits ? "upstream-downstream" : peerHits ? "peer-competitor" : "macro-social";
+    const impactScore = Math.max(0, Math.min(100, relevanceScore * 0.36 + influenceScore * 0.28 + validityScore * 0.18 + truthScore * 0.16 - manipulationRisk * 0.18));
+    const signedScore = sentiment * (impactScore / 100) * (truthScore / 100) * 18 - (manipulationRisk > 60 ? 2.5 : 0);
+    const createdAt = post.created_utc ? new Date(post.created_utc * 1000).toISOString() : null;
+    return {
+      ...post,
+      text,
+      createdAt,
+      subredditSubscribers,
+      relation: channel,
+      relevance: Number(relevanceScore.toFixed(2)),
+      influence: Number(influenceScore.toFixed(2)),
+      validity: Number(validityScore.toFixed(2)),
+      relevanceScore: Number(relevanceScore.toFixed(2)),
+      influenceScore: Number(influenceScore.toFixed(2)),
+      validityScore: Number(validityScore.toFixed(2)),
+      manipulationRisk: Number(manipulationRisk.toFixed(2)),
+      truthScore: Number(truthScore.toFixed(2)),
+      sentiment: Number(sentiment.toFixed(3)),
+      impactScore: Number(impactScore.toFixed(2)),
+      socialScore: Number(signedScore.toFixed(2)),
+      channel,
+      retainTier: impactScore >= 70 || relevanceScore >= 76 ? "high" : impactScore >= 42 || relevanceScore >= 45 ? "medium" : "low",
+    };
+  }).filter((item) => {
+    const keyValue = item.id || item.permalink || item.title;
+    if (!keyValue || seen.has(keyValue)) return false;
+    seen.add(keyValue);
+    return item.relevanceScore >= 12 || item.impactScore >= 25;
+  }).map((item) => {
+    const ttlMs = redditCacheTtlForItem(item);
+    return {
+      ...item,
+      ttlMs,
+      retainUntil: new Date(now + ttlMs).toISOString(),
+    };
+  }).sort((a, b) => b.impactScore - a.impactScore || Math.abs(b.socialScore) - Math.abs(a.socialScore));
+  const kept = items.slice(0, 80);
+  const topItems = kept.slice(0, Math.max(1, Math.min(20, Number(limit || 10))));
+  const average = (values) => values.length ? values.reduce((sum, value) => sum + Number(value || 0), 0) / values.length : 0;
+  const score = Math.max(-15, Math.min(15, kept.reduce((sum, item) => sum + item.socialScore, 0) / Math.max(1, Math.sqrt(kept.length || 1))));
+  const confidence = Math.max(0, Math.min(99, average(topItems.map((item) => item.impactScore)) * 0.62 + average(topItems.map((item) => item.truthScore)) * 0.26 + Math.min(12, topItems.length * 1.2)));
+  const sentiment = average(topItems.map((item) => item.sentiment));
+  const manipulationRisk = average(topItems.map((item) => item.manipulationRisk));
+  const truthScore = average(topItems.map((item) => item.truthScore));
+  return {
+    available: kept.length > 0,
+    source: "reddit-social",
+    score: Number(score.toFixed(2)),
+    weight: Number(Math.max(0, Math.min(1.4, confidence / 85)).toFixed(2)),
+    confidence: Number(confidence.toFixed(1)),
+    sentiment: Number(sentiment.toFixed(3)),
+    manipulationRisk: Number(manipulationRisk.toFixed(1)),
+    truthScore: Number(truthScore.toFixed(1)),
+    items: kept,
+    topItems,
+    thesis: kept.length
+      ? [`Reddit social factor scored ${kept.length} relevant posts; Top10 avg truth ${truthScore.toFixed(0)}, manipulation risk ${manipulationRisk.toFixed(0)}, sentiment ${sentiment.toFixed(2)}.`]
+      : ["Reddit returned no sufficiently relevant social-media posts for this symbol/context."],
+  };
+}
+
+function redditBackgroundStatus() {
+  return {
+    running: redditBackgroundState.running,
+    active: redditBackgroundState.active,
+    pending: redditBackgroundQueue.length,
+    queuedKeys: redditBackgroundQueued.size,
+    processed: redditBackgroundState.processed,
+    failed: redditBackgroundState.failed,
+    lastStartedAt: redditBackgroundState.lastStartedAt,
+    lastFinishedAt: redditBackgroundState.lastFinishedAt,
+    lastError: redditBackgroundState.lastError,
+  };
+}
+
+function queueRedditBackgroundRefresh(market = "ASX", symbols = [], options = {}) {
+  const key = safeMarket(market);
+  const maxSymbols = Math.max(1, Math.min(200, Number(options.maxSymbols || process.env.REDDIT_BACKGROUND_MAX_SYMBOLS || 80)));
+  const normalizedSymbols = [...new Set((Array.isArray(symbols) ? symbols : [])
+    .map((symbol) => cleanCode(symbol, key))
+    .filter((symbol) => isValidMarketCode(symbol, key) && !symbol.startsWith("^")))]
+    .slice(0, maxSymbols);
+  const poolSymbols = normalizedSymbols.slice(0, maxSymbols);
+  let queued = 0;
+  normalizedSymbols.forEach((symbol) => {
+    const queueKey = `${key}:${symbol}`;
+    if (redditBackgroundQueued.has(queueKey)) return;
+    redditBackgroundQueued.add(queueKey);
+    redditBackgroundQueue.push({
+      key: queueKey,
+      market: key,
+      symbol,
+      force: Boolean(options.force),
+      poolSymbols,
+      limit: Math.max(1, Math.min(20, Number(options.limit || 10))),
+      queuedAt: new Date().toISOString(),
+      reason: options.reason || "background",
+    });
+    queued += 1;
+  });
+  void processRedditBackgroundQueue();
+  return {
+    ok: true,
+    market: key,
+    requested: normalizedSymbols.length,
+    queued,
+    status: redditBackgroundStatus(),
+  };
+}
+
+function invalidateRedditDerivedCaches(market, symbol) {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const prefix = `${key}:${code}:`;
+  for (const cacheKey of Array.from(redditResponseCache.keys())) {
+    if (cacheKey.startsWith(prefix)) redditResponseCache.delete(cacheKey);
+  }
+  for (const cacheKey of Array.from(factorResponseCache.keys())) {
+    if (cacheKey.startsWith(prefix)) factorResponseCache.delete(cacheKey);
+  }
+}
+
+async function processRedditBackgroundQueue() {
+  if (redditBackgroundState.running) return;
+  redditBackgroundState.running = true;
+  redditBackgroundState.lastStartedAt = new Date().toISOString();
+  try {
+    while (redditBackgroundQueue.length) {
+      const job = redditBackgroundQueue.shift();
+      redditBackgroundQueued.delete(job.key);
+      redditBackgroundState.active = { market: job.market, symbol: job.symbol, reason: job.reason, startedAt: new Date().toISOString() };
+      try {
+        invalidateRedditDerivedCaches(job.market, job.symbol);
+        await fetchRedditSocialFactor(job.symbol, job.market, {
+          mode: job.force ? "refresh" : "auto",
+          limit: job.limit,
+          background: true,
+          forcePool: Boolean(job.force),
+          poolSymbols: job.poolSymbols || [],
+          timeoutMs: Number(process.env.REDDIT_BACKGROUND_TIMEOUT_MS || 20000),
+          postsPerSubreddit: Number(process.env.REDDIT_BACKGROUND_POSTS_PER_SUBREDDIT || process.env.REDDIT_POSTS_PER_SUBREDDIT || 6),
+        });
+        invalidateRedditDerivedCaches(job.market, job.symbol);
+        redditBackgroundState.processed += 1;
+      } catch (error) {
+        redditBackgroundState.failed += 1;
+        redditBackgroundState.lastError = `${job.market}:${job.symbol}: ${error.message || error}`;
+      }
+      if (Number(process.env.REDDIT_BACKGROUND_GAP_MS || 450) > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Number(process.env.REDDIT_BACKGROUND_GAP_MS || 450)));
+      }
+    }
+  } finally {
+    redditBackgroundState.active = null;
+    redditBackgroundState.running = false;
+    redditBackgroundState.lastFinishedAt = new Date().toISOString();
+  }
+}
+
+async function fetchRedditSocialFactor(symbol, market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const mode = ["auto", "local", "refresh", "live"].includes(String(options.mode || "").toLowerCase())
+    ? String(options.mode || "").toLowerCase()
+    : "auto";
+  const limit = Math.max(1, Math.min(20, Number(options.limit || 10)));
+  const cacheKey = `${key}:${code}:${mode}:${limit}`;
+  const forceLive = mode === "refresh" || mode === "live";
+  const refreshMs = Number(process.env.REDDIT_REFRESH_MS || 60 * 60 * 1000);
+  const cachedMemory = redditResponseCache.get(cacheKey);
+  if (!forceLive && cachedMemory && Date.now() - cachedMemory.time < Math.min(refreshMs, 10 * 60 * 1000)) return cachedMemory.value;
+  const disk = await readRedditCache(key, code);
+  const diskFresh = disk?.cache?.cachedAt && Date.now() - Date.parse(disk.cache.cachedAt) < refreshMs;
+  if (mode === "local" || (!forceLive && diskFresh)) {
+    const value = disk || {
+      available: false,
+      source: "reddit-social-cache-miss",
+      score: 0,
+      weight: 0,
+      confidence: 0,
+      sentiment: 0,
+      manipulationRisk: 0,
+      truthScore: 0,
+      items: [],
+      topItems: [],
+      thesis: ["No local Reddit social cache exists yet."],
+      cache: { cache: "disk-miss", cachedAt: null },
+    };
+    redditResponseCache.set(cacheKey, { time: Date.now(), value });
+    return value;
+  }
+  const status = redditStatusBase();
+  if (!status.configured) {
+    const value = disk || {
+      available: false,
+      source: "reddit-disabled",
+      score: 0,
+      weight: 0,
+      confidence: 0,
+      sentiment: 0,
+      manipulationRisk: 0,
+      truthScore: 0,
+      items: [],
+      topItems: [],
+      thesis: [`Reddit social provider disabled or incomplete: ${status.missing.join(", ") || "not configured"}.`],
+      cache: { cache: disk ? "disk-stale-fallback" : "disabled", cachedAt: disk?.cache?.cachedAt || null },
+      warning: status.missing.join(", "),
+    };
+    redditResponseCache.set(cacheKey, { time: Date.now(), value });
+    return value;
+  }
+  try {
+    const subreddits = redditSubredditsForMarket(key);
+    const keywords = redditKeywordsForSymbol(code, key);
+    const poolSymbols = [code, ...(Array.isArray(options.poolSymbols) ? options.poolSymbols : [])];
+    let raw;
+    let queryMeta = { subreddits, keywords };
+    let source = "reddit-social";
+    const cachedPool = !forceLive ? await readRedditMarketPoolCache(key, refreshMs) : null;
+    if (options.background || cachedPool?.posts?.length) {
+      const pool = cachedPool?.posts?.length
+        ? cachedPool
+        : await fetchRedditMarketPool(key, {
+          force: Boolean(options.forcePool),
+          symbols: poolSymbols,
+          timeoutMs: Number(options.timeoutMs || process.env.REDDIT_BACKGROUND_TIMEOUT_MS || 20000),
+          postsPerSubreddit: Number(options.postsPerSubreddit || process.env.REDDIT_POOL_POSTS_PER_SOURCE || process.env.REDDIT_BACKGROUND_POSTS_PER_SUBREDDIT || 8),
+        });
+      raw = { posts: pool.posts || [], errors: pool.errors || [] };
+      queryMeta = pool.queries || { subreddits, keywords: redditPoolKeywordsForMarket(key, poolSymbols) };
+      source = pool.cache?.cache || pool.source || "reddit-market-pool";
+    } else {
+      raw = await runRedditPython({
+        market: key,
+        symbol: code,
+        subreddits,
+        keywords,
+        postsPerSubreddit: Math.max(2, Math.min(10, Number(options.postsPerSubreddit || process.env.REDDIT_POSTS_PER_SUBREDDIT || 4))),
+        background: Boolean(options.background),
+      }, Number(options.timeoutMs || process.env.REDDIT_TIMEOUT_MS || 6500));
+      source = "reddit-symbol-live";
+    }
+    const scored = scoreRedditSocialPosts(raw.posts || [], { symbol: code, market: key, limit });
+    const value = {
+      ...scored,
+      market: key,
+      symbol: code,
+      source: scored.available ? source : `${source}-empty`,
+      queries: queryMeta,
+      cache: { cache: "live", cachedAt: new Date().toISOString(), refreshMs },
+    };
+    const written = await writeRedditCache(key, code, value);
+    redditResponseCache.set(cacheKey, { time: Date.now(), value: written });
+    if (redditResponseCache.size > 80) redditResponseCache.delete(redditResponseCache.keys().next().value);
+    return written;
+  } catch (error) {
+    const value = disk ? {
+      ...disk,
+      cache: { ...(disk.cache || {}), cache: "disk-stale-fallback", refreshMs },
+      warning: `Live Reddit unavailable; using local cache. ${error.message || error}`,
+    } : {
+      available: false,
+      source: "reddit-social-unavailable",
+      score: 0,
+      weight: 0,
+      confidence: 0,
+      sentiment: 0,
+      manipulationRisk: 0,
+      truthScore: 0,
+      items: [],
+      topItems: [],
+      thesis: [`Reddit social factor unavailable: ${error.message || error}`],
+      cache: { cache: "live-error", cachedAt: null, refreshMs },
+      warning: error.message || String(error),
+    };
+    redditResponseCache.set(cacheKey, { time: Date.now(), value });
+    return value;
+  }
 }
 
 function marketHistoryPathFor(market, symbol, interval = "1d") {
@@ -4324,6 +5275,7 @@ const FACTOR_LAYER_KEYS = [
   "shortInterest",
   "macro",
   "sector",
+  "socialMedia",
   "flowOptions",
   "marketRegime",
   "relativeStrength",
@@ -6961,6 +7913,7 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     fetchSectorFactor(symbol, key),
     fetchRelativeStrengthFactor(symbol, candles, key),
     fetchFlowOptionsFactor(symbol, key, candles),
+    fetchRedditSocialFactor(symbol, key, { mode: "local", limit: 10 }),
   ]);
   const get = (index, fallback) => results[index].status === "fulfilled" ? results[index].value : fallback(results[index].reason);
   const factors = {
@@ -6970,6 +7923,7 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     sector: get(3, (error) => ({ available: false, source: "sector-unavailable", score: 0, thesis: [`Sector factor unavailable: ${error.message || error}`] })),
     relativeStrength: get(4, (error) => ({ available: false, source: "relative-strength-unavailable", score: 0, thesis: [`Relative strength factor unavailable: ${error.message || error}`] })),
     flowOptions: get(5, (error) => ({ available: false, source: "flow-options-unavailable", score: 0, thesis: [`Flow/options factor unavailable: ${error.message || error}`] })),
+    socialMedia: get(6, (error) => ({ available: false, source: "reddit-social-unavailable", score: 0, weight: 0, confidence: 0, sentiment: 0, manipulationRisk: 0, truthScore: 0, items: [], topItems: [], thesis: [`Reddit social factor unavailable: ${error.message || error}`] })),
     marketRegime: marketRegimeFactor(candles),
     liquidity: liquidityFactor(candles),
     calibration: calibrationFactor(candles, Number(strategy.horizonDays || 15), Number(strategy.targetUpside || 5), Number(strategy.stopLoss || 4)),
@@ -8634,6 +9588,28 @@ function compactAiInput(input) {
         score: compactNumber(input.factors.sector.score),
         thesis: asList(input.factors.sector.thesis, 2),
       } : null,
+      socialMedia: input.factors.socialMedia ? {
+        score: compactNumber(input.factors.socialMedia.score),
+        weight: compactNumber(input.factors.socialMedia.weight),
+        confidence: compactNumber(input.factors.socialMedia.confidence),
+        sentiment: compactNumber(input.factors.socialMedia.sentiment),
+        manipulationRisk: compactNumber(input.factors.socialMedia.manipulationRisk),
+        truthScore: compactNumber(input.factors.socialMedia.truthScore),
+        available: input.factors.socialMedia.available,
+        cache: input.factors.socialMedia.cache || null,
+        thesis: asList(input.factors.socialMedia.thesis, 2),
+        topItems: asList(input.factors.socialMedia.items || input.factors.socialMedia.topItems, 3).map((item) => ({
+          title: compactText(item.title, 120),
+          subreddit: compactText(item.subreddit, 40),
+          relevance: compactNumber(item.relevance),
+          impactScore: compactNumber(item.impactScore),
+          socialScore: compactNumber(item.socialScore),
+          truthScore: compactNumber(item.truthScore),
+          manipulationRisk: compactNumber(item.manipulationRisk),
+          sentiment: compactNumber(item.sentiment),
+          relation: compactText(item.relation, 30),
+        })),
+      } : null,
     } : null,
     news: compactSignalItems(input.news || [], 6),
     x: compactSignalItems(input.xPosts || [], 4),
@@ -9211,12 +10187,20 @@ async function handleApi(req, res, url) {
       error: error.message || String(error),
       order_execution_enabled: false,
     }));
+    const reddit = await redditProviderStatus().catch((error) => ({
+      available: false,
+      configured: false,
+      enabled: redditEnabled(),
+      provider: "reddit-social",
+      lastError: error.message || String(error),
+    }));
     sendJson(res, 200, {
       ok: true,
       version: APP_VERSION,
       startedAt: SERVER_STARTED_AT,
       markets,
       pythonCore,
+      reddit,
       externalAi: {
         enabled: externalAiEnabled(),
         providers: aiProviderStatus(),
@@ -9245,15 +10229,21 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/social/reddit/status" && req.method === "GET") {
+    sendJson(res, 200, await redditProviderStatus());
+    return;
+  }
+
   if (url.pathname === "/api/data-health" && req.method === "GET") {
     const market = marketFromUrl(url);
     const sampleCode = normalizeMarketSymbol(url.searchParams.get("symbol") || { ASX: "BHP", US: "AAPL", CN: "600519" }[market], market);
     const candidates = providerCandidates(market, sampleCode, "9mo", "1d").map(([source]) => source);
     const configured = Object.fromEntries(candidates.map((source) => [source, providerConfigured(source)]));
-    const [budget, capabilities, newsCache] = await Promise.all([
+    const [budget, capabilities, newsCache, redditStatus] = await Promise.all([
       runPythonQuantCore("provider-budget", { market, candidates, configured }).catch((error) => ({ error: error.message, providers: [], policy: {} })),
       dataCapabilities(market, sampleCode).catch((error) => ({ error: error.message })),
       newsDiskCacheSummary(market),
+      redditProviderStatus(market),
     ]);
     sendJson(res, 200, {
       ok: true,
@@ -9266,6 +10256,8 @@ async function handleApi(req, res, url) {
       newsProviders: newsProviderStatus().providers || [],
       newsPrimary: newsProviderStatus().primary || process.env.NEWS_PRIMARY_PROVIDER || "auto",
       newsCache,
+      socialProviders: [redditStatus],
+      redditSocial: redditStatus,
       refreshSchedule: newsRefreshDecision(market, newsCache.summary?.latestCachedAt || null),
       cachePolicy: {
         localFirst: true,
@@ -9784,6 +10776,44 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/social/reddit" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    const mode = url.searchParams.get("mode") || "auto";
+    const limit = Math.max(1, Math.min(25, Number(url.searchParams.get("limit") || 10)));
+    const factor = await fetchRedditSocialFactor(symbol, market, { mode, limit });
+    sendJson(res, 200, { symbol, market, ...factor });
+    return;
+  }
+
+  if (url.pathname === "/api/social/reddit/background" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const rawSymbols = String(url.searchParams.get("symbols") || url.searchParams.get("symbol") || "");
+    const symbols = rawSymbols
+      ? rawSymbols.split(",").map((item) => item.trim()).filter(Boolean)
+      : MARKET_CONFIG[market].defaultSymbols || [];
+    const force = ["1", "true", "yes", "refresh"].includes(String(url.searchParams.get("force") || "").toLowerCase());
+    const limit = Math.max(1, Math.min(20, Number(url.searchParams.get("limit") || 10)));
+    const maxSymbols = Math.max(1, Math.min(200, Number(url.searchParams.get("maxSymbols") || process.env.REDDIT_BACKGROUND_MAX_SYMBOLS || 80)));
+    const result = queueRedditBackgroundRefresh(market, symbols, {
+      force,
+      limit,
+      maxSymbols,
+      reason: url.searchParams.get("reason") || "api",
+    });
+    sendJson(res, 202, result);
+    return;
+  }
+
+  if (url.pathname === "/api/social/reddit/cache" && req.method === "DELETE") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    const deleted = await deleteRedditCache(market, symbol);
+    invalidateRedditDerivedCaches(market, symbol);
+    sendJson(res, 200, { ok: true, market, symbol, deleted });
+    return;
+  }
+
   if (url.pathname === "/api/fundamentals") {
     const market = marketFromUrl(url);
     const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
@@ -9915,6 +10945,10 @@ export {
   runPythonQuantCore,
   sanitizeResearchConfig,
   sanitizeUniverseRows,
+  scoreRedditSocialPosts,
+  redditCacheTtlForItem,
+  redditProviderStatus,
+  fetchRedditSocialFactor,
   stockAnalysisHistoryRows,
   tradeFootprintRows,
   tushareRows,

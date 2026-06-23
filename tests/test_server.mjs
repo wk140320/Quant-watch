@@ -13,9 +13,13 @@ const {
   isLimitedProvider,
   localBatchAnalysis,
   providerConfigured,
+  redditCacheTtlForItem,
+  redditProviderStatus,
   runPythonQuantCore,
   sanitizeResearchConfig,
   sanitizeUniverseRows,
+  scoreRedditSocialPosts,
+  fetchRedditSocialFactor,
   stockAnalysisHistoryRows,
   tradeFootprintRows,
   tushareRows,
@@ -270,4 +274,94 @@ test("Saved factor configuration changes the decision factor signal", () => {
   assert.ok(momentum.score > reversal.score);
   assert.ok(momentum.enabledFactors.includes("momentum_5"));
   assert.ok(!momentum.enabledFactors.includes("reversal_5"));
+});
+
+test("Reddit social scoring rewards relevant fact-backed engagement", () => {
+  const result = scoreRedditSocialPosts([
+    {
+      id: "bhp-fact",
+      title: "BHP iron ore demand and China stimulus: 6% shipment growth",
+      content: "According to the latest filing and earnings call, revenue margin improved 3.2% while China infrastructure demand is recovering.",
+      subreddit: "AusFinance",
+      created_utc: 1780000000,
+      score: 420,
+      upvote_ratio: 0.89,
+      num_comments: 74,
+      url: "https://example.com/bhp-filing",
+      permalink: "/r/AusFinance/comments/bhp_fact",
+    },
+  ], { market: "ASX", symbol: "BHP", limit: 10 });
+  assert.equal(result.available, true);
+  assert.ok(result.score > 0);
+  assert.ok(result.confidence > 35);
+  assert.ok(result.topItems[0].truthScore > 60);
+  assert.equal(result.topItems[0].relation, "direct-stock");
+});
+
+test("Reddit social scoring does not overrate unrelated viral posts", () => {
+  const result = scoreRedditSocialPosts([
+    {
+      id: "viral-unrelated",
+      title: "A viral post about gaming laptops with no company link",
+      content: "This has many comments but discusses a consumer gadget launch with no connection to the target company or its supply chain.",
+      subreddit: "technology",
+      created_utc: 1780000000,
+      score: 20000,
+      upvote_ratio: 0.96,
+      num_comments: 5400,
+      url: "https://example.com/viral",
+      permalink: "/r/technology/comments/viral",
+    },
+  ], { market: "US", symbol: "NVDA", limit: 10 });
+  assert.ok(Math.abs(result.score) < 1);
+  if (result.topItems[0]) assert.ok(result.topItems[0].relevanceScore < 20);
+});
+
+test("Reddit social scoring penalizes manipulation-style hype", () => {
+  const result = scoreRedditSocialPosts([
+    {
+      id: "tsla-pump",
+      title: "TSLA guaranteed 100x pump moon all in",
+      content: "Trust me insider short squeeze cannot lose yolo. No source, no numbers, no filing.",
+      subreddit: "wallstreetbets",
+      created_utc: 1780000000,
+      score: 1500,
+      upvote_ratio: 0.51,
+      num_comments: 620,
+      url: "https://www.reddit.com/r/wallstreetbets/comments/tsla_pump",
+      permalink: "/r/wallstreetbets/comments/tsla_pump",
+    },
+  ], { market: "US", symbol: "TSLA", limit: 10 });
+  assert.equal(result.available, true);
+  assert.ok(result.topItems[0].manipulationRisk >= 65);
+  assert.ok(result.topItems[0].truthScore < 55);
+  assert.ok(result.score <= 0);
+});
+
+test("Reddit cache TTL stratifies high, medium, and low impact items", () => {
+  const high = redditCacheTtlForItem({ impactScore: 72, relevanceScore: 30 });
+  const medium = redditCacheTtlForItem({ impactScore: 45, relevanceScore: 30 });
+  const low = redditCacheTtlForItem({ impactScore: 15, relevanceScore: 20 });
+  assert.ok(high > medium);
+  assert.ok(medium > low);
+  assert.equal(high, 3 * 24 * 60 * 60 * 1000);
+  assert.equal(medium, 24 * 60 * 60 * 1000);
+  assert.equal(low, 12 * 60 * 60 * 1000);
+});
+
+test("Reddit disabled status and factor fallback do not throw", async () => {
+  const previous = process.env.REDDIT_ENABLED;
+  process.env.REDDIT_ENABLED = "false";
+  try {
+    const status = await redditProviderStatus("US");
+    assert.equal(status.enabled, false);
+    assert.equal(status.configured, false);
+    const factor = await fetchRedditSocialFactor("ZZZUNIT", "US", { mode: "refresh", limit: 10 });
+    assert.equal(factor.available, false);
+    assert.equal(factor.score, 0);
+    assert.ok(/disabled|incomplete/i.test(factor.thesis[0]));
+  } finally {
+    if (previous === undefined) delete process.env.REDDIT_ENABLED;
+    else process.env.REDDIT_ENABLED = previous;
+  }
 });

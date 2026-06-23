@@ -2384,6 +2384,135 @@ canvas {
   background: rgba(248, 250, 252, 0.96);
 }
 
+.social-factor-card {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+  padding: 13px;
+  border: 1px solid rgba(62, 139, 199, 0.34);
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(8, 20, 33, 0.96), rgba(9, 35, 48, 0.9));
+  color: var(--text);
+}
+
+.social-factor-card.good {
+  border-color: rgba(34, 197, 94, 0.42);
+}
+
+.social-factor-card.warn {
+  border-color: rgba(245, 158, 11, 0.42);
+}
+
+.social-factor-card.danger {
+  border-color: rgba(251, 113, 133, 0.46);
+}
+
+.social-factor-head,
+.modal-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.social-factor-head span,
+.social-factor-card small,
+.reddit-social-meta {
+  color: var(--muted);
+}
+
+.social-factor-head strong {
+  display: block;
+  margin-top: 2px;
+  color: #e0f2fe;
+  font-size: 24px;
+}
+
+.social-factor-actions,
+.modal-action-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.social-score-strip {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.social-score-strip span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid rgba(103, 232, 249, 0.22);
+  border-radius: 999px;
+  background: rgba(103, 232, 249, 0.09);
+  color: #cffafe;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.social-score-strip.compact span {
+  min-height: 20px;
+  padding: 2px 7px;
+  font-size: 10px;
+}
+
+.reddit-social-panel {
+  width: min(1060px, 96vw);
+}
+
+.reddit-social-panel [data-reddit-social-body] {
+  overflow: auto;
+  padding: 14px 16px 18px;
+  scrollbar-width: thin;
+}
+
+.reddit-social-list {
+  display: grid;
+  gap: 10px;
+}
+
+.reddit-social-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid rgba(62, 139, 199, 0.24);
+  border-radius: 8px;
+  background: rgba(4, 12, 22, 0.42);
+}
+
+.reddit-social-row strong,
+.reddit-social-row a {
+  color: #e0f2fe;
+}
+
+.reddit-social-row strong {
+  display: block;
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.reddit-social-rank {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 999px;
+  background: rgba(103, 232, 249, 0.14);
+  color: #67e8f9;
+  font-weight: 800;
+}
+
+.reddit-social-meta {
+  margin: 5px 0 8px;
+  font-size: 12px;
+}
+
 .model-log-row.warn {
   border-color: rgba(245, 158, 11, 0.42);
 }

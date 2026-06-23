@@ -1,12 +1,109 @@
-function readJsonStorage(key, fallback) {
+if (!Array.prototype.at) {
+  Object.defineProperty(Array.prototype, "at", {
+    value(index) {
+      const length = this == null ? 0 : this.length >>> 0;
+      let offset = Number(index) || 0;
+      if (offset < 0) offset += length;
+      return offset < 0 || offset >= length ? undefined : this[offset];
+    },
+    configurable: true,
+    writable: true,
+  });
+}
+
+if (!Array.prototype.flatMap) {
+  Object.defineProperty(Array.prototype, "flatMap", {
+    value(callback, thisArg) {
+      return Array.prototype.concat.apply([], this.map(callback, thisArg));
+    },
+    configurable: true,
+    writable: true,
+  });
+}
+
+if (!Object.fromEntries) {
+  Object.fromEntries = function fromEntries(entries) {
+    const result = {};
+    Array.from(entries || []).forEach((entry) => {
+      if (entry && entry.length >= 2) result[entry[0]] = entry[1];
+    });
+    return result;
+  };
+}
+
+if (!Promise.allSettled) {
+  Promise.allSettled = function allSettled(promises) {
+    return Promise.all(Array.from(promises || []).map((promise) => (
+      Promise.resolve(promise)
+        .then((value) => ({ status: "fulfilled", value }))
+        .catch((reason) => ({ status: "rejected", reason }))
+    )));
+  };
+}
+
+const safeStorage = {
+  getItem(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (error) {
+      console.warn(`Unable to read safeStorage.${key}`, error);
+      return null;
+    }
+  },
+  setItem(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+      return true;
+    } catch (error) {
+      console.warn(`Unable to write safeStorage.${key}`, error);
+      return false;
+    }
+  },
+  removeItem(key) {
+    try {
+      window.localStorage.removeItem(key);
+      return true;
+    } catch (error) {
+      console.warn(`Unable to remove safeStorage.${key}`, error);
+      return false;
+    }
+  },
+};
+
+const BOOT_PENDING_KEY = "quantWatchBootPending";
+let startupRecoveredFromPreviousCrash = false;
+try {
+  startupRecoveredFromPreviousCrash = safeStorage.getItem(BOOT_PENDING_KEY) === "true";
+  safeStorage.setItem(BOOT_PENDING_KEY, "true");
+} catch (error) {
+  startupRecoveredFromPreviousCrash = false;
+}
+function hasStartupSafeQuery() {
   try {
-    const raw = localStorage.getItem(key);
+    if (typeof URLSearchParams !== "undefined") return new URLSearchParams(location.search).has("safe");
+  } catch (error) {
+    console.warn("Unable to inspect startup query", error);
+  }
+  return /(?:\?|&)safe(?:=|&|$)/.test(location.search || "");
+}
+
+const STARTUP_STORAGE_CHAR_LIMIT = 240000;
+const STARTUP_SAFE_MODE = startupRecoveredFromPreviousCrash || hasStartupSafeQuery();
+
+function readJsonStorage(key, fallback, options = {}) {
+  try {
+    const raw = safeStorage.getItem(key);
     if (!raw) return fallback;
+    const maxChars = Number(options.maxChars || STARTUP_STORAGE_CHAR_LIMIT);
+    if (raw.length > maxChars) {
+      console.warn(`Skipping oversized safeStorage.${key}`, { length: raw.length, maxChars });
+      return fallback;
+    }
     const value = JSON.parse(raw);
     return value == null ? fallback : value;
   } catch (error) {
-    console.warn(`Ignoring invalid localStorage.${key}`, error);
-    localStorage.removeItem(key);
+    console.warn(`Ignoring invalid safeStorage.${key}`, error);
+    safeStorage.removeItem(key);
     return fallback;
   }
 }
@@ -245,7 +342,7 @@ function normalizeHoldingForStorage(holding, fallbackMarket = "ASX") {
   };
 }
 
-const initialMarket = safeMarket(localStorage.getItem("selectedMarket") || "ASX");
+const initialMarket = safeMarket(safeStorage.getItem("selectedMarket") || "ASX");
 const savedPortfolio = readJsonStorage("portfolioJson", []);
 const savedPortfolioByMarket = readJsonStorage("portfolioByMarket", null);
 const savedWatchlistOrigins = readJsonStorage("watchlistOriginsByMarket", {});
@@ -268,11 +365,11 @@ const state = {
   analyses: new Map(),
   analysesByMarket: new Map(),
   selected: null,
-  activePage: localStorage.getItem("activeQuantPage") || "dashboard",
-  chartRange: localStorage.getItem("chartRange") || "6M",
-  chartInterval: localStorage.getItem("chartInterval") || "1d",
+  activePage: safeStorage.getItem("activeQuantPage") || "dashboard",
+  chartRange: safeStorage.getItem("chartRange") || "6M",
+  chartInterval: safeStorage.getItem("chartInterval") || "1d",
   chartHoverIndex: null,
-  chartZoom: Number(localStorage.getItem("chartZoom") || 1),
+  chartZoom: Number(safeStorage.getItem("chartZoom") || 1),
   chartOffset: 0,
   chartDragging: null,
   chartOverlays: readJsonStorage("chartOverlays", {
@@ -306,15 +403,15 @@ const state = {
   factorLabChartDragging: null,
   chartExpanded: false,
   autoRefreshTimer: null,
-  autoRefreshEnabled: localStorage.getItem("autoRefreshEnabled") === "true",
+  autoRefreshEnabled: safeStorage.getItem("autoRefreshEnabled") === "true",
   nextAutoRefreshAt: null,
   isRefreshing: false,
   aiRefreshToken: 0,
   clockTimer: null,
-  snapshotUpdatedAt: localStorage.getItem(`analysisSnapshotTime:${initialMarket}`) || (initialMarket === "ASX" ? localStorage.getItem("analysisSnapshotTime") : null),
+  snapshotUpdatedAt: safeStorage.getItem(`analysisSnapshotTime:${initialMarket}`) || (initialMarket === "ASX" ? safeStorage.getItem("analysisSnapshotTime") : null),
   history: Array.isArray(readJsonStorage("decisionHistory", [])) ? readJsonStorage("decisionHistory", []) : [],
   notifiedAlerts: readJsonStorage("notifiedAlerts", {}),
-  notificationsEnabled: localStorage.getItem("notificationsEnabled") === "true",
+  notificationsEnabled: safeStorage.getItem("notificationsEnabled") === "true",
   latestAlerts: [],
   apiCache: new Map(),
   marketCache: new Map(),
@@ -324,10 +421,10 @@ const state = {
   accuracySummary: null,
   marketIndexes: [],
   marketIndexSignal: null,
-  marketIndexChartSymbol: localStorage.getItem("marketIndexChartSymbol") || null,
-  indexChartInterval: localStorage.getItem("indexChartInterval") || "1d",
-  indexChartRange: localStorage.getItem("indexChartRange") || "6M",
-  indexChartZoom: Number(localStorage.getItem("indexChartZoom") || 1),
+  marketIndexChartSymbol: safeStorage.getItem("marketIndexChartSymbol") || null,
+  indexChartInterval: safeStorage.getItem("indexChartInterval") || "1d",
+  indexChartRange: safeStorage.getItem("indexChartRange") || "6M",
+  indexChartZoom: Number(safeStorage.getItem("indexChartZoom") || 1),
   indexChartOffset: 0,
   indexChartHoverIndex: null,
   indexChartDragging: null,
@@ -335,6 +432,8 @@ const state = {
   marketIndexUsedSnapshotFallback: false,
   marketIndexRefreshing: false,
   marketIndexHydrationTimer: null,
+  redditWarmupTimer: null,
+  redditWarmupStatus: null,
   stockPicker: { forecast: [], today: [], rejected: [], failures: [], updatedAt: null },
   marketMoversByMarket: readJsonStorage("marketMoversByMarket", {}),
   agentConfigByMarket: readJsonStorage("agentConfigByMarket", {}),
@@ -349,9 +448,32 @@ const state = {
   universeStatusByMarket: readJsonStorage("universeStatusByMarket", {}),
   apiStatusByMarket: readJsonStorage("apiStatusByMarket", {}),
   latestFeatureAnalysis: null,
+  renderQueue: {
+    cards: false,
+    summary: false,
+    detail: false,
+    indexes: false,
+    agent: false,
+    handle: null,
+  },
+  chartRedrawHandles: {},
+  statusThrottle: { lastAt: 0, handle: null, message: "" },
+  marketSwitchToken: 0,
 };
 
 const $ = (id) => document.getElementById(id);
+const requestUiFrame = window.requestAnimationFrame
+  ? (callback) => window.requestAnimationFrame(callback)
+  : (callback) => setTimeout(callback, 16);
+const cancelUiFrame = window.cancelAnimationFrame
+  ? (handle) => window.cancelAnimationFrame(handle)
+  : (handle) => clearTimeout(handle);
+const requestUiIdle = window.requestIdleCallback
+  ? (callback, options) => window.requestIdleCallback(callback, options)
+  : (callback) => setTimeout(() => callback({ didTimeout: true, timeRemaining: () => 0 }), 32);
+const cancelUiIdle = window.cancelIdleCallback
+  ? (handle) => window.cancelIdleCallback(handle)
+  : (handle) => clearTimeout(handle);
 const WHEEL_ZOOM_IN = 1.012;
 const WHEEL_ZOOM_OUT = 0.988;
 const WHEEL_PAN_DIVISOR = 520;
@@ -407,6 +529,161 @@ const DEFAULT_ANALYSIS = {
 function bind(id, event, handler) {
   const element = $(id);
   if (element) element.addEventListener(event, handler);
+}
+
+function compactRuntimeError(error) {
+  return compactDisplayError(error?.message || String(error || "未知错误"));
+}
+
+function safeUiStep(label, task, fallback = null) {
+  try {
+    return task();
+  } catch (error) {
+    console.error(`${label} failed`, error);
+    setStatus(`${label}失败：${compactRuntimeError(error)}；其余模块继续可用`);
+    return fallback;
+  }
+}
+
+async function safeUiStepAsync(label, task, fallback = null) {
+  try {
+    return await task();
+  } catch (error) {
+    console.error(`${label} failed`, error);
+    setStatus(`${label}失败：${compactRuntimeError(error)}；其余模块继续可用`);
+    return fallback;
+  }
+}
+
+function runUiTask(label, task, fallback = null) {
+  try {
+    const result = task();
+    if (result && typeof result.catch === "function") {
+      return result.catch((error) => {
+        console.error(`${label} failed`, error);
+        setStatus(`${label}失败：${compactRuntimeError(error)}；页面保持可用`);
+        return fallback;
+      });
+    }
+    return result;
+  } catch (error) {
+    console.error(`${label} failed`, error);
+    setStatus(`${label}失败：${compactRuntimeError(error)}；页面保持可用`);
+    return fallback;
+  }
+}
+
+function deferUiStep(label, task, delay = 0, options = {}) {
+  setTimeout(() => {
+    const runner = () => runUiTask(label, task, options.fallback ?? null);
+    if (options.frame) {
+      requestUiFrame(runner);
+      return;
+    }
+    if (options.idle !== false) {
+      requestUiIdle(runner, { timeout: options.timeout || 2500 });
+      return;
+    }
+    runner();
+  }, delay);
+}
+
+function setStatusThrottled(message, interval = 450) {
+  const now = Date.now();
+  if (now - state.statusThrottle.lastAt >= interval) {
+    state.statusThrottle.lastAt = now;
+    setStatus(message);
+    return;
+  }
+  state.statusThrottle.message = message;
+  if (state.statusThrottle.handle) return;
+  state.statusThrottle.handle = setTimeout(() => {
+    state.statusThrottle.handle = null;
+    state.statusThrottle.lastAt = Date.now();
+    if (state.statusThrottle.message) setStatus(state.statusThrottle.message);
+    state.statusThrottle.message = "";
+  }, Math.max(0, interval - (now - state.statusThrottle.lastAt)));
+}
+
+function flushMainRenderQueue() {
+  const queue = state.renderQueue;
+  if (queue.handle) {
+    cancelUiFrame(queue.handle);
+    queue.handle = null;
+  }
+  const pending = {
+    cards: queue.cards,
+    summary: queue.summary,
+    detail: queue.detail,
+    indexes: queue.indexes,
+    agent: queue.agent,
+  };
+  queue.cards = false;
+  queue.summary = false;
+  queue.detail = false;
+  queue.indexes = false;
+  queue.agent = false;
+  safeUiStep("批量渲染", () => {
+    if (pending.cards) renderCards();
+    if (pending.summary) renderPortfolioSummary();
+    if (pending.indexes) renderMarketIndexPanel();
+    if (pending.agent) {
+      renderAgentPanel();
+      renderOptimalStrategyPanel();
+    }
+    if (pending.detail) renderDetail();
+  });
+}
+
+function queueMainRender(parts = ["cards", "summary", "detail"], options = {}) {
+  const queue = state.renderQueue;
+  (Array.isArray(parts) ? parts : [parts]).forEach((part) => {
+    if (part && Object.prototype.hasOwnProperty.call(queue, part)) queue[part] = true;
+  });
+  if (options.immediate) {
+    flushMainRenderQueue();
+    return;
+  }
+  if (queue.handle) return;
+  queue.handle = requestUiFrame(() => {
+    queue.handle = null;
+    flushMainRenderQueue();
+  });
+}
+
+function renderAnalysisPanelsNow() {
+  queueMainRender(["cards", "summary", "detail"], { immediate: true });
+}
+
+function scheduleChartRedraw(key, task) {
+  const handleKey = String(key || "chart");
+  if (state.chartRedrawHandles[handleKey]) return;
+  state.chartRedrawHandles[handleKey] = requestUiFrame(() => {
+    state.chartRedrawHandles[handleKey] = null;
+    safeUiStep(`${handleKey} 图表重绘`, task);
+  });
+}
+
+function deferMarketStep(token, label, task, delay = 0, options = {}) {
+  deferUiStep(label, () => {
+    if (token !== state.marketSwitchToken) return false;
+    return task();
+  }, delay, options);
+}
+
+function deferMarketStepAsync(token, label, task, delay = 0, options = {}) {
+  deferMarketStep(token, label, async () => {
+    if (token !== state.marketSwitchToken) return false;
+    try {
+      const result = await task();
+      if (token !== state.marketSwitchToken) return false;
+      return result;
+    } catch (error) {
+      console.error(`${label} failed`, error);
+      setStatus(`${label}失败：${compactRuntimeError(error)}；页面保持可用`);
+      return false;
+    }
+  }, delay, options);
 }
 
 function activeMarketConfig() {
@@ -754,7 +1031,7 @@ function getRuntimeSettings() {
 
 function saveRuntimeSettings() {
   state.runtimeSettings = getRuntimeSettings();
-  localStorage.setItem("runtimeSettings", JSON.stringify(state.runtimeSettings));
+  safeStorage.setItem("runtimeSettings", JSON.stringify(state.runtimeSettings));
 }
 
 function snapshotsEnabled() {
@@ -826,21 +1103,21 @@ function saveState() {
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
   reconcileWatchlistOrigins(state.market);
   state.watchlistsByMarket[state.market] = state.watchlist;
-  localStorage.setItem("selectedMarket", state.market);
-  localStorage.setItem("watchlistsByMarket", JSON.stringify(state.watchlistsByMarket));
-  localStorage.setItem("watchlistOriginsByMarket", JSON.stringify(state.watchlistOriginsByMarket));
-  localStorage.setItem("watchlist", JSON.stringify(state.watchlist));
-  localStorage.setItem("strategy", JSON.stringify(getStrategy()));
-  localStorage.setItem("capital", JSON.stringify({ ...getCapital(), baseCapital: asNumber($("totalCapital").value, 0) }));
-  localStorage.setItem(`portfolioCsv:${state.market}`, $("portfolioCsv").value);
-  localStorage.setItem("portfolioJson", JSON.stringify(state.portfolio));
-  localStorage.setItem("portfolioByMarket", JSON.stringify(portfolioByMarketRows()));
-  localStorage.setItem("chartRange", state.chartRange);
-  localStorage.setItem("chartInterval", state.chartInterval || "1d");
-  localStorage.setItem("autoRefreshEnabled", String(state.autoRefreshEnabled));
-  localStorage.setItem("refreshInterval", $("refreshInterval").value);
-  localStorage.setItem("marketUniverseByMarket", JSON.stringify(state.marketUniverseByMarket));
-  localStorage.setItem("universeStatusByMarket", JSON.stringify(state.universeStatusByMarket));
+  safeStorage.setItem("selectedMarket", state.market);
+  safeStorage.setItem("watchlistsByMarket", JSON.stringify(state.watchlistsByMarket));
+  safeStorage.setItem("watchlistOriginsByMarket", JSON.stringify(state.watchlistOriginsByMarket));
+  safeStorage.setItem("watchlist", JSON.stringify(state.watchlist));
+  safeStorage.setItem("strategy", JSON.stringify(getStrategy()));
+  safeStorage.setItem("capital", JSON.stringify({ ...getCapital(), baseCapital: asNumber($("totalCapital").value, 0) }));
+  safeStorage.setItem(`portfolioCsv:${state.market}`, $("portfolioCsv").value);
+  safeStorage.setItem("portfolioJson", JSON.stringify(state.portfolio));
+  safeStorage.setItem("portfolioByMarket", JSON.stringify(portfolioByMarketRows()));
+  safeStorage.setItem("chartRange", state.chartRange);
+  safeStorage.setItem("chartInterval", state.chartInterval || "1d");
+  safeStorage.setItem("autoRefreshEnabled", String(state.autoRefreshEnabled));
+  safeStorage.setItem("refreshInterval", $("refreshInterval").value);
+  safeStorage.setItem("marketUniverseByMarket", JSON.stringify(state.marketUniverseByMarket));
+  safeStorage.setItem("universeStatusByMarket", JSON.stringify(state.universeStatusByMarket));
   saveRuntimeSettings();
 }
 
@@ -870,13 +1147,13 @@ function loadSavedInputs() {
   if ($("fastInitialRefresh")) $("fastInitialRefresh").checked = runtimeSettings.fastInitialRefresh !== false;
   if ($("allowOffHoursFetch")) $("allowOffHoursFetch").checked = runtimeSettings.allowOffHoursFetch !== false;
   if ($("keepSnapshots")) $("keepSnapshots").checked = runtimeSettings.keepSnapshots !== false;
-  const savedInterval = asNumber(localStorage.getItem("refreshInterval"), 1800000);
+  const savedInterval = asNumber(safeStorage.getItem("refreshInterval"), 1800000);
   const refreshIntervals = [60000, 300000, 600000, 1800000, 3600000];
   const nearestInterval = refreshIntervals.reduce((best, value) => (
     Math.abs(value - savedInterval) < Math.abs(best - savedInterval) ? value : best
   ), 1800000);
   $("refreshInterval").value = String(nearestInterval);
-  $("portfolioCsv").value = localStorage.getItem(`portfolioCsv:${state.market}`) || holdingsToCsv(activePortfolio()) || activeMarketConfig().samplePortfolio;
+  $("portfolioCsv").value = safeStorage.getItem(`portfolioCsv:${state.market}`) || holdingsToCsv(activePortfolio()) || activeMarketConfig().samplePortfolio;
   $("holdingEntryDate").value = todayIso();
   syncCapitalFields();
 }
@@ -947,9 +1224,9 @@ function holdingsToCsv(holdings) {
 function savePortfolio() {
   state.portfolio = sanitizePortfolioByMarket();
   $("portfolioCsv").value = holdingsToCsv(activePortfolio());
-  localStorage.setItem(`portfolioCsv:${state.market}`, $("portfolioCsv").value);
-  localStorage.setItem("portfolioJson", JSON.stringify(state.portfolio));
-  localStorage.setItem("portfolioByMarket", JSON.stringify(portfolioByMarketRows()));
+  safeStorage.setItem(`portfolioCsv:${state.market}`, $("portfolioCsv").value);
+  safeStorage.setItem("portfolioJson", JSON.stringify(state.portfolio));
+  safeStorage.setItem("portfolioByMarket", JSON.stringify(portfolioByMarketRows()));
   activePortfolio().forEach((holding) => {
     addWatchSymbol(holding.symbol, holding.source || "holding", holding.market || state.market);
   });
@@ -1468,7 +1745,7 @@ function formatCompactNumber(value, maximumFractionDigits = 2) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "—";
   return number.toLocaleString(activeMarketConfig().locale, {
-    notation: Math.abs(number) >= 1_000_000 ? "compact" : "standard",
+    notation: Math.abs(number) >= 1000000 ? "compact" : "standard",
     maximumFractionDigits,
   });
 }
@@ -1524,7 +1801,7 @@ function researchConfigForMarket(market = state.market) {
 function saveResearchConfigLocal(config = researchConfigForMarket()) {
   const normalized = normalizeResearchConfig(config, config.market || state.market);
   state.researchConfigByMarket[normalized.market] = normalized;
-  localStorage.setItem("researchConfigByMarket", JSON.stringify(state.researchConfigByMarket));
+  safeStorage.setItem("researchConfigByMarket", JSON.stringify(state.researchConfigByMarket));
   return normalized;
 }
 
@@ -1570,7 +1847,7 @@ function modelChangeLogForMarket(market = state.market) {
 }
 
 function saveModelChangeLog() {
-  localStorage.setItem("modelChangeLogByMarket", JSON.stringify(state.modelChangeLogByMarket));
+  safeStorage.setItem("modelChangeLogByMarket", JSON.stringify(state.modelChangeLogByMarket));
 }
 
 function modelChangeLogEventToRow(event) {
@@ -1928,7 +2205,7 @@ function featureMetricButtons() {
 }
 
 function saveFeatureChartState() {
-  localStorage.setItem("featureChart", JSON.stringify(state.featureChart || {}));
+  safeStorage.setItem("featureChart", JSON.stringify(state.featureChart || {}));
 }
 
 const FEATURE_SIDE_LABELS = {
@@ -1959,8 +2236,8 @@ function writeFeatureSideCorrections(result, corrections) {
   const clean = Object.fromEntries(
     Object.entries(corrections || {}).filter(([, value]) => value?.label && FEATURE_SIDE_LABELS[value.label])
   );
-  if (Object.keys(clean).length) localStorage.setItem(key, JSON.stringify(clean));
-  else localStorage.removeItem(key);
+  if (Object.keys(clean).length) safeStorage.setItem(key, JSON.stringify(clean));
+  else safeStorage.removeItem(key);
 }
 
 function featureSideRowKey(row) {
@@ -2345,7 +2622,7 @@ function renderFeatureOverlayChart(result) {
           state.featureChart.zoom = clamp(Number(state.featureChart.zoom || 1) * factor, 1, 40);
         }
         saveFeatureChartState();
-        renderFeatureOverlayChart(result);
+        scheduleChartRedraw("feature", () => renderFeatureOverlayChart(result));
       }, { passive: false });
       targetCanvas.addEventListener("pointerdown", (event) => {
         state.featureChartDragging = { x: event.clientX, offset: Number(state.featureChart.offset || 0) };
@@ -2357,12 +2634,12 @@ function renderFeatureOverlayChart(result) {
         if (state.featureChartDragging) {
           const barsPerPixel = currentRows.length / Math.max(1, rect.width - 62);
           state.featureChart.offset = Math.max(0, Math.round(state.featureChartDragging.offset - (event.clientX - state.featureChartDragging.x) * barsPerPixel));
-          renderFeatureOverlayChart(result);
+          scheduleChartRedraw("feature", () => renderFeatureOverlayChart(result));
           return;
         }
         const ratio = clamp((event.clientX - rect.left - 48) / Math.max(1, rect.width - 62), 0, 1);
         state.featureChartHoverIndex = Math.round(ratio * (currentRows.length - 1));
-        renderFeatureOverlayChart(result);
+        scheduleChartRedraw("feature", () => renderFeatureOverlayChart(result));
       });
       targetCanvas.addEventListener("pointerup", () => {
         state.featureChartDragging = null;
@@ -2374,7 +2651,7 @@ function renderFeatureOverlayChart(result) {
         if (readout) readout.textContent = "悬停查看全时段特征值";
         const orderflowReadout = $("featureOrderflowReadout");
         if (orderflowReadout) orderflowReadout.textContent = "悬停查看每根 K 线价位买卖层级";
-        renderFeatureOverlayChart(result);
+        scheduleChartRedraw("feature", () => renderFeatureOverlayChart(result));
       });
     });
   }
@@ -2419,7 +2696,7 @@ function setWorkspacePage(page, options = {}) {
   const validPages = new Set(["dashboard", "features", "factors", "regime", "strategy", "simulation", "sources"]);
   const next = validPages.has(page) ? page : "dashboard";
   state.activePage = next;
-  localStorage.setItem("activeQuantPage", next);
+  safeStorage.setItem("activeQuantPage", next);
   document.querySelectorAll("[data-quant-page]").forEach((section) => {
     section.hidden = section.dataset.quantPage !== next;
   });
@@ -3000,7 +3277,7 @@ function factorLabFactorButtons(result = state.latestFactorLab) {
 }
 
 function saveFactorLabChartState() {
-  localStorage.setItem("factorLabChart", JSON.stringify(state.factorLabChart || {}));
+  safeStorage.setItem("factorLabChart", JSON.stringify(state.factorLabChart || {}));
 }
 
 function visibleFactorLabRows(sourceRows) {
@@ -3160,7 +3437,7 @@ function drawFactorLabOverlayChart(result = state.latestFactorLab) {
         state.factorLabChart.zoom = clamp(Number(state.factorLabChart.zoom || 1) * factor, 1, 40);
       }
       saveFactorLabChartState();
-      drawFactorLabOverlayChart(result);
+      scheduleChartRedraw("factorLab", () => drawFactorLabOverlayChart(result));
     }, { passive: false });
     canvas.addEventListener("pointerdown", (event) => {
       state.factorLabChartDragging = { x: event.clientX, offset: Number(state.factorLabChart.offset || 0) };
@@ -3172,12 +3449,12 @@ function drawFactorLabOverlayChart(result = state.latestFactorLab) {
       if (state.factorLabChartDragging) {
         const barsPerPixel = currentRows.length / Math.max(1, rect.width - 62);
         state.factorLabChart.offset = Math.max(0, Math.round(state.factorLabChartDragging.offset - (event.clientX - state.factorLabChartDragging.x) * barsPerPixel));
-        drawFactorLabOverlayChart(result);
+        scheduleChartRedraw("factorLab", () => drawFactorLabOverlayChart(result));
         return;
       }
       const ratio = clamp((event.clientX - rect.left - 48) / Math.max(1, rect.width - 62), 0, 1);
       state.factorLabChartHoverIndex = Math.round(ratio * (currentRows.length - 1));
-      drawFactorLabOverlayChart(result);
+      scheduleChartRedraw("factorLab", () => drawFactorLabOverlayChart(result));
     });
     canvas.addEventListener("pointerup", () => {
       state.factorLabChartDragging = null;
@@ -3185,7 +3462,7 @@ function drawFactorLabOverlayChart(result = state.latestFactorLab) {
     });
     canvas.addEventListener("mouseleave", () => {
       state.factorLabChartHoverIndex = null;
-      drawFactorLabOverlayChart(result);
+      scheduleChartRedraw("factorLab", () => drawFactorLabOverlayChart(result));
     });
   }
 }
@@ -3605,7 +3882,10 @@ function renderDataHealth(payload) {
   }
   const marketProviders = Array.isArray(payload.marketProviders) ? payload.marketProviders : [];
   const newsProviders = Array.isArray(payload.newsProviders) ? payload.newsProviders : [];
+  const socialProviders = Array.isArray(payload.socialProviders) ? payload.socialProviders : (payload.redditSocial ? [payload.redditSocial] : []);
   const cacheRows = Array.isArray(payload.newsCache?.rows) ? payload.newsCache.rows : [];
+  const redditCacheRows = Array.isArray(payload.redditSocial?.cache?.rows) ? payload.redditSocial.cache.rows : [];
+  const redditSummary = payload.redditSocial?.cache?.summary || {};
   const cacheSummary = payload.newsCache?.summary || {};
   const schedule = payload.refreshSchedule || {};
   const monitoredRows = [...state.analyses.values()];
@@ -3639,6 +3919,11 @@ function renderDataHealth(payload) {
         <small>${escapeHtml(schedule.reason || "")}</small>
       </div>
       <div>
+        <span>Reddit 社媒缓存</span>
+        <strong>${redditSummary.totalFiles || 0} 文件 · ${redditSummary.itemCount || 0} 条</strong>
+        <small>最近 ${redditSummary.latestCachedAt ? `${new Date(redditSummary.latestCachedAt).toLocaleString()} · ${formatAge(Date.now() - Date.parse(redditSummary.latestCachedAt))}` : "暂无"}</small>
+      </div>
+      <div>
         <span>真实逐笔/L1/L2</span>
         <strong>${payload.capabilities?.tick?.available ? "逐笔可用" : "逐笔未授权"} / ${payload.capabilities?.l1?.available ? "L1可用" : "L1未授权"} / ${payload.capabilities?.l2?.available ? "L2可用" : "L2未授权"}</strong>
         <small>${escapeHtml(payload.capabilities?.tick?.note || payload.capabilities?.tick?.reason || "")}</small>
@@ -3657,6 +3942,10 @@ function renderDataHealth(payload) {
       <summary>新闻源状态</summary>
       <div class="api-status-scroll">${newsProviders.slice(0, 14).map(providerPill).join("") || "<span class=\"muted\">暂无新闻源状态</span>"}</div>
     </details>
+    <details class="health-details" open>
+      <summary>社媒源状态</summary>
+      <div class="api-status-scroll">${socialProviders.slice(0, 8).map(providerPill).join("") || "<span class=\"muted\">暂无社媒源状态</span>"}</div>
+    </details>
     <details class="health-details">
       <summary>本地新闻缓存明细</summary>
       <div class="news-cache-list">
@@ -3667,6 +3956,18 @@ function renderDataHealth(payload) {
             <em>${row.refreshDecision?.due ? "到刷新窗口" : "本地可用"}</em>
           </div>
         `).join("") : `<p class="muted">当前市场还没有本地新闻缓存。</p>`}
+      </div>
+    </details>
+    <details class="health-details">
+      <summary>本地 Reddit 缓存明细</summary>
+      <div class="news-cache-list">
+        ${redditCacheRows.length ? redditCacheRows.slice(0, 24).map((row) => `
+          <div>
+            <strong>${escapeHtml(row.symbol || row.file || "UNKNOWN")}</strong>
+            <span>${row.count || 0} 条 · ${escapeHtml(row.source || "reddit-social")} · ${row.cachedAt ? formatAge(Date.now() - Date.parse(row.cachedAt)) : "未知时间"}</span>
+            <em>${row.invalid ? "无效缓存" : "本地可用"}</em>
+          </div>
+        `).join("") : `<p class="muted">当前市场还没有本地 Reddit 社媒缓存。</p>`}
       </div>
     </details>
   `;
@@ -3713,7 +4014,7 @@ async function refreshNewsNow() {
 }
 
 function saveApiStatusState() {
-  localStorage.setItem("apiStatusByMarket", JSON.stringify(state.apiStatusByMarket));
+  safeStorage.setItem("apiStatusByMarket", JSON.stringify(state.apiStatusByMarket));
 }
 
 function providerHealth(provider = {}) {
@@ -3746,6 +4047,7 @@ function renderApiStatusBar(payload = state.apiStatusByMarket[state.market]) {
   } else {
     const providers = Array.isArray(payload.providers) ? payload.providers : [];
     const newsProviders = Array.isArray(payload.newsProviders) ? payload.newsProviders : [];
+    const socialProviders = Array.isArray(payload.socialProviders) ? payload.socialProviders : [];
     const modelProviders = Array.isArray(payload.modelProviders) ? payload.modelProviders : [];
     const capabilities = payload.capabilities || {};
     const providerPills = providers.slice(0, 8).map((provider) => {
@@ -3783,6 +4085,15 @@ function renderApiStatusBar(payload = state.apiStatusByMarket[state.market]) {
         </span>
       `;
     }).join("");
+    const socialPills = socialProviders.slice(0, 4).map((provider) => {
+      const health = providerHealth(provider);
+      const label = !provider.enabled ? "关闭" : !provider.configured ? "未接入" : health === "warn" ? "缓存/权限" : "可用";
+      return `
+        <span class="api-pill social ${health}">
+          <i></i><b>${escapeHtml(provider.name || "reddit")}</b><em>${escapeHtml(label)}</em>
+        </span>
+      `;
+    }).join("");
     const modelPills = (modelProviders.length ? modelProviders : [{ name: "AI模型", configured: false, note: "未接入" }]).slice(0, 5).map((provider) => {
       const health = providerHealth(provider);
       const label = !provider.configured ? "未接入" : provider.model ? provider.model : "可用";
@@ -3794,7 +4105,7 @@ function renderApiStatusBar(payload = state.apiStatusByMarket[state.market]) {
     }).join("");
     bar.innerHTML = `
       <strong>${escapeHtml(config.code)} API</strong>
-      <div class="api-status-scroll">${providerPills}${capabilityPills}${newsPills}${modelPills}</div>
+      <div class="api-status-scroll">${providerPills}${capabilityPills}${newsPills}${socialPills}${modelPills}</div>
       <button class="api-status-refresh" type="button" data-api-status-refresh>检查</button>
     `;
   }
@@ -3827,6 +4138,7 @@ async function refreshApiStatusBar(showStatus = false) {
       updatedAt: new Date().toISOString(),
       providers: budget?.providers || [],
       newsProviders: newsStatus?.providers || [],
+      socialProviders: health?.reddit ? [health.reddit] : [],
       modelProviders,
       newsPrimary: newsStatus?.primary || "auto",
       policy: budget?.policy || {},
@@ -4149,7 +4461,7 @@ function tagClass(value, goodAt, badAt) {
 
 function factorTotal(factors) {
   if (!factors) return 0;
-  return ["announcements", "shortInterest", "macro", "sector", "flowOptions", "marketRegime", "relativeStrength", "liquidity", "calibration"]
+  return ["announcements", "shortInterest", "macro", "sector", "socialMedia", "flowOptions", "marketRegime", "relativeStrength", "liquidity", "calibration"]
     .reduce((sum, key) => sum + Number(factors[key]?.available === false ? 0 : factors[key]?.score || 0), 0);
 }
 
@@ -4194,6 +4506,7 @@ function factorRows(factors) {
     [state.market === "ASX" ? "空头" : "资金/空头", factors.shortInterest],
     ["宏观", factors.macro],
     ["行业", factors.sector],
+    ["Reddit社媒", factors.socialMedia],
     [state.market === "US" ? "期权隐波" : state.market === "CN" ? "两融/北向" : "资金/期权", factors.flowOptions],
     ["市场状态", factors.marketRegime],
     ["相对强弱", factors.relativeStrength],
@@ -4408,7 +4721,7 @@ function loadMarketIndexSnapshot() {
   const payload = readJsonStorage(indexSnapshotKey(), null);
   if (!payload || payload.market !== state.market || !Array.isArray(payload.rows)) return false;
   if (!marketIndexRowsComplete(payload.rows)) {
-    localStorage.removeItem(indexSnapshotKey());
+    safeStorage.removeItem(indexSnapshotKey());
     return false;
   }
   state.marketIndexes = payload.rows;
@@ -4424,7 +4737,7 @@ function saveMarketIndexSnapshot(rows, signal) {
     rows,
     signal,
   };
-  localStorage.setItem(indexSnapshotKey(), JSON.stringify(payload));
+  safeStorage.setItem(indexSnapshotKey(), JSON.stringify(payload));
 }
 
 function indexChartRangeCount(range = state.indexChartRange) {
@@ -4456,16 +4769,16 @@ function selectedMarketIndexRow(rowsOverride = null) {
     : (state.marketIndexes?.length ? state.marketIndexes : activeMarketConfig().indexes || []);
   const rows = (sourceRows || []).filter((row) => !row?.error);
   if (!rows.length) return null;
-  const saved = state.marketIndexChartSymbol || localStorage.getItem("marketIndexChartSymbol");
+  const saved = state.marketIndexChartSymbol || safeStorage.getItem("marketIndexChartSymbol");
   const selected = rows.find((row) => row.symbol === saved || row.displaySymbol === saved);
   return selected || rows[0];
 }
 
 function saveIndexChartView() {
-  localStorage.setItem("marketIndexChartSymbol", state.marketIndexChartSymbol || "");
-  localStorage.setItem("indexChartInterval", state.indexChartInterval || "1d");
-  localStorage.setItem("indexChartRange", state.indexChartRange || "6M");
-  localStorage.setItem("indexChartZoom", String(state.indexChartZoom || 1));
+  safeStorage.setItem("marketIndexChartSymbol", state.marketIndexChartSymbol || "");
+  safeStorage.setItem("indexChartInterval", state.indexChartInterval || "1d");
+  safeStorage.setItem("indexChartRange", state.indexChartRange || "6M");
+  safeStorage.setItem("indexChartZoom", String(state.indexChartZoom || 1));
 }
 
 function visibleIndexCandles(sourceCandles) {
@@ -4805,7 +5118,7 @@ function bindIndexChartEvents(row, candles) {
         state.indexChartZoom = clamp(Number(state.indexChartZoom || 1) * factor, 1, 40);
       }
       saveIndexChartView();
-      drawIndexChart(row);
+      scheduleChartRedraw("index", () => drawIndexChart(row));
     }, { passive: false });
     canvas.addEventListener("pointerdown", (event) => {
       state.indexChartDragging = { x: event.clientX, offset: Number(state.indexChartOffset || 0) };
@@ -4816,12 +5129,12 @@ function bindIndexChartEvents(row, candles) {
       if (state.indexChartDragging) {
         const barsPerPixel = candles.length / Math.max(1, rect.width - 62);
         state.indexChartOffset = Math.max(0, Math.round(state.indexChartDragging.offset - (event.clientX - state.indexChartDragging.x) * barsPerPixel));
-        drawIndexChart(row);
+        scheduleChartRedraw("index", () => drawIndexChart(row));
         return;
       }
       const ratio = clamp((event.clientX - rect.left - 48) / Math.max(1, rect.width - 62), 0, 1);
       state.indexChartHoverIndex = Math.round(ratio * (candles.length - 1));
-      drawIndexChart(row);
+      scheduleChartRedraw("index", () => drawIndexChart(row));
     });
     canvas.addEventListener("pointerup", () => {
       state.indexChartDragging = null;
@@ -4829,7 +5142,7 @@ function bindIndexChartEvents(row, candles) {
     });
     canvas.addEventListener("mouseleave", () => {
       state.indexChartHoverIndex = null;
-      drawIndexChart(row);
+      scheduleChartRedraw("index", () => drawIndexChart(row));
     });
   });
 }
@@ -5043,9 +5356,9 @@ async function fetchNews(symbol, mode = "auto") {
     const payload = await requestJson(url);
     state.apiCache.set(cacheKey, { time: Date.now(), value: payload });
     if (payload.scope === "macro") state.apiCache.set(`news:${state.market}:__macro__`, { time: Date.now(), value: payload });
-    localStorage.setItem(`lastNewsOpen:${state.market}`, new Date().toISOString());
+    safeStorage.setItem(`lastNewsOpen:${state.market}`, new Date().toISOString());
     return dedupeNewsClient(payload.news || []);
-  } catch {
+  } catch (error) {
     try {
       const [macro, stock] = await Promise.all([
         requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=macro&mode=${encodeURIComponent(safeMode)}`),
@@ -5054,12 +5367,12 @@ async function fetchNews(symbol, mode = "auto") {
       state.apiCache.set(`news:${state.market}:__macro__`, { time: Date.now(), value: macro });
       state.apiCache.set(`news:${state.market}:${symbol}:stock`, { time: Date.now(), value: stock });
       return dedupeNewsClient([...(macro.news || []), ...(stock.news || [])]);
-    } catch {
+    } catch (fallbackError) {
       try {
         const payload = await requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=stock&mode=local`);
         state.apiCache.set(`news:${state.market}:${symbol}`, { time: Date.now(), value: payload });
         return dedupeNewsClient(payload.news || []);
-      } catch {
+      } catch (localError) {
         return [];
       }
     }
@@ -5109,6 +5422,50 @@ async function refreshDueNewsOnOpen() {
   return true;
 }
 
+function redditWarmupSymbolsForMarket(limit = 60) {
+  const portfolioSymbols = activePortfolio().map((holding) => holding.symbol);
+  const analysisSymbols = [...state.analyses.keys()];
+  const defaults = activeMarketConfig().defaultSymbols || [];
+  return [...new Set([...portfolioSymbols, ...state.watchlist, ...analysisSymbols, ...defaults]
+    .map((symbol) => normalizeSymbolForMarket(symbol, state.market))
+    .filter(Boolean)
+    .filter((symbol) => !String(symbol).startsWith("^")))]
+    .slice(0, limit);
+}
+
+async function queueRedditSocialWarmup(reason = "auto", options = {}) {
+  const symbols = redditWarmupSymbolsForMarket(options.maxSymbols || 60);
+  if (!symbols.length) return null;
+  const params = new URLSearchParams({
+    market: state.market,
+    symbols: symbols.join(","),
+    limit: String(options.limit || 10),
+    maxSymbols: String(options.maxSymbols || 60),
+    reason,
+  });
+  if (options.force) params.set("force", "true");
+  try {
+    const payload = await requestJson(`/api/social/reddit/background?${params.toString()}`);
+    state.redditWarmupStatus = payload;
+    if (options.showStatus) {
+      setStatus(`Reddit 社媒后台缓存已排队：新增 ${payload.queued || 0} / ${payload.requested || symbols.length}，页面刷新继续走本地缓存`);
+    }
+    return payload;
+  } catch (error) {
+    console.warn("Unable to queue Reddit social warmup", error);
+    if (options.showStatus) setStatus(`Reddit 后台缓存排队失败：${compactDisplayError(error.message)}`);
+    return null;
+  }
+}
+
+function scheduleRedditSocialWarmup(reason = "auto", delay = 1800, options = {}) {
+  if (state.redditWarmupTimer) clearTimeout(state.redditWarmupTimer);
+  state.redditWarmupTimer = setTimeout(() => {
+    state.redditWarmupTimer = null;
+    queueRedditSocialWarmup(reason, options);
+  }, Math.max(0, delay));
+}
+
 function cachedNewsValue(symbol) {
   const all = cachedSignalValue(`news:${state.market}:${symbol}:all`, { news: [] }).news || [];
   if (all.length) return dedupeNewsClient(all);
@@ -5123,7 +5480,7 @@ async function fetchFundamentals(symbol) {
   try {
     const payload = await cachedJson(`fundamentals:${state.market}:${symbol}`, `/api/fundamentals?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, 60 * 60 * 1000);
     return payload.fundamentals || null;
-  } catch {
+  } catch (error) {
     return null;
   }
 }
@@ -5132,7 +5489,7 @@ async function fetchX(symbol) {
   try {
     const payload = await cachedJson(`x:${state.market}:${symbol}`, `/api/x?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, 10 * 60 * 1000);
     return payload.posts || [];
-  } catch {
+  } catch (error) {
     return [];
   }
 }
@@ -5141,7 +5498,7 @@ async function fetchYouTube(symbol) {
   try {
     const payload = await cachedJson(`youtube:${state.market}:${symbol}`, `/api/youtube?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, 15 * 60 * 1000);
     return payload.videos || [];
-  } catch {
+  } catch (error) {
     return [];
   }
 }
@@ -5393,13 +5750,13 @@ function pruneLocalAnalysisSnapshot(symbol) {
     const analyses = (Array.isArray(payload.analyses) ? payload.analyses : [])
       .filter((item) => normalizeSymbolForMarket(item.symbol, state.market) !== normalized);
     if (!watchlist.length && !analyses.length) {
-      localStorage.removeItem(key);
+      safeStorage.removeItem(key);
       return;
     }
     const selected = normalizeSymbolForMarket(payload.selected, state.market) === normalized
       ? normalizeSymbolForMarket(watchlist[0] || analyses[0]?.symbol, state.market)
       : payload.selected;
-    localStorage.setItem(key, JSON.stringify({
+    safeStorage.setItem(key, JSON.stringify({
       ...payload,
       watchlist,
       analyses,
@@ -5423,8 +5780,8 @@ async function deleteWatchSymbol(rawSymbol) {
   deleteCacheEntriesForSymbol(symbol);
   pruneLocalAnalysisSnapshot(symbol);
   if (!state.analyses.size) {
-    localStorage.removeItem(snapshotTimeKey());
-    if (state.market === "ASX") localStorage.removeItem("analysisSnapshotTime");
+    safeStorage.removeItem(snapshotTimeKey());
+    if (state.market === "ASX") safeStorage.removeItem("analysisSnapshotTime");
     state.snapshotUpdatedAt = null;
   }
   saveState();
@@ -5533,9 +5890,9 @@ function persistAnalysisSnapshot(reason = "refresh") {
     return false;
   }
   try {
-    localStorage.setItem(snapshotKey(), JSON.stringify(payload));
-    localStorage.setItem(snapshotTimeKey(), updatedAt);
-    if (state.market === "ASX") localStorage.setItem("analysisSnapshotTime", updatedAt);
+    safeStorage.setItem(snapshotKey(), JSON.stringify(payload));
+    safeStorage.setItem(snapshotTimeKey(), updatedAt);
+    if (state.market === "ASX") safeStorage.setItem("analysisSnapshotTime", updatedAt);
     state.snapshotUpdatedAt = updatedAt;
     updateSydneyClock();
     fetch(`/api/snapshot?market=${encodeURIComponent(state.market)}`, {
@@ -5569,25 +5926,25 @@ function applySnapshotPayload(payload) {
       addWatchSymbol(symbol, watchlistOriginFor(symbol, state.market, "snapshot"), state.market);
     });
   }
-  state.snapshotUpdatedAt = snapshot.updatedAt || snapshot.savedAt || localStorage.getItem(snapshotTimeKey());
+  state.snapshotUpdatedAt = snapshot.updatedAt || snapshot.savedAt || safeStorage.getItem(snapshotTimeKey());
   return true;
 }
 
 function restoreAnalysisSnapshot() {
   if (!snapshotsEnabled()) return false;
   try {
-    const payload = JSON.parse(localStorage.getItem(snapshotKey()) || (state.market === "ASX" ? localStorage.getItem(SNAPSHOT_KEY) : "null") || "null");
+    const payload = JSON.parse(safeStorage.getItem(snapshotKey()) || (state.market === "ASX" ? safeStorage.getItem(SNAPSHOT_KEY) : "null") || "null");
     const restored = applySnapshotPayload(payload);
     if (!restored && payload) {
-      localStorage.removeItem(snapshotKey());
-      localStorage.removeItem(snapshotTimeKey());
+      safeStorage.removeItem(snapshotKey());
+      safeStorage.removeItem(snapshotTimeKey());
       state.snapshotUpdatedAt = null;
     }
     return restored;
   } catch (error) {
     console.warn("Unable to restore analysis snapshot", error);
-    localStorage.removeItem(snapshotKey());
-    localStorage.removeItem(snapshotTimeKey());
+    safeStorage.removeItem(snapshotKey());
+    safeStorage.removeItem(snapshotTimeKey());
     state.snapshotUpdatedAt = null;
     return false;
   }
@@ -5600,12 +5957,10 @@ async function restoreServerSnapshot() {
     if (!response.ok) return false;
     const payload = await response.json();
     if (!applySnapshotPayload(payload)) return false;
-    localStorage.setItem(snapshotKey(), JSON.stringify(payload));
-    localStorage.setItem(snapshotTimeKey(), state.snapshotUpdatedAt || "");
+    safeStorage.setItem(snapshotKey(), JSON.stringify(payload));
+    safeStorage.setItem(snapshotTimeKey(), state.snapshotUpdatedAt || "");
     evaluateAlerts();
-    renderCards();
-    renderPortfolioSummary();
-    renderDetail();
+    queueMainRender(["cards", "summary", "detail"]);
     updateSydneyClock();
     return true;
   } catch (error) {
@@ -5622,9 +5977,7 @@ function useLocalSnapshotOnly(reason = `${activeMarketConfig().code} 休市中`)
   const restored = currentAnalysesCoverWatchlist() ? true : restoreAnalysisSnapshot();
   if (restored) {
     evaluateAlerts();
-    renderCards();
-    renderPortfolioSummary();
-    renderDetail();
+    queueMainRender(["cards", "summary", "detail"]);
     setStatus(`${reason}，未请求外部 API/AI，已使用 ${formatSnapshotTime(state.snapshotUpdatedAt)} 的本地快照`);
   } else {
     setStatus(`${reason}，未请求外部 API/AI；本地还没有可用快照，请在交易时间内刷新一次`);
@@ -5888,9 +6241,7 @@ async function runBackgroundSignalAi(preparedItems, token) {
   const signalMerged = enriched.map(mergePreparedSignalsIntoAnalysis).filter(Boolean);
   if (signalMerged.length) {
     persistAnalysisSnapshot("background-signal-merge");
-    renderCards();
-    renderPortfolioSummary();
-    renderDetail();
+    queueMainRender(["cards", "summary", "detail"]);
     const newsCount = signalMerged.reduce((sum, item) => sum + Number(item.news?.length || 0), 0);
     setStatus(`后台新闻/因子已写入：${newsCount} 条新闻证据，AI 复核继续进行`);
   }
@@ -5906,9 +6257,7 @@ async function runBackgroundSignalAi(preparedItems, token) {
   if (state.aiRefreshToken !== token) return;
   const adjusted = commitAnalysisResults(results, { agentStep: false });
   const buyAlerts = adjusted.filter((item) => isBuyAction(item.analysis?.action)).length;
-  renderCards();
-  renderPortfolioSummary();
-  renderDetail();
+  renderAnalysisPanelsNow();
   setStatus(`后台新闻/AI 复核完成：${buyAlerts} 个买入/轻仓关注提醒`);
 }
 
@@ -5936,7 +6285,7 @@ function saveDecision(item) {
   };
   state.history.unshift(record);
   state.history = state.history.slice(0, 60);
-  localStorage.setItem("decisionHistory", JSON.stringify(state.history));
+  safeStorage.setItem("decisionHistory", JSON.stringify(state.history));
   renderHistory();
   setStatus(`${item.symbol} 决策已记录`);
 }
@@ -6050,7 +6399,7 @@ function notifyUser(title, body, key) {
   if (key && state.notifiedAlerts[key]) return;
   if (key) {
     state.notifiedAlerts[key] = Date.now();
-    localStorage.setItem("notifiedAlerts", JSON.stringify(state.notifiedAlerts));
+    safeStorage.setItem("notifiedAlerts", JSON.stringify(state.notifiedAlerts));
   }
   new Notification(title, { body, silent: false });
 }
@@ -6065,7 +6414,7 @@ function renderNotificationButton() {
 async function toggleNotifications() {
   if (state.notificationsEnabled) {
     state.notificationsEnabled = false;
-    localStorage.setItem("notificationsEnabled", "false");
+    safeStorage.setItem("notificationsEnabled", "false");
     renderNotificationButton();
     setStatus("系统提醒已关闭，应用不会再发送买入/卖出通知");
     return;
@@ -6076,7 +6425,7 @@ async function toggleNotifications() {
   }
   const permission = await Notification.requestPermission();
   state.notificationsEnabled = permission === "granted";
-  localStorage.setItem("notificationsEnabled", String(state.notificationsEnabled));
+  safeStorage.setItem("notificationsEnabled", String(state.notificationsEnabled));
   renderNotificationButton();
   setStatus(state.notificationsEnabled ? "系统提醒已开启" : "系统提醒未授权");
 }
@@ -7085,8 +7434,8 @@ function normalizeUniverseRows(rows = [], market = state.market) {
 }
 
 function saveUniverseState() {
-  localStorage.setItem("marketUniverseByMarket", JSON.stringify(state.marketUniverseByMarket));
-  localStorage.setItem("universeStatusByMarket", JSON.stringify(state.universeStatusByMarket));
+  safeStorage.setItem("marketUniverseByMarket", JSON.stringify(state.marketUniverseByMarket));
+  safeStorage.setItem("universeStatusByMarket", JSON.stringify(state.universeStatusByMarket));
 }
 
 function cachedUniverseRows(market = state.market) {
@@ -7232,7 +7581,7 @@ function marketMoversForCurrentMarket() {
 }
 
 function saveMarketMoversState() {
-  localStorage.setItem("marketMoversByMarket", JSON.stringify(state.marketMoversByMarket));
+  safeStorage.setItem("marketMoversByMarket", JSON.stringify(state.marketMoversByMarket));
 }
 
 function moverRowHtml(row, type) {
@@ -7999,9 +8348,9 @@ function getAgentLedger(market = state.market) {
 }
 
 function saveAgentState() {
-  localStorage.setItem("agentConfigByMarket", JSON.stringify(state.agentConfigByMarket));
-  localStorage.setItem("agentLedgerByMarket", JSON.stringify(state.agentLedgerByMarket));
-  localStorage.setItem("agentMemoryByMarket", JSON.stringify(state.agentMemoryByMarket));
+  safeStorage.setItem("agentConfigByMarket", JSON.stringify(state.agentConfigByMarket));
+  safeStorage.setItem("agentLedgerByMarket", JSON.stringify(state.agentLedgerByMarket));
+  safeStorage.setItem("agentMemoryByMarket", JSON.stringify(state.agentMemoryByMarket));
 }
 
 function emptyAgentMemory(market = state.market) {
@@ -8738,7 +9087,7 @@ function readForecastMemory() {
 }
 
 function writeForecastMemory(memory) {
-  localStorage.setItem(forecastMemoryKey(), JSON.stringify(memory || {}));
+  safeStorage.setItem(forecastMemoryKey(), JSON.stringify(memory || {}));
 }
 
 function storeForecastMemory(results = []) {
@@ -9430,125 +9779,145 @@ function renderCards() {
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
   const cardsEl = $("cards");
   if (!cardsEl) return;
+  const universeMeta = new Map();
+  cachedUniverseRows(state.market).forEach((row) => {
+    if (row.symbol) universeMeta.set(row.symbol, row);
+    if (row.code) universeMeta.set(row.code, row);
+  });
   const cards = state.watchlist.map((symbol) => {
-    const meta = universeMetaForSymbol(symbol);
-    const displayName = meta.name && meta.name !== symbol ? meta.name : activeMarketConfig().label;
-    const watchOriginLabel = watchSourceLabel(watchlistOriginFor(symbol, state.market, "saved"));
-    const item = state.analyses.get(symbol);
-    const selectedClass = state.selected === symbol ? " selected" : "";
-    if (!item) {
+    try {
+      const meta = universeMeta.get(symbol) || {};
+      const displayName = meta.name && meta.name !== symbol ? meta.name : activeMarketConfig().label;
+      const watchOriginLabel = watchSourceLabel(watchlistOriginFor(symbol, state.market, "saved"));
+      const item = state.analyses.get(symbol);
+      const selectedClass = state.selected === symbol ? " selected" : "";
+      if (!item) {
+        return `
+          <article class="stock-card empty-card${selectedClass}" data-symbol="${symbol}" data-card-symbol="${symbol}">
+            <div class="card-top">
+              <div class="stock-title-block">
+                <h3>${symbol}</h3>
+                <small class="stock-name">${escapeHtml(displayName)}</small>
+              </div>
+              <div class="card-signal-stack">
+                <span class="card-state-chip warn">未刷新</span>
+                <div class="card-actions card-top-actions">
+                  <button class="danger-soft mini-btn" type="button" data-delete-symbol="${symbol}">删除</button>
+                </div>
+              </div>
+            </div>
+            <div class="tag-row card-primary-tags"><span class="tag warn">${watchOriginLabel}</span><span class="tag">${activeMarketConfig().label}</span></div>
+            <div class="decision-row">
+              <span class="muted">等待真实行情</span>
+            </div>
+          </article>
+        `;
+      }
+      const technicals = normalizeTechnicals(item.technicals);
+      const analysis = normalizeAnalysis(item.analysis);
+      const isError = analysis.action === "ERROR";
+      const isDegraded = item.marketValidation?.degraded;
+      const sourceClass = isError ? "danger" : isDegraded ? "warn" : "good";
+      const sourceLabel = isError ? errorLabel(item.errorKind) : isDegraded ? "单源真实数据" : item.marketSource;
+      const quoteLabel = item.quote?.source ? `最新价 ${item.quote.delayed ? "延迟" : "实时"}` : "";
+      const alertTag = !isError && isBuyAction(analysis.action)
+        ? `<span class="tag ${analysis.action === "LIGHT_BUY" ? "warn" : "good"}">${actionLabel(analysis.action)} ${formatMoney(analysis.suggestedTradeValue || 0)}</span>`
+        : !isError && ["STRONG_AVOID", "CRITICAL_SELL"].includes(analysis.action)
+          ? `<span class="tag danger">${actionLabel(analysis.action)}</span>`
+        : "";
+      const factorScore = factorScoreForItem(item);
+      const directionText = directionLabel(analysis);
+      const directionProb = directionReliability(analysis);
+      const finalProb = finalReturnProbability(analysis);
+      const maxMove = projectedMaxUpside(analysis);
+      const maxProb = maxUpsideProbability(analysis);
+      const strategyProb = strategyProbability(analysis);
+      const cardTone = isError ? "blocked" : isStrictBuyAction(analysis.action) ? "ready" : isRiskAction(analysis.action) ? "danger" : "watch";
+      const indicatorTags = isError ? "" : `
+            ${alertTag}
+            <span class="tag ${tagClass(projectedFinalReturn(analysis), getStrategy().targetUpside, 0)}">结束 ${formatPct(projectedFinalReturn(analysis))}</span>
+            <span class="tag ${tagClass(finalProb, Math.max(55, getStrategy().confidence - 22), 36)}">结束置信 ${Math.round(finalProb)}%</span>
+            <span class="tag ${tagClass(maxMove, getStrategy().targetUpside, 0)}">最高触达 ${formatPct(maxMove)}</span>
+            <span class="tag ${tagClass(maxProb, Math.max(55, getStrategy().confidence - 22), 36)}">触达置信 ${Math.round(maxProb)}%</span>
+            <span class="tag ${tagClass(directionProb, getStrategy().confidence, 40)}">方向 ${directionText} ${Math.round(directionProb)}%</span>
+            <span class="tag ${tagClass(strategyProb, strategyProbabilityTarget(analysis), 45)}">策略达标 ${Math.round(strategyProb)}%</span>
+            <span class="tag ${tagClass(analysis.confidence, getStrategy().confidence, 45)}">综合 ${Math.round(analysis.confidence)}%</span>
+            <span class="tag ${tagClass(factorScore, 8, -6)}">因子 ${factorScore.toFixed(1)}</span>
+            <span class="tag ${tagClass(technicals.rsi, 55, 35)}">RSI ${technicals.rsi.toFixed(1)}</span>
+            <span class="tag ${tagClass(technicals.mainForceProxy, 58, 42)}">主力代理 ${technicals.mainForceProxy.toFixed(0)}</span>`;
+      const subline = isError
+        ? "配置真实行情源后再分析"
+        : `5日 ${formatPct(technicals.change5d)} · 量比 ${technicals.volumeRatio.toFixed(2)}`;
       return `
-        <article class="stock-card empty-card${selectedClass}" data-symbol="${symbol}" data-card-symbol="${symbol}">
+        <article class="stock-card${selectedClass} ${isStrictBuyAction(analysis.action) ? "buy-alert" : isRiskAction(analysis.action) ? "risk-alert" : ""}" data-symbol="${symbol}" data-card-symbol="${symbol}">
           <div class="card-top">
             <div class="stock-title-block">
               <h3>${symbol}</h3>
               <small class="stock-name">${escapeHtml(displayName)}</small>
             </div>
             <div class="card-signal-stack">
-              <span class="card-state-chip warn">未刷新</span>
+              <div class="price">${isError ? "N/A" : formatMoney(technicals.close)}</div>
+              <span class="card-state-chip ${cardTone}">${actionLabel(analysis.action)}</span>
               <div class="card-actions card-top-actions">
+                <button class="secondary mini-btn" type="button" data-view="${symbol}">详情</button>
                 <button class="danger-soft mini-btn" type="button" data-delete-symbol="${symbol}">删除</button>
               </div>
             </div>
           </div>
-          <div class="tag-row card-primary-tags"><span class="tag warn">${watchOriginLabel}</span><span class="tag">${activeMarketConfig().label}</span></div>
+          ${isError ? "" : `
+            <div class="card-snapshot-grid">
+              <span><b>${formatPct(projectedFinalReturn(analysis))}</b><small>周期结束</small></span>
+              <span><b>${Math.round(strategyProb)}%</b><small>策略达标</small></span>
+              <span><b>${formatPct(maxMove)}</b><small>最高触达</small></span>
+              <span><b>${formatPct(technicals.change5d)}</b><small>5日变化</small></span>
+            </div>
+          `}
+          <div class="tag-row card-primary-tags">
+            <span class="tag ${sourceClass}">${sourceLabel}</span>
+            <span class="tag">${watchOriginLabel}</span>
+            ${quoteLabel ? `<span class="tag good">${quoteLabel}</span>` : ""}
+          </div>
+          <div class="tag-row card-factor-tags">
+            ${indicatorTags}
+          </div>
           <div class="decision-row">
-            <span class="muted">等待真实行情</span>
+            <span class="muted">${subline}</span>
           </div>
         </article>
       `;
-    }
-    const technicals = normalizeTechnicals(item.technicals);
-    const analysis = normalizeAnalysis(item.analysis);
-    const isError = analysis.action === "ERROR";
-    const isDegraded = item.marketValidation?.degraded;
-    const sourceClass = isError ? "danger" : isDegraded ? "warn" : "good";
-    const sourceLabel = isError ? errorLabel(item.errorKind) : isDegraded ? "单源真实数据" : item.marketSource;
-    const quoteLabel = item.quote?.source ? `最新价 ${item.quote.delayed ? "延迟" : "实时"}` : "";
-    const alertTag = !isError && isBuyAction(analysis.action)
-      ? `<span class="tag ${analysis.action === "LIGHT_BUY" ? "warn" : "good"}">${actionLabel(analysis.action)} ${formatMoney(analysis.suggestedTradeValue || 0)}</span>`
-      : !isError && ["STRONG_AVOID", "CRITICAL_SELL"].includes(analysis.action)
-        ? `<span class="tag danger">${actionLabel(analysis.action)}</span>`
-      : "";
-    const factorScore = factorScoreForItem(item);
-    const directionText = directionLabel(analysis);
-    const directionProb = directionReliability(analysis);
-    const magnitudeProb = magnitudeProbability(analysis);
-    const finalProb = finalReturnProbability(analysis);
-    const maxMove = projectedMaxUpside(analysis);
-    const maxProb = maxUpsideProbability(analysis);
-    const strategyProb = strategyProbability(analysis);
-    const cardTone = isError ? "blocked" : isStrictBuyAction(analysis.action) ? "ready" : isRiskAction(analysis.action) ? "danger" : "watch";
-    const indicatorTags = isError ? "" : `
-          ${alertTag}
-          <span class="tag ${tagClass(projectedFinalReturn(analysis), getStrategy().targetUpside, 0)}">结束 ${formatPct(projectedFinalReturn(analysis))}</span>
-          <span class="tag ${tagClass(finalProb, Math.max(55, getStrategy().confidence - 22), 36)}">结束置信 ${Math.round(finalProb)}%</span>
-          <span class="tag ${tagClass(maxMove, getStrategy().targetUpside, 0)}">最高触达 ${formatPct(maxMove)}</span>
-          <span class="tag ${tagClass(maxProb, Math.max(55, getStrategy().confidence - 22), 36)}">触达置信 ${Math.round(maxProb)}%</span>
-          <span class="tag ${tagClass(directionProb, getStrategy().confidence, 40)}">方向 ${directionText} ${Math.round(directionProb)}%</span>
-          <span class="tag ${tagClass(strategyProb, strategyProbabilityTarget(analysis), 45)}">策略达标 ${Math.round(strategyProb)}%</span>
-          <span class="tag ${tagClass(analysis.confidence, getStrategy().confidence, 45)}">综合 ${Math.round(analysis.confidence)}%</span>
-          <span class="tag ${tagClass(factorScore, 8, -6)}">因子 ${factorScore.toFixed(1)}</span>
-          <span class="tag ${tagClass(technicals.rsi, 55, 35)}">RSI ${technicals.rsi.toFixed(1)}</span>
-          <span class="tag ${tagClass(technicals.mainForceProxy, 58, 42)}">主力代理 ${technicals.mainForceProxy.toFixed(0)}</span>`;
-    const subline = isError
-      ? "配置真实行情源后再分析"
-      : `5日 ${formatPct(technicals.change5d)} · 量比 ${technicals.volumeRatio.toFixed(2)}`;
-    return `
-      <article class="stock-card${selectedClass} ${isStrictBuyAction(analysis.action) ? "buy-alert" : isRiskAction(analysis.action) ? "risk-alert" : ""}" data-symbol="${symbol}" data-card-symbol="${symbol}">
-        <div class="card-top">
-          <div class="stock-title-block">
-            <h3>${symbol}</h3>
-            <small class="stock-name">${escapeHtml(displayName)}</small>
-          </div>
-          <div class="card-signal-stack">
-            <div class="price">${isError ? "N/A" : formatMoney(technicals.close)}</div>
-            <span class="card-state-chip ${cardTone}">${actionLabel(analysis.action)}</span>
+    } catch (error) {
+      console.error(`Unable to render card for ${symbol}`, error);
+      return `
+        <article class="stock-card blocked" data-symbol="${symbol}" data-card-symbol="${symbol}">
+          <div class="card-top">
+            <div class="stock-title-block">
+              <h3>${symbol}</h3>
+              <small class="stock-name">卡片渲染失败</small>
+            </div>
             <div class="card-actions card-top-actions">
-              <button class="secondary mini-btn" type="button" data-view="${symbol}">详情</button>
               <button class="danger-soft mini-btn" type="button" data-delete-symbol="${symbol}">删除</button>
             </div>
           </div>
-        </div>
-        ${isError ? "" : `
-          <div class="card-snapshot-grid">
-            <span><b>${formatPct(projectedFinalReturn(analysis))}</b><small>周期结束</small></span>
-            <span><b>${Math.round(strategyProb)}%</b><small>策略达标</small></span>
-            <span><b>${formatPct(maxMove)}</b><small>最高触达</small></span>
-            <span><b>${formatPct(technicals.change5d)}</b><small>5日变化</small></span>
-          </div>
-        `}
-        <div class="tag-row card-primary-tags">
-          <span class="tag ${sourceClass}">${sourceLabel}</span>
-          <span class="tag">${watchOriginLabel}</span>
-          ${quoteLabel ? `<span class="tag good">${quoteLabel}</span>` : ""}
-        </div>
-        <div class="tag-row card-factor-tags">
-          ${indicatorTags}
-        </div>
-        <div class="decision-row">
-          <span class="muted">${subline}</span>
-        </div>
-      </article>
-    `;
+          <div class="decision-row"><span class="muted">${escapeHtml(compactRuntimeError(error))}</span></div>
+        </article>
+      `;
+    }
   }).join("");
   cardsEl.innerHTML = cards;
-  cardsEl.querySelectorAll("[data-card-symbol]").forEach((card) => {
-    card.addEventListener("click", (event) => {
-      if (event.target.closest("button")) return;
-      selectWatchSymbol(card.dataset.cardSymbol);
-    });
-  });
-  cardsEl.querySelectorAll("[data-view]").forEach((button) => {
-    button.addEventListener("click", () => {
-      selectWatchSymbol(button.dataset.view);
-    });
-  });
-  cardsEl.querySelectorAll("[data-delete-symbol]").forEach((button) => {
-    button.addEventListener("click", () => {
-      deleteWatchSymbol(button.dataset.deleteSymbol);
-    });
-  });
+  cardsEl.onclick = (event) => {
+    const deleteButton = event.target.closest("[data-delete-symbol]");
+    if (deleteButton) {
+      deleteWatchSymbol(deleteButton.dataset.deleteSymbol);
+      return;
+    }
+    const viewButton = event.target.closest("[data-view]");
+    if (viewButton) {
+      selectWatchSymbol(viewButton.dataset.view);
+      return;
+    }
+    const card = event.target.closest("[data-card-symbol]");
+    if (card) selectWatchSymbol(card.dataset.cardSymbol);
+  };
 }
 
 function renderPendingDetail(symbol) {
@@ -9581,7 +9950,7 @@ function renderPendingDetail(symbol) {
   $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(normalized));
 }
 
-function renderDetail() {
+function renderDetailUnsafe() {
   const selected = normalizeSymbolForMarket(state.selected, state.market);
   let item = selected ? state.analyses.get(selected) : null;
   if (!item && selected && state.watchlist.includes(selected)) {
@@ -9628,6 +9997,7 @@ function renderDetail() {
   const maxMove = projectedMaxUpside(analysis);
   const maxProb = maxUpsideProbability(analysis);
   const decision = decisionExplanation(item);
+  const socialMedia = item.factors?.socialMedia || null;
   $("detailPanel").innerHTML = `
     <h3>${symbol} · ${actionLabel(analysis.action)}</h3>
     <p class="muted">周期 ${analysis.horizonDays || getStrategy().horizonDays} 日 · 结束预估 ${formatPct(projectedFinalReturn(analysis))}/${Math.round(finalProb)}% · 最高触达 ${formatPct(maxMove)}/${Math.round(maxProb)}% · 方向 ${directionText} ${Math.round(directionProb)}% · 策略达标 ${Math.round(targetProb)}% / ${Math.round(targetProbRequired)}% · 综合 ${Math.round(analysis.confidence)}%${analysis.rawConfidence !== analysis.confidence ? `（原始 ${Math.round(analysis.rawConfidence)}%）` : ""}</p>
@@ -9640,6 +10010,7 @@ function renderDetail() {
       ${analysis.calibration?.sampleCount >= 5 ? `<span class="tag ${analysis.calibration.adjustment >= 0 ? "good" : "warn"}">校准 ${analysis.calibration.adjustment >= 0 ? "+" : ""}${analysis.calibration.adjustment}%</span>` : `<span class="tag warn">校准样本收集中</span>`}
       ${analysis.strategyCalibration?.sampleCount >= 5 ? `<span class="tag ${analysis.strategyCalibration.adjustment >= 0 ? "good" : "warn"}">达标校准 ${analysis.strategyCalibration.adjustment >= 0 ? "+" : ""}${analysis.strategyCalibration.adjustment}%</span>` : `<span class="tag warn">达标校准收集中</span>`}
       ${analysis.factorSignal?.configApplied ? `<span class="tag good">研究因子配置已接入 · ${factorScoreForItem(item).toFixed(1)}</span>` : `<span class="tag warn">研究因子使用默认权重</span>`}
+      ${socialMedia ? `<span class="tag ${redditSocialStatusClass(socialMedia)}">Reddit社媒 ${Number(socialMedia.score || 0).toFixed(1)} · ${socialMedia.available === false ? "不可用" : `置信 ${Math.round(Number(socialMedia.confidence || 0))}%`}</span>` : `<span class="tag warn">Reddit社媒待读取</span>`}
     </div>
     <div class="decision-actions">
       <button id="acceptDecision" type="button">接受并记录决策</button>
@@ -9713,8 +10084,10 @@ function renderDetail() {
       <div class="detail-item"><span>样本外/Meta</span><strong>${item.analog?.model?.oosSampleCount ? `方向 ${asNumber(item.analog.model.oosDirectionalAccuracy ?? item.analog.model.directionalAccuracy).toFixed(0)}% · 最高触达 ${asNumber(item.analog.model.oosMaxUpsideHitAccuracy ?? item.analog.model.maxUpsideHitAccuracy).toFixed(0)}% · P80 ${formatPct(item.analog.model.conformalP80Error)}` : "样本不足"}</strong></div>
       <div class="detail-item"><span>可用资金 / 建议票额</span><strong>${formatMoney(getCapital().availableCash)} / ${formatMoney(analysis.suggestedTradeValue || 0)}</strong></div>
       <div class="detail-item"><span>基本面</span><strong>${item.fundamentals ? `PE ${Number(item.fundamentals.peRatio || 0).toFixed(1)} · Yield ${formatPct(Number(item.fundamentals.dividendYield || 0) * 100)}` : "套餐未授权"}</strong></div>
+      <div class="detail-item"><span>Reddit 社媒</span><strong>${socialMedia ? `${Number(socialMedia.score || 0).toFixed(1)} · 权重 ${Number(socialMedia.weight || 0).toFixed(2)} · Top ${redditSocialItems(socialMedia).length}` : "待读取"}</strong></div>
       <div class="detail-item"><span>X / YouTube 信号</span><strong>${item.xPosts?.length || 0} / ${item.youtubeItems?.length || 0}</strong></div>
     </div>
+    ${redditSocialCardHtml(item)}
     <h4>多模型集成</h4>
     <div class="ensemble-summary">
       <span>方向 ${ensemble.direction || "n/a"}</span>
@@ -9761,7 +10134,35 @@ function renderDetail() {
   $("confirmBuy")?.addEventListener("click", () => buyFromSignal(item));
   $("confirmReduce")?.addEventListener("click", () => reduceFromSignal(item));
   $("expandChart")?.addEventListener("click", () => openChartModal(item));
+  $("openRedditTop10")?.addEventListener("click", () => openRedditSocialModal(item));
+  $("refreshRedditSocial")?.addEventListener("click", () => refreshRedditSocialForItem(item));
+  $("clearRedditSocialCache")?.addEventListener("click", () => clearRedditSocialForItem(item));
   requestAnimationFrame(() => renderCharts(item, document));
+}
+
+function renderDetail() {
+  try {
+    return renderDetailUnsafe();
+  } catch (error) {
+    console.error("renderDetail failed", error);
+    const symbol = normalizeSymbolForMarket(state.selected || state.watchlist?.[0] || "", state.market);
+    if ($("analysisSource")) $("analysisSource").textContent = `分析：详情渲染失败 · ${activeMarketConfig().label}`;
+    if ($("detailPanel")) {
+      $("detailPanel").innerHTML = `
+        <h3>${symbol || activeMarketConfig().label} · 详情渲染失败</h3>
+        <p class="tag danger">${escapeHtml(compactRuntimeError(error))}</p>
+        <p class="muted">行情、市场切换和刷新仍可继续使用。你可以刷新当前股票，或切换市场后重新加载详情。</p>
+        <div class="decision-actions">
+          <button id="retryRenderDetail" type="button">重试详情渲染</button>
+          ${symbol ? `<button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button>` : ""}
+        </div>
+      `;
+      $("retryRenderDetail")?.addEventListener("click", () => renderDetail());
+      $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(symbol));
+    }
+    setStatus(`详情模块已降级：${compactRuntimeError(error)}；市场切换仍可用`);
+    return null;
+  }
 }
 
 function buyFromSignal(item) {
@@ -9789,7 +10190,7 @@ function recordTradeHistory(record) {
     ...record,
   });
   state.history = state.history.slice(0, 60);
-  localStorage.setItem("decisionHistory", JSON.stringify(state.history));
+  safeStorage.setItem("decisionHistory", JSON.stringify(state.history));
   renderHistory();
 }
 
@@ -9861,6 +10262,232 @@ function setupCanvas(canvas) {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { ctx, width: rect.width, height: cssHeight };
+}
+
+function safeSocialFactor(factor) {
+  return factor && typeof factor === "object" ? factor : {};
+}
+
+function redditSocialItems(factor = {}) {
+  const safeFactor = safeSocialFactor(factor);
+  const rows = Array.isArray(safeFactor.items) && safeFactor.items.length ? safeFactor.items : safeFactor.topItems;
+  return Array.isArray(rows) ? rows.slice(0, 10) : [];
+}
+
+function redditSocialStatusClass(factor = {}) {
+  const safeFactor = safeSocialFactor(factor);
+  if (!Object.keys(safeFactor).length || safeFactor.available === false) return "warn";
+  if (Number(safeFactor.manipulationRisk || 0) >= 55) return "danger";
+  if (Number(safeFactor.score || 0) >= 1) return "good";
+  if (Number(safeFactor.score || 0) <= -1) return "danger";
+  return "warn";
+}
+
+function redditSocialCacheText(factor = {}) {
+  const safeFactor = safeSocialFactor(factor);
+  const cachedAt = safeFactor.cache?.cachedAt || safeFactor.cachedAt || null;
+  if (!cachedAt) return safeFactor.available === false ? "缓存为空" : "未写入缓存";
+  const parsed = Date.parse(cachedAt);
+  if (!Number.isFinite(parsed)) return cachedAt;
+  return `${new Date(cachedAt).toLocaleString()} · ${formatAge(Date.now() - parsed)}`;
+}
+
+function redditSocialCardHtml(item = {}) {
+  const factor = safeSocialFactor(item?.factors?.socialMedia);
+  const statusClass = redditSocialStatusClass(factor);
+  const items = redditSocialItems(factor);
+  const thesis = factor?.thesis?.[0] || (factor?.available === false ? "Reddit 未配置、缓存为空或本轮无相关帖子。" : "Reddit 社媒因子等待后台读取。");
+  return `
+    <div class="social-factor-card ${statusClass}">
+      <div class="social-factor-head">
+        <div>
+          <span>社媒因子 · Reddit</span>
+          <strong>${factor ? Number(factor.score || 0).toFixed(1) : "0.0"}</strong>
+        </div>
+        <div class="social-factor-actions">
+          <button id="openRedditTop10" class="secondary" type="button">查看 Reddit Top10</button>
+          <button id="refreshRedditSocial" type="button">刷新 Reddit</button>
+          <button id="clearRedditSocialCache" class="danger-soft" type="button">清空 Reddit 缓存</button>
+        </div>
+      </div>
+      <div class="social-score-strip">
+        <span>权重 ${Number(factor?.weight || 0).toFixed(2)}</span>
+        <span>置信 ${Math.round(Number(factor?.confidence || 0))}%</span>
+        <span>情绪 ${Number(factor?.sentiment || 0).toFixed(2)}</span>
+        <span>真伪 ${Math.round(Number(factor?.truthScore || 0))}</span>
+        <span>操纵风险 ${Math.round(Number(factor?.manipulationRisk || 0))}</span>
+        <span>Top ${items.length}</span>
+      </div>
+      <p>${escapeHtml(thesis)}</p>
+      <small>缓存：${escapeHtml(redditSocialCacheText(factor || {}))}</small>
+    </div>
+  `;
+}
+
+function redditTopItemHtml(item = {}, index = 0) {
+  const title = escapeHtml(item.title || item.text || "Untitled Reddit post");
+  const subreddit = escapeHtml(item.subreddit ? `r/${item.subreddit}` : "reddit");
+  const link = item.permalink || item.url || "";
+  const relation = escapeHtml(item.relation || item.channel || "social");
+  const meta = [
+    subreddit,
+    item.createdAt ? new Date(item.createdAt).toLocaleString() : "",
+    `score ${Math.round(Number(item.score || 0))}`,
+    `comments ${Math.round(Number(item.num_comments || 0))}`,
+    relation,
+  ].filter(Boolean).join(" · ");
+  return `
+    <div class="reddit-social-row">
+      <div class="reddit-social-rank">${index + 1}</div>
+      <div>
+        <strong>${link ? `<a href="${escapeHtml(link)}" target="_blank" rel="noreferrer">${title}</a>` : title}</strong>
+        <p class="reddit-social-meta">${escapeHtml(meta)}</p>
+        <div class="social-score-strip compact">
+          <span>相关 ${Math.round(Number(item.relevance ?? item.relevanceScore ?? 0))}</span>
+          <span>影响 ${Math.round(Number(item.impactScore || 0))}</span>
+          <span>真伪 ${Math.round(Number(item.truthScore || 0))}</span>
+          <span>操纵 ${Math.round(Number(item.manipulationRisk || 0))}</span>
+          <span>情绪 ${Number(item.sentiment || 0).toFixed(2)}</span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderRedditSocialModalBody(modal, item = {}, message = "") {
+  const body = modal.querySelector("[data-reddit-social-body]");
+  if (!body) return;
+  const factor = safeSocialFactor(item?.factors?.socialMedia);
+  const items = redditSocialItems(factor);
+  body.innerHTML = `
+    ${message ? `<p class="muted">${escapeHtml(message)}</p>` : ""}
+    <div class="social-factor-card ${redditSocialStatusClass(factor)}">
+      <div class="social-score-strip">
+        <span>分数 ${Number(factor.score || 0).toFixed(1)}</span>
+        <span>权重 ${Number(factor.weight || 0).toFixed(2)}</span>
+        <span>置信 ${Math.round(Number(factor.confidence || 0))}%</span>
+        <span>真伪 ${Math.round(Number(factor.truthScore || 0))}</span>
+        <span>操纵风险 ${Math.round(Number(factor.manipulationRisk || 0))}</span>
+      </div>
+      <p>${escapeHtml(factor.thesis?.[0] || "Reddit 当前没有足够相关的社媒证据。")}</p>
+      <small>缓存：${escapeHtml(redditSocialCacheText(factor))}</small>
+    </div>
+    <div class="reddit-social-list">
+      ${items.length ? items.map(redditTopItemHtml).join("") : `<p class="muted">暂无可展示的 Reddit Top10。未配置、缓存为空或当前股票在 Reddit 覆盖较弱时会出现这种状态。</p>`}
+    </div>
+  `;
+}
+
+function replaceItemSocialFactor(symbol, factor) {
+  const normalized = normalizeSymbolForMarket(symbol, state.market);
+  const current = state.analyses.get(normalized);
+  if (!current) return null;
+  const next = {
+    ...current,
+    factors: {
+      ...(current.factors || {}),
+      socialMedia: factor,
+    },
+  };
+  state.analyses.set(normalized, next);
+  return next;
+}
+
+async function refreshRedditSocialForItem(item, modal = null) {
+  const symbol = normalizeSymbolForMarket(item.symbol, state.market);
+  const button = modal?.querySelector("[data-refresh-reddit-social]") || $("refreshRedditSocial");
+  try {
+    if (button) button.disabled = true;
+    setStatus(`正在把 ${symbol} 加入 Reddit 后台社媒缓存队列...`);
+    if (modal) renderRedditSocialModalBody(modal, item, "已将当前股票加入 Reddit 后台刷新队列；当前窗口先显示本地缓存。");
+    const params = new URLSearchParams({
+      market: state.market,
+      symbols: symbol,
+      limit: "10",
+      maxSymbols: "1",
+      force: "true",
+      reason: "manual-symbol-refresh",
+    });
+    await requestJson(`/api/social/reddit/background?${params.toString()}`);
+    const factor = await requestJson(`/api/social/reddit?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}&mode=local&limit=10`);
+    const next = replaceItemSocialFactor(symbol, factor) || item;
+    persistAnalysisSnapshot("reddit-social-refresh");
+    renderCards();
+    renderDetail();
+    if (modal) renderRedditSocialModalBody(modal, next, "Reddit 后台刷新已排队；这里显示的是当前本地缓存，后台完成后下一次打开/刷新会自动读取新缓存。");
+    setStatus(`${symbol} Reddit 后台缓存已排队；当前本地缓存 Top ${redditSocialItems(factor).length}`);
+  } catch (error) {
+    if (modal) renderRedditSocialModalBody(modal, item, `Reddit 后台排队失败：${compactDisplayError(error.message)}`);
+    setStatus(`Reddit 后台排队失败：${compactDisplayError(error.message)}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function clearRedditSocialForItem(item, modal = null) {
+  const symbol = normalizeSymbolForMarket(item.symbol, state.market);
+  const button = modal?.querySelector("[data-clear-reddit-social]") || $("clearRedditSocialCache");
+  try {
+    if (button) button.disabled = true;
+    await requestJson(`/api/social/reddit/cache?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, { method: "DELETE" });
+    const emptyFactor = {
+      available: false,
+      source: "reddit-social-cache-cleared",
+      score: 0,
+      weight: 0,
+      confidence: 0,
+      sentiment: 0,
+      manipulationRisk: 0,
+      truthScore: 0,
+      items: [],
+      topItems: [],
+      thesis: ["Reddit social cache cleared for this symbol."],
+      cache: { cache: "cleared", cachedAt: null },
+    };
+    const next = replaceItemSocialFactor(symbol, emptyFactor) || item;
+    persistAnalysisSnapshot("reddit-social-cache-clear");
+    renderCards();
+    renderDetail();
+    if (modal) renderRedditSocialModalBody(modal, next, "该股票 Reddit 缓存已清空。");
+    setStatus(`${symbol} Reddit 缓存已清空；下次刷新会重新请求 Reddit。`);
+  } catch (error) {
+    if (modal) renderRedditSocialModalBody(modal, item, `清空 Reddit 缓存失败：${compactDisplayError(error.message)}`);
+    setStatus(`清空 Reddit 缓存失败：${compactDisplayError(error.message)}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function openRedditSocialModal(item) {
+  const symbol = normalizeSymbolForMarket(item.symbol, state.market);
+  const fresh = state.analyses.get(symbol) || item;
+  const modal = document.createElement("div");
+  modal.className = "chart-modal reddit-social-modal";
+  modal.innerHTML = `
+    <div class="chart-modal-panel reddit-social-panel">
+      <div class="chart-modal-head">
+        <div>
+          <h3>${escapeHtml(symbol)} Reddit Top10</h3>
+          <p class="muted">按相关度、影响力、有效性、真伪风险和产业传导综合排序。</p>
+        </div>
+        <div class="modal-action-row">
+          <button class="secondary" type="button" data-refresh-reddit-social>刷新 Reddit</button>
+          <button class="danger-soft" type="button" data-clear-reddit-social>清空缓存</button>
+          <button class="secondary" type="button" data-close-reddit-social>关闭</button>
+        </div>
+      </div>
+      <div data-reddit-social-body></div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) close();
+  });
+  modal.querySelector("[data-close-reddit-social]")?.addEventListener("click", close);
+  modal.querySelector("[data-refresh-reddit-social]")?.addEventListener("click", () => refreshRedditSocialForItem(state.analyses.get(symbol) || fresh, modal));
+  modal.querySelector("[data-clear-reddit-social]")?.addEventListener("click", () => clearRedditSocialForItem(state.analyses.get(symbol) || fresh, modal));
+  renderRedditSocialModalBody(modal, fresh);
 }
 
 function drawGrid(ctx, width, height) {
@@ -9980,11 +10607,11 @@ function overlayEnabled(name) {
 }
 
 function saveChartView() {
-  localStorage.setItem("chartRange", state.chartRange);
-  localStorage.setItem("chartInterval", state.chartInterval || "1d");
-  localStorage.setItem("chartZoom", String(state.chartZoom || 1));
-  localStorage.setItem("chartOverlays", JSON.stringify(state.chartOverlays || {}));
-  localStorage.setItem("chartFactorKeys", JSON.stringify(selectedChartFactorKeys()));
+  safeStorage.setItem("chartRange", state.chartRange);
+  safeStorage.setItem("chartInterval", state.chartInterval || "1d");
+  safeStorage.setItem("chartZoom", String(state.chartZoom || 1));
+  safeStorage.setItem("chartOverlays", JSON.stringify(state.chartOverlays || {}));
+  safeStorage.setItem("chartFactorKeys", JSON.stringify(selectedChartFactorKeys()));
 }
 
 function chartIntervalButtons() {
@@ -10988,7 +11615,7 @@ function renderCharts(item, root = document) {
           state.chartZoom = clamp(Number(state.chartZoom || 1) * factor, 1, 30);
         }
         saveChartView();
-        renderCharts(item, root);
+        scheduleChartRedraw("detail", () => renderCharts(item, root));
       }, { passive: false });
       canvas.addEventListener("pointerdown", (event) => {
         state.chartDragging = { x: event.clientX, offset: Number(state.chartOffset || 0) };
@@ -10999,7 +11626,7 @@ function renderCharts(item, root = document) {
         const rect = canvas.getBoundingClientRect();
         const barsPerPixel = candles.length / Math.max(1, rect.width - 62);
         state.chartOffset = Math.max(0, Math.round(state.chartDragging.offset - (event.clientX - state.chartDragging.x) * barsPerPixel));
-        renderCharts(item, root);
+        scheduleChartRedraw("detail", () => renderCharts(item, root));
       });
       canvas.addEventListener("pointerup", () => {
         state.chartDragging = null;
@@ -11010,13 +11637,13 @@ function renderCharts(item, root = document) {
         const rect = canvas.getBoundingClientRect();
         const ratio = clamp((event.clientX - rect.left - 48) / Math.max(1, rect.width - 62), 0, 1);
         state.chartHoverIndex = Math.round(ratio * (candles.length - 1));
-        renderCharts(item, root);
+        scheduleChartRedraw("detail", () => renderCharts(item, root));
       });
       canvas.addEventListener("mouseleave", () => {
         state.chartHoverIndex = null;
         const readout = root.querySelector("#chartReadout");
         if (readout) readout.textContent = chartFallbackReadout(state.chartDataCache.get(chartDataKey(item.symbol, state.chartInterval)));
-        renderCharts(item, root);
+        scheduleChartRedraw("detail", () => renderCharts(item, root));
       });
     });
   }
@@ -11086,80 +11713,90 @@ async function refreshAll() {
     if (state.autoRefreshEnabled) scheduleNextAutoRefresh();
     return;
   }
-  const session = marketState();
-  const runtime = getRuntimeSettings();
-  if (!session.canRefresh && !runtime.allowOffHoursFetch) {
-    const shouldStop = await useSnapshotOrFetch(`当前不在 ${activeMarketConfig().code} 交易/收盘刷新窗口`, true);
-    if (shouldStop) {
-      scheduleNextAutoRefresh();
-      return;
-    }
-  }
-  if (state.autoRefreshTimer) {
-    clearTimeout(state.autoRefreshTimer);
-    state.autoRefreshTimer = null;
-  }
-  state.isRefreshing = true;
-  saveState();
-  $("refreshAll").disabled = true;
   const startedAt = new Date();
   const preparedItems = [];
-  const symbols = orderedSymbolsForRefresh();
-  await fetchAccuracySummary(true);
-  await refreshMarketIndexes(true).catch((error) => {
-    console.warn("Unable to refresh market indexes", error);
-    loadMarketIndexSnapshot();
-  });
-  setStatus(runtime.fastInitialRefresh
-    ? `快速并行读取 ${symbols.length} 只股票真实行情；新闻/AI 后台复核...`
-    : `并行读取 ${symbols.length} 只股票真实行情、新闻和因子；持仓股优先...`);
-  const tasks = symbols.map(async (symbol) => {
-    try {
-      const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh });
-      preparedItems.push(prepared);
-      setStatus(`${symbol} 数据准备完成`);
-    } catch (error) {
-      console.error(error);
-      setSymbolError(symbol, error);
-    } finally {
-      renderCards();
-      renderPortfolioSummary();
-      renderDetail();
+  let symbols = [];
+  let runtime = getRuntimeSettings();
+  try {
+    const session = marketState();
+    runtime = getRuntimeSettings();
+    if (!session.canRefresh && !runtime.allowOffHoursFetch) {
+      const shouldStop = await useSnapshotOrFetch(`当前不在 ${activeMarketConfig().code} 交易/收盘刷新窗口`, true);
+      if (shouldStop) {
+        safeUiStep("安排下一次自动刷新", scheduleNextAutoRefresh);
+        return;
+      }
     }
-  });
-  await Promise.allSettled(tasks);
-  preparedItems.sort((a, b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
-  if (preparedItems.length) {
-    try {
-      setStatus(runtime.fastInitialRefresh
-        ? `快速本地融合 ${preparedItems.length} 只股票，先给出技术/历史/自监督结论...`
-        : `本地模型融合 ${preparedItems.length} 只股票，已纳入新闻/因子，AI 批量分析后台更新...`);
-      const results = await requestBatchAnalysis(preparedItems, { localOnly: true });
-      const buyAlerts = results.filter((item) => isBuyAction(item.analysis?.action)).length;
-      setStatus(`本地融合完成：${buyAlerts} 个买入/轻仓关注提醒，新闻/因子/AI 正在后台复核`);
-    } catch (error) {
-      console.error(error);
-      preparedItems.forEach((item) => setSymbolError(item.symbol, error));
-    } finally {
-      renderCards();
-      renderPortfolioSummary();
-      renderDetail();
+    if (state.autoRefreshTimer) {
+      clearTimeout(state.autoRefreshTimer);
+      state.autoRefreshTimer = null;
     }
-  }
-  $("refreshAll").disabled = false;
-  state.isRefreshing = false;
-  const seconds = ((Date.now() - startedAt.getTime()) / 1000).toFixed(1);
-  setStatus(`刷新完成：${preparedItems.length}/${symbols.length} 只股票，用时 ${seconds}s；后台复核继续更新新闻、因子和 AI`);
-  scheduleNextAutoRefresh();
-  if (preparedItems.length) {
-    const token = Date.now();
-    state.aiRefreshToken = token;
-    runBackgroundSignalAi(preparedItems, token)
-      .catch((error) => {
-        if (state.aiRefreshToken !== token) return;
+    state.isRefreshing = true;
+    safeUiStep("保存刷新状态", saveState);
+    const refreshButton = $("refreshAll");
+    if (refreshButton) refreshButton.disabled = true;
+    symbols = orderedSymbolsForRefresh();
+    safeUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-start", 250, { maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
+    await safeUiStepAsync("同步预测准确率", () => fetchAccuracySummary(true));
+    await refreshMarketIndexes(true).catch((error) => {
+      console.warn("Unable to refresh market indexes", error);
+      safeUiStep("恢复本地大盘快照", loadMarketIndexSnapshot);
+    });
+    setStatus(runtime.fastInitialRefresh
+      ? `快速并行读取 ${symbols.length} 只股票真实行情；新闻/AI 后台复核...`
+      : `并行读取 ${symbols.length} 只股票真实行情、新闻和因子；持仓股优先...`);
+    const tasks = symbols.map(async (symbol) => {
+      try {
+        const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh });
+        preparedItems.push(prepared);
+        setStatusThrottled(`${symbol} 数据准备完成 · ${preparedItems.length}/${symbols.length}`);
+      } catch (error) {
         console.error(error);
-        setStatus(`后台新闻/AI 复核未完成：${error.message}`);
-      });
+        safeUiStep(`${symbol} 写入失败状态`, () => setSymbolError(symbol, error));
+      } finally {
+        queueMainRender(["cards", "summary", "detail"]);
+      }
+    });
+    await Promise.allSettled(tasks);
+    preparedItems.sort((a, b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
+    if (preparedItems.length) {
+      try {
+        setStatus(runtime.fastInitialRefresh
+          ? `快速本地融合 ${preparedItems.length} 只股票，先给出技术/历史/自监督结论...`
+          : `本地模型融合 ${preparedItems.length} 只股票，已纳入新闻/因子，AI 批量分析后台更新...`);
+        const results = await requestBatchAnalysis(preparedItems, { localOnly: true });
+        const buyAlerts = results.filter((item) => isBuyAction(item.analysis?.action)).length;
+        setStatus(`本地融合完成：${buyAlerts} 个买入/轻仓关注提醒，新闻/因子/AI 正在后台复核`);
+      } catch (error) {
+        console.error(error);
+        preparedItems.forEach((item) => safeUiStep(`${item.symbol} 写入本地模型失败`, () => setSymbolError(item.symbol, error)));
+      } finally {
+        renderAnalysisPanelsNow();
+      }
+    }
+    const seconds = ((Date.now() - startedAt.getTime()) / 1000).toFixed(1);
+    setStatus(`刷新完成：${preparedItems.length}/${symbols.length} 只股票，用时 ${seconds}s；后台复核继续更新新闻、因子和 AI`);
+    safeUiStep("刷新后排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-complete", 1200, { maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
+    safeUiStep("安排下一次自动刷新", scheduleNextAutoRefresh);
+    if (preparedItems.length) {
+      const token = Date.now();
+      state.aiRefreshToken = token;
+      runBackgroundSignalAi(preparedItems, token)
+        .catch((error) => {
+          if (state.aiRefreshToken !== token) return;
+          console.error(error);
+          setStatus(`后台新闻/AI 复核未完成：${error.message}`);
+        });
+    }
+  } catch (error) {
+    console.error("Refresh failed", error);
+    setStatus(`刷新中断：${compactRuntimeError(error)}；按钮已恢复，可继续切换市场或再次刷新`);
+    renderAnalysisPanelsNow();
+    safeUiStep("刷新失败后安排自动刷新", scheduleNextAutoRefresh);
+  } finally {
+    const refreshButton = $("refreshAll");
+    if (refreshButton) refreshButton.disabled = false;
+    state.isRefreshing = false;
   }
 }
 
@@ -11207,8 +11844,8 @@ function stashActiveMarketState() {
   reconcileWatchlistOrigins(state.market);
   state.watchlistsByMarket[state.market] = state.watchlist;
   state.analysesByMarket.set(state.market, new Map(state.analyses));
-  localStorage.setItem("watchlistsByMarket", JSON.stringify(state.watchlistsByMarket));
-  localStorage.setItem("watchlistOriginsByMarket", JSON.stringify(state.watchlistOriginsByMarket));
+  safeStorage.setItem("watchlistsByMarket", JSON.stringify(state.watchlistsByMarket));
+  safeStorage.setItem("watchlistOriginsByMarket", JSON.stringify(state.watchlistOriginsByMarket));
 }
 
 function updateMarketUi() {
@@ -11242,7 +11879,7 @@ function updateMarketUi() {
     }
   });
   const portfolioCsv = $("portfolioCsv");
-  if (portfolioCsv) portfolioCsv.value = localStorage.getItem(`portfolioCsv:${state.market}`) || holdingsToCsv(activePortfolio()) || config.samplePortfolio;
+  if (portfolioCsv) portfolioCsv.value = safeStorage.getItem(`portfolioCsv:${state.market}`) || holdingsToCsv(activePortfolio()) || config.samplePortfolio;
   const agentInitialCapital = $("agentInitialCapital");
   if (agentInitialCapital) agentInitialCapital.value = agentConfigForMarket().initialCapital;
   syncCapitalFields();
@@ -11252,54 +11889,62 @@ function updateMarketUi() {
 async function switchMarket(nextMarket) {
   const market = safeMarket(nextMarket);
   if (market === state.market) return;
-  stashActiveMarketState();
+  const token = ++state.marketSwitchToken;
+  safeUiStep("保存当前市场状态", stashActiveMarketState);
   state.market = market;
   state.watchlist = sanitizeSymbolsForMarket(initialWatchlistForMarket(market), market);
   state.analyses = new Map(state.analysesByMarket.get(market) || []);
-  sanitizeActiveMarketState();
+  safeUiStep("清理市场状态", sanitizeActiveMarketState);
   state.chartHoverIndex = null;
   state.marketCache.clear();
   state.chartDataCache.clear();
   state.stockPicker = { forecast: [], today: [], rejected: [], failures: [], updatedAt: null };
   state.latestFactorLab = null;
-  state.snapshotUpdatedAt = localStorage.getItem(snapshotTimeKey()) || null;
-  saveState();
-  updateMarketUi();
+  state.snapshotUpdatedAt = safeStorage.getItem(snapshotTimeKey()) || null;
+  safeUiStep("保存市场选择", saveState);
+  safeUiStep("更新市场 UI", updateMarketUi);
+  setStatus(`已切换到${activeMarketConfig().label}；基础面板已可操作，历史数据后台恢复中`);
   state.marketIndexes = [];
   state.marketIndexSignal = null;
-  loadMarketIndexSnapshot();
-  renderMarketIndexPanel();
-  renderAgentPanel();
-  renderOptimalStrategyPanel();
-  restoreAnalysisSnapshot();
-  await restoreServerSnapshot();
-  sanitizeActiveMarketState();
-  await loadResearchConfig();
-  await fetchAccuracySummary(true);
-  evaluateAlerts();
-  renderCards();
-  renderPortfolioSummary();
-  renderMarketIndexPanel();
-  renderUniversePanel();
-  renderMarketMoversPanel();
-  renderAiPickPanel();
-  renderAgentPanel();
-  renderOptimalStrategyPanel();
-  renderDetail();
-  setStatus(`已切换到${activeMarketConfig().label}；刷新后读取该市场真实行情`);
+  safeUiStep("恢复大盘快照", loadMarketIndexSnapshot);
+  safeUiStep("恢复本地分析快照", () => {
+    const restored = restoreAnalysisSnapshot();
+    if (restored) evaluateAlerts();
+    return restored;
+  });
+  queueMainRender(["cards", "summary", "detail", "indexes", "agent"]);
+  safeUiStep("渲染股票池", renderUniversePanel);
+  safeUiStep("渲染涨跌榜", renderMarketMoversPanel);
+  safeUiStep("渲染 AI 选股", renderAiPickPanel);
+  deferMarketStepAsync(token, "恢复服务器快照", restoreServerSnapshot, 150, { idle: true, timeout: 3000 });
+  deferMarketStep(token, "清理恢复后的市场状态", sanitizeActiveMarketState, 360, { idle: true });
+  deferMarketStepAsync(token, "加载研究配置", loadResearchConfig, 560, { idle: true, timeout: 3500 });
+  deferMarketStepAsync(token, "加载预测准确率", () => fetchAccuracySummary(true), 820, { idle: true, timeout: 4500 });
+  deferMarketStep(token, "后台渲染市场面板", () => {
+    evaluateAlerts();
+    queueMainRender(["cards", "summary", "detail", "indexes", "agent"]);
+    renderUniversePanel();
+    renderMarketMoversPanel();
+    renderAiPickPanel();
+    setStatus(`已切换到${activeMarketConfig().label}；刷新后读取该市场真实行情`);
+  }, 1050, { idle: true });
   if (state.activePage === "sources") {
-    refreshProviderBudget(false);
-    refreshDataHealth(false);
+    deferMarketStepAsync(token, "刷新数据源预算", () => refreshProviderBudget(false), 1250, { idle: true, timeout: 4500 });
+    deferMarketStepAsync(token, "刷新数据健康中心", () => refreshDataHealth(false), 1450, { idle: true, timeout: 4500 });
   }
-  refreshApiStatusBar(false);
-  queueMarketIndexHydration(`${activeMarketConfig().label} 大盘快照不完整`);
-  if (state.autoRefreshEnabled) scheduleNextAutoRefresh();
+  deferMarketStepAsync(token, "刷新 API 状态", () => refreshApiStatusBar(false), 1650, { idle: true, timeout: 4500 });
+  deferMarketStep(token, "排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("market-switch", 300, { maxSymbols: 60 }), 1850, { idle: true });
+  deferMarketStep(token, "排队补齐大盘快照", () => queueMarketIndexHydration(`${activeMarketConfig().label} 大盘快照不完整`), 2200, { idle: true });
+  if (state.autoRefreshEnabled) safeUiStep("安排自动刷新", scheduleNextAutoRefresh);
 }
 
 function cycleMarket() {
   const order = ["ASX", "US", "CN"];
   const currentIndex = Math.max(0, order.indexOf(state.market));
-  switchMarket(order[(currentIndex + 1) % order.length]);
+  switchMarket(order[(currentIndex + 1) % order.length]).catch((error) => {
+    console.error("Market switch failed", error);
+    setStatus(`市场切换部分失败：${compactRuntimeError(error)}；可继续切换其它市场`);
+  });
 }
 
 async function importPortfolioImage(event) {
@@ -11346,49 +11991,80 @@ async function importPortfolioImage(event) {
 }
 
 function boot() {
-  localStorage.setItem(`lastAppOpen:${state.market}`, new Date().toISOString());
+  safeStorage.setItem(`lastAppOpen:${state.market}`, new Date().toISOString());
   window.addEventListener("pagehide", () => {
-    localStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
+    safeStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
   });
   window.addEventListener("beforeunload", () => {
-    localStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
+    safeStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
   });
-  loadSavedInputs();
-  sanitizeActiveMarketState();
-  updateMarketUi();
-  savePortfolio();
-  restoreAnalysisSnapshot();
-  loadMarketIndexSnapshot();
-  restoreServerSnapshot();
-  fetchAccuracySummary(true);
-  evaluateAlerts();
-  renderCards();
-  renderPortfolioSummary();
-  renderMarketIndexPanel();
-  renderUniversePanel();
-  renderMarketMoversPanel();
-  renderAiPickPanel();
-  renderAgentPanel();
-  renderOptimalStrategyPanel();
-  renderHistory();
-  renderFactorConfigPanel();
-  renderStrategyRevisionPanel();
-  renderNotificationButton();
-  renderApiStatusBar();
-  refreshApiStatusBar(false);
-  startSydneyClock();
-  setWorkspacePage(state.activePage, { silent: true });
-  loadResearchConfig();
-  queueMarketIndexHydration("启动时大盘快照不完整");
-  setTimeout(() => {
-    refreshDueNewsOnOpen().catch((error) => console.warn("Scheduled news refresh failed", error));
-  }, 900);
-
   document.querySelectorAll("[data-page-target]").forEach((button) => {
     button.addEventListener("click", () => setWorkspacePage(button.dataset.pageTarget));
   });
-
   bind("marketCycleButton", "click", cycleMarket);
+
+  if (STARTUP_SAFE_MODE) {
+    state.activePage = "dashboard";
+    safeStorage.setItem("activeQuantPage", "dashboard");
+  }
+  safeUiStep("读取保存输入", loadSavedInputs);
+  safeUiStep("清理启动状态", sanitizeActiveMarketState);
+  safeUiStep("更新市场 UI", updateMarketUi);
+  safeUiStep("保存持仓", savePortfolio);
+  safeUiStep("渲染基础股票卡片", renderCards);
+  safeUiStep("渲染基础持仓概览", renderPortfolioSummary);
+  safeUiStep("渲染提醒按钮", renderNotificationButton);
+  safeUiStep("渲染 API 状态", renderApiStatusBar);
+  safeUiStep("启动市场时钟", startSydneyClock);
+  safeUiStep("切换启动页面", () => setWorkspacePage(state.activePage, { silent: true }));
+  setStatus(STARTUP_SAFE_MODE
+    ? "已进入安全启动模式：先保证页面可操作，旧快照/新闻后台暂不自动加载"
+    : "页面已进入可操作状态，历史快照和模型面板正在后台恢复");
+
+  deferUiStep("恢复本地分析快照", () => {
+    if (STARTUP_SAFE_MODE) return false;
+    const restored = restoreAnalysisSnapshot();
+    if (restored) {
+      safeUiStep("快照恢复后渲染卡片", renderCards);
+      safeUiStep("快照恢复后渲染详情", renderDetail);
+      safeUiStep("快照恢复后检查提醒", evaluateAlerts);
+    }
+    return restored;
+  }, 500);
+  deferUiStep("恢复大盘快照", () => {
+    if (STARTUP_SAFE_MODE) return false;
+    loadMarketIndexSnapshot();
+    renderMarketIndexPanel();
+  }, 900);
+  deferUiStep("恢复服务器快照", async () => {
+    if (STARTUP_SAFE_MODE) return false;
+    return restoreServerSnapshot();
+  }, 1400);
+  deferUiStep("加载研究配置", loadResearchConfig, 1700);
+  deferUiStep("加载预测准确率", () => fetchAccuracySummary(true), STARTUP_SAFE_MODE ? 4500 : 2200);
+  deferUiStep("渲染股票池", renderUniversePanel, 2600);
+  deferUiStep("渲染涨跌榜", renderMarketMoversPanel, 2900);
+  deferUiStep("渲染 AI 选股", renderAiPickPanel, 3200);
+  deferUiStep("渲染 Agent", renderAgentPanel, 3500);
+  deferUiStep("渲染最优策略", renderOptimalStrategyPanel, 3800);
+  deferUiStep("渲染历史", renderHistory, 4100);
+  deferUiStep("渲染因子配置", renderFactorConfigPanel, 4400);
+  deferUiStep("渲染策略版本", renderStrategyRevisionPanel, 4700);
+  deferUiStep("刷新 API 状态", () => refreshApiStatusBar(false), 5200);
+  deferUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("startup", 300, { maxSymbols: 60 }), STARTUP_SAFE_MODE ? 6500 : 5600);
+  deferUiStep("排队补齐大盘快照", () => {
+    if (STARTUP_SAFE_MODE) return false;
+    queueMarketIndexHydration("启动时大盘快照不完整");
+    return true;
+  }, 5800);
+  deferUiStep("启动新闻窗口补抓", () => {
+    if (STARTUP_SAFE_MODE) return false;
+    return refreshDueNewsOnOpen();
+  }, 9000);
+  deferUiStep("确认启动完成", () => {
+    safeStorage.setItem(BOOT_PENDING_KEY, "false");
+    if (STARTUP_SAFE_MODE) setStatus("安全启动完成：页面可操作。需要数据时请手动点击刷新或数据源页检查。");
+  }, 12000);
 
   bind("runFeatureAnalysis", "click", runFeatureAnalysis);
   bind("runTradeAnalysis", "click", runTradeAnalysis);
@@ -11417,6 +12093,7 @@ function boot() {
     $("symbolInput").value = "";
     saveState();
     renderCards();
+    scheduleRedditSocialWarmup("manual-symbol-add", 500, { maxSymbols: 60 });
   });
 
   bind("saveStrategy", "click", () => {
@@ -11585,7 +12262,7 @@ function boot() {
 
   bind("clearHistory", "click", () => {
     state.history = state.history.filter((item) => safeMarket(item.market || "ASX") !== state.market);
-    localStorage.setItem("decisionHistory", JSON.stringify(state.history));
+    safeStorage.setItem("decisionHistory", JSON.stringify(state.history));
     renderHistory();
   });
 
@@ -11655,11 +12332,21 @@ function boot() {
   if (state.autoRefreshEnabled) startAutoRefresh(false);
 }
 
+window.addEventListener("unhandledrejection", (event) => {
+  console.error("Unhandled async error", event.reason);
+  setStatus(`后台模块失败：${compactRuntimeError(event.reason)}；市场切换仍可用`);
+});
+
+window.addEventListener("error", (event) => {
+  console.error("Unhandled runtime error", event.error || event.message);
+  setStatus(`页面模块失败：${compactRuntimeError(event.error || event.message)}；市场切换仍可用`);
+});
+
 try {
   boot();
 } catch (error) {
   console.error(error);
-  setStatus(`页面启动失败：${error.message}。已忽略旧缓存，请刷新页面。`);
+  setStatus(`页面部分模块启动失败：${error.message}。市场切换仍可用。`);
   const cards = $("cards");
   if (cards && !cards.innerHTML) {
     cards.innerHTML = `<article class="stock-card"><div class="card-top"><h3>启动失败</h3><span class="muted">${error.message}</span></div></article>`;
