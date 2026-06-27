@@ -4,133 +4,29 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Global Quant Watch</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/styles.css?v=20260624-detail-safe">
   </head>
   <body>
     <div class="app-shell">
-      <aside class="sidebar">
+      <header class="sidebar terminal-header">
         <div class="brand">
-          <span class="brand-mark">AQ</span>
+          <button id="marketCycleButton" class="brand-mark market-cycle" type="button" title="点击切换 AUX / US / CN">AUX</button>
           <div>
-            <h1>Global Quant Watch</h1>
-            <p>多市场只读分析与提醒</p>
+            <h1 id="brandMarketTitle">澳股 ASX</h1>
+            <p id="brandSubtitle">Global Quant Watch · 多市场只读分析与提醒</p>
           </div>
         </div>
 
-        <section class="panel">
-          <div class="panel-head">
-            <h2>策略</h2>
-            <button id="saveStrategy" type="button">保存</button>
-          </div>
-          <label>
-            周期
-            <input id="horizonDays" type="number" min="1" max="60" value="15">
-          </label>
-          <label>
-            策略置信度 %
-            <input id="confidence" type="number" min="1" max="99" value="80">
-          </label>
-          <label>
-            目标涨幅 %
-            <input id="targetUpside" type="number" min="0.5" max="50" step="0.5" value="5">
-          </label>
-          <label>
-            单票最大仓位 %
-            <input id="maxPosition" type="number" min="1" max="100" value="20">
-          </label>
-          <label>
-            补仓现金预留 %
-            <input id="reserveCashPct" type="number" min="0" max="80" value="15">
-          </label>
-          <label>
-            止损 %
-            <input id="stopLoss" type="number" min="1" max="50" value="4">
-          </label>
-          <textarea id="strategyText" rows="5">单只股票交易周期在15日以内，上涨置信区间80%，预估上涨幅度5%，优先选择流动性充足、成交量放大、MACD转强且新闻面没有重大利空的澳大利亚股票。</textarea>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head">
-            <h2>资金</h2>
-            <button id="saveCapital" type="button">保存</button>
-          </div>
-          <label>
-            总资金 <span class="currencyLabel">AUD</span>
-            <input id="totalCapital" type="number" min="0" step="100" value="5000">
-          </label>
-          <label>
-            持仓占额 <span class="currencyLabel">AUD</span>
-            <input id="holdingOccupied" type="number" min="0" step="100" value="0" readonly>
-          </label>
-          <label>
-            当前可用资金 <span class="currencyLabel">AUD</span>
-            <input id="availableCash" type="number" min="0" step="100" value="5000" readonly>
-          </label>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head">
-            <h2>自动刷新</h2>
-            <button id="toggleAutoRefresh" type="button">启动</button>
-          </div>
-          <label>
-            间隔
-            <select id="refreshInterval">
-              <option value="1800000" selected>30 分钟</option>
-              <option value="3600000">1 小时</option>
-            </select>
-          </label>
-          <label class="check-row">
-            <input id="fastInitialRefresh" type="checkbox" checked>
-            <span>先快速分析，新闻/AI 后台复核</span>
-          </label>
-          <label class="check-row">
-            <input id="allowOffHoursFetch" type="checkbox" checked>
-            <span>休市也允许刷新免 API 源</span>
-          </label>
-          <label class="check-row">
-            <input id="keepSnapshots" type="checkbox" checked>
-            <span>保留本地快照兜底</span>
-          </label>
-          <button id="enableNotifications" class="secondary full-btn" type="button">开启系统提醒</button>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head">
-            <h2>持仓管理</h2>
-            <button id="loadPortfolio" type="button">导入</button>
-          </div>
-          <div class="mini-grid">
-            <label>
-              代码
-              <input id="holdingSymbol" placeholder="BHP">
-            </label>
-            <label>
-              数量
-              <input id="holdingQty" type="number" min="0" step="1">
-            </label>
-            <label>
-              均价
-              <input id="holdingAvgPrice" type="number" min="0" step="0.01">
-            </label>
-            <label>
-              买入日期
-              <input id="holdingEntryDate" type="date">
-            </label>
-          </div>
-          <button id="addHolding" class="secondary full-btn" type="button">添加/更新持仓</button>
-          <textarea id="portfolioCsv" rows="6">symbol,qty,avgPrice
-BHP,120,43.20
-CBA,20,118.50</textarea>
-          <label>
-            截图导入
-            <input id="portfolioImage" type="file" accept="image/*">
-          </label>
-          <textarea id="portfolioOcrText" rows="4" placeholder="截图识别文本会显示在这里，也可以粘贴持仓文本后点应用。"></textarea>
-          <button id="applyPortfolioText" class="secondary full-btn" type="button">应用识别文本</button>
-          <p id="imageImportStatus" class="muted small-text">截图 OCR 依赖 AI/Vision 网络；不可用时可粘贴文本或 CSV。</p>
-        </section>
-      </aside>
+        <nav class="workspace-nav side-workspace-nav" aria-label="量化工作区">
+          <button class="active" data-page-target="dashboard" type="button">监控台</button>
+          <button data-page-target="features" type="button">特征分析</button>
+          <button data-page-target="factors" type="button">因子实验室</button>
+          <button data-page-target="regime" type="button">市场状态</button>
+          <button data-page-target="strategy" type="button">策略/Agent</button>
+          <button data-page-target="simulation" type="button">模拟持仓</button>
+          <button data-page-target="sources" type="button">数据源</button>
+        </nav>
+      </header>
 
       <main class="main">
         <header class="topbar">
@@ -144,21 +40,376 @@ CBA,20,118.50</textarea>
             <small id="marketSession">读取交易状态...</small>
             <small id="snapshotTime">本地快照：暂无</small>
           </div>
-          <label class="market-switch">
-            市场
-            <select id="marketSelect">
-              <option value="ASX" selected>澳股 ASX</option>
-              <option value="US">美股 US</option>
-              <option value="CN">A股 CN</option>
-            </select>
-          </label>
           <form id="symbolForm" class="symbol-form">
             <input id="symbolInput" placeholder="输入 ASX 代码，如 BHP, CBA, WDS" autocomplete="off">
             <button type="submit">加入监控</button>
           </form>
         </header>
 
-        <section class="market-board">
+        <section class="quant-page-section quant-lab-page" data-quant-page="features" hidden>
+          <div class="section-head">
+            <div>
+              <h2>底层成交与特征分析</h2>
+              <p class="muted small-text">真实行情或持久化真实快照；主动买卖代理会明确标注，不伪装为逐笔或 L2。</p>
+            </div>
+            <button id="runFeatureAnalysis" type="button">运行分析</button>
+          </div>
+          <div class="quant-lab-controls">
+            <label>
+              股票代码
+              <input id="featureSymbol" placeholder="BHP">
+            </label>
+            <label>
+              周期
+              <select id="featureInterval">
+                <option value="1d" selected>日线</option>
+                <option value="60m">60 分钟</option>
+                <option value="15m">15 分钟</option>
+                <option value="5m">5 分钟</option>
+              </select>
+            </label>
+            <label>
+              范围
+              <select id="featureRange">
+                <option value="1mo">1 个月</option>
+                <option value="3mo">3 个月</option>
+                <option value="6mo">6 个月</option>
+                <option value="9mo" selected>9 个月</option>
+                <option value="1y">1 年</option>
+              </select>
+            </label>
+          </div>
+          <div id="featureAnalysisPanel" class="quant-lab-panel">
+            <p class="muted">选择股票后运行，查看 VWAP、成交额、量价失衡代理、价格分布和原始数据日志。</p>
+          </div>
+          <div class="section-head quant-subhead">
+            <div>
+              <h2>真实逐笔成交</h2>
+              <p class="muted small-text">美股配置 Alpaca 后可读取真实 Trades；澳股和 A 股需要另行授权的逐笔源。逐笔成交不等于 L2，未提供的主动买卖方向不会被推测。</p>
+            </div>
+            <button id="runTradeAnalysis" class="secondary" type="button">读取逐笔</button>
+          </div>
+          <div class="quant-lab-controls compact-controls">
+            <label>
+              回看窗口
+              <select id="tradeWindowMinutes">
+                <option value="15">15 分钟</option>
+                <option value="30" selected>30 分钟</option>
+                <option value="60">60 分钟</option>
+                <option value="390">当日交易时段</option>
+              </select>
+            </label>
+          </div>
+          <div id="tradeAnalysisPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">点击读取逐笔后显示真实成交、成交所分布、逐分钟 VWAP 与大单占比。</p>
+          </div>
+        </section>
+
+        <section class="quant-page-section quant-lab-page" data-quant-page="sources" hidden>
+          <div class="section-head">
+            <div>
+              <h2>数据源中心</h2>
+              <p class="muted small-text">集中查看行情源、新闻源、缓存、授权、单源/双源和降级状态；普通分析优先读本地缓存，必要时再请求外部接口。</p>
+            </div>
+            <div class="section-actions">
+              <button id="refreshProviderBudget" class="secondary" type="button">检查数据源</button>
+              <button id="refreshDataHealth" class="secondary" type="button">检查健康</button>
+              <button id="refreshNewsNow" type="button">刷新新闻</button>
+            </div>
+          </div>
+          <div id="providerBudgetPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">打开此页面或点击检查后显示当前市场的数据源调用策略。</p>
+          </div>
+          <div id="dataHealthPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">打开此页面或点击检查后显示数据健康状态。</p>
+          </div>
+        </section>
+
+        <section class="quant-page-section quant-lab-page" data-quant-page="factors" hidden>
+          <div class="section-head">
+            <div>
+              <h2>因子实验室</h2>
+              <p class="muted small-text">使用时间序列样本外标签评估 IC、Rank IC、稳定性与因子重叠。</p>
+            </div>
+            <button id="runFactorLab" type="button">评估因子</button>
+          </div>
+          <div class="quant-lab-controls">
+            <label>
+              股票代码
+              <input id="factorLabSymbol" placeholder="BHP">
+            </label>
+            <label>
+              未来收益标签
+              <select id="factorLabHorizon">
+                <option value="5">未来 5 日</option>
+                <option value="10">未来 10 日</option>
+                <option value="15" selected>未来 15 日</option>
+                <option value="20">未来 20 日</option>
+                <option value="30">未来 30 日</option>
+              </select>
+            </label>
+          </div>
+          <div id="factorLabPanel" class="quant-lab-panel">
+            <p class="muted">评估只使用当时可获得的数据构造因子，未来收益仅作为评分标签。</p>
+          </div>
+          <div class="section-head quant-subhead">
+            <div>
+              <h2>当前市场因子配置</h2>
+              <p class="muted small-text">可关闭高度重叠因子或手工调整权重；配置按市场分开持久化。</p>
+            </div>
+            <button id="saveFactorConfig" class="secondary" type="button">保存配置</button>
+          </div>
+          <div id="factorConfigPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">先运行一次因子评估，再保存启用状态和权重。</p>
+          </div>
+        </section>
+
+        <section class="portfolio-board quant-page-section" data-quant-page="strategy" hidden>
+          <div class="section-head">
+            <div>
+              <h2>策略约束</h2>
+              <p class="muted small-text">你的周期、目标涨幅、置信门槛和仓位约束会参与选股、提醒和模拟 Agent。</p>
+            </div>
+            <button id="saveStrategy" type="button">保存策略</button>
+          </div>
+          <div class="strategy-control-grid">
+            <label>
+              周期
+              <input id="horizonDays" type="number" min="1" max="60" value="15">
+            </label>
+            <label>
+              策略置信度 %
+              <input id="confidence" type="number" min="1" max="99" value="80">
+            </label>
+            <label>
+              目标涨幅 %
+              <input id="targetUpside" type="number" min="0.5" max="50" step="0.5" value="5">
+            </label>
+            <label>
+              单票最大仓位 %
+              <input id="maxPosition" type="number" min="1" max="100" value="20">
+            </label>
+            <label>
+              补仓现金预留 %
+              <input id="reserveCashPct" type="number" min="0" max="80" value="15">
+            </label>
+            <label>
+              止损 %
+              <input id="stopLoss" type="number" min="1" max="50" value="4">
+            </label>
+          </div>
+          <textarea id="strategyText" rows="4">单只股票交易周期在15日以内，上涨置信区间80%，预估上涨幅度5%，优先选择流动性充足、成交量放大、MACD转强且新闻面没有重大利空的澳大利亚股票。</textarea>
+        </section>
+
+        <section class="portfolio-board quant-page-section" data-quant-page="simulation" hidden>
+          <div class="section-head">
+            <div>
+              <h2>资金与持仓导入</h2>
+              <p class="muted small-text">总资金由你输入；持仓占额由持仓股票计算，可用资金 = 总资金 - 持仓占额。</p>
+            </div>
+            <div class="section-actions">
+              <button id="saveCapital" class="secondary" type="button">保存资金</button>
+              <button id="loadPortfolio" type="button">导入持仓</button>
+            </div>
+          </div>
+          <div class="capital-holding-grid">
+            <section>
+              <h3>资金</h3>
+              <div class="strategy-control-grid compact-grid">
+                <label>
+                  总资金 <span class="currencyLabel">AUD</span>
+                  <input id="totalCapital" type="number" min="0" step="100" value="5000">
+                </label>
+                <label>
+                  持仓占额 <span class="currencyLabel">AUD</span>
+                  <input id="holdingOccupied" type="number" min="0" step="100" value="0" readonly>
+                </label>
+                <label>
+                  当前可用资金 <span class="currencyLabel">AUD</span>
+                  <input id="availableCash" type="number" min="0" step="100" value="5000" readonly>
+                </label>
+              </div>
+            </section>
+            <section>
+              <h3>持仓管理</h3>
+              <div class="mini-grid">
+                <label>
+                  代码
+                  <input id="holdingSymbol" placeholder="BHP">
+                </label>
+                <label>
+                  数量
+                  <input id="holdingQty" type="number" min="0" step="1">
+                </label>
+                <label>
+                  均价
+                  <input id="holdingAvgPrice" type="number" min="0" step="0.01">
+                </label>
+                <label>
+                  买入日期
+                  <input id="holdingEntryDate" type="date">
+                </label>
+              </div>
+              <button id="addHolding" class="secondary full-btn" type="button">添加/更新持仓</button>
+            </section>
+          </div>
+          <details class="scroll-fold" open>
+            <summary>CSV / 截图导入</summary>
+            <div class="scroll-fold-body">
+              <textarea id="portfolioCsv" rows="6">symbol,qty,avgPrice
+BHP,120,43.20
+CBA,20,118.50</textarea>
+              <button id="loadPortfolioCsv" class="secondary full-btn" type="button">保存 CSV 到持仓</button>
+              <label>
+                截图导入
+                <input id="portfolioImage" type="file" accept="image/*">
+              </label>
+              <textarea id="portfolioOcrText" rows="4" placeholder="截图识别文本会显示在这里，也可以粘贴持仓文本后点应用。"></textarea>
+              <button id="applyPortfolioText" class="secondary full-btn" type="button">保存识别文本到持仓</button>
+              <p id="imageImportStatus" class="muted small-text">截图 OCR 依赖 AI/Vision 网络；不可用时可粘贴文本或 CSV。</p>
+            </div>
+          </details>
+        </section>
+
+        <section class="quant-page-section quant-lab-page" data-quant-page="simulation" hidden>
+          <div class="section-head">
+            <div>
+              <h2>模拟组合风险引擎</h2>
+              <p class="muted small-text">按模拟持仓、真实价格和资金计算敞口、集中度、储备现金、止损与回撤；评估会写入本地 SQLite 审计库。</p>
+            </div>
+            <button id="runRiskAssessment" type="button">运行风控</button>
+          </div>
+          <div class="quant-lab-controls">
+            <label>
+              行业最大敞口 %
+              <input id="maxSectorExposure" type="number" min="1" max="100" value="35">
+            </label>
+            <label>
+              最大组合回撤 %
+              <input id="maxPortfolioDrawdown" type="number" min="1" max="100" value="12">
+            </label>
+            <label>
+              总敞口上限 %
+              <input id="maxGrossExposure" type="number" min="1" max="200" value="100">
+            </label>
+          </div>
+          <div id="riskAssessmentPanel" class="quant-lab-panel">
+            <p class="muted">点击运行风控后，会显示当前组合是否允许新增买入意图。</p>
+          </div>
+        </section>
+
+        <section class="quant-page-section quant-lab-page" data-quant-page="simulation" hidden>
+          <div class="section-head">
+            <div>
+              <h2>模拟订单意图审计</h2>
+              <p class="muted small-text">只校验并记录模拟意图，不会向 IBKR 或其他券商发送订单；Live 模式由 Python 服务强制拒绝。</p>
+            </div>
+            <button id="submitPaperIntent" type="button">校验并记录</button>
+          </div>
+          <div class="quant-lab-controls paper-intent-controls">
+            <label>
+              股票代码
+              <input id="paperIntentSymbol" placeholder="BHP">
+            </label>
+            <label>
+              方向
+              <select id="paperIntentSide">
+                <option value="BUY">买入</option>
+                <option value="SELL">卖出</option>
+              </select>
+            </label>
+            <label>
+              数量
+              <input id="paperIntentQty" type="number" min="0.0001" step="1" value="1">
+            </label>
+            <label>
+              参考/限价
+              <input id="paperIntentPrice" type="number" min="0.0001" step="0.01">
+            </label>
+            <label>
+              幂等键
+              <input id="paperIntentKey" placeholder="自动生成或自行填写">
+            </label>
+          </div>
+          <label class="check-row paper-confirm-row">
+            <input id="paperIntentConfirmed" type="checkbox">
+            <span>我确认这只是 Paper 审计意图，不会发送订单</span>
+          </label>
+          <div id="paperIntentResult" class="quant-lab-panel compact-panel">
+            <p class="muted">通过风险校验的意图也只会进入本地审计记录。</p>
+          </div>
+          <div class="section-head quant-subhead">
+            <h2>本地审计记录</h2>
+            <button id="refreshTradingAudit" class="secondary" type="button">刷新记录</button>
+          </div>
+          <div id="tradingAuditPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">尚未读取 SQLite 审计记录。</p>
+          </div>
+        </section>
+
+        <section class="quant-page-section quant-lab-page" data-quant-page="trading" hidden>
+          <div class="section-head">
+            <div>
+              <h2>真实交易接口预留</h2>
+              <p class="muted small-text">这里预留给未来 IBKR / CommSec / 其他券商 API 的真实交易接入；当前仅检查本机 TWS / IB Gateway 端口，不发送任何订单。</p>
+            </div>
+            <button id="checkIbkrReadiness" type="button">检查连接</button>
+          </div>
+          <div class="quant-lab-controls">
+            <label>
+              本机地址
+              <input id="ibkrHost" value="127.0.0.1">
+            </label>
+            <label>
+              Paper 端口
+              <input id="ibkrPort" type="number" min="1" max="65535" value="7497">
+            </label>
+            <label>
+              Client ID
+              <input id="ibkrClientId" type="number" min="0" value="17">
+            </label>
+          </div>
+          <div id="ibkrReadinessPanel" class="quant-lab-panel compact-panel">
+            <p class="muted">订单执行被服务器强制关闭。后续只有在风控、幂等、人工确认和审计日志齐全后才会单独开放。</p>
+          </div>
+        </section>
+
+        <section class="market-board quant-page-section" data-quant-page="regime" hidden>
+          <div class="section-head">
+            <div>
+              <h2>自动刷新与快照策略</h2>
+              <p class="muted small-text">交易时间外优先使用本地快照，避免重复消耗行情和 AI token。</p>
+            </div>
+            <button id="toggleAutoRefresh" type="button">启动</button>
+          </div>
+          <div class="refresh-control-grid">
+            <label>
+              间隔
+              <select id="refreshInterval">
+                <option value="60000">1 分钟</option>
+                <option value="300000">5 分钟</option>
+                <option value="600000">10 分钟</option>
+                <option value="1800000" selected>30 分钟</option>
+                <option value="3600000">60 分钟</option>
+              </select>
+            </label>
+            <label class="check-row">
+              <input id="fastInitialRefresh" type="checkbox" checked>
+              <span>先快速分析，新闻/AI 后台复核</span>
+            </label>
+            <label class="check-row">
+              <input id="allowOffHoursFetch" type="checkbox" checked>
+              <span>休市也允许刷新免 API 源</span>
+            </label>
+            <label class="check-row">
+              <input id="keepSnapshots" type="checkbox" checked>
+              <span>保留本地快照兜底</span>
+            </label>
+            <button id="enableNotifications" class="secondary full-btn" type="button">开启系统提醒</button>
+          </div>
+        </section>
+
+        <section class="market-board quant-page-section" data-quant-page="regime" hidden>
           <div class="section-head">
             <h2>市场大盘</h2>
             <button id="refreshIndexes" class="secondary" type="button">更新大盘</button>
@@ -166,9 +417,41 @@ CBA,20,118.50</textarea>
           <div id="marketIndexPanel" class="market-index-grid">
             <p class="muted">刷新后会显示当前市场核心指数、涨跌和大盘预测。</p>
           </div>
+          <div id="marketRegimePanel" class="market-regime-panel">
+            <p class="muted">股票池完成分析后，这里会显示市场宽度、领涨和领跌队列。</p>
+          </div>
         </section>
 
-        <section class="market-board stock-picker-board">
+        <section class="market-board stock-picker-board quant-page-section" data-quant-page="regime" hidden>
+          <div class="section-head">
+            <div>
+              <h2>市场股票池覆盖</h2>
+              <p class="muted small-text">先读取真实市场股票代码宇宙；AI选股从这里选择候选，不再固定几十只。</p>
+            </div>
+            <div class="section-actions">
+              <button id="loadUniverse" class="secondary" type="button">读取股票池</button>
+              <button id="refreshUniverse" type="button">重读股票池</button>
+            </div>
+          </div>
+          <div id="universePanel" class="universe-panel">
+            <p class="muted">尚未读取当前市场股票池。点击读取后会显示数量、来源、缓存状态和前几百只预览。</p>
+          </div>
+        </section>
+
+        <section class="market-board stock-picker-board quant-page-section" data-quant-page="regime" hidden>
+          <div class="section-head">
+            <div>
+              <h2>大盘涨跌榜 / 龙虎榜</h2>
+              <p class="muted small-text">读取真实市场榜单；榜单股票可直接加入监控台。覆盖不足时会标明扫描数量。</p>
+            </div>
+            <button id="refreshMarketMovers" class="secondary" type="button">读取榜单</button>
+          </div>
+          <div id="marketMoversPanel" class="market-movers-panel">
+            <p class="muted">尚未读取涨跌榜。点击后会显示当日上涨最多、下跌最多，以及 A 股龙虎榜可用记录。</p>
+          </div>
+        </section>
+
+        <section class="market-board stock-picker-board quant-page-section" data-quant-page="dashboard">
           <div class="section-head">
             <h2>AI选股</h2>
             <button id="aiPickStocks" class="secondary" type="button">严格筛选Top15</button>
@@ -178,11 +461,11 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="metrics-row" id="portfolioSummary"></section>
+        <section class="metrics-row quant-page-section" data-quant-page="dashboard" id="portfolioSummary"></section>
 
-        <section class="portfolio-board">
+        <section class="portfolio-board quant-page-section" data-quant-page="simulation" hidden>
           <div class="section-head">
-            <h2>持仓与仓位建议</h2>
+            <h2>模拟持仓与仓位建议</h2>
             <button id="rebalanceAdvice" class="secondary" type="button">重新计算</button>
           </div>
           <div id="alertStrip" class="alert-strip"></div>
@@ -190,17 +473,30 @@ CBA,20,118.50</textarea>
           <div id="allocationAdvice" class="allocation-list"></div>
         </section>
 
-        <section class="portfolio-board accuracy-board">
+        <section class="portfolio-board quant-page-section" data-quant-page="simulation" hidden>
+          <div class="panel history-panel">
+            <div class="panel-head">
+              <h2>决策记录</h2>
+              <button id="clearHistory" type="button" class="secondary">清空</button>
+            </div>
+            <div id="decisionHistory" class="history-list"></div>
+          </div>
+        </section>
+
+        <section class="portfolio-board accuracy-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <h2>预测学习与准确率</h2>
-            <button id="refreshAccuracy" class="secondary" type="button">更新</button>
+            <div class="inline-actions">
+              <button id="runHistoricalBacktest" class="secondary" type="button">5年历史预测校准</button>
+              <button id="refreshAccuracy" class="secondary" type="button">更新</button>
+            </div>
           </div>
           <div id="accuracyPanel" class="accuracy-panel">
             <p class="muted">刷新后会保存预测样本；达到策略周期或触及目标/止损后自动统计命中率，并显示失败后的模型调整。</p>
           </div>
         </section>
 
-        <section class="portfolio-board agent-board">
+        <section class="portfolio-board agent-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <h2>模拟交易 Agent</h2>
             <div class="agent-controls">
@@ -209,15 +505,19 @@ CBA,20,118.50</textarea>
                 <input id="agentInitialCapital" type="number" min="100" step="100" value="10000">
               </label>
               <button id="saveAgentCapital" class="secondary" type="button">保存本金</button>
+              <button id="openModelChangeLog" class="secondary" type="button">模型修改动线</button>
               <button id="resetAgents" class="danger-soft" type="button">重置训练</button>
             </div>
           </div>
           <div id="agentPanel" class="agent-grid">
             <p class="muted">Agent 会用真实行情做本地模拟交易，不会真实下单。</p>
           </div>
+          <div id="simulationArchivePanel" class="simulation-archive-panel">
+            <p class="muted">重置训练后，独立 Agent 周期会归档在这里。</p>
+          </div>
         </section>
 
-        <section class="portfolio-board strategy-board">
+        <section class="portfolio-board strategy-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <h2>Agent 最优策略</h2>
             <button id="refreshOptimalStrategy" class="secondary" type="button">更新草稿</button>
@@ -227,7 +527,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="portfolio-board ai-chat-board">
+        <section class="portfolio-board ai-chat-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <h2>AI策略对话</h2>
             <button id="sendAiChat" class="secondary" type="button">发送</button>
@@ -238,7 +538,21 @@ CBA,20,118.50</textarea>
           <textarea id="aiChatInput" rows="3" placeholder="例如：我昨天买入WOW今天跌了2%，请结合当前持仓和策略告诉我是否要止损、减仓还是继续持有。"></textarea>
         </section>
 
-        <section class="workspace">
+        <section class="portfolio-board quant-page-section" data-quant-page="strategy" hidden>
+          <div class="section-head">
+            <div>
+              <h2>策略版本记录</h2>
+              <p class="muted small-text">保存当前侧栏策略与修改原因，形成可复盘的时间线。</p>
+            </div>
+            <button id="recordStrategyRevision" class="secondary" type="button">记录当前版本</button>
+          </div>
+          <textarea id="strategyRevisionNote" rows="3" placeholder="本次修改原因，例如：高置信样本仍频繁未达标，因此降低单票仓位并提高量价一致性要求。"></textarea>
+          <div id="strategyRevisionPanel" class="strategy-revision-panel">
+            <p class="muted">还没有保存策略版本。</p>
+          </div>
+        </section>
+
+        <section class="workspace quant-page-section" data-quant-page="dashboard">
           <div class="watchlist">
             <div class="section-head">
               <h2>选票与提醒</h2>
@@ -255,18 +569,15 @@ CBA,20,118.50</textarea>
           <div id="detailPanel" class="detail-panel">
             <p>选择或刷新一只股票后，这里会显示技术盘、新闻面、策略匹配和风险说明。</p>
           </div>
-          <div class="panel history-panel">
-            <div class="panel-head">
-              <h2>决策记录</h2>
-              <button id="clearHistory" type="button" class="secondary">清空</button>
-            </div>
-            <div id="decisionHistory" class="history-list"></div>
-          </div>
         </div>
       </section>
       </main>
+      <footer id="apiStatusBar" class="api-status-bar" aria-live="polite">
+        <strong>API 状态</strong>
+        <span class="api-status-note">正在检查数据源...</span>
+      </footer>
     </div>
 
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260626-python-local-model"></script>
   </body>
 </html>

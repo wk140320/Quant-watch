@@ -3,11 +3,14 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "A local, read-only multi-market equity analysis dashboard for ASX, US stocks, and China A-shares.",
+  "description": "A local multi-market quantitative research workspace for ASX, US stocks, and China A-shares.",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check app.js",
-    "check:providers": "node tools/check-providers.mjs"
+    "check": "node --check server.mjs && node --check app.js && SERVER_DISABLE_LISTEN=true node --test tests/test_server.mjs && python3 -m unittest discover -s tests -v",
+    "check:node": "SERVER_DISABLE_LISTEN=true node --test tests/test_server.mjs",
+    "check:python": "python3 -m unittest discover -s tests -v",
+    "check:providers": "node tools/check-providers.mjs",
+    "import:postman-env": "node tools/import-postman-env.mjs"
   },
   "keywords": [
     "stocks",

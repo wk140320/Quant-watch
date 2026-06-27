@@ -1,8 +1,8 @@
 # Global Quant Watch
 
-A local, read-only multi-market equity analysis dashboard for ASX, US stocks, and China A-shares.
+A local, read-only multi-market quantitative research workspace for ASX, US stocks, and China A-shares.
 
-It combines real market data providers, technical indicators, macro/news signals, portfolio-aware risk rules, prediction learning, and paper-trading agents. The app does **not** place real trades.
+It combines real market data providers, a Python quantitative core, technical indicators, macro/news signals, portfolio-aware risk rules, prediction learning, and paper-trading agents. The app does **not** place real trades.
 
 ## Important Disclaimer
 
@@ -18,15 +18,46 @@ This project is for research and personal analysis only. It is not financial adv
 - Prediction sample tracking with hit-rate buckets, failure penalties, confidence calibration, and learning visibility.
 - Paper-trading agents that preserve strategy memory across reset cycles.
 - Local snapshots for off-hours or provider outage fallback.
+- Multi-page workspaces for monitoring, bottom-level feature analysis, factor experiments, market regime, strategy review, simulation, and account readiness.
+- Python feature analysis for VWAP, notional, volume profile, liquidity, and explicitly labeled OHLCV order-flow proxies.
+- Structure analysis for Bollinger Bands, Fibonacci retracement, Fair Value Gap, ICT liquidity-sweep proxies, Wyckoff phase proxies, absorption, and effort-versus-result.
+- Optional real US trade analysis through Alpaca, with exchange distribution, tick VWAP, large-trade share, and explicit `true_tick`/`true_l2` capability labels.
+- Quant-dinger-style dark trading workspace with top page navigation, high-density panels, chart overlay controls, Bollinger/Fib/FVG overlays, and wheel/trackpad X-axis zoom plus drag panning on time-series charts.
+- Feature analysis now returns full-window data logs, anomaly segments, feature formulas, ATAS adapter status, volume profile, VWAP, liquidity, and order-flow proxy diagnostics.
+- Factor lab now includes structure factors, formula metadata, positive/negative factor interpretation, price/prediction/VWAP correlations, heatmap-style correlation review, rolling IC/Rank IC, and manually persisted factor weights.
+- Regime page fuses feature, factor, news, sector, and index state into a Feature + Factor + Regime risk-on/risk-off strip.
+- Walk-forward factor lab with IC, Rank IC, stability, overlap checks, and suggested weights.
+- Anti-overfitting controls with chronological train/validation/test splits, purged/embargoed walk-forward validation, 3-batch gradient accumulation, early stopping, and best-checkpoint rollback.
+- Persisted per-market factor configuration and timestamped strategy revision history.
+- Market breadth plus leader/laggard queues based only on successfully analysed real-data stocks.
+- Python portfolio risk engine covering reserve cash, exposure, single-stock/sector concentration, stop-loss, drawdown, and paper-order validation.
+- SQLite control plane for strategy/simulation/risk events and idempotent audit-only paper-order intents.
+- SQLite local market-data store for authorised tick, L1 quote, and L2 depth rows. Empty stores remain explicitly unavailable and are not backfilled with simulated rows.
+- Provider-budget policy that enforces at most one quota-limited market source per task plus free support sources.
+- News aggregation that selects one configured quota-limited news provider per request and combines it with free/direct sources.
+- Optional official FRED macro factor with a shared cache so it is not re-requested per stock.
+- Optional Alpaca IEX US bars and Tushare China A-share daily bars, both governed by the limited-source budget.
+- External AI fallback chain: OpenAI first, then SiliconFlow or Tencent Hunyuan when configured. Provider status is exposed without revealing keys.
+- Optional ATAS feature adapter endpoint for external order-flow/feature extraction. Without `ATAS_FEATURE_ENDPOINT` or `ATAS_BASE_URL`, the app reports the adapter as reserved and sends no request.
+- Local-only IBKR Paper/TWS readiness checks and audit-only paper-order intents. Broker order transmission and live trading are forcibly disabled.
 
 ## Requirements
 
 - Node.js 20 or newer.
+- Python 3.9 or newer.
 - Optional API keys for richer market/news/AI coverage.
 
 No npm dependencies are required.
 
 ## Quick Start
+
+The most reliable start command, including environments where `node` is not on `PATH`:
+
+```bash
+./start-local.sh
+```
+
+Or use npm:
 
 ```bash
 cp .env.example .env.local
@@ -43,6 +74,18 @@ If `npm` is unavailable, run directly:
 
 ```bash
 node server.mjs
+```
+
+Python local client entry points:
+
+```bash
+python3 quant_client.py health
+python3 quant_client.py features --market ASX --symbol BHP
+python3 quant_client.py trades --market US --symbol AAPL --window-minutes 30
+python3 quant_client.py factors --market ASX --symbol BHP --horizon-days 15
+python3 quant_client.py risk --market ASX --total-capital 10000 --available-cash 5000 --position BHP:100:45:46:Materials
+python3 quant_client.py market-data --market US --symbol AAPL
+python3 quant_client.py gui
 ```
 
 ## Configuration
@@ -68,13 +111,26 @@ TIANAPI_KEY=
 X_BEARER_TOKEN=
 YOUTUBE_API_KEY=
 OPENAI_API_KEY=
+ENABLE_DOMESTIC_AI_ANALYSIS=false
+SILICONFLOW_API_KEY=
+HUNYUAN_API_KEY=
+TUSHARE_TOKEN=
+ALPACA_API_KEY=
+ALPACA_API_SECRET=
+ALPACA_TRADES_LIMIT=1000
+ATAS_API_KEY=
+ATAS_FEATURE_ENDPOINT=
+FINNHUB_API_KEY=
+TIINGO_API_KEY=
+MARKETAUX_API_KEY=
+FRED_API_KEY=
 ```
 
 OpenAI analysis is disabled by default. To enable it:
 
 ```bash
 ENABLE_OPENAI_ANALYSIS=true
-OPENAI_API_KEY=your_key_here
+OPENAI_API_KEY=
 ```
 
 ## Data Behavior
@@ -83,11 +139,17 @@ OPENAI_API_KEY=your_key_here
 - `.cache/` stores local snapshots and prediction samples. It is ignored by git because it may contain personal watchlists, portfolio data, and analysis history.
 - If only one real provider is available, the app can degrade to that real source and reduce confidence.
 - If no real provider or saved real snapshot is available, the app should report a provider failure rather than fabricate prices.
+- US trades are available only when Alpaca credentials and entitlements permit them. ASX/A-share tick data and all true L2 data remain unavailable until a separately authorised feed is configured.
+- Provider-reported trades are not treated as L2. If quotes or aggressor-side fields are absent, the app explicitly marks them unavailable.
+- Authorised tick/L1/L2 rows can be recorded through the local market-data store, but candle proxies are never promoted to true order-book data.
+- ATAS is treated as an optional external feature extractor, not as a market-data source. It receives real feature payloads only when an endpoint is configured.
 
 ## Useful Commands
 
 ```bash
 npm run check
+npm run check:node
+npm run check:python
 npm run check:providers
 ```
 
@@ -100,6 +162,12 @@ index.html                Browser UI
 styles.css                App styling
 app.js                    Frontend state, charts, alerts, UI rendering
 server.mjs                Local HTTP server, providers, analysis, calibration
+quant_client.py           Python local CLI/Tk client for core analysis workflows
+quant_core/               Python feature, factor, trade, risk, provider-budget, and SQLite control core
+tests/                    Python quantitative core tests
+docs/upgrade-roadmap.md   Incremental upgrade requirements and acceptance roadmap
+docs/source-project-study.md Verified source-project distillation and architecture mapping
+docs/word-requirements-audit.md Requirement-by-requirement verification status
 tools/check-providers.mjs Provider smoke test helper
 .env.example              Safe environment template
 ```
