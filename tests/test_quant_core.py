@@ -291,6 +291,36 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(result["predictionCalibration"]["framework"], "prediction-method-weight-calibration")
         self.assertIn(result["predictionCalibration"]["horizonBucket"], {"short", "mid", "long"})
 
+    def test_historical_backtest_uses_multi_step_sampling_without_leakage(self):
+        sparse = run_historical_backtest(
+            candles(260),
+            market="US",
+            symbol="UNIT",
+            horizon=10,
+            target_upside=2,
+            stop_loss=3,
+            min_train=80,
+            step=5,
+            max_predictions=500,
+        )
+        expanded = run_historical_backtest(
+            candles(260),
+            market="US",
+            symbol="UNIT",
+            horizon=10,
+            target_upside=2,
+            stop_loss=3,
+            min_train=80,
+            step=5,
+            step_schedule=[2, 3, 5],
+            max_step_offsets=2,
+            max_predictions=500,
+        )
+        self.assertTrue(expanded["available"])
+        self.assertGreater(expanded["metrics"]["samples"], sparse["metrics"]["samples"])
+        self.assertIn("slicePlan", expanded["dataDepth"])
+        self.assertEqual(expanded["dataDepth"]["leakageAudit"]["rule"], "train_row.index + horizon <= prediction_index - embargo")
+
     def test_worker_dispatch_exposes_multi_horizon_prediction_weight_calibration(self):
         result = dispatch({
             "operation": "historical-backtest-batch",
@@ -305,11 +335,14 @@ class QuantCoreTests(unittest.TestCase):
             "stop_loss": 3,
             "min_train": 80,
             "step": 5,
+            "step_schedule": [2, 3, 5],
+            "max_step_offsets": 2,
             "max_predictions": 240,
         })
         self.assertTrue(result["available"])
         self.assertIn("predictionCalibration", result)
         self.assertGreaterEqual(len(result["horizonCalibrations"]), 2)
+        self.assertIn("sampling", result)
         for row in result["horizonCalibrations"]:
             self.assertIn("optimizedWeights", row)
             self.assertGreater(row["sampleCount"], 0)

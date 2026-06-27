@@ -8258,6 +8258,8 @@ async function historicalBacktestForCandles({ market, symbol, candles, strategy 
     stop_loss: stopLoss,
     min_train: Number(process.env.HISTORICAL_BACKTEST_MIN_TRAIN || 120),
     step: Number(process.env.HISTORICAL_BACKTEST_STEP || 5),
+    step_schedule: numberListEnv(process.env.HISTORICAL_BACKTEST_STEP_SCHEDULE, [Number(process.env.HISTORICAL_BACKTEST_STEP || 5)]),
+    max_step_offsets: Number(process.env.HISTORICAL_BACKTEST_MAX_STEP_OFFSETS || 2),
     max_predictions: Number(process.env.HISTORICAL_BACKTEST_MAX_PREDICTIONS || 2200),
     retrain_interval: Number(process.env.HISTORICAL_BACKTEST_RETRAIN_INTERVAL || 60),
     max_train_window: Number(process.env.HISTORICAL_BACKTEST_TRAIN_WINDOW || 240),
@@ -8339,6 +8341,12 @@ function historicalBacktestFactor(result) {
   };
 }
 
+function numberListEnv(value, fallback = []) {
+  if (Array.isArray(value)) return value.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item > 0);
+  const rows = String(value || "").split(",").map((item) => Number(item.trim())).filter((item) => Number.isFinite(item) && item > 0);
+  return rows.length ? rows : fallback;
+}
+
 async function fetchBacktestCandlesForSymbol(symbol, market, range = "5y") {
   const key = safeMarket(market);
   const code = normalizeMarketSymbol(symbol, key);
@@ -8376,6 +8384,8 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     strategyHorizon,
     Math.max(30, strategyHorizon >= 25 ? strategyHorizon : 30),
   ].map((value) => Math.max(1, Math.round(Number(value || 15)))))].slice(0, 4);
+  const defaultStep = Number(process.env.HISTORICAL_BACKTEST_BATCH_STEP || process.env.HISTORICAL_BACKTEST_STEP || 4);
+  const stepSchedule = numberListEnv(process.env.HISTORICAL_BACKTEST_BATCH_STEP_SCHEDULE || process.env.HISTORICAL_BACKTEST_STEP_SCHEDULE, [2, 3, 5, Math.max(1, defaultStep)]);
   const result = await runPythonQuantCore("historical-backtest-batch", {
     market: key,
     items,
@@ -8384,8 +8394,10 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     target_upside: Number(strategy.targetUpside || 5),
     stop_loss: Number(strategy.stopLoss || 4),
     min_train: Number(process.env.HISTORICAL_BACKTEST_MIN_TRAIN || 120),
-    step: Number(process.env.HISTORICAL_BACKTEST_BATCH_STEP || process.env.HISTORICAL_BACKTEST_STEP || 8),
-    max_predictions: Number(process.env.HISTORICAL_BACKTEST_MAX_PREDICTIONS || 600),
+    step: defaultStep,
+    step_schedule: stepSchedule,
+    max_step_offsets: Number(process.env.HISTORICAL_BACKTEST_BATCH_MAX_STEP_OFFSETS || process.env.HISTORICAL_BACKTEST_MAX_STEP_OFFSETS || 2),
+    max_predictions: Number(process.env.HISTORICAL_BACKTEST_MAX_PREDICTIONS || 1400),
     retrain_interval: Number(process.env.HISTORICAL_BACKTEST_RETRAIN_INTERVAL || 60),
     max_train_window: Number(process.env.HISTORICAL_BACKTEST_TRAIN_WINDOW || 240),
     knn_window: Number(process.env.HISTORICAL_BACKTEST_KNN_WINDOW || 260),

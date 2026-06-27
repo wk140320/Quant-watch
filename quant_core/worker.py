@@ -257,6 +257,8 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             stop_loss=float(payload.get("stop_loss", payload.get("stopLoss", 4)) or 4),
             min_train=int(payload.get("min_train", payload.get("minTrain", 120)) or 120),
             step=int(payload.get("step") or 1),
+            step_schedule=payload.get("step_schedule", payload.get("stepSchedule", payload.get("steps"))),
+            max_step_offsets=int(payload.get("max_step_offsets", payload.get("maxStepOffsets", 1)) or 1),
             max_predictions=int(payload.get("max_predictions", payload.get("maxPredictions", 2000)) or 2000),
             retrain_interval=int(payload.get("retrain_interval", payload.get("retrainInterval", 60)) or 60),
             max_train_window=int(payload.get("max_train_window", payload.get("maxTrainWindow", 240)) or 240),

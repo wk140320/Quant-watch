@@ -179,6 +179,60 @@ FEATURE_NAMES = [
 ]
 
 
+FORMULA_BOOK = {
+    "features": {
+        "pct_change_n": "(close[t] - close[t-n]) / close[t-n] * 100",
+        "sma20": "mean(close[t-19:t])",
+        "sma50": "mean(close[t-49:t])",
+        "volume20": "mean(volume[t-19:t])",
+        "volatility": "sqrt(mean(daily_return[t-19:t]^2))",
+        "rsi14": "100 - 100 / (1 + avg_gain_14 / avg_loss_14)",
+        "macdHist": "EMA12(close[:t]) - EMA26(close[:t]) - EMA9(MACD[:t])",
+        "rangePosition": "(close[t] - min(close[t-20:t])) / (max(close[t-20:t]) - min(close[t-20:t]))",
+        "trendScore": "clamp(50 + I(close>sma20)*12 - I(close<=sma20)*9 + I(sma20>sma50)*11 - I(sma20<=sma50)*10 + clamp(change20*0.62,-9,9),0,100)",
+        "momentumScore": "clamp(50 + macdHist/close*9200 + (rsi14-50)*0.55 + clamp(change5,-6,6)*0.35 + clamp(change20*0.12,-3,3),0,100)",
+        "riskScore": "clamp(82 - volatility*8,0,100)",
+    },
+    "normalized_features": {
+        "change1": "clamp(change1/10,-2.5,2.5)",
+        "change3": "clamp(change3/15,-2.5,2.5)",
+        "change5": "clamp(change5/20,-2.5,2.5)",
+        "change10": "clamp(change10/25,-2.5,2.5)",
+        "change20": "clamp(change20/35,-2.5,2.5)",
+        "volumeRatio": "clamp((volume[t]/volume20 - 1)/3,-2.5,2.5)",
+        "rsi": "clamp((rsi14-50)/50,-2,2)",
+        "macdHist": "clamp((macd_hist/close)*20,-2.5,2.5)",
+        "smaGap": "clamp((sma20/sma50 - 1)*8,-2.5,2.5)",
+        "volatility": "clamp(volatility/5,0,3)",
+        "rangePosition": "clamp((rangePosition-0.5)*2,-1.5,1.5)",
+    },
+    "labels": {
+        "forwardReturn": "(close[t+horizon] - close[t]) / close[t] * 100",
+        "maxUpside": "(max(high[t+1:t+horizon]) - close[t]) / close[t] * 100",
+        "maxDrawdown": "(min(low[t+1:t+horizon]) - close[t]) / close[t] * 100",
+        "targetWins": "maxUpside>=targetUpside and target touch occurs before stop touch when both occur",
+        "stopWins": "maxDrawdown<=-stopLoss and stop touch occurs before target touch when both occur",
+        "riskAdjustedReturn": "targetUpside if targetWins else -stopLoss if stopWins else forwardReturn",
+    },
+    "prediction_heads": {
+        "ridge_final_return": "rolling ridge regression predicting forwardReturn",
+        "ridge_risk_adjusted": "rolling ridge regression predicting riskAdjustedReturn",
+        "knn_analog": "mean forwardReturn of nearest historical feature vectors",
+        "trend_momentum": "change20*0.12 + change5*0.18 + (trendScore-50)*0.035 + (momentumScore-50)*0.03 + macdHist*1.6",
+        "mean_reversion": "clamp((50-rsi14)*0.075,-4.5,4.5) - change5*0.18 + (0.25 if change20>-8 else -0.45)",
+        "volume_breakout": "max(0,volumeRatio-1)*1.35*(1 if change5>=0 else -0.55) + change20*0.08 + macdHist*1.2",
+        "risk_guard": "ridge_final_return - stopProbability*stopLoss*0.9 + (riskScore-50)*0.025",
+        "target_probability": "(targetProbability-0.5)*targetUpside*2.2 - max(0,stopProbability-0.36)*stopLoss*1.25",
+    },
+    "weight_learning": {
+        "objective": "minimize holdout MSE of weighted prediction vs actual forwardReturn with simplex weights",
+        "constraint": "weights>=0, sum(weights)=1, per-head cap≈0.48",
+        "split": "time ordered train 58%, validation 21%, test 21%",
+        "activation_gate": "active only if test beats equal-weight enough without sacrificing direction hit rate",
+    },
+}
+
+
 def vector_from_feature(feature: dict[str, float]) -> list[float]:
     return [number(feature.get(name)) for name in FEATURE_NAMES]
 
@@ -776,6 +830,69 @@ def compact_horizon_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def parse_step_schedule(raw: Any, default_step: int) -> list[int]:
+    if isinstance(raw, str):
+        parts = [part.strip() for part in raw.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        parts = list(raw)
+    elif raw is None:
+        parts = [default_step]
+    else:
+        parts = [raw]
+    values: list[int] = []
+    for part in parts:
+        step_value = max(1, int(number(part, default_step)))
+        if step_value not in values:
+            values.append(step_value)
+    return values or [max(1, int(default_step or 1))]
+
+
+def candidate_indexes_from_step_schedule(
+    *,
+    start: int,
+    stop: int,
+    by_index: dict[int, dict[str, Any]],
+    step_schedule: list[int],
+    max_offsets_per_step: int,
+    max_predictions: int,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    seen: set[int] = set()
+    source_counts: dict[str, int] = {}
+    for step_value in step_schedule:
+        step_value = max(1, int(step_value or 1))
+        offsets = list(range(min(step_value, max(1, int(max_offsets_per_step or 1)))))
+        if step_value > 2 and 0 not in offsets:
+            offsets.insert(0, 0)
+        for offset in offsets:
+            count = 0
+            first_index = start + offset
+            for index in range(first_index, stop, step_value):
+                if index in by_index:
+                    seen.add(index)
+                    count += 1
+            source_counts[f"step{step_value}:offset{offset}"] = count
+    candidate_indexes = sorted(seen)
+    raw_count = len(candidate_indexes)
+    downsample_stride = 1
+    if max_predictions > 0 and len(candidate_indexes) > max_predictions:
+        downsample_stride = math.ceil(len(candidate_indexes) / max_predictions)
+        candidate_indexes = candidate_indexes[::downsample_stride]
+    slice_plan = [
+        {"source": source, "rawCuts": count}
+        for source, count in sorted(source_counts.items(), key=lambda item: item[0])
+    ]
+    return candidate_indexes, [
+        *slice_plan,
+        {
+            "source": "dedupe-and-cap",
+            "rawUniqueCuts": raw_count,
+            "finalCuts": len(candidate_indexes),
+            "downsampleStride": downsample_stride,
+            "maxPredictions": max_predictions,
+        },
+    ]
+
+
 def run_historical_backtest(
     candles: list[dict[str, Any]],
     *,
@@ -786,6 +903,8 @@ def run_historical_backtest(
     stop_loss: float = 4.0,
     min_train: int = 120,
     step: int = 1,
+    step_schedule: list[int] | None = None,
+    max_step_offsets: int = 1,
     max_predictions: int = 2000,
     retrain_interval: int = 60,
     max_train_window: int = 240,
@@ -796,6 +915,8 @@ def run_historical_backtest(
     target_upside = max(0.5, number(target_upside, 5.0))
     stop_loss = max(0.8, abs(number(stop_loss, 4.0)))
     step = max(1, int(step or 1))
+    steps = parse_step_schedule(step_schedule, step)
+    max_step_offsets = max(1, min(12, int(max_step_offsets or 1)))
     if len(rows) < min_train + horizon + 40:
         return {
             "available": False,
@@ -811,14 +932,14 @@ def run_historical_backtest(
     by_index = {row["index"]: row for row in labeled}
     predictions: list[dict[str, Any]] = []
     model_cache: dict[int, dict[str, Any]] = {}
-    candidate_indexes = [
-        index
-        for index in range(max(70, min_train), len(rows) - horizon, step)
-        if index in by_index
-    ]
-    if len(candidate_indexes) > max_predictions:
-        stride = math.ceil(len(candidate_indexes) / max_predictions)
-        candidate_indexes = candidate_indexes[::stride]
+    candidate_indexes, slice_plan = candidate_indexes_from_step_schedule(
+        start=max(70, min_train),
+        stop=len(rows) - horizon,
+        by_index=by_index,
+        step_schedule=steps,
+        max_offsets_per_step=max_step_offsets,
+        max_predictions=max_predictions,
+    )
 
     train_depths: list[int] = []
     embargo = max(2, math.ceil(horizon / 2))
@@ -925,6 +1046,8 @@ def run_historical_backtest(
         "embargoSamples": embargo,
         "minTrainSamples": min_train,
         "step": step,
+        "stepSchedule": steps,
+        "maxStepOffsets": max_step_offsets,
         "model": {
             "name": "rolling-ridge-logistic-plus-knn-analog",
             "featureCount": len(FEATURE_NAMES),
@@ -934,14 +1057,24 @@ def run_historical_backtest(
             "knnWindow": knn_window,
             "leakageControl": "For each historical cut, labels are trained only when their full future window ended before the prediction date, plus embargo.",
             "predictionWeightCalibration": "Return-prediction method weights are trained on earlier prediction cuts and evaluated on later holdout cuts; inactive unless they beat simple baselines.",
+            "formulas": FORMULA_BOOK,
         },
         "dataDepth": {
             "labelCount": len(labeled),
             "predictionCuts": len(predictions),
+            "candidateCuts": len(candidate_indexes),
             "trainSamplesMin": min(train_depths) if train_depths else 0,
             "trainSamplesMedian": median(train_depths) if train_depths else 0,
             "trainSamplesMax": max(train_depths) if train_depths else 0,
             "maxPredictions": max_predictions,
+            "slicePlan": slice_plan,
+            "leakageAudit": {
+                "embargoSamples": embargo,
+                "rule": "train_row.index + horizon <= prediction_index - embargo",
+                "minimumTrainCutoffGap": horizon + embargo,
+                "features": "All features use candles <= prediction index t.",
+                "labels": "Outcome labels are used only for completed historical rows and never for the prediction cut model training.",
+            },
         },
         "metrics": {key: (round(value, 5) if isinstance(value, float) and math.isfinite(value) else value) for key, value in summary.items()},
         "benchmarks": [
@@ -981,6 +1114,12 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         horizons = [max(1, int(number(raw_horizons, 15)))]
     main_horizon = max(1, int(number(payload.get("horizon_days", payload.get("horizonDays")), horizons[0] or 15)))
+    default_step = int(payload.get("step") or 1)
+    step_schedule = parse_step_schedule(
+        payload.get("step_schedule", payload.get("stepSchedule", payload.get("steps"))),
+        default_step,
+    )
+    max_step_offsets = max(1, min(12, int(number(payload.get("max_step_offsets", payload.get("maxStepOffsets")), 1))))
     horizon_set = []
     for value in [main_horizon, *horizons]:
         if value not in horizon_set:
@@ -997,7 +1136,9 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
                 target_upside=number(payload.get("target_upside", payload.get("targetUpside")), 5.0),
                 stop_loss=number(payload.get("stop_loss", payload.get("stopLoss")), 4.0),
                 min_train=int(payload.get("min_train", payload.get("minTrain")) or 120),
-                step=int(payload.get("step") or 1),
+                step=default_step,
+                step_schedule=step_schedule,
+                max_step_offsets=max_step_offsets,
                 max_predictions=int(payload.get("max_predictions", payload.get("maxPredictions")) or 2000),
                 retrain_interval=int(payload.get("retrain_interval", payload.get("retrainInterval")) or 60),
                 max_train_window=int(payload.get("max_train_window", payload.get("maxTrainWindow")) or 240),
@@ -1035,6 +1176,12 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         "availableCount": len(available),
         "sampleTotal": sample_total,
         "buySignalTotal": buy_total,
+        "sampling": {
+            "step": default_step,
+            "stepSchedule": step_schedule,
+            "maxStepOffsets": max_step_offsets,
+            "dedupeKey": "symbol+horizon+historical candle index/date",
+        },
         "metrics": {
             "directionHitRate": round(weighted("directionHitRate"), 4) if available else None,
             "targetHitRate": round(weighted("targetHitRate"), 4) if available else None,
