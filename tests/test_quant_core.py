@@ -10,6 +10,8 @@ sys.path.insert(0, str(ROOT / "quant_core"))
 
 from alpha_mining import analyze_alpha_evolution  # noqa: E402
 from features import analyze_factors, analyze_features  # noqa: E402
+from historical_backtest import run_historical_backtest  # noqa: E402
+from local_model import train_local_model_suite  # noqa: E402
 from provider_budget import provider_plan  # noqa: E402
 from risk import assess_portfolio, build_paper_order_intent  # noqa: E402
 from store import append_event, control_plane_summary, list_events, list_market_rows, market_data_summary, record_market_rows, record_order_intent  # noqa: E402
@@ -32,6 +34,68 @@ def candles(count=140):
                 "low": close - 0.9,
                 "close": close,
                 "volume": 1000 + index * 12,
+            }
+        )
+    return rows
+
+
+def prediction_samples(count=48):
+    pattern = [-3.0, -1.8, -0.7, 0.4, 1.1, 2.2, 3.1, 4.0, 1.6, -0.4, 2.7, -2.4]
+    rows = []
+    for index in range(count):
+        actual = pattern[index % len(pattern)] + (0.03 if index % 2 == 0 else -0.02)
+        target_wins = actual >= 2.0
+        stop_wins = actual <= -2.0
+        trend = max(5, min(95, 50 + actual * 8))
+        momentum = max(5, min(95, 50 + actual * 7))
+        rows.append(
+            {
+                "id": f"unit-{index}",
+                "market": "US",
+                "symbol": "UNIT",
+                "createdAt": f"2026-03-{(index % 28) + 1:02d}T09:{index % 60:02d}:00Z",
+                "asOfDate": f"2026-03-{(index % 28) + 1:02d}",
+                "action": "WATCH_BUY" if target_wins else "HOLD_WATCH",
+                "confidence": 62 if target_wins else 44,
+                "predictionConfidence": 62 if target_wins else 44,
+                "strategyHitProbability": 70 if target_wins else 28,
+                "magnitudeHitProbability": 68 if target_wins else 34,
+                "projectedFinalReturn": -actual * 0.5,
+                "projectedMaxUpside": max(0.2, actual + 1.0),
+                "targetUpside": 2,
+                "featureScores": {
+                    "trend": trend,
+                    "momentum": momentum,
+                    "change5d": actual * 0.55,
+                    "change20d": actual * 1.3,
+                    "volumeRatio": 1.0 + max(0, actual) * 0.08,
+                    "rsi": max(25, min(80, 50 + actual * 4)),
+                    "volume": 52 + max(0, actual) * 4,
+                    "risk": 55 - max(0, -actual) * 5,
+                    "factor": actual * 3,
+                    "analogConfidence": 55 + actual * 4,
+                    "modelConfidence": 55 + actual * 4,
+                },
+                "signalCounts": {"news": 2 if abs(actual) > 1 else 0, "x": 0, "youtube": 0, "factors": 3},
+                "ensemble": {
+                    "projectedUpside": -actual * 0.55,
+                    "upsideAgreement": 70 if actual > 0 else 35,
+                    "consensusAgreement": 68,
+                    "models": [
+                        {"name": "Good ML", "available": True, "projectedUpside": actual * 0.96, "weight": 0.34, "normalizedWeight": 0.34},
+                        {"name": "Bad ML", "available": True, "projectedUpside": -actual * 0.9, "weight": 0.33, "normalizedWeight": 0.33},
+                        {"name": "Flat ML", "available": True, "projectedUpside": 0.1, "weight": 0.33, "normalizedWeight": 0.33},
+                    ],
+                },
+                "outcome": {
+                    "resolved": True,
+                    "resolvedAt": f"2026-04-{(index % 28) + 1:02d}T09:{index % 60:02d}:00Z",
+                    "forwardReturnPct": actual,
+                    "maxUpsidePct": max(0, actual + 0.8),
+                    "maxDrawdownPct": min(0, actual - 1.2),
+                    "targetWins": target_wins,
+                    "stopWins": stop_wins,
+                },
             }
         )
     return rows
@@ -156,6 +220,136 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("models", result)
         self.assertEqual({row["id"] for row in result["models"]}, {"lightgbm", "lstm", "transformer"})
         self.assertIn("dimensionless", result["factor_gate_required"])
+
+    def test_local_model_suite_learns_oos_weights_and_signal_heads(self):
+        result = train_local_model_suite(prediction_samples(), market="US")
+        weights = result["ensembleWeightOptimization"]["weights"]
+        self.assertIn("Good ML", weights)
+        self.assertIn("Bad ML", weights)
+        self.assertGreater(weights["Good ML"], weights["Bad ML"])
+        self.assertIn("featureScoreHead", result["signalModels"])
+        self.assertIn("factorScoreHead", result["signalModels"])
+        self.assertIn("backtestMetaHead", result["signalModels"])
+        self.assertIn("stopRiskHead", result["signalModels"])
+        self.assertIn("tradeQualityHead", result["signalModels"])
+        self.assertIn("tripleBarrier", result["signalModels"])
+        self.assertGreater(result["signalModels"]["tripleBarrier"]["targetRate"], 0)
+        feature_head = result["signalModels"]["featureScoreHead"]
+        self.assertEqual(feature_head["model"]["featureCount"], 19)
+        self.assertIn("buyPressure5", feature_head["featureNames"])
+        self.assertIn("profileDistance", feature_head["featureNames"])
+        self.assertIn("volumeAccel", feature_head["featureNames"])
+        self.assertEqual(result["splitAudit"]["method"], "purged_walk_forward_embargo")
+        self.assertGreater(result["splitAudit"]["testSamples"], 0)
+        self.assertIn("target", result["calibrationDiagnostics"])
+        self.assertIn("stop", result["calibrationDiagnostics"])
+        self.assertEqual(result["noTradeGate"]["framework"], "no-trade-quality-gate")
+        self.assertGreater(result["noTradeGate"]["sampleCount"], 0)
+        self.assertEqual(result["signalModels"]["splitAudit"]["method"], "purged_walk_forward_embargo")
+        self.assertIn("noTradeGate", result["signalModels"])
+        self.assertIn("lightgbm", result)
+        self.assertIn("tripleBarrier", result)
+
+    def test_historical_backtest_uses_point_in_time_slices(self):
+        result = run_historical_backtest(
+            candles(260),
+            market="US",
+            symbol="UNIT",
+            horizon=10,
+            target_upside=2,
+            stop_loss=3,
+            min_train=80,
+            step=2,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["framework"], "historical-walk-forward-backtest")
+        self.assertGreater(result["metrics"]["samples"], 20)
+        self.assertGreater(result["dataDepth"]["trainSamplesMedian"], 70)
+        self.assertIn("benchmarks", result)
+        self.assertIn("leakageControl", result["model"])
+        self.assertIn("values", result)
+        self.assertIn("hitRate", result["values"])
+
+    def test_worker_dispatch_exposes_local_model_train(self):
+        result = dispatch({"operation": "local-model-train", "market": "US", "samples": prediction_samples()})
+        self.assertEqual(result["framework"], "python-local-quant-model-suite")
+        self.assertIn("ensembleWeightOptimization", result)
+        self.assertIn("signalModels", result)
+        self.assertIn("lightgbm", result)
+
+    def test_worker_dispatch_exposes_historical_backtest(self):
+        result = dispatch({
+            "operation": "historical-backtest",
+            "market": "US",
+            "symbol": "UNIT",
+            "candles": candles(240),
+            "horizon_days": 10,
+            "target_upside": 2,
+            "stop_loss": 3,
+            "min_train": 80,
+            "step": 3,
+        })
+        self.assertTrue(result["available"])
+        self.assertGreater(result["metrics"]["samples"], 10)
+        self.assertIn("predictionCalibration", result)
+        self.assertEqual(result["predictionCalibration"]["framework"], "prediction-method-weight-calibration")
+        self.assertIn(result["predictionCalibration"]["horizonBucket"], {"short", "mid", "long"})
+
+    def test_historical_backtest_uses_multi_step_sampling_without_leakage(self):
+        sparse = run_historical_backtest(
+            candles(260),
+            market="US",
+            symbol="UNIT",
+            horizon=10,
+            target_upside=2,
+            stop_loss=3,
+            min_train=80,
+            step=5,
+            max_predictions=500,
+        )
+        expanded = run_historical_backtest(
+            candles(260),
+            market="US",
+            symbol="UNIT",
+            horizon=10,
+            target_upside=2,
+            stop_loss=3,
+            min_train=80,
+            step=5,
+            step_schedule=[2, 3, 5],
+            max_step_offsets=2,
+            max_predictions=500,
+        )
+        self.assertTrue(expanded["available"])
+        self.assertGreater(expanded["metrics"]["samples"], sparse["metrics"]["samples"])
+        self.assertIn("slicePlan", expanded["dataDepth"])
+        self.assertEqual(expanded["dataDepth"]["leakageAudit"]["rule"], "train_row.index + horizon <= prediction_index - embargo")
+
+    def test_worker_dispatch_exposes_multi_horizon_prediction_weight_calibration(self):
+        result = dispatch({
+            "operation": "historical-backtest-batch",
+            "market": "US",
+            "items": [
+                {"market": "US", "symbol": "AAA", "candles": candles(260)},
+                {"market": "US", "symbol": "BBB", "candles": candles(280)},
+            ],
+            "horizon_days": 10,
+            "horizons": [5, 10, 30],
+            "target_upside": 2,
+            "stop_loss": 3,
+            "min_train": 80,
+            "step": 5,
+            "step_schedule": [2, 3, 5],
+            "max_step_offsets": 2,
+            "max_predictions": 240,
+        })
+        self.assertTrue(result["available"])
+        self.assertIn("predictionCalibration", result)
+        self.assertGreaterEqual(len(result["horizonCalibrations"]), 2)
+        self.assertIn("sampling", result)
+        for row in result["horizonCalibrations"]:
+            self.assertIn("optimizedWeights", row)
+            self.assertGreater(row["sampleCount"], 0)
 
     def test_provider_plan_limits_limited_sources(self):
         result = provider_plan("US", ["nasdaq-us", "eodhd-us", "twelvedata-us", "stooq-us"])

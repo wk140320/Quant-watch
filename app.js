@@ -419,6 +419,7 @@ const state = {
   chartDataCache: new Map(),
   chartLoading: new Set(),
   accuracySummary: null,
+  historicalBacktestSummary: null,
   marketIndexes: [],
   marketIndexSignal: null,
   marketIndexChartSymbol: safeStorage.getItem("marketIndexChartSymbol") || null,
@@ -1358,12 +1359,22 @@ function computeTechnicals(candles) {
       .reduce((sum, value) => sum + value, 0) / 20
   );
 
-  const trendScore = clamp(50 + (close > sma20 ? 14 : -8) + (sma20 > sma50 ? 12 : -10) + change20d, 0, 100);
-  const momentumScore = clamp(50 + macdHistogram * 120 + (latestRsi - 50) * 0.9 + change5d, 0, 100);
+  const boundedChange5d = clamp(change5d, -6, 6);
+  const trendScore = clamp(50 + (close > sma20 ? 12 : -9) + (sma20 > sma50 ? 11 : -10) + clamp(change20d * 0.62, -9, 9), 0, 100);
+  const momentumScore = clamp(50 + macdHistogram * 92 + (latestRsi - 50) * 0.55 + boundedChange5d * 0.35 + clamp(change20d * 0.12, -3, 3), 0, 100);
   const volumeScore = clamp(45 + (volumeRatio - 1) * 28, 0, 100);
   const riskScore = clamp(82 - volatility * 8, 0, 100);
-  const projectedUpside = clamp((trendScore + momentumScore + volumeScore - 145) / 8, -12, 18);
-  const mainForceProxy = clamp(50 + (volumeRatio - 1) * 18 + macdHistogram * 80 + change5d * 0.9, 0, 100);
+  const overextensionPenalty = Math.max(0, change5d - 4) * 0.35 + Math.max(0, latestRsi - 72) * 0.12;
+  const projectedUpside = clamp(
+    (trendScore - 50) * 0.045
+      + (momentumScore - 50) * 0.035
+      + (volumeScore - 50) * 0.02
+      + (riskScore - 50) * 0.015
+      - overextensionPenalty,
+    -10,
+    12
+  );
+  const mainForceProxy = clamp(50 + (volumeRatio - 1) * 18 + macdHistogram * 70 + boundedChange5d * 0.45 - overextensionPenalty * 1.2, 0, 100);
 
   return {
     close,
@@ -5585,6 +5596,46 @@ async function fetchAccuracySummary(force = false) {
   }
 }
 
+async function runHistoricalBacktest() {
+  const button = $("runHistoricalBacktest");
+  const symbols = predictionActiveSymbols().slice(0, 20);
+  if (!symbols.length) {
+    setStatus("请先添加关注股票或持仓股票，再运行历史预测校准");
+    return null;
+  }
+  try {
+    if (button) button.disabled = true;
+    setStatus(`正在运行 ${activeMarketConfig().label} 5年历史预测校准（短/中/长期，${symbols.length}只）...`);
+    const strategy = getStrategy();
+    const result = await requestJson(`/api/historical-backtest-batch?market=${encodeURIComponent(state.market)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        market: state.market,
+        symbols,
+        range: "5y",
+        limit: 20,
+        horizonDays: strategy.horizonDays,
+        targetUpside: strategy.targetUpside,
+        stopLoss: strategy.stopLoss,
+      }),
+    });
+    state.historicalBacktestSummary = result;
+    if (result.savedModel && state.accuracySummary) {
+      state.accuracySummary.historicalPredictionModel = result.savedModel;
+    }
+    renderAccuracyPanel();
+    setStatus(`历史预测校准完成：${result.sampleTotal || 0} 个历史切片，${(result.horizonCalibrations || []).length || 1} 套周期权重`);
+    return result;
+  } catch (error) {
+    console.warn("Historical backtest failed", error);
+    setStatus(`历史预测校准失败：${compactDisplayError(error.message)}`);
+    return null;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 function analysisSampleId(item, createdAt = new Date().toISOString()) {
   const analysis = normalizeAnalysis(item.analysis);
   const technicals = normalizeTechnicals(item.technicals);
@@ -5600,6 +5651,44 @@ function predictionSampleFromResult(item) {
   const technicals = normalizeTechnicals(item.technicals);
   const strategy = getStrategy();
   const latest = (item.candles || []).at(-1) || {};
+  const recentCandles = normalizeCandles(item.candles || []);
+  const latestCandle = recentCandles.at(-1) || {};
+  const prevCandle = recentCandles.at(-2) || {};
+  const recent5 = recentCandles.slice(-5);
+  const recent20 = recentCandles.slice(-20);
+  const volumeMean = (rows) => rows.length ? rows.reduce((sum, row) => sum + Number(row.volume || 0), 0) / rows.length : 0;
+  const avgVolume5 = volumeMean(recent5);
+  const avgVolume20 = volumeMean(recent20) || 1;
+  const signedPressure = (row) => {
+    const buy = Number(row.buyVolume);
+    const sell = Number(row.sellVolume);
+    if (Number.isFinite(buy) && Number.isFinite(sell) && buy + sell > 0) return clamp((buy - sell) / (buy + sell), -1, 1);
+    const high = Number(row.high || row.close || 0);
+    const low = Number(row.low || row.close || 0);
+    const open = Number(row.open || row.close || 0);
+    const close = Number(row.close || 0);
+    const width = Math.max(1e-9, high - low);
+    return clamp((((close - low) / width - 0.5) * 2) * 0.55 + ((close - open) / width) * 0.45, -1, 1);
+  };
+  const buyPressure5 = recent5.length
+    ? recent5.reduce((sum, row) => sum + signedPressure(row) * Math.max(1, Number(row.volume || 0)), 0) / recent5.reduce((sum, row) => sum + Math.max(1, Number(row.volume || 0)), 0)
+    : 0;
+  const buyPressure20 = recent20.length
+    ? recent20.reduce((sum, row) => sum + signedPressure(row) * Math.max(1, Number(row.volume || 0)), 0) / recent20.reduce((sum, row) => sum + Math.max(1, Number(row.volume || 0)), 0)
+    : 0;
+  const typicalRows = recent20.map((row) => ({
+    price: (Number(row.high || row.close || 0) + Number(row.low || row.close || 0) + Number(row.close || 0)) / 3,
+    volume: Math.max(1, Number(row.volume || 0)),
+  }));
+  const vwap20 = typicalRows.length
+    ? typicalRows.reduce((sum, row) => sum + row.price * row.volume, 0) / typicalRows.reduce((sum, row) => sum + row.volume, 0)
+    : Number(latestCandle.close || technicals.close || 0);
+  const profileDistance = vwap20 ? pctChange(Number(latestCandle.close || technicals.close || 0), vwap20) : 0;
+  const factorList = factorRows(item.factors);
+  const factorScoreByLabel = (matcher) => {
+    const found = factorList.find(([label]) => matcher(String(label)));
+    return Number(found?.[1]?.score || 0);
+  };
   const asOfDate = String(latest.date || "").slice(0, 10);
   if (!asOfDate || !technicals.close) return null;
   const createdAt = new Date().toISOString();
@@ -5661,6 +5750,21 @@ function predictionSampleFromResult(item) {
       volume: technicals.volumeScore,
       risk: technicals.riskScore,
       factor: factorScoreForItem(item),
+      gap: prevCandle.close ? pctChange(Number(latestCandle.open || latestCandle.close || 0), Number(prevCandle.close || 0)) : 0,
+      buyPressure: signedPressure(latestCandle),
+      buyPressure5,
+      pressureChange: buyPressure5 - buyPressure20,
+      volumeAccel: avgVolume5 / Math.max(1, avgVolume20) - 1,
+      profileDistance,
+      liquidityShock: Math.abs(Number(technicals.change1d || 0)) * Math.max(0, Number(technicals.volumeRatio || 1) - 1),
+      socialScore: factorScoreByLabel((label) => /reddit|社媒/i.test(label)),
+      macroScore: factorScoreByLabel((label) => /宏观/i.test(label)),
+      sectorScore: factorScoreByLabel((label) => /行业/i.test(label)),
+      flowScore: factorScoreByLabel((label) => /资金|期权|flow|两融|北向/i.test(label)),
+      liquidityScore: factorScoreByLabel((label) => /流动性/i.test(label)),
+      relativeStrengthScore: factorScoreByLabel((label) => /相对强弱/i.test(label)),
+      calibrationScore: factorScoreByLabel((label) => /回测|校准/i.test(label)),
+      announcementScore: factorScoreByLabel((label) => /公告|SEC/i.test(label)),
       analogConfidence: item.analog?.confidence || 0,
       modelConfidence: item.analog?.model?.confidence || 0,
     },
@@ -6791,6 +6895,89 @@ function improvementHtml(improvement = {}) {
   `;
 }
 
+function predictionCalibrationSummaryHtml(source = null) {
+  if (!source) return `<p class="muted">预测权重校准尚未生成。运行历史预测校准后会在这里显示短/中/长期模型权重。</p>`;
+  const calibration = source.predictionCalibration || null;
+  const horizons = Array.isArray(source.horizonCalibrations) ? source.horizonCalibrations : [];
+  const rows = horizons.length ? horizons : calibration ? [calibration] : [];
+  const cards = rows.map((row) => {
+    const weights = Object.entries(row.optimizedWeights || {})
+      .sort(([, a], [, b]) => Number(b || 0) - Number(a || 0))
+      .slice(0, 5);
+    const test = row.test || {};
+    const baseline = row.baselines || {};
+    return `
+      <div class="boost-row">
+        <strong>${escapeHtml(row.horizonLabel || row.horizonBucket || "预测周期")} · ${row.horizonDays || "-"}日 · ${row.active ? "已通过" : row.status || "研究中"}</strong>
+        <span>样本 ${formatCompactNumber(row.sampleCount || 0, 0)} · 测试方向 ${pctOrPending(test.directionHitRate)} · 等权 ${pctOrPending(baseline.equalWeightDirectionHitRate ?? baseline.equalWeight?.directionHitRate)} · 动量 ${pctOrPending(baseline.momentumOnlyDirectionHitRate ?? baseline.momentumOnly?.directionHitRate)}</span>
+        <p>${escapeHtml(row.reason || "按时间序列切分学习预测头权重；样本外没有打赢基准时只保留为研究证据。")}</p>
+        ${weights.length ? `<p class="muted small-text">权重：${weights.map(([name, value]) => `${escapeHtml(name)} ${Math.round(Number(value || 0) * 100)}%`).join(" · ")}</p>` : ""}
+      </div>
+    `;
+  }).join("");
+  return `
+    <div class="boost-plan">
+      <div class="boost-row">
+        <strong>预测准确率校准模型</strong>
+        <span>${escapeHtml(source.framework || "prediction-weight-calibration")} · 保存 ${source.savedAt ? new Date(source.savedAt).toLocaleString() : source.generatedAt ? new Date(source.generatedAt).toLocaleString() : "本次运行"} · 股票 ${source.availableCount || source.symbolCount || 0}/${source.symbolCount || 0}</span>
+        <p>目标是校准“预测方法本身”的准确率，不等同于买入策略回测；短期、中期、长期分别学习权重，避免把长期逻辑硬套到隔日/短线预测。</p>
+      </div>
+      ${cards || `<div class="boost-row"><strong>样本不足</strong><span>等待更多历史切片</span><p>需要更多真实K线切片才能分周期学习权重。</p></div>`}
+    </div>
+  `;
+}
+
+function historicalBacktestHtml(summary = null) {
+  const savedModel = state.accuracySummary?.historicalPredictionModel || null;
+  if (!summary) {
+    return `
+      <div class="learning-section">
+        <h4>历史预测校准</h4>
+        ${savedModel ? predictionCalibrationSummaryHtml(savedModel) : `<p class="muted">点击“5年历史预测校准”后，会用过去每个可用交易日模拟当时预测，只用该日以前的数据训练，再按短/中/长期验证预测头权重是否优于等权和动量基线。</p>`}
+      </div>
+    `;
+  }
+  const metrics = summary.metrics || {};
+  const results = Array.isArray(summary.results) ? summary.results : [];
+  const availableRows = results.filter((row) => row.available);
+  const unavailableRows = results.filter((row) => !row.available);
+  return `
+    <div class="learning-section">
+      <h4>历史预测校准</h4>
+      ${predictionCalibrationSummaryHtml(summary.savedModel || summary)}
+      <div class="accuracy-grid">
+        <div class="accuracy-metric"><span>股票 / 可用</span><strong>${summary.symbolCount || 0} / ${summary.availableCount || 0}</strong></div>
+        <div class="accuracy-metric"><span>历史切片样本</span><strong>${summary.sampleTotal || 0}</strong></div>
+        <div class="accuracy-metric"><span>买入信号</span><strong>${summary.buySignalTotal || 0}</strong></div>
+        <div class="accuracy-metric"><span>方向命中</span><strong>${pctOrPending(metrics.directionHitRate)}</strong></div>
+        <div class="accuracy-metric"><span>达标命中</span><strong>${pctOrPending(metrics.targetHitRate)}</strong></div>
+        <div class="accuracy-metric"><span>先止损率</span><strong>${pctOrPending(metrics.stopRate)}</strong></div>
+        <div class="accuracy-metric"><span>平均收益</span><strong>${metrics.avgForwardReturn == null ? "n/a" : formatPct(metrics.avgForwardReturn)}</strong></div>
+        <div class="accuracy-metric"><span>目标Brier</span><strong>${numberOrPending(metrics.brierTarget, 3)}</strong></div>
+      </div>
+      <div class="bucket-list">
+        ${availableRows.length ? availableRows
+          .sort((a, b) => Number(b.metrics?.samples || 0) - Number(a.metrics?.samples || 0))
+          .slice(0, 16)
+          .map((row) => `
+            <div class="bucket-row">
+              <strong>${escapeHtml(row.symbol || "-")}</strong>
+              <span>K线 ${row.candleCount || 0}</span>
+              <span>切片 ${row.metrics?.samples || 0}</span>
+              <span>训练中位 ${formatCompactNumber(row.dataDepth?.trainSamplesMedian || 0, 0)}</span>
+              <span>买入 ${row.metrics?.buySignals || 0}</span>
+              <span>达标 ${pctOrPending(row.metrics?.acceptedTargetRate ?? row.metrics?.targetHitRate)}</span>
+              <span>止损 ${pctOrPending(row.metrics?.stopRate)}</span>
+              <span>均值 ${row.metrics?.avgForwardReturn == null ? "n/a" : formatPct(row.metrics.avgForwardReturn)}</span>
+            </div>
+          `).join("") : `<p class="muted">没有股票拥有足够历史K线完成回测。</p>`}
+        ${unavailableRows.length ? `<p class="muted small-text">不可用 ${unavailableRows.length} 只：${unavailableRows.slice(0, 8).map((row) => escapeHtml(row.symbol || "-")).join("、")}${unavailableRows.length > 8 ? "..." : ""}</p>` : ""}
+      </div>
+      <p class="muted small-text">方法：${escapeHtml(summary.framework || "historical-walk-forward-backtest-batch")} · range ${escapeHtml(summary.range || "5y")} · ${summary.generatedAt ? new Date(summary.generatedAt).toLocaleString() : "刚刚运行"}</p>
+    </div>
+  `;
+}
+
 function learningEventsHtml(events = []) {
   if (!events.length) return `<p class="muted">目前还没有触发失败迁移的预测。出现止损、未达标或未完成逆行后，这里会显示调参记录。</p>`;
   return `
@@ -6821,6 +7008,307 @@ function accuracyBoostPlanHtml(rows = []) {
           <p>${row.effect || ""}</p>
         </div>
       `).join("")}
+    </div>
+  `;
+}
+
+function optimizedWeightLearningHtml(optimization = null) {
+  if (!optimization) return `<p class="muted">学习型权重尚未生成。</p>`;
+  const weights = Object.entries(optimization.weights || {})
+    .sort(([, a], [, b]) => Number(b || 0) - Number(a || 0))
+    .slice(0, 10);
+  const statusText = optimization.active
+    ? `已启用 · 样本 ${optimization.sampleCount || 0} · 测试集MSE改善 ${optimization.testImprovementPct == null ? "n/a" : `${Number(optimization.testImprovementPct).toFixed(1)}%`} · 混合 ${Math.round(Number(optimization.deploymentBlend || 0) * 100)}%`
+    : `${optimization.status || "collecting"} · 样本 ${optimization.sampleCount || 0}/${optimization.minSamples || 24}`;
+  return `
+    <div class="boost-plan">
+      <div class="boost-row">
+        <strong>${optimization.active ? "样本外最优权重已启用" : "学习型权重未替换线上权重"}</strong>
+        <span>${escapeHtml(statusText)}</span>
+        <p>${escapeHtml(optimization.reason || "需要更多到期样本或样本外表现还没有超过旧权重。")}</p>
+      </div>
+    </div>
+    <div class="bucket-list">
+      ${weights.length ? weights.map(([name, weight]) => `
+        <div class="bucket-row">
+          <strong>${escapeHtml(name)}</strong>
+          <span>学习权重 ${Math.round(Number(weight || 0) * 100)}%</span>
+        </div>
+      `).join("") : `<p class="muted">权重向量仍在收集中。</p>`}
+    </div>
+  `;
+}
+
+const MODEL_FORMULA_CATALOG = {
+  change5d: "close[t] / close[t-5] - 1",
+  change20d: "close[t] / close[t-20] - 1",
+  volumeRatio: "volume[t] / mean(volume[t-19:t])",
+  volume: "成交活跃度、量比和流动性惩罚的综合评分",
+  gap: "(open[t] - close[t-1]) / close[t-1]",
+  buyPressure: "真实buy/sell量优先；缺失时用收盘位置和K线实体代理主动买卖压力",
+  buyPressure5: "5日成交量加权买卖压力；有真实buy/sell量时用真实值，否则用K线位置代理",
+  pressureChange: "buyPressure5 - 20日成交量加权买卖压力",
+  profileDistance: "(close - rollingVWAP20) / rollingVWAP20",
+  volumeAccel: "mean(volume_5) / mean(volume_20) - 1",
+  liquidityShock: "abs(1日涨跌) * max(0, 量比 - 1)",
+  trend: "close/sma20 与 sma20/sma50 叠加20日涨跌",
+  momentum: "MACD histogram、RSI、5日/20日涨跌组合",
+  factor: "公告、社媒、宏观、行业、资金流、相对强弱、回测校准的综合因子",
+  socialScore: "Reddit社媒相关度、影响力、有效性、真伪风险后的净分",
+  macroScore: "利率、汇率、战争、政策、风险偏好等宏观新闻影响分",
+  sectorScore: "公司、同业、上游、下游、竞品和行业新闻的传导影响分",
+  flowScore: "资金流、订单流、主被动成交和拥挤度代理分",
+  liquidityScore: "成交额、滑点风险、价差和可执行性的综合分",
+  relativeStrengthScore: "个股相对大盘/行业的横截面强弱分",
+  calibrationScore: "历史同类预测在样本外是否有效的校准分",
+  announcementScore: "财报、公告、分红、业绩指引等基本面事件分",
+  ridge_final_return: "rolling ridge regression(features <= t -> forwardReturn[t+H])",
+  ridge_risk_adjusted: "rolling ridge regression(features <= t -> riskAdjustedReturn)",
+  knn_analog: "只在历史已知样本里找相似特征向量，取相似样本未来收益均值",
+  trend_momentum: "change20*0.12 + change5*0.18 + trend/momentum/MACD 组合",
+  mean_reversion: "RSI超买超卖、短线涨跌和中期趋势的均值回归头",
+  volume_breakout: "量比放大 * 趋势方向 + 中期涨跌 + MACD",
+  risk_guard: "ridge_final_return - stopProbability*stopLoss + riskScore修正",
+  target_probability: "目标触达概率与止损概率的收益化映射",
+  orderflow_pressure: "buyPressure5*4.2 + pressureChange*3.1 + closeLocation*0.7 + volumeAccel*0.9",
+  volume_profile: "-profileDistance*0.42 + profileSkew*0.55 + profilePocDistance*0.38 + profileImbalance*2.2",
+  factor_quality: "factorQuality*0.14 + trendQuality*1.3 - liquidityShock*0.25",
+  liquidity_reversal: "-change5*0.12 + reversalPressure*2.7 + volumeAccel*0.8 - trueRange*0.35",
+};
+
+function collectModelFeatureRows(summary = {}) {
+  const catalog = summary.featureCatalog || {};
+  const rows = new Map();
+  const addFeature = (name, rawWeight = 0, source = "model", metric = "") => {
+    if (!name) return;
+    const key = String(name);
+    const meta = catalog[key] || {};
+    const current = rows.get(key) || {
+      name: key,
+      label: meta.label || key,
+      family: meta.family || "model",
+      why: meta.why || "该参数在样本外模型中出现，具体方向由验证集/测试集决定。",
+      formula: meta.formula || MODEL_FORMULA_CATALOG[key] || "见后端 featureCatalog / historical formula book",
+      weight: 0,
+      sources: [],
+    };
+    current.weight += Math.abs(Number(rawWeight || 0));
+    current.sources.push(`${source}${metric ? ` ${metric}` : ""}`);
+    rows.set(key, current);
+  };
+  const signalModels = summary.localSignalModels || {};
+  [
+    signalModels.featureScoreHead,
+    signalModels.factorScoreHead,
+    signalModels.backtestMetaHead,
+    signalModels.stopRiskHead,
+    signalModels.tradeQualityHead,
+  ].filter(Boolean).forEach((head) => {
+    (head.model?.topCoefficients || []).forEach((row) => addFeature(row.feature, row.coef, head.name || head.kind, head.active ? "active" : head.status));
+  });
+  const lightgbm = summary.lightgbmModel || {};
+  [
+    lightgbm.targetHead,
+    lightgbm.stopHead,
+    lightgbm.returnHead,
+    lightgbm.tripleBarrierHead,
+  ].filter(Boolean).forEach((head) => {
+    (head.topFeatures || []).forEach((row) => addFeature(row.feature, Number(row.importance || 0) / 100, head.name || head.kind, head.active ? "active" : head.status));
+  });
+  return [...rows.values()]
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, 18);
+}
+
+function modelExplainabilityHtml(summary = {}) {
+  const featureRows = collectModelFeatureRows(summary);
+  const policy = summary.modelAdjustmentPolicy || {};
+  const historical = summary.historicalPredictionModel || state.historicalBacktestSummary?.savedModel || state.historicalBacktestSummary || {};
+  const horizonRows = Array.isArray(historical.horizonCalibrations) ? historical.horizonCalibrations : [];
+  const methodRows = horizonRows.flatMap((horizon) => Object.entries(horizon.optimizedWeights || {}).map(([name, weight]) => ({
+    name,
+    horizon: horizon.horizonLabel || horizon.horizonBucket || `${horizon.horizonDays || ""}日`,
+    weight: Number(weight || 0),
+    active: horizon.active,
+  }))).sort((a, b) => b.weight - a.weight).slice(0, 12);
+  const familyTotals = featureRows.reduce((map, row) => {
+    map.set(row.family, (map.get(row.family) || 0) + Number(row.weight || 0));
+    return map;
+  }, new Map());
+  const maxFamily = Math.max(1, ...familyTotals.values());
+  const maxFeature = Math.max(1e-9, ...featureRows.map((row) => row.weight));
+  return `
+    <div class="model-explainability">
+      <div class="boost-plan">
+        <div class="boost-row">
+          <strong>模型可解释性地图</strong>
+          <span>特征 ${featureRows.length || 0} · 历史预测头 ${methodRows.length || 0} · 微调 ${policy.status || "collecting"}</span>
+          <p>这里展示的是模型已经接入并在样本外训练中参与过的参数。权重越高代表它在当前本地模型/树模型/历史校准中更常被使用，但是否上线仍取决于验证集和测试集表现。</p>
+        </div>
+        ${policy.framework ? `
+          <div class="boost-row">
+            <strong>失败/成功后的动态微调</strong>
+            <span>平均调整 ${Math.round(Number(policy.avgAdjustmentScale || 0) * 100)}% · 平均误差 ${policy.avgForecastError == null ? "n/a" : formatPct(policy.avgForecastError)} · 事件 ${policy.eventCount || 0}</span>
+            <p>${escapeHtml(policy.scaleFormula || "scale = error-sensitive capped micro tuning")}</p>
+            <p class="muted small-text">${escapeHtml(policy.effectFormula || "偏差越大调整越大，但有上限，防止过拟合。")}</p>
+          </div>
+        ` : ""}
+      </div>
+      <div class="bucket-list">
+        ${[...familyTotals.entries()].sort((a, b) => b[1] - a[1]).map(([family, value]) => `
+          <div class="bucket-row model-family-row">
+            <strong>${escapeHtml(family)}</strong>
+            <span>相对权重 ${Math.round(value / maxFamily * 100)}%</span>
+            <span class="model-weight-track"><i style="width:${Math.max(4, Math.round(value / maxFamily * 100))}%"></i></span>
+          </div>
+        `).join("") || `<p class="muted">等待本地模型返回特征重要性。</p>`}
+      </div>
+      <div class="bucket-list">
+        ${featureRows.length ? featureRows.map((row) => `
+          <div class="bucket-row model-feature-row">
+            <strong>${escapeHtml(row.label)}</strong>
+            <span>${escapeHtml(row.family)}</span>
+            <span>强度 ${Math.round(row.weight / maxFeature * 100)}%</span>
+            <span class="model-weight-track"><i style="width:${Math.max(4, Math.round(row.weight / maxFeature * 100))}%"></i></span>
+            <span>${escapeHtml(row.formula)}</span>
+            <span>${escapeHtml(row.why)}</span>
+          </div>
+        `).join("") : `<p class="muted">本地模型头样本不足，暂时没有可解释性权重。</p>`}
+      </div>
+      <div class="bucket-list">
+        ${methodRows.length ? methodRows.map((row) => `
+          <div class="bucket-row">
+            <strong>${escapeHtml(row.name)}</strong>
+            <span>${escapeHtml(row.horizon)} · ${row.active ? "active" : "research"}</span>
+            <span>历史校准权重 ${Math.round(row.weight * 100)}%</span>
+            <span>${escapeHtml(MODEL_FORMULA_CATALOG[row.name] || "该预测头由后端历史回测公式生成，权重由样本外误差决定。")}</span>
+          </div>
+        `).join("") : `<p class="muted">运行历史预测校准后，会显示短/中/长期预测头权重。</p>`}
+      </div>
+    </div>
+  `;
+}
+
+function localSignalModelsHtml(signalModels = null, deepLearning = null, diagnostics = {}) {
+  if (!signalModels) {
+    return `<p class="muted">Python 本地模型头尚未返回；当前仍使用 JS 校准和规则闸门。</p>`;
+  }
+  const split = diagnostics.splitAudit || signalModels.splitAudit || {};
+  const calibration = diagnostics.calibrationDiagnostics || signalModels.calibrationDiagnostics || {};
+  const noTrade = diagnostics.noTradeGate || signalModels.noTradeGate || {};
+  const heads = [
+    ["特征分回归", signalModels.featureScoreHead],
+    ["因子分回归", signalModels.factorScoreHead],
+    ["回测Meta达标", signalModels.backtestMetaHead],
+    ["止损风险过滤", signalModels.stopRiskHead],
+    ["交易质量过滤", signalModels.tradeQualityHead],
+  ].filter(([, head]) => head);
+  const headRows = heads.map(([label, head]) => {
+    const validation = head.validation || {};
+    const test = head.test || {};
+    const improvement = head.kind === "logistic_meta_label" ? test.improvementPct : test.improvementPct;
+    const metricText = head.kind === "logistic_meta_label"
+      ? `测试Brier ${numberOrPending(test.brier, 3)} / 改善 ${improvement == null ? "n/a" : `${Number(improvement).toFixed(1)}%`}`
+      : `测试MSE ${numberOrPending(test.mse, 3)} / 改善 ${improvement == null ? "n/a" : `${Number(improvement).toFixed(1)}%`}`;
+    const important = (head.model?.topCoefficients || []).slice(0, 3).map((row) => `${row.feature}:${Number(row.coef || 0).toFixed(3)}`).join(" · ");
+    return `
+      <div class="boost-row">
+        <strong>${escapeHtml(label)} · ${head.active ? "已启用" : head.status === "collecting" ? "样本收集中" : "样本外未通过"}</strong>
+        <span>${escapeHtml(head.kind || "model")} · 样本 ${head.sampleCount || 0}${head.minSamples ? `/${head.minSamples}` : ""} · ${escapeHtml(metricText)}</span>
+        <p>${escapeHtml(head.reason || "按时间序列切分训练/验证/测试，未通过时不参与线上买卖。")}</p>
+        ${important ? `<p class="muted small-text">主要系数：${escapeHtml(important)}</p>` : ""}
+        ${validation.samples ? `<p class="muted small-text">验证集：${head.kind === "logistic_meta_label" ? `Brier ${numberOrPending(validation.brier, 3)} · 命中 ${pctOrPending(validation.hitRate)}` : `MSE ${numberOrPending(validation.mse, 3)} · 方向 ${pctOrPending(validation.directionHitRate)}`}</p>` : ""}
+      </div>
+    `;
+  }).join("");
+  const deep = deepLearning || {};
+  const barrier = signalModels.tripleBarrier || {};
+  const diagnosticRows = `
+    ${split.sampleCount ? `
+      <div class="boost-row">
+        <strong>时间序列验证 · Purged Walk-forward</strong>
+        <span>样本 ${split.sampleCount || 0} · 训练 ${split.trainSamples || 0} · 验证 ${split.validationSamples || 0} · 测试 ${split.testSamples || 0} · embargo ${split.embargoSamples || 0}</span>
+        <p>${escapeHtml(split.note || "训练、验证、测试按时间顺序切分，并在窗口之间留隔离带，降低未来函数和标签重叠风险。")}</p>
+      </div>
+    ` : ""}
+    ${calibration.target || calibration.stop ? `
+      <div class="boost-row">
+        <strong>概率校准诊断</strong>
+        <span>达标ECE ${calibration.target?.expectedCalibrationError == null ? "n/a" : `${Number(calibration.target.expectedCalibrationError).toFixed(1)}%`} · 达标Brier ${numberOrPending(calibration.target?.brier, 3)} · 止损ECE ${calibration.stop?.expectedCalibrationError == null ? "n/a" : `${Number(calibration.stop.expectedCalibrationError).toFixed(1)}%`} · 止损Brier ${numberOrPending(calibration.stop?.brier, 3)}</span>
+        <p>用于检查“模型说 70%”时历史实际是否接近 70%；校准偏差高时会压低线上置信度。</p>
+      </div>
+    ` : ""}
+    ${noTrade.sampleCount ? `
+      <div class="boost-row">
+        <strong>No-Trade 训练闸门</strong>
+        <span>样本 ${noTrade.sampleCount || 0} · 拦截候选 ${noTrade.flaggedCount || 0} · 可交易 ${noTrade.tradableCount || 0} · 拦截组止损率 ${pctOrPending(noTrade.flaggedStopRate)} · 可交易组达标率 ${pctOrPending(noTrade.tradableTargetRate)}</span>
+        <p>${escapeHtml(noTrade.note || "让模型学会拒绝低质量交易，而不是每次都强行给出方向。")}</p>
+      </div>
+    ` : ""}
+  `;
+  return `
+    <div class="boost-plan">
+      ${diagnosticRows}
+      ${barrier.sampleCount ? `
+        <div class="boost-row">
+          <strong>Triple-barrier 标签</strong>
+          <span>样本 ${barrier.sampleCount || 0} · 先达标 ${pctOrPending(barrier.targetRate)} · 先止损 ${pctOrPending(barrier.stopRate)} · 到期 ${pctOrPending(barrier.timeoutRate)}</span>
+          <p>${escapeHtml(barrier.note || "用目标先触达、止损先触发、到期未触发三类结果训练交易标签。")}</p>
+        </div>
+      ` : ""}
+      ${headRows || `<div class="boost-row"><strong>样本不足</strong><span>已验证样本 ${signalModels.sampleCount || 0}</span><p>需要更多到期预测样本训练本地模型头。</p></div>`}
+      <div class="boost-row">
+        <strong>深度学习头 · ${deep.active ? "已启用" : deep.status || "未启用"}</strong>
+        <span>PyTorch ${deep.torchReady ? "可用" : "不可用"} · 样本 ${deep.sampleCount || signalModels.sampleCount || 0}/${deep.minSamples || 180}</span>
+        <p>${escapeHtml(deep.reason || "LSTM/Transformer 必须先在样本外连续优于线性/树模型基线，当前不会硬上线。")}</p>
+      </div>
+    </div>
+  `;
+}
+
+function lightgbmModelHtml(lightgbm = null, tripleBarrier = null) {
+  if (!lightgbm) return `<p class="muted">LightGBM 基线尚未返回。</p>`;
+  const heads = [
+    ["目标先于止损", lightgbm.targetHead],
+    ["止损先触发", lightgbm.stopHead],
+    ["周期收益回归", lightgbm.returnHead],
+    ["Triple-barrier分类", lightgbm.tripleBarrierHead],
+  ].filter(([, head]) => head);
+  const headRows = heads.map(([label, head]) => {
+    const test = head.test || {};
+    const validation = head.validation || {};
+    const metric = head.kind === "lightgbm_regressor"
+      ? `测试MSE ${numberOrPending(test.mse, 3)} · 改善 ${test.improvementPct == null ? "n/a" : `${Number(test.improvementPct).toFixed(1)}%`}`
+      : head.kind === "lightgbm_multiclass"
+        ? `测试准确 ${pctOrPending(test.accuracy)} · 目标召回 ${pctOrPending(test.targetRecall)} · 止损召回 ${pctOrPending(test.stopRecall)}`
+        : `测试Brier ${numberOrPending(test.brier, 3)} · 改善 ${test.improvementPct == null ? "n/a" : `${Number(test.improvementPct).toFixed(1)}%`}`;
+    const important = (head.topFeatures || []).slice(0, 4).map((row) => `${row.feature}:${row.importance}`).join(" · ");
+    return `
+      <div class="boost-row">
+        <strong>${escapeHtml(label)} · ${head.active ? "已通过" : head.status === "collecting" ? "样本收集中" : "样本外未通过"}</strong>
+        <span>${escapeHtml(head.kind || "lightgbm")} · 样本 ${head.sampleCount || 0}${head.minSamples ? `/${head.minSamples}` : ""} · ${escapeHtml(metric)}</span>
+        <p>${escapeHtml(head.reason || "LightGBM 只在样本外打赢基线后进入研究证据。")}</p>
+        ${important ? `<p class="muted small-text">重要特征：${escapeHtml(important)}</p>` : ""}
+        ${validation.samples ? `<p class="muted small-text">验证集：${head.kind === "lightgbm_multiclass" ? `准确 ${pctOrPending(validation.accuracy)}` : head.kind === "lightgbm_regressor" ? `MSE ${numberOrPending(validation.mse, 3)}` : `Brier ${numberOrPending(validation.brier, 3)}`}</p>` : ""}
+      </div>
+    `;
+  }).join("");
+  const barrier = tripleBarrier || {};
+  return `
+    <div class="boost-plan">
+      <div class="boost-row">
+        <strong>LightGBM 树模型基线 · ${lightgbm.active ? "有头通过" : lightgbm.status || "未启用"}</strong>
+        <span>可用 ${lightgbm.available ? "是" : "否"} · ${escapeHtml(lightgbm.provider || lightgbm.framework || "tree-model")} · 样本 ${lightgbm.sampleCount || 0} · 通过 ${lightgbm.activeHeadCount || 0} 个头</span>
+        <p>${escapeHtml(lightgbm.reason || "LightGBM 未安装或样本不足时不会影响现有模型。")}</p>
+      </div>
+      ${barrier.sampleCount ? `
+        <div class="boost-row">
+          <strong>交易结果标签分布</strong>
+          <span>先达标 ${pctOrPending(barrier.targetRate)} · 先止损 ${pctOrPending(barrier.stopRate)} · 到期 ${pctOrPending(barrier.timeoutRate)}</span>
+          <p>用 triple-barrier 把“涨跌预测”改成“目标、止损、到期”的交易结果预测。</p>
+        </div>
+      ` : ""}
+      ${headRows || ""}
     </div>
   `;
 }
@@ -6866,6 +7354,7 @@ function renderAccuracyPanel() {
     </div>
     ${learningCurveHtml(summary.learningCurve || [])}
     ${improvementHtml(summary.improvement || {})}
+    ${historicalBacktestHtml(state.historicalBacktestSummary)}
     <div class="accuracy-grid">
       <div class="accuracy-metric"><span>样本 / 已验证</span><strong>${summary.total || 0} / ${summary.resolved || 0}</strong></div>
       <div class="accuracy-metric"><span>方向准确率</span><strong>${pctOrPending(summary.directionalHitRate ?? summary.hitRate)}</strong></div>
@@ -6904,6 +7393,10 @@ function renderAccuracyPanel() {
     </div>
   `;
   const adjustmentsHtml = `
+    <div class="learning-section">
+      <h4>模型可解释性与参数地图</h4>
+      ${modelExplainabilityHtml(summary)}
+    </div>
     <div class="learning-section">
       <h4>失败后的模型调整</h4>
       ${learningEventsHtml(summary.learningEvents || [])}
@@ -6979,6 +7472,18 @@ function renderAccuracyPanel() {
           </div>
         `).join("") : `<p class="muted">还没有足够样本校准策略达标概率。</p>`}
       </div>
+    </div>
+    <div class="learning-section">
+      <h4>学习型最优权重</h4>
+      ${optimizedWeightLearningHtml(summary.ensembleWeightOptimization)}
+    </div>
+    <div class="learning-section">
+      <h4>Python本地模型头</h4>
+      ${localSignalModelsHtml(summary.localSignalModels, summary.deepLearningModel, summary)}
+    </div>
+    <div class="learning-section">
+      <h4>LightGBM与Triple-barrier</h4>
+      ${lightgbmModelHtml(summary.lightgbmModel, summary.tripleBarrierModel)}
     </div>
     <div class="learning-section">
       <h4>模型样本外权重</h4>
@@ -9254,6 +9759,92 @@ function conservativeClientForecast(analysis) {
   };
 }
 
+function clientBacktestQualityGate(result, analysis) {
+  const strategy = getStrategy();
+  const projected = selectionUpside(analysis);
+  const positiveForecast = projected > Math.max(0.35, Number(strategy.targetUpside || 5) * 0.18);
+  const serverGate = analysis.qualityGate?.backtestGate || {};
+  const walkValues = result.factors?.calibration?.values || {};
+  const samples = Number(serverGate.samples ?? walkValues.samples ?? 0);
+  const hitRate = Number(serverGate.hitRate ?? walkValues.hitRate ?? 0);
+  const stopRate = Number(serverGate.stopRate ?? walkValues.stopRate ?? 0);
+  const avgReturn = Number(serverGate.avgReturn ?? walkValues.avgReturn ?? 0);
+  const minSamples = Number(serverGate.minSamples || (["ASX", "US"].includes(state.market) ? 12 : 8));
+  const requiredHitRate = Number(serverGate.requiredHitRate || Math.max(52, strategyProbabilityTarget(analysis) - 8));
+  const historyGate = analysis.qualityGate?.historyGate || analysis.ensemble?.historyGate || {};
+  const oosPassed = Boolean(serverGate.oosPassed)
+    || (Number(historyGate.samplePower || 0) >= 0.32
+      && Number(historyGate.reliability || 0) >= 52
+      && Number(historyGate.strategyHitProbability || 0) >= strategyProbabilityTarget(analysis)
+      && historyGate.blocksUpside !== true);
+  const walkPassed = Boolean(serverGate.walkForwardPassed)
+    || (samples >= minSamples && hitRate >= requiredHitRate && stopRate <= 46 && avgReturn > -0.15);
+  const passed = !positiveForecast || Boolean(serverGate.passed) || walkPassed || oosPassed;
+  return {
+    passed,
+    positiveForecast,
+    walkPassed,
+    oosPassed,
+    samples,
+    minSamples,
+    hitRate,
+    stopRate,
+    avgReturn,
+    requiredHitRate,
+  };
+}
+
+function enforceClientBacktestQualityGate(result, analysis) {
+  const gate = clientBacktestQualityGate(result, analysis);
+  if (gate.passed) {
+    return {
+      ...analysis,
+      qualityGate: {
+        ...(analysis.qualityGate || {}),
+        clientBacktestGate: gate,
+      },
+    };
+  }
+  const sampleCap = gate.samples >= gate.minSamples ? 58 : 55;
+  const poorHitCap = gate.samples >= gate.minSamples && gate.hitRate < 50 ? 52 : sampleCap;
+  const confidenceCap = Math.min(Number(analysis.qualityGate?.confidenceCap || 99), poorHitCap);
+  const shrink = gate.samples >= gate.minSamples ? 0.58 : 0.46;
+  const finalProjected = Number((projectedFinalReturn(analysis) > 0 ? projectedFinalReturn(analysis) * shrink : projectedFinalReturn(analysis)).toFixed(2));
+  const finalMax = Number((projectedMaxUpside(analysis) > 0 ? projectedMaxUpside(analysis) * Math.max(0.44, shrink * 0.88) : projectedMaxUpside(analysis)).toFixed(2));
+  const penalty = gate.samples >= gate.minSamples ? 10 : 16;
+  const reason = gate.samples >= gate.minSamples
+    ? `回测未达标：${gate.hitRate.toFixed(0)}%命中 / 要求${gate.requiredHitRate.toFixed(0)}%，先止损${gate.stopRate.toFixed(0)}%`
+    : `回测样本不足：${gate.samples}/${gate.minSamples}`;
+  const adjusted = {
+    ...analysis,
+    confidence: clamp(Math.min(Math.round(Number(analysis.confidence || 0)), confidenceCap), 0, 99),
+    predictionConfidence: clamp(Math.min(Math.round(Number(analysis.predictionConfidence ?? analysis.confidence ?? 0)), confidenceCap), 0, 99),
+    projectedUpside: finalProjected,
+    projectedFinalReturn: finalProjected,
+    projectedMaxUpside: Math.max(0, finalMax),
+    magnitudeConfidence: clamp(Math.min(magnitudeProbability(analysis) - penalty, confidenceCap), 0, 92),
+    magnitudeHitProbability: clamp(Math.min(magnitudeProbability(analysis) - penalty, confidenceCap), 0, 92),
+    finalReturnConfidence: clamp(Math.min(finalReturnProbability(analysis) - penalty, confidenceCap), 0, 92),
+    finalReturnHitProbability: clamp(Math.min(finalReturnProbability(analysis) - penalty, confidenceCap), 0, 92),
+    maxUpsideConfidence: clamp(Math.min(maxUpsideProbability(analysis) - penalty * 0.8, confidenceCap), 0, 92),
+    maxUpsideHitProbability: clamp(Math.min(maxUpsideProbability(analysis) - penalty * 0.8, confidenceCap), 0, 92),
+    qualityGate: {
+      ...(analysis.qualityGate || {}),
+      blocked: true,
+      buyEligible: false,
+      confidenceCap,
+      clientBacktestGate: gate,
+      backtestBlockedReason: reason,
+    },
+    thesis: [
+      `回测质量闸门：${reason}。正向预测在通过 walk-forward/OOS 验证前不能升级为买入信号。`,
+      ...(analysis.thesis || []),
+    ],
+  };
+  adjusted.action = finalizeActionFromStrategy(adjusted);
+  return adjusted;
+}
+
 function clientHorizonBucket(days) {
   const value = Number(days || getStrategy().horizonDays || 15);
   if (value <= 5) return "short";
@@ -9552,8 +10143,10 @@ function applyPostModelAdjustments(result) {
   };
   adjusted = evidenceQualityCalibration(result, adjusted);
   adjusted = adaptiveClientLearningAdjustment(result, adjusted);
+  adjusted = enforceClientBacktestQualityGate(result, adjusted);
   adjusted = conservativeClientForecast(adjusted);
   adjusted = applyForecastStability(result, adjusted);
+  adjusted = enforceClientBacktestQualityGate(result, adjusted);
   adjusted = conservativeClientForecast(adjusted);
   adjusted.action = finalizeActionFromStrategy(adjusted);
   return { ...result, analysis: adjusted };
@@ -10084,10 +10677,9 @@ function renderDetailUnsafe() {
       <div class="detail-item"><span>样本外/Meta</span><strong>${item.analog?.model?.oosSampleCount ? `方向 ${asNumber(item.analog.model.oosDirectionalAccuracy ?? item.analog.model.directionalAccuracy).toFixed(0)}% · 最高触达 ${asNumber(item.analog.model.oosMaxUpsideHitAccuracy ?? item.analog.model.maxUpsideHitAccuracy).toFixed(0)}% · P80 ${formatPct(item.analog.model.conformalP80Error)}` : "样本不足"}</strong></div>
       <div class="detail-item"><span>可用资金 / 建议票额</span><strong>${formatMoney(getCapital().availableCash)} / ${formatMoney(analysis.suggestedTradeValue || 0)}</strong></div>
       <div class="detail-item"><span>基本面</span><strong>${item.fundamentals ? `PE ${Number(item.fundamentals.peRatio || 0).toFixed(1)} · Yield ${formatPct(Number(item.fundamentals.dividendYield || 0) * 100)}` : "套餐未授权"}</strong></div>
-      <div class="detail-item"><span>Reddit 社媒</span><strong>${socialMedia ? `${Number(socialMedia.score || 0).toFixed(1)} · 权重 ${Number(socialMedia.weight || 0).toFixed(2)} · Top ${redditSocialItems(socialMedia).length}` : "待读取"}</strong></div>
       <div class="detail-item"><span>X / YouTube 信号</span><strong>${item.xPosts?.length || 0} / ${item.youtubeItems?.length || 0}</strong></div>
+      <div class="detail-item"><span>Reddit 社媒</span><strong>${socialMedia ? `${Number(socialMedia.score || 0).toFixed(1)} · 权重 ${Number(socialMedia.weight || 0).toFixed(2)} · Top ${redditSocialItems(socialMedia).length}` : "待读取"}</strong></div>
     </div>
-    ${redditSocialCardHtml(item)}
     <h4>多模型集成</h4>
     <div class="ensemble-summary">
       <span>方向 ${ensemble.direction || "n/a"}</span>
@@ -10097,12 +10689,13 @@ function renderDetailUnsafe() {
       <span>证据奖励 ${Number(ensemble.evidenceBonus || 0).toFixed(1)} / 分歧扣分 ${Number(ensemble.disagreementPenalty || 0).toFixed(1)}</span>
       <span>策略达标 ${Math.round(targetProb)}% / 门槛 ${Math.round(targetProbRequired)}%</span>
       <span>动态调权 ${Math.round(ensemble.performanceWeightAdjusted || 0)} 个模型</span>
+      <span>${ensemble.optimizedWeighting?.applied ? `样本外优化权重已启用 · ${Math.round(Number(ensemble.optimizedWeighting.deploymentBlend || 0) * 100)}%` : `权重模式 ${ensemble.weightingMethod || "prior-performance-regime"}`}</span>
     </div>
     <div class="ensemble-grid">
       ${ensembleModels.length ? ensembleModels.map((model) => `
         <div class="ensemble-card ${model.available === false ? "muted-factor" : ""}">
           <div><strong>${model.name || "模型"}</strong><span class="${Number(model.projectedUpside || 0) >= 0 ? "good-text" : "danger-text"}">${formatPct(model.projectedUpside || 0)}</span></div>
-          <p>置信 ${Math.round(model.confidence || 0)}% · 权重 ${Math.round((model.normalizedWeight || model.weight || 0) * 100)}%${model.values?.performanceWeightMultiplier ? ` · 表现权重 ${Math.round(model.values.performanceWeightMultiplier * 100)}%` : ""}${model.values?.regimeWeightMultiplier ? ` · 环境权重 ${Math.round(model.values.regimeWeightMultiplier * 100)}%` : ""}</p>
+          <p>置信 ${Math.round(model.confidence || 0)}% · 权重 ${Math.round((model.normalizedWeight || model.weight || 0) * 100)}%${model.values?.optimizedEnsembleWeight != null ? ` · 学习权重 ${Math.round(Number(model.values.optimizedEnsembleWeight || 0) * 100)}%` : ""}${model.values?.performanceWeightMultiplier ? ` · 表现权重 ${Math.round(model.values.performanceWeightMultiplier * 100)}%` : ""}${model.values?.regimeWeightMultiplier ? ` · 环境权重 ${Math.round(model.values.regimeWeightMultiplier * 100)}%` : ""}</p>
           <p>${model.reason || ""}</p>
         </div>
       `).join("") : `<p class="muted">集成模型正在等待分析结果。</p>`}
@@ -10128,6 +10721,7 @@ function renderDetailUnsafe() {
     <ul>${(item.xPosts || []).slice(0, 5).map((post) => `<li>${post.text}</li>`).join("") || "<li>未配置 X_BEARER_TOKEN，暂不读取 X。</li>"}</ul>
     <h4>YouTube 热门/搜索</h4>
     <ul>${(item.youtubeItems || []).slice(0, 5).map((video) => `<li><a href="${video.link}" target="_blank" rel="noreferrer">${video.title}</a> <span class="muted">${video.publisher || ""} · ${video.channel || ""}</span></li>`).join("") || "<li>未配置 YOUTUBE_API_KEY，或 YouTube 当前未返回视频。</li>"}</ul>
+    ${redditSocialCardHtml(item)}
   `;
   $("acceptDecision")?.addEventListener("click", () => saveDecision(item));
   $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(symbol));
@@ -12124,6 +12718,10 @@ function boot() {
   bind("refreshAccuracy", "click", async () => {
     await fetchAccuracySummary(true);
     setStatus("预测准确率已更新");
+  });
+
+  bind("runHistoricalBacktest", "click", async () => {
+    await runHistoricalBacktest();
   });
 
   bind("refreshIndexes", "click", async () => {

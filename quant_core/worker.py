@@ -8,6 +8,8 @@ from typing import Any
 
 from alpha_mining import analyze_alpha_evolution
 from features import analyze_factors, analyze_features
+from historical_backtest import batch_historical_backtest, run_historical_backtest
+from local_model import train_local_model_suite
 from provider_budget import provider_plan
 from risk import assess_portfolio, build_paper_order_intent
 from store import append_event, control_plane_summary, list_events, list_market_rows, list_order_intents, market_data_summary, record_market_rows, record_order_intent
@@ -194,9 +196,11 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "sqlite-event-store",
                 "local-market-data-store",
                 "local-market-data-replay",
+                "historical-walk-forward-backtest",
                 "ibkr-readiness",
                 "qlib-readiness",
                 "alpha-evolution",
+                "local-model-suite",
             ],
             "order_execution_enabled": False,
         }
@@ -238,6 +242,30 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             generations=int(payload.get("generations") or 4),
             population=int(payload.get("population") or 24),
         )
+    if operation == "local-model-train":
+        return train_local_model_suite(
+            payload.get("samples") or [],
+            market=str(payload.get("market") or "ASX"),
+        )
+    if operation == "historical-backtest":
+        return run_historical_backtest(
+            payload.get("candles") or [],
+            market=str(payload.get("market") or "ASX"),
+            symbol=str(payload.get("symbol") or ""),
+            horizon=int(payload.get("horizon_days") or payload.get("horizonDays") or 15),
+            target_upside=float(payload.get("target_upside", payload.get("targetUpside", 5)) or 5),
+            stop_loss=float(payload.get("stop_loss", payload.get("stopLoss", 4)) or 4),
+            min_train=int(payload.get("min_train", payload.get("minTrain", 120)) or 120),
+            step=int(payload.get("step") or 1),
+            step_schedule=payload.get("step_schedule", payload.get("stepSchedule", payload.get("steps"))),
+            max_step_offsets=int(payload.get("max_step_offsets", payload.get("maxStepOffsets", 1)) or 1),
+            max_predictions=int(payload.get("max_predictions", payload.get("maxPredictions", 2000)) or 2000),
+            retrain_interval=int(payload.get("retrain_interval", payload.get("retrainInterval", 60)) or 60),
+            max_train_window=int(payload.get("max_train_window", payload.get("maxTrainWindow", 240)) or 240),
+            knn_window=int(payload.get("knn_window", payload.get("knnWindow", 260)) or 260),
+        )
+    if operation == "historical-backtest-batch":
+        return batch_historical_backtest(payload)
     if operation == "trade-analysis":
         return analyze_trades(
             payload.get("trades") or [],

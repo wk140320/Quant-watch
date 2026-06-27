@@ -37,17 +37,19 @@ loadLocalEnv();
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-06-08-python-quant-core-v36";
+const APP_VERSION = "2026-06-26-python-local-model-v37";
 const SERVER_STARTED_AT = new Date().toISOString();
 const providerBackoff = new Map();
 const marketResponseCache = new Map();
 const marketCandlesCache = new Map();
 const quoteResponseCache = new Map();
 const factorResponseCache = new Map();
+const historicalBacktestCache = new Map();
 const newsResponseCache = new Map();
 const macroResponseCache = new Map();
 const universeResponseCache = new Map();
 const secFilingsCache = new Map();
+const localModelTrainingCache = new Map();
 const snapshotBasePath = join(root, ".cache");
 const NEWS_DISK_CACHE_TTL_MS = Number(process.env.NEWS_DISK_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const NEWS_DISK_CACHE_CLEANUP_MS = Number(process.env.NEWS_DISK_CACHE_CLEANUP_MS || 7 * 24 * 60 * 60 * 1000);
@@ -1437,6 +1439,10 @@ function modelCalibrationPathForMarket(market) {
   return join(snapshotBasePath, `model-calibration-${safeMarket(market).toLowerCase()}.json`);
 }
 
+function predictionWeightModelPathForMarket(market) {
+  return join(snapshotBasePath, "models", `prediction-weight-calibration-${safeMarket(market).toLowerCase()}.json`);
+}
+
 function predictionRecordPathForMarket(market) {
   return join(snapshotBasePath, "records", `prediction-record-${safeMarket(market).toLowerCase()}.jsonl`);
 }
@@ -1470,9 +1476,82 @@ async function writeModelCalibrationSnapshot(market, summary = {}) {
     adaptive: summary.adaptive || null,
     improvement: summary.improvement || null,
     modelStats: summary.modelStats || null,
+    ensembleWeightOptimization: summary.ensembleWeightOptimization || null,
+    localModelDeployment: summary.localModelDeployment || null,
+    localSignalModels: summary.localSignalModels || null,
+    lightgbmModel: summary.lightgbmModel || null,
+    tripleBarrierModel: summary.tripleBarrierModel || null,
+    splitAudit: summary.splitAudit || null,
+    calibrationDiagnostics: summary.calibrationDiagnostics || null,
+    noTradeGate: summary.noTradeGate || null,
+    deepLearningModel: summary.deepLearningModel || null,
+    featureCatalog: summary.featureCatalog || null,
+    modelAdjustmentPolicy: summary.modelAdjustmentPolicy || null,
     horizonStats: summary.horizonStats || summary.adaptive?.horizonStats || null,
   };
   await writeFile(modelCalibrationPathForMarket(market), JSON.stringify(payload, null, 2), "utf8");
+}
+
+async function appendAdaptiveModelAdjustmentLog(market, summary = {}) {
+  const policy = summary.modelAdjustmentPolicy || {};
+  const events = Array.isArray(policy.latestEvents) ? policy.latestEvents : [];
+  if (!events.length) return;
+  const top = events[0];
+  await appendModelChangeLogFile(market, {
+    event_type: "model-change-log-adaptive-micro-tuning",
+    entity_id: `${safeMarket(market)}:${top.symbol || "market"}:${top.date || summary.updatedAt || new Date().toISOString()}:${top.adjustmentScale || 0}`,
+    payload: {
+      title: "预测结果触发动态微调",
+      type: "adaptive-micro-tuning",
+      market: safeMarket(market),
+      framework: policy.framework,
+      scaleFormula: policy.scaleFormula,
+      avgAdjustmentScale: policy.avgAdjustmentScale,
+      avgForecastError: policy.avgForecastError,
+      latestEvents: events,
+      guardrails: policy.guardrails,
+    },
+  });
+}
+
+async function readPredictionWeightModelSnapshot(market) {
+  try {
+    const payload = JSON.parse(await readFile(predictionWeightModelPathForMarket(market), "utf8"));
+    if (!payload || typeof payload !== "object") return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function writePredictionWeightModelSnapshot(market, summary = {}) {
+  const key = safeMarket(market);
+  const calibration = summary.predictionCalibration || null;
+  const horizonCalibrations = Array.isArray(summary.horizonCalibrations) ? summary.horizonCalibrations : [];
+  if (!calibration && !horizonCalibrations.length) return null;
+  await mkdir(join(snapshotBasePath, "models"), { recursive: true });
+  const payload = {
+    market: key,
+    savedAt: new Date().toISOString(),
+    framework: summary.framework || "historical-walk-forward-backtest-batch",
+    range: summary.range || "5y",
+    requestedSymbols: summary.requestedSymbols || [],
+    symbolCount: summary.symbolCount || 0,
+    availableCount: summary.availableCount || 0,
+    sampleTotal: summary.sampleTotal || 0,
+    predictionCalibration: calibration,
+    horizonCalibrations,
+    dataSources: (summary.dataSources || []).map((row) => ({
+      symbol: row.symbol,
+      source: row.source,
+      candles: row.candles,
+      warning: row.warning ? String(row.warning).slice(0, 260) : "",
+    })),
+    leakageControl: calibration?.leakageControl || "Historical prediction-weight calibration uses point-in-time cuts; weights are not fitted on future holdout rows.",
+    note: "Stored locally so dashboard loads can read the latest prediction-weight model without retraining.",
+  };
+  await writeFile(predictionWeightModelPathForMarket(key), JSON.stringify(payload, null, 2), "utf8");
+  return payload;
 }
 
 async function appendPredictionRecordFile(market, samples = []) {
@@ -2887,6 +2966,250 @@ function buildModelPerformanceStats(scoped = []) {
     .slice(0, 32));
 }
 
+function sampleModelWeight(model = {}) {
+  const normalized = Number(model.normalizedWeight);
+  if (Number.isFinite(normalized) && normalized > 0) return normalized;
+  const raw = Number(model.weight);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+function ensembleWeightLearningRows(scoped = []) {
+  return scoped
+    .filter((sample) => sample?.outcome?.resolved && Array.isArray(sample?.ensemble?.models) && sample.ensemble.models.length)
+    .map((sample) => {
+      const modelValues = {};
+      const priorWeights = {};
+      for (const model of sample.ensemble.models || []) {
+        if (!model?.name || model.available === false) continue;
+        const projected = Number(model.projectedUpside);
+        if (!Number.isFinite(projected)) continue;
+        modelValues[model.name] = clampNumber(projected, -18, 18);
+        priorWeights[model.name] = sampleModelWeight(model);
+      }
+      const actualReturn = clampNumber(Number(sample.outcome?.forwardReturnPct || 0), -24, 24);
+      const storedPrediction = clampNumber(Number(sample.ensemble?.projectedUpside ?? sample.projectedFinalReturn ?? sample.projectedUpside ?? 0), -18, 18);
+      return {
+        date: String(sample.outcome?.resolvedAt || sample.resolvedAt || sample.createdAt || sample.asOfDate || ""),
+        symbol: sample.symbol,
+        actualReturn,
+        targetWins: Boolean(sample.outcome?.targetWins),
+        stopWins: Boolean(sample.outcome?.stopWins),
+        storedPrediction,
+        modelValues,
+        priorWeights,
+      };
+    })
+    .filter((row) => Object.keys(row.modelValues).length >= 2 && Number.isFinite(row.actualReturn))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function modelNamesForWeightLearning(rows = []) {
+  const stats = new Map();
+  for (const row of rows) {
+    for (const [name, value] of Object.entries(row.modelValues || {})) {
+      const stat = stats.get(name) || { count: 0, absSignal: 0 };
+      stat.count += 1;
+      stat.absSignal += Math.abs(Number(value || 0));
+      stats.set(name, stat);
+    }
+  }
+  const minCount = Math.max(6, Math.ceil(rows.length * 0.28));
+  return [...stats.entries()]
+    .filter(([, stat]) => stat.count >= minCount && stat.absSignal / Math.max(1, stat.count) >= 0.08)
+    .sort(([, a], [, b]) => b.count - a.count || b.absSignal - a.absSignal)
+    .slice(0, 14)
+    .map(([name]) => name);
+}
+
+function normalizeWeights(values = []) {
+  const cleaned = values.map((value) => Math.max(0, Number.isFinite(Number(value)) ? Number(value) : 0));
+  const total = cleaned.reduce((sum, value) => sum + value, 0);
+  if (total > 0) return cleaned.map((value) => value / total);
+  return cleaned.length ? cleaned.map(() => 1 / cleaned.length) : [];
+}
+
+function averagePriorVector(rows = [], names = []) {
+  const sums = names.map(() => 0);
+  let contributingRows = 0;
+  for (const row of rows) {
+    const raw = names.map((name) => Number(row.priorWeights?.[name] || 0));
+    const total = raw.reduce((sum, value) => sum + Math.max(0, value), 0);
+    if (total <= 0) continue;
+    const normalized = raw.map((value) => Math.max(0, value) / total);
+    normalized.forEach((value, index) => { sums[index] += value; });
+    contributingRows += 1;
+  }
+  if (!contributingRows) return names.map(() => 1 / Math.max(1, names.length));
+  return normalizeWeights(sums.map((value) => value / contributingRows));
+}
+
+function projectToSimplex(values = []) {
+  if (!values.length) return [];
+  const sorted = [...values].sort((a, b) => b - a);
+  let cumulative = 0;
+  let rho = 0;
+  for (let index = 0; index < sorted.length; index += 1) {
+    cumulative += sorted[index];
+    const theta = (cumulative - 1) / (index + 1);
+    if (sorted[index] - theta > 0) rho = index + 1;
+  }
+  const theta = (sorted.slice(0, rho).reduce((sum, value) => sum + value, 0) - 1) / Math.max(1, rho);
+  return values.map((value) => Math.max(0, value - theta));
+}
+
+function predictionForWeightVector(row, names = [], weights = []) {
+  return names.reduce((sum, name, index) => sum + Number(weights[index] || 0) * Number(row.modelValues?.[name] || 0), 0);
+}
+
+function evaluateStoredEnsembleForecast(rows = []) {
+  if (!rows.length) return { samples: 0, mse: null, mae: null, directionHitRate: null, targetHitRate: null };
+  const errors = rows.map((row) => Number(row.storedPrediction || 0) - Number(row.actualReturn || 0));
+  const directionHits = rows.filter((row) => {
+    const predicted = Number(row.storedPrediction || 0);
+    return predicted >= 0 ? Number(row.actualReturn || 0) >= 0 : Number(row.actualReturn || 0) < 0;
+  }).length;
+  const targetRows = rows.filter((row) => Number(row.storedPrediction || 0) > 0);
+  return {
+    samples: rows.length,
+    mse: mean(errors.map((error) => error ** 2)),
+    mae: mean(errors.map((error) => Math.abs(error))),
+    directionHitRate: directionHits / rows.length * 100,
+    targetHitRate: targetRows.length ? targetRows.filter((row) => row.targetWins).length / targetRows.length * 100 : null,
+  };
+}
+
+function evaluateWeightVector(rows = [], names = [], weights = []) {
+  if (!rows.length || !names.length || !weights.length) return { samples: 0, mse: null, mae: null, directionHitRate: null, targetHitRate: null };
+  const predictions = rows.map((row) => predictionForWeightVector(row, names, weights));
+  const errors = rows.map((row, index) => predictions[index] - Number(row.actualReturn || 0));
+  const directionHits = rows.filter((row, index) => predictions[index] >= 0 ? Number(row.actualReturn || 0) >= 0 : Number(row.actualReturn || 0) < 0).length;
+  const targetRows = rows.filter((row, index) => predictions[index] > 0);
+  return {
+    samples: rows.length,
+    mse: mean(errors.map((error) => error ** 2)),
+    mae: mean(errors.map((error) => Math.abs(error))),
+    directionHitRate: directionHits / rows.length * 100,
+    targetHitRate: targetRows.length ? targetRows.filter((row) => row.targetWins).length / targetRows.length * 100 : null,
+    avgPrediction: mean(predictions),
+  };
+}
+
+function fitSimplexRidgeWeights(rows = [], names = [], prior = [], lambda = 0.06) {
+  if (!rows.length || !names.length) return normalizeWeights(prior);
+  let weights = normalizeWeights(prior);
+  const avgSignal = mean(rows.flatMap((row) => names.map((name) => Math.abs(Number(row.modelValues?.[name] || 0)))));
+  const step = 0.018 / (1 + avgSignal * avgSignal * 0.16);
+  const ridge = Math.max(0.001, Number(lambda || 0.06));
+  for (let iteration = 0; iteration < 900; iteration += 1) {
+    const gradient = names.map((_, index) => 2 * ridge * (weights[index] - (prior[index] || 0)));
+    for (const row of rows) {
+      const predicted = predictionForWeightVector(row, names, weights);
+      const error = predicted - Number(row.actualReturn || 0);
+      names.forEach((name, index) => {
+        gradient[index] += (2 / rows.length) * error * Number(row.modelValues?.[name] || 0);
+      });
+    }
+    weights = projectToSimplex(weights.map((weight, index) => weight - step * gradient[index]));
+  }
+  return normalizeWeights(weights);
+}
+
+function improvementPct(candidateMse, baselineMse) {
+  if (!Number.isFinite(Number(candidateMse)) || !Number.isFinite(Number(baselineMse)) || Number(baselineMse) <= 0) return null;
+  return (Number(baselineMse) - Number(candidateMse)) / Number(baselineMse) * 100;
+}
+
+function buildEnsembleWeightOptimization(scoped = []) {
+  const rows = ensembleWeightLearningRows(scoped);
+  if (rows.length < 24) {
+    return {
+      status: "collecting",
+      active: false,
+      sampleCount: rows.length,
+      minSamples: 24,
+      reason: "Need at least 24 resolved ensemble samples before replacing engineering prior weights.",
+    };
+  }
+  const names = modelNamesForWeightLearning(rows);
+  if (names.length < 2) {
+    return {
+      status: "collecting",
+      active: false,
+      sampleCount: rows.length,
+      minSamples: 24,
+      reason: "Not enough recurrent ensemble models to optimize a stable simplex weight vector.",
+    };
+  }
+  const trainEnd = Math.max(10, Math.floor(rows.length * 0.58));
+  const validationEnd = Math.max(trainEnd + 5, Math.floor(rows.length * 0.78));
+  const train = rows.slice(0, trainEnd);
+  const validation = rows.slice(trainEnd, validationEnd);
+  const test = rows.slice(validationEnd);
+  if (validation.length < 5 || test.length < 5) {
+    return {
+      status: "collecting",
+      active: false,
+      sampleCount: rows.length,
+      minSamples: 32,
+      reason: "Need separate validation and untouched test windows for weight learning.",
+      modelNames: names,
+    };
+  }
+  const prior = averagePriorVector(train, names);
+  const lambdas = [0.16, 0.1, 0.065, 0.04, 0.025, 0.012];
+  const candidates = lambdas.map((lambda) => {
+    const weights = fitSimplexRidgeWeights(train, names, prior, lambda);
+    return { lambda, weights, validation: evaluateWeightVector(validation, names, weights) };
+  }).sort((a, b) => Number(a.validation.mse || Infinity) - Number(b.validation.mse || Infinity));
+  const selected = candidates[0];
+  const deploymentPrior = averagePriorVector([...train, ...validation], names);
+  const deploymentWeights = fitSimplexRidgeWeights([...train, ...validation], names, deploymentPrior, selected.lambda);
+  const trainMetrics = evaluateWeightVector(train, names, deploymentWeights);
+  const validationMetrics = evaluateWeightVector(validation, names, selected.weights);
+  const testMetrics = evaluateWeightVector(test, names, deploymentWeights);
+  const storedValidation = evaluateStoredEnsembleForecast(validation);
+  const storedTest = evaluateStoredEnsembleForecast(test);
+  const priorTest = evaluateWeightVector(test, names, deploymentPrior);
+  const validationImprovementPct = improvementPct(validationMetrics.mse, storedValidation.mse);
+  const testImprovementPct = improvementPct(testMetrics.mse, storedTest.mse);
+  const directionFloorOk = storedTest.directionHitRate == null || testMetrics.directionHitRate >= Number(storedTest.directionHitRate) - 2.5;
+  const targetFloorOk = storedTest.targetHitRate == null || testMetrics.targetHitRate == null || testMetrics.targetHitRate >= Number(storedTest.targetHitRate) - 4;
+  const active = (
+    Number(validationImprovementPct) >= 1
+    && Number(testImprovementPct) >= 0.5
+    && directionFloorOk
+    && targetFloorOk
+  );
+  const samplePower = clampNumber((rows.length - 24) / 120, 0, 1);
+  const deploymentBlend = active ? Number((0.35 + samplePower * 0.45).toFixed(2)) : 0;
+  const weights = Object.fromEntries(names.map((name, index) => [name, Number(deploymentWeights[index].toFixed(5))]));
+  const priorWeights = Object.fromEntries(names.map((name, index) => [name, Number(deploymentPrior[index].toFixed(5))]));
+  return {
+    status: active ? "active" : "rejected_oos",
+    active,
+    sampleCount: rows.length,
+    modelCount: names.length,
+    modelNames: names,
+    selectedLambda: selected.lambda,
+    deploymentBlend,
+    weights,
+    priorWeights,
+    train: trainMetrics,
+    validation: validationMetrics,
+    test: testMetrics,
+    baselines: {
+      storedValidation,
+      storedTest,
+      priorTest,
+    },
+    validationImprovementPct: Number.isFinite(validationImprovementPct) ? Number(validationImprovementPct.toFixed(2)) : null,
+    testImprovementPct: Number.isFinite(testImprovementPct) ? Number(testImprovementPct.toFixed(2)) : null,
+    reason: active
+      ? `Optimized simplex weights improved untouched test MSE by ${Number(testImprovementPct || 0).toFixed(1)}% versus stored ensemble.`
+      : "Learned weights did not beat the stored ensemble on validation/test without weakening direction or target-hit reliability.",
+  };
+}
+
 function buildRegimeStats(scoped = []) {
   const buckets = ["uptrend", "range", "downtrend", "volatile", "unknown"];
   return Object.fromEntries(buckets.map((bucket) => {
@@ -3213,6 +3536,9 @@ function buildLearningEvents(scoped = [], adaptive = {}) {
       if (Number(adjustment.upsideShrink || 1) < 0.98) changes.push(`正向涨幅预估收缩到 ${Math.round(Number(adjustment.upsideShrink || 1) * 100)}%`);
       if (adjustment.matchedPatterns?.length) changes.push(`迁移到 ${adjustment.matchedPatterns.map((row) => row.label).join("、")}`);
       if (!changes.length) changes.push("记录为观察样本，等待更多同类失败后再触发参数迁移");
+      const forecastError = Number.isFinite(Number(sampleForecastError(sample))) ? Math.abs(Number(sampleForecastError(sample))) : 0;
+      const missSeverity = (sampleMissed(sample) ? 1 : 0) + (sample.interim?.adverse ? 0.6 : 0) + Math.max(0, -Number(returnPct || 0)) / 8 + Math.max(0, -Number(drawdownPct || 0)) / 12;
+      const adjustmentScale = clampNumber(0.02 + forecastError * 0.012 + missSeverity * 0.035, 0.02, 0.22);
       return {
         date: sampleEventDate(sample),
         symbol: sample.symbol,
@@ -3223,10 +3549,37 @@ function buildLearningEvents(scoped = [], adaptive = {}) {
         drawdown: Number.isFinite(drawdownPct) ? Number(drawdownPct.toFixed(2)) : null,
         status: sampleStatusLabel(sample),
         transferScopes: scopes.length ? scopes : ["观察"],
+        adjustmentScale: Number(adjustmentScale.toFixed(3)),
+        forecastError: Number(forecastError.toFixed(2)),
         changes,
         reasons: adjustment.reasons || [],
       };
     });
+}
+
+function buildModelAdjustmentPolicy(scoped = [], adaptive = {}) {
+  const events = buildLearningEvents(scoped, adaptive);
+  const resolved = scoped.filter((sample) => sample.outcome?.resolved);
+  const errors = resolved.map(sampleForecastError).filter(Number.isFinite).map(Math.abs);
+  const avgError = errors.length ? mean(errors) : null;
+  const avgScale = events.length ? mean(events.map((row) => Number(row.adjustmentScale || 0))) : 0;
+  return {
+    framework: "adaptive-error-scaled-micro-tuning",
+    status: resolved.length >= 4 ? "active" : "collecting",
+    sampleCount: resolved.length,
+    eventCount: events.length,
+    avgForecastError: avgError == null ? null : Number(avgError.toFixed(3)),
+    avgAdjustmentScale: Number(avgScale.toFixed(3)),
+    scaleFormula: "scale = clamp(0.02 + abs(forecastError)*0.012 + missSeverity*0.035, 0.02, 0.22)",
+    effectFormula: "confidencePenalty/upsideShrink are adjusted by global, horizon, symbol, and matched-pattern errors; larger realized miss causes larger but capped micro-tuning.",
+    guardrails: [
+      "time-ordered resolved outcomes only",
+      "no fixed one-size penalty",
+      "scale capped at 22% to reduce overfitting",
+      "pattern transfer only when similar behavior has evidence",
+    ],
+    latestEvents: events.slice(0, 6),
+  };
 }
 
 function buildAccuracyBoostPlan(summary = {}, adaptive = {}) {
@@ -3406,8 +3759,10 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
     .slice(0, 8);
   const adaptive = buildAdaptiveCalibration(scoped);
+  const modelAdjustmentPolicy = buildModelAdjustmentPolicy(scoped, adaptive);
   const strategyBuckets = buildStrategyProbabilityBuckets(buyResolved);
   const modelStats = buildModelPerformanceStats(scoped);
+  const ensembleWeightOptimization = buildEnsembleWeightOptimization(scoped);
   const regimeStats = buildRegimeStats(scoped);
   const sectorStats = buildSectorStats(scoped);
   const errorTypeStats = buildErrorTypeStats(scoped);
@@ -3460,12 +3815,14 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     buckets,
     strategyBuckets,
     modelStats,
+    ensembleWeightOptimization,
     regimeStats,
     sectorStats,
     benchmarkComparisons,
     errorTypeStats,
     horizonStats: adaptive.horizonStats,
     adaptive,
+    modelAdjustmentPolicy,
     learningCurve: rollingLearningCurve(scoped),
     improvement: learningImprovement(scoped),
     learningEvents: buildLearningEvents(scoped, adaptive),
@@ -3473,6 +3830,82 @@ function summarizePredictionSamples(samples = [], market = "ASX") {
     recent,
     updatedAt: new Date().toISOString(),
   };
+}
+
+function predictionSamplesTrainingSignature(samples = [], market = "ASX") {
+  const key = safeMarket(market);
+  const scoped = (Array.isArray(samples) ? samples : []).filter((item) => safeMarket(item.market || key) === key);
+  const resolved = scoped.filter((item) => item.outcome?.resolved);
+  const tail = scoped
+    .slice()
+    .sort((a, b) => String(a.outcome?.resolvedAt || a.createdAt || a.id || "").localeCompare(String(b.outcome?.resolvedAt || b.createdAt || b.id || "")))
+    .slice(-8)
+    .map((item) => `${item.id || ""}:${item.outcome?.resolvedAt || ""}:${item.outcome?.forwardReturnPct ?? ""}`)
+    .join("|");
+  return `${key}:${scoped.length}:${resolved.length}:${tail}`;
+}
+
+function attachLocalModelSuite(summary, suite) {
+  if (!suite || typeof suite !== "object") return summary;
+  summary.localModelDeployment = suite;
+  if (suite.ensembleWeightOptimization) {
+    summary.ensembleWeightOptimization = suite.ensembleWeightOptimization;
+  }
+  if (suite.signalModels) {
+    summary.localSignalModels = suite.signalModels;
+  }
+  if (suite.lightgbm) {
+    summary.lightgbmModel = suite.lightgbm;
+  }
+  if (suite.tripleBarrier) {
+    summary.tripleBarrierModel = suite.tripleBarrier;
+  }
+  if (suite.splitAudit) {
+    summary.splitAudit = suite.splitAudit;
+  }
+  if (suite.calibrationDiagnostics) {
+    summary.calibrationDiagnostics = suite.calibrationDiagnostics;
+  }
+  if (suite.noTradeGate) {
+    summary.noTradeGate = suite.noTradeGate;
+  }
+  if (suite.deepLearning) {
+    summary.deepLearningModel = suite.deepLearning;
+  }
+  if (suite.featureCatalog) {
+    summary.featureCatalog = suite.featureCatalog;
+  }
+  return summary;
+}
+
+async function summarizePredictionSamplesWithLocalModel(samples = [], market = "ASX") {
+  const key = safeMarket(market);
+  const summary = summarizePredictionSamples(samples, key);
+  summary.historicalPredictionModel = await readPredictionWeightModelSnapshot(key);
+  const signature = predictionSamplesTrainingSignature(samples, key);
+  const cached = localModelTrainingCache.get(key);
+  const cacheTtl = Number(process.env.LOCAL_MODEL_CACHE_TTL_MS || 10 * 60 * 1000);
+  if (cached?.signature === signature && Date.now() - Number(cached.time || 0) < cacheTtl) {
+    return attachLocalModelSuite(summary, cached.suite);
+  }
+  try {
+    const suite = await runPythonQuantCore(
+      "local-model-train",
+      { market: key, samples: Array.isArray(samples) ? samples : [] },
+      Number(process.env.LOCAL_MODEL_TIMEOUT_MS || 18000),
+    );
+    localModelTrainingCache.set(key, { signature, time: Date.now(), suite });
+    attachLocalModelSuite(summary, suite);
+  } catch (error) {
+    summary.localModelDeployment = {
+      framework: "python-local-quant-model-suite",
+      available: false,
+      status: "fallback_js_calibration",
+      error: error.message,
+      fallback: "js-ensemble-weight-optimizer",
+    };
+  }
+  return summary;
 }
 
 function calibrateConfidenceValue(confidence, summary) {
@@ -3617,7 +4050,7 @@ async function updatePredictionSamples(market, incoming = [], options = {}) {
   }
   const samples = [...byId.values()];
   await writePredictionSamples(key, samples);
-  return summarizePredictionSamples(samples, key);
+  return await summarizePredictionSamplesWithLocalModel(samples, key);
 }
 
 async function fetchJson(url, timeoutMs = 10000, extraHeaders = {}) {
@@ -4052,6 +4485,9 @@ function rangeStartIso(range = "9mo") {
     "9mo": 310,
     "1y": 390,
     "2y": 760,
+    "3y": 1140,
+    "5y": 1900,
+    "10y": 3800,
   }[range] || 310;
   return new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
 }
@@ -4370,8 +4806,7 @@ function nasdaqRows(payload, range = "9mo") {
     };
   })).filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
     .sort((a, b) => a.date.localeCompare(b.date));
-  const count = range === "1mo" ? 45 : range === "3mo" ? 90 : 260;
-  return normalized.slice(-count);
+  return normalized.slice(-candleLimitForRange(range));
 }
 
 function stooqRows(csv, range = "9mo") {
@@ -4387,8 +4822,7 @@ function stooqRows(csv, range = "9mo") {
       volume: Number(volume || 0),
     };
   })).filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date));
-  const count = range === "1mo" ? 45 : range === "3mo" ? 90 : 260;
-  return rows.slice(-count);
+  return rows.slice(-candleLimitForRange(range));
 }
 
 const SATOSHIMACRO_YAHOO_MARKETS_URL = "https://satoshimacro.com/assets/data/yahoo-markets.json";
@@ -4401,12 +4835,7 @@ function satoshiMacroSeriesForIndex(code, market = "ASX") {
 }
 
 function closeOnlyLimitForRange(range = "9mo") {
-  if (range === "1mo") return 45;
-  if (range === "3mo") return 90;
-  if (range === "6mo") return 140;
-  if (range === "1y" || range === "9mo") return 260;
-  if (range === "2y") return 520;
-  return 1300;
+  return candleLimitForRange(range);
 }
 
 function fredIndexCloseRows(csv, seriesId, range = "9mo") {
@@ -4504,8 +4933,7 @@ function stockAnalysisHistoryRows(html, range = "9mo") {
     }))
   ).filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
     .sort((a, b) => a.date.localeCompare(b.date));
-  const count = range === "1mo" ? 45 : range === "3mo" ? 90 : 260;
-  return rows.slice(-count);
+  return rows.slice(-candleLimitForRange(range));
 }
 
 function quoteDateFromTimestamp(timestamp) {
@@ -5776,7 +6204,7 @@ async function fetchTwelveDataCandles(code, range, interval, market = "ASX") {
   const exchange = twelveExchangeForCode(code, key);
   if (exchange) endpoint.searchParams.set("exchange", exchange);
   endpoint.searchParams.set("interval", normalizeTwelveInterval(interval));
-  endpoint.searchParams.set("outputsize", isIntradayInterval(interval) ? "390" : range === "1mo" ? "45" : "220");
+  endpoint.searchParams.set("outputsize", String(isIntradayInterval(interval) ? 390 : Math.min(5000, candleLimitForRange(range))));
   endpoint.searchParams.set("apikey", process.env.TWELVEDATA_API_KEY);
   try {
     const payload = await fetchJson(endpoint);
@@ -5803,7 +6231,7 @@ async function fetchTwelveDataIndexCandles(code, range, interval, market = "US")
   endpoint.searchParams.set("symbol", index.twelve);
   endpoint.searchParams.set("exchange", key === "ASX" ? "ASX" : "INDEX");
   endpoint.searchParams.set("interval", normalizeTwelveInterval(interval));
-  endpoint.searchParams.set("outputsize", range === "1mo" ? "45" : "260");
+  endpoint.searchParams.set("outputsize", String(Math.min(5000, candleLimitForRange(range))));
   endpoint.searchParams.set("apikey", process.env.TWELVEDATA_API_KEY);
   try {
     const payload = await fetchJson(endpoint, 7000);
@@ -5836,11 +6264,8 @@ async function fetchEodhdCandles(code, range, interval, market = "ASX") {
       const payload = await fetchJson(endpoint, 7000);
       return { candles: eodhdIntradayRows(payload), source: `eodhd-${key.toLowerCase()}-${interval}` };
     }
-    const months = range === "1mo" ? 2 : 10;
-    const from = new Date();
-    from.setMonth(from.getMonth() - months);
     const endpoint = new URL(`https://eodhd.com/api/eod/${ticker}`);
-    endpoint.searchParams.set("from", from.toISOString().slice(0, 10));
+    endpoint.searchParams.set("from", rangeStartIso(range));
     endpoint.searchParams.set("period", interval === "1wk" ? "w" : "d");
     endpoint.searchParams.set("fmt", "json");
     endpoint.searchParams.set("api_token", process.env.EODHD_API_KEY);
@@ -6064,7 +6489,7 @@ async function fetchNasdaqUsCandles(code, range, interval) {
   if (backoff) throw new Error(backoff);
   const to = new Date();
   const from = new Date();
-  from.setMonth(from.getMonth() - (range === "1mo" ? 3 : range === "3mo" ? 6 : 16));
+  from.setTime(new Date(`${rangeStartIso(range)}T00:00:00Z`).getTime());
   const endpoint = new URL(`https://api.nasdaq.com/api/quote/${encodeURIComponent(cleanCode(code, "US"))}/historical`);
   endpoint.searchParams.set("assetclass", "stocks");
   endpoint.searchParams.set("fromdate", from.toISOString().slice(0, 10));
@@ -6105,7 +6530,7 @@ async function fetchNasdaqUsIndexCandles(code, range, interval) {
   }[cleanCode(code, "US")] || [cleanCode(code, "US").replace(/^\^/, "")];
   const to = new Date();
   const from = new Date();
-  from.setMonth(from.getMonth() - (range === "1mo" ? 3 : range === "3mo" ? 6 : 16));
+  from.setTime(new Date(`${rangeStartIso(range)}T00:00:00Z`).getTime());
   const errors = [];
   for (const candidate of symbolCandidates) {
     const endpoint = new URL(`https://api.nasdaq.com/api/quote/${encodeURIComponent(candidate)}/historical`);
@@ -6186,7 +6611,7 @@ async function fetchTencentCnCandles(code, range, interval) {
   }
 
   const period = interval === "1wk" ? "week" : "day";
-  const count = range === "1mo" ? 45 : range === "3mo" ? 90 : 260;
+  const count = candleLimitForRange(range);
   const endpoint = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},${period},,,${count},qfq`;
   const payload = await fetchJson(endpoint, 6500);
   const rows = payload?.data?.[symbol]?.[`qfq${period}`] || payload?.data?.[symbol]?.[period] || [];
@@ -6202,7 +6627,7 @@ async function fetchEastmoneyCnCandles(code, range, interval) {
   endpoint.searchParams.set("klt", eastmoneyKltForInterval(interval));
   endpoint.searchParams.set("fqt", "1");
   endpoint.searchParams.set("end", "20500101");
-  endpoint.searchParams.set("lmt", range === "1mo" ? "45" : range === "3mo" ? "90" : isIntradayInterval(interval) ? "640" : "260");
+  endpoint.searchParams.set("lmt", String(isIntradayInterval(interval) ? 640 : candleLimitForRange(range)));
   const payload = await fetchJson(endpoint, 6500);
   return { candles: eastmoneyKlinesToRows(payload), source: `eastmoney-cn-${interval}` };
 }
@@ -6422,6 +6847,12 @@ function candleLimitForRange(range = "9mo") {
   if (range === "5d") return 8;
   if (range === "1mo") return 45;
   if (range === "3mo") return 90;
+  if (range === "6mo") return 140;
+  if (range === "9mo" || range === "1y") return 260;
+  if (range === "2y") return 520;
+  if (range === "3y") return 780;
+  if (range === "5y") return 1300;
+  if (range === "10y") return 2600;
   return 260;
 }
 
@@ -7868,6 +8299,200 @@ function calibrationFactor(candles, horizon = 15, targetUpside = 5, stopLoss = 4
   };
 }
 
+async function historicalBacktestForCandles({ market, symbol, candles, strategy = {}, source = "" }) {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  const horizonDays = Number(strategy.horizonDays || 15);
+  const targetUpside = Number(strategy.targetUpside || 5);
+  const stopLoss = Number(strategy.stopLoss || 4);
+  const cacheKey = `${key}:${code}:${candles?.length || 0}:${candles?.at?.(-1)?.date || ""}:${horizonDays}:${targetUpside}:${stopLoss}`;
+  const cached = historicalBacktestCache.get(cacheKey);
+  if (cached && Date.now() - cached.time < Number(process.env.HISTORICAL_BACKTEST_CACHE_TTL_MS || 30 * 60 * 1000)) return cached.value;
+  const result = await runPythonQuantCore("historical-backtest", {
+    market: key,
+    symbol: code,
+    candles: sanitizeCandleRows(candles || []),
+    horizon_days: horizonDays,
+    target_upside: targetUpside,
+    stop_loss: stopLoss,
+    min_train: Number(process.env.HISTORICAL_BACKTEST_MIN_TRAIN || 120),
+    step: Number(process.env.HISTORICAL_BACKTEST_STEP || 5),
+    step_schedule: numberListEnv(process.env.HISTORICAL_BACKTEST_STEP_SCHEDULE, [Number(process.env.HISTORICAL_BACKTEST_STEP || 5)]),
+    max_step_offsets: Number(process.env.HISTORICAL_BACKTEST_MAX_STEP_OFFSETS || 2),
+    max_predictions: Number(process.env.HISTORICAL_BACKTEST_MAX_PREDICTIONS || 2200),
+    retrain_interval: Number(process.env.HISTORICAL_BACKTEST_RETRAIN_INTERVAL || 60),
+    max_train_window: Number(process.env.HISTORICAL_BACKTEST_TRAIN_WINDOW || 240),
+    knn_window: Number(process.env.HISTORICAL_BACKTEST_KNN_WINDOW || 260),
+  }, Number(process.env.HISTORICAL_BACKTEST_TIMEOUT_MS || 18000));
+  const value = {
+    ...result,
+    market: key,
+    symbol: code,
+    marketSource: source || result.source || "historical-market-data",
+  };
+  historicalBacktestCache.set(cacheKey, { time: Date.now(), value });
+  if (historicalBacktestCache.size > 120) historicalBacktestCache.delete(historicalBacktestCache.keys().next().value);
+  return value;
+}
+
+function historicalBacktestFactor(result) {
+  if (!result?.available) {
+    return {
+      available: false,
+      source: "historical-walk-forward-unavailable",
+      score: 0,
+      thesis: [result?.reason || "Historical walk-forward backtest did not have enough real candles."],
+      values: { samples: 0, hitRate: 0, stopRate: 0, avgReturn: 0 },
+    };
+  }
+  const values = result.values || {};
+  const samples = Number(values.samples || result.metrics?.buySignals || result.metrics?.samples || 0);
+  const predictionCuts = Number(result.dataDepth?.predictionCuts || result.metrics?.samples || samples || 0);
+  const hitRate = Number(values.hitRate ?? result.metrics?.targetHitRate ?? 0);
+  const stopRate = Number(values.stopRate ?? result.metrics?.stopRate ?? 0);
+  const avgReturn = Number(values.avgReturn ?? result.metrics?.avgForwardReturn ?? 0);
+  const brier = Number(values.brierTarget ?? result.metrics?.brierTarget ?? 0);
+  const predictionCalibration = result.predictionCalibration || {};
+  const predictionDirection = Number(predictionCalibration.test?.directionHitRate || 0);
+  const predictionLift = Number(predictionCalibration.directionLiftPct || 0);
+  const predictionActive = !!predictionCalibration.active;
+  const predictionScore = predictionCalibration.available
+    ? clampNumber((predictionDirection - 50) / 3.6 + predictionLift * 0.12 + (predictionActive ? 1.2 : -0.6), -4, 4)
+    : 0;
+  const score = clampNumber((hitRate - 52) / 3.2 + avgReturn * 0.28 - stopRate * 0.04 - Math.max(0, brier - 0.25) * 10 + predictionScore, -12, 12);
+  return {
+    available: predictionCuts >= 12,
+    source: "historical-walk-forward-backtest",
+    score,
+    thesis: [
+      ...(result.thesis || [
+        `Historical walk-forward: ${samples} point-in-time cuts, target-hit ${hitRate.toFixed(0)}%, stop-first ${stopRate.toFixed(0)}%, avg return ${avgReturn.toFixed(2)}%.`,
+      ]),
+      predictionCalibration.available
+        ? `Prediction-weight calibration: ${predictionCalibration.horizonLabel || ""}${predictionCalibration.horizonDays || ""}d ${predictionCalibration.status || "research"}; holdout direction ${predictionDirection.toFixed(0)}%, lift ${predictionLift.toFixed(1)}pct.`
+        : "Prediction-weight calibration is still collecting historical cuts.",
+    ],
+    values: {
+      ...values,
+      samples,
+      hitRate,
+      stopRate,
+      avgReturn,
+      directionHitRate: Number(values.directionHitRate ?? result.metrics?.directionHitRate ?? 0),
+      brierTarget: Number(values.brierTarget ?? result.metrics?.brierTarget ?? 0),
+      candleCount: result.candleCount,
+      trainSamplesMedian: result.dataDepth?.trainSamplesMedian || 0,
+      predictionCuts,
+      buySignals: result.metrics?.buySignals || 0,
+      predictionCalibrationActive: predictionActive,
+      predictionCalibrationDirectionHitRate: predictionDirection,
+      predictionCalibrationLiftPct: predictionLift,
+    },
+    backtest: {
+      framework: result.framework,
+      dataDepth: result.dataDepth,
+      metrics: result.metrics,
+      benchmarks: result.benchmarks,
+      model: result.model,
+      dateRange: result.dateRange,
+      predictionCalibration,
+    },
+  };
+}
+
+function numberListEnv(value, fallback = []) {
+  if (Array.isArray(value)) return value.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item > 0);
+  const rows = String(value || "").split(",").map((item) => Number(item.trim())).filter((item) => Number.isFinite(item) && item > 0);
+  return rows.length ? rows : fallback;
+}
+
+async function fetchBacktestCandlesForSymbol(symbol, market, range = "5y") {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  try {
+    const data = await fetchMarketCandles(code, range, "1d", key);
+    return { symbol: code, market: key, candles: data.candles || [], source: data.source || "market-data", warning: data.warning || "" };
+  } catch (marketError) {
+    const fallback = await fetchSnapshotMarketCandles(code, range, "1d", key, marketError)
+      || await fetchCachedMarketHistory(code, range, "1d", key, marketError);
+    if (fallback?.candles?.length) {
+      return { symbol: code, market: key, candles: fallback.candles, source: fallback.source || "snapshot-or-cache", warning: fallback.warning || marketError.message };
+    }
+    return { symbol: code, market: key, candles: [], source: "unavailable", warning: marketError.message || String(marketError), error: marketError.message || String(marketError) };
+  }
+}
+
+async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy = {}, range = "5y", limit = 20 } = {}) {
+  const key = safeMarket(market);
+  const uniqueSymbols = [...new Set((symbols || []).map((symbol) => normalizeMarketSymbol(symbol, key)).filter(Boolean))].slice(0, Math.max(1, Math.min(80, Number(limit || 20))));
+  const concurrency = Math.max(1, Math.min(5, Number(process.env.HISTORICAL_BACKTEST_FETCH_CONCURRENCY || 4)));
+  const items = [];
+  let cursor = 0;
+  async function worker() {
+    while (cursor < uniqueSymbols.length) {
+      const current = uniqueSymbols[cursor];
+      cursor += 1;
+      const item = await fetchBacktestCandlesForSymbol(current, key, range);
+      items.push(item);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, uniqueSymbols.length) }, () => worker()));
+  const strategyHorizon = Math.max(1, Number(strategy.horizonDays || 15));
+  const horizons = [...new Set([
+    5,
+    strategyHorizon,
+    Math.max(30, strategyHorizon >= 25 ? strategyHorizon : 30),
+  ].map((value) => Math.max(1, Math.round(Number(value || 15)))))].slice(0, 4);
+  const defaultStep = Number(process.env.HISTORICAL_BACKTEST_BATCH_STEP || process.env.HISTORICAL_BACKTEST_STEP || 4);
+  const stepSchedule = numberListEnv(process.env.HISTORICAL_BACKTEST_BATCH_STEP_SCHEDULE || process.env.HISTORICAL_BACKTEST_STEP_SCHEDULE, [2, 3, 5, Math.max(1, defaultStep)]);
+  const result = await runPythonQuantCore("historical-backtest-batch", {
+    market: key,
+    items,
+    horizon_days: strategyHorizon,
+    horizons,
+    target_upside: Number(strategy.targetUpside || 5),
+    stop_loss: Number(strategy.stopLoss || 4),
+    min_train: Number(process.env.HISTORICAL_BACKTEST_MIN_TRAIN || 120),
+    step: defaultStep,
+    step_schedule: stepSchedule,
+    max_step_offsets: Number(process.env.HISTORICAL_BACKTEST_BATCH_MAX_STEP_OFFSETS || process.env.HISTORICAL_BACKTEST_MAX_STEP_OFFSETS || 2),
+    max_predictions: Number(process.env.HISTORICAL_BACKTEST_MAX_PREDICTIONS || 1400),
+    retrain_interval: Number(process.env.HISTORICAL_BACKTEST_RETRAIN_INTERVAL || 60),
+    max_train_window: Number(process.env.HISTORICAL_BACKTEST_TRAIN_WINDOW || 240),
+    knn_window: Number(process.env.HISTORICAL_BACKTEST_KNN_WINDOW || 260),
+  }, Number(process.env.HISTORICAL_BACKTEST_BATCH_TIMEOUT_MS || 65000));
+  const finalResult = {
+    ...result,
+    range,
+    horizons,
+    requestedSymbols: uniqueSymbols,
+    dataSources: items.map((item) => ({
+      symbol: item.symbol,
+      source: item.source,
+      candles: item.candles?.length || 0,
+      warning: item.warning || item.error || "",
+    })),
+    generatedAt: new Date().toISOString(),
+  };
+  const savedModel = await writePredictionWeightModelSnapshot(key, finalResult).catch(() => null);
+  if (savedModel) {
+    await appendModelChangeLogFile(key, {
+      event_type: "model-change-log-prediction-weight-calibration",
+      entity_id: `${key}:prediction-weight:${savedModel.savedAt}`,
+      payload: {
+        title: "历史预测权重校准已更新",
+        type: "prediction-weight-calibration",
+        market: key,
+        sampleTotal: savedModel.sampleTotal,
+        symbolCount: savedModel.symbolCount,
+        horizonCalibrations: savedModel.horizonCalibrations,
+        leakageControl: savedModel.leakageControl,
+      },
+    }).catch(() => null);
+  }
+  return { ...finalResult, savedModel };
+}
+
 function marketRegimeFactor(candles) {
   const rows = sanitizeCandleRows(candles);
   if (rows.length < 70) return { available: false, source: "market-regime-local", score: 0, thesis: ["Not enough candles for market regime classification."] };
@@ -7904,7 +8529,8 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
   const cacheKey = `${key}:${code}:${strategy.horizonDays || 15}:${strategy.targetUpside || 5}`;
   const cached = factorResponseCache.get(cacheKey);
   if (cached && Date.now() - cached.time < Number(process.env.FACTOR_CACHE_TTL_MS || 10 * 60 * 1000)) return cached.value;
-  const marketData = await fetchMarketCandles(symbol, "9mo", "1d", key);
+  const factorBacktestRange = process.env.FACTOR_BACKTEST_RANGE || "2y";
+  const marketData = await fetchMarketCandles(symbol, factorBacktestRange, "1d", key);
   const candles = marketData.candles || [];
   const results = await Promise.allSettled([
     fetchAsxAnnouncementsFactor(symbol, key),
@@ -7914,8 +8540,12 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     fetchRelativeStrengthFactor(symbol, candles, key),
     fetchFlowOptionsFactor(symbol, key, candles),
     fetchRedditSocialFactor(symbol, key, { mode: "local", limit: 10 }),
+    historicalBacktestForCandles({ market: key, symbol, candles, strategy, source: marketData.source }),
   ]);
   const get = (index, fallback) => results[index].status === "fulfilled" ? results[index].value : fallback(results[index].reason);
+  const historicalBacktest = get(7, (error) => ({ available: false, reason: `Historical walk-forward unavailable: ${error.message || error}` }));
+  const historicalCalibration = historicalBacktestFactor(historicalBacktest);
+  const simpleCalibration = calibrationFactor(candles, Number(strategy.horizonDays || 15), Number(strategy.targetUpside || 5), Number(strategy.stopLoss || 4));
   const factors = {
     announcements: get(0, (error) => ({ available: false, source: "asx-announcements-unavailable", score: 0, thesis: [`ASX announcement factor unavailable: ${error.message || error}`] })),
     shortInterest: get(1, (error) => ({ available: false, source: "asic-short-unavailable", score: 0, thesis: [`ASIC short-interest factor unavailable: ${error.message || error}`] })),
@@ -7926,7 +8556,9 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     socialMedia: get(6, (error) => ({ available: false, source: "reddit-social-unavailable", score: 0, weight: 0, confidence: 0, sentiment: 0, manipulationRisk: 0, truthScore: 0, items: [], topItems: [], thesis: [`Reddit social factor unavailable: ${error.message || error}`] })),
     marketRegime: marketRegimeFactor(candles),
     liquidity: liquidityFactor(candles),
-    calibration: calibrationFactor(candles, Number(strategy.horizonDays || 15), Number(strategy.targetUpside || 5), Number(strategy.stopLoss || 4)),
+    calibration: historicalCalibration.available ? historicalCalibration : simpleCalibration,
+    historicalCalibration,
+    simpleCalibration,
   };
   const signal = factorSignal(factors);
   const value = { symbol: normalizeMarketSymbol(symbol, key), market: key, source: "factor-layer", factors, signal };
@@ -8168,6 +8800,55 @@ function applyPerformanceAndRegimeWeights(models = [], calibrationSummary = {}, 
     }
   }
   return adjusted;
+}
+
+function applyOptimizedEnsembleWeights(models = [], calibrationSummary = {}) {
+  const optimization = calibrationSummary?.ensembleWeightOptimization || {};
+  if (!optimization.active || !optimization.weights || typeof optimization.weights !== "object") {
+    return {
+      applied: false,
+      status: optimization.status || "unavailable",
+      reason: optimization.reason || "No OOS-approved learned ensemble weights yet.",
+      sampleCount: Number(optimization.sampleCount || 0),
+    };
+  }
+  const available = models.filter((model) => model.available && Number(model.weight || 0) > 0);
+  if (!available.length) {
+    return { applied: false, status: "no_available_models", reason: "No available models to receive optimized weights." };
+  }
+  const learnedRaw = available.map((model) => Math.max(0, Number(optimization.weights[model.name] || 0)));
+  const learnedTotal = learnedRaw.reduce((sum, value) => sum + value, 0);
+  if (learnedTotal <= 0) {
+    return {
+      applied: false,
+      status: "no_overlap",
+      reason: "Current ensemble models do not overlap with learned weight vector.",
+      sampleCount: Number(optimization.sampleCount || 0),
+    };
+  }
+  const currentTotal = available.reduce((sum, model) => sum + Number(model.weight || 0), 0) || 1;
+  const blend = clampNumber(Number(optimization.deploymentBlend || 0.45), 0.2, 0.85);
+  available.forEach((model, index) => {
+    const currentNormalized = Number(model.weight || 0) / currentTotal;
+    const learnedNormalized = learnedRaw[index] / learnedTotal;
+    const blendedNormalized = (1 - blend) * currentNormalized + blend * learnedNormalized;
+    model.weight = Number((blendedNormalized * currentTotal).toFixed(5));
+    model.values = {
+      ...(model.values || {}),
+      optimizedEnsembleWeight: Number(learnedNormalized.toFixed(5)),
+      optimizedWeightBlend: blend,
+    };
+  });
+  return {
+    applied: true,
+    status: optimization.status || "active",
+    sampleCount: Number(optimization.sampleCount || 0),
+    modelCount: Number(optimization.modelCount || Object.keys(optimization.weights || {}).length),
+    deploymentBlend: blend,
+    testImprovementPct: optimization.testImprovementPct ?? null,
+    validationImprovementPct: optimization.validationImprovementPct ?? null,
+    reason: optimization.reason || "OOS-approved learned ensemble weights applied.",
+  };
 }
 
 function fundamentalsView(fundamentals) {
@@ -8560,6 +9241,175 @@ function metaLabelOosDistilledView({ analog, technicals, strategy }) {
   );
 }
 
+function evaluateLocalLinearHead(head, featureValues = {}) {
+  if (!head?.active || !head.model?.weights || !head.model?.centers || !head.model?.scales) return null;
+  const model = head.model;
+  let value = finiteNumber(model.intercept, 0);
+  for (const [name, weight] of Object.entries(model.weights || {})) {
+    const raw = finiteNumber(featureValues[name], finiteNumber(model.centers?.[name], 0));
+    const center = finiteNumber(model.centers?.[name], 0);
+    const scale = Math.max(1e-9, finiteNumber(model.scales?.[name], 1));
+    value += finiteNumber(weight, 0) * ((raw - center) / scale);
+  }
+  return Number(value.toFixed(4));
+}
+
+function sigmoid(value) {
+  return 1 / (1 + Math.exp(-clampNumber(Number(value || 0), -18, 18)));
+}
+
+function buildLocalModelFeatureValues({ technicals, analog, macroSignal, socialSignal, factor, strategy, preliminary = {} }) {
+  const newsCount = finiteNumber(macroSignal?.checkedItems, 0);
+  const socialCount = finiteNumber(socialSignal?.checkedItems, 0);
+  const projectedFinalReturn = finiteNumber(preliminary.projectedFinalReturn ?? analog?.model?.predictedReturn ?? technicals?.projectedUpside, 0);
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const projectedMaxUpside = Math.max(
+    0,
+    finiteNumber(analog?.model?.predictedMaxUpside, 0),
+    finiteNumber(analog?.averageMaxUpside, 0),
+    projectedFinalReturn > 0 ? projectedFinalReturn * 1.15 : target * 0.25,
+  );
+  return {
+    trend: finiteNumber(technicals?.trendScore, 50),
+    momentum: finiteNumber(technicals?.momentumScore, 50),
+    change5d: finiteNumber(technicals?.change5d, 0),
+    change20d: finiteNumber(technicals?.change20d, 0),
+    volumeRatio: finiteNumber(technicals?.volumeRatio, 1),
+    rsi: finiteNumber(technicals?.rsi, 50),
+    volume: finiteNumber(technicals?.volumeScore, 50),
+    risk: finiteNumber(technicals?.riskScore, 50),
+    factor: finiteNumber(factor?.score, 0),
+    analogConfidence: finiteNumber(analog?.confidence, 0),
+    modelConfidence: finiteNumber(analog?.model?.confidence, 0),
+    newsCount,
+    xCount: 0,
+    youtubeCount: socialCount,
+    factorCount: finiteNumber(factor?.checked, 0),
+    upsideAgreement: finiteNumber(preliminary.upsideAgreement, 50),
+    consensusAgreement: finiteNumber(preliminary.consensusAgreement, 50),
+    predictionConfidence: finiteNumber(preliminary.confidence ?? analog?.model?.confidence ?? analog?.confidence, 50),
+    strategyHitProbability: finiteNumber(analog?.strategyHitProbability ?? analog?.targetHitRate, 0),
+    magnitudeHitProbability: finiteNumber(analog?.maxUpsideHitRate ?? analog?.targetHitRate, 0),
+    projectedFinalReturn,
+    projectedMaxUpside,
+  };
+}
+
+function preliminaryModelConsensus(models = []) {
+  const available = models.filter((model) => model.available && model.weight > 0);
+  const totalWeight = available.reduce((sum, model) => sum + Number(model.weight || 0), 0) || 1;
+  const weightedUpside = available.reduce((sum, model) => sum + Number(model.projectedUpside || 0) * (Number(model.weight || 0) / totalWeight), 0);
+  const weightedConfidence = available.reduce((sum, model) => sum + Number(model.confidence || 0) * (Number(model.weight || 0) / totalWeight), 0);
+  const directional = available.filter((model) => Math.abs(Number(model.projectedUpside || 0)) >= 0.15);
+  const directionalWeight = directional.reduce((sum, model) => sum + Number(model.weight || 0) / totalWeight, 0) || 1;
+  const upsideWeight = directional.filter((model) => Number(model.projectedUpside || 0) > 0).reduce((sum, model) => sum + Number(model.weight || 0) / totalWeight, 0);
+  const downsideWeight = directional.filter((model) => Number(model.projectedUpside || 0) < 0).reduce((sum, model) => sum + Number(model.weight || 0) / totalWeight, 0);
+  return {
+    projectedFinalReturn: Number(weightedUpside.toFixed(3)),
+    confidence: Number(weightedConfidence.toFixed(1)),
+    upsideAgreement: Number((upsideWeight / directionalWeight * 100).toFixed(1)),
+    consensusAgreement: Number((Math.max(upsideWeight, downsideWeight) / directionalWeight * 100).toFixed(1)),
+  };
+}
+
+function localPythonSignalModelViews({ technicals, analog, macroSignal, socialSignal, factor, strategy, calibrationSummary, preliminary }) {
+  const signalModels = calibrationSummary?.localSignalModels || {};
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const features = buildLocalModelFeatureValues({ technicals, analog, macroSignal, socialSignal, factor, strategy, preliminary });
+  const views = [];
+  const featurePrediction = evaluateLocalLinearHead(signalModels.featureScoreHead, features);
+  if (featurePrediction != null) {
+    const test = signalModels.featureScoreHead.test || {};
+    const confidence = clampNumber(50 + finiteNumber(test.directionHitRate, 50) * 0.28 + finiteNumber(test.improvementPct, 0) * 0.5, 0, 92);
+    views.push(ensembleModel(
+      "Python-特征分模型",
+      confidence,
+      clampNumber(featurePrediction, -Math.max(target, 6), target * 1.35),
+      0.07,
+      true,
+      `Local ridge head on technical/order features; OOS improvement ${finiteNumber(test.improvementPct, 0).toFixed(1)}%, direction ${finiteNumber(test.directionHitRate, 0).toFixed(0)}%.`,
+      { family: "python-local", head: "feature_score_head", predictedReturn: featurePrediction, oosImprovement: finiteNumber(test.improvementPct, 0), featureValues: features },
+    ));
+  }
+  const factorPrediction = evaluateLocalLinearHead(signalModels.factorScoreHead, features);
+  if (factorPrediction != null) {
+    const test = signalModels.factorScoreHead.test || {};
+    const confidence = clampNumber(50 + finiteNumber(test.directionHitRate, 50) * 0.28 + finiteNumber(test.improvementPct, 0) * 0.5, 0, 92);
+    views.push(ensembleModel(
+      "Python-因子分模型",
+      confidence,
+      clampNumber(factorPrediction, -Math.max(target, 6), target * 1.35),
+      0.07,
+      true,
+      `Local ridge head on factor/news/history features; OOS improvement ${finiteNumber(test.improvementPct, 0).toFixed(1)}%, direction ${finiteNumber(test.directionHitRate, 0).toFixed(0)}%.`,
+      { family: "python-local", head: "factor_score_head", predictedReturn: factorPrediction, oosImprovement: finiteNumber(test.improvementPct, 0), featureValues: features },
+    ));
+  }
+  const metaLogit = evaluateLocalLinearHead(signalModels.backtestMetaHead, features);
+  if (metaLogit != null) {
+    const probability = sigmoid(metaLogit) * 100;
+    const test = signalModels.backtestMetaHead.test || {};
+    const projected = (probability - 50) / 50 * target;
+    views.push(ensembleModel(
+      "Python-回测Meta模型",
+      clampNumber(probability, 0, 92),
+      clampNumber(projected, -target, target * 1.15),
+      0.08,
+      true,
+      `Local logistic meta-label predicts target-before-stop ${probability.toFixed(0)}%; test Brier improvement ${finiteNumber(test.improvementPct, 0).toFixed(1)}%.`,
+      { family: "python-local", head: "backtest_meta_head", targetHitProbability: Number(probability.toFixed(1)), oosImprovement: finiteNumber(test.improvementPct, 0), featureValues: features },
+    ));
+  }
+  const stopLogit = evaluateLocalLinearHead(signalModels.stopRiskHead, features);
+  if (stopLogit != null) {
+    const probability = sigmoid(stopLogit) * 100;
+    const test = signalModels.stopRiskHead.test || {};
+    const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+    views.push(ensembleModel(
+      "Python-止损风险模型",
+      clampNumber(probability, 0, 94),
+      -clampNumber((probability / 100) * stop, 0, stop * 1.25),
+      0.085,
+      true,
+      `Local stop-first meta model estimates stop risk ${probability.toFixed(0)}%; test Brier improvement ${finiteNumber(test.improvementPct, 0).toFixed(1)}%.`,
+      { family: "python-local", head: "stop_risk_head", stopRiskProbability: Number(probability.toFixed(1)), oosImprovement: finiteNumber(test.improvementPct, 0), featureValues: features },
+    ));
+  }
+  const tradeQualityLogit = evaluateLocalLinearHead(signalModels.tradeQualityHead, features);
+  if (tradeQualityLogit != null) {
+    const probability = sigmoid(tradeQualityLogit) * 100;
+    const test = signalModels.tradeQualityHead.test || {};
+    const projected = (probability - 50) / 50 * target;
+    views.push(ensembleModel(
+      "Python-交易质量模型",
+      clampNumber(probability, 0, 92),
+      clampNumber(projected, -target, target * 1.2),
+      0.075,
+      true,
+      `Local trade-quality model estimates target-before-stop quality ${probability.toFixed(0)}%; test Brier improvement ${finiteNumber(test.improvementPct, 0).toFixed(1)}%.`,
+      { family: "python-local", head: "trade_quality_head", tradeQualityProbability: Number(probability.toFixed(1)), oosImprovement: finiteNumber(test.improvementPct, 0), featureValues: features },
+    ));
+  }
+  return views;
+}
+
+function localNoTradeEvidenceFromEnsemble(ensemble = {}) {
+  const models = Array.isArray(ensemble.models) ? ensemble.models : [];
+  const stopRisks = models
+    .map((model) => Number(model?.values?.stopRiskProbability))
+    .filter((value) => Number.isFinite(value));
+  const tradeQualities = models
+    .map((model) => Number(model?.values?.tradeQualityProbability ?? model?.values?.targetHitProbability))
+    .filter((value) => Number.isFinite(value));
+  const stopRiskProbability = stopRisks.length ? Math.max(...stopRisks) : null;
+  const tradeQualityProbability = tradeQualities.length ? Math.max(...tradeQualities) : null;
+  return {
+    active: stopRiskProbability != null || tradeQualityProbability != null,
+    stopRiskProbability,
+    tradeQualityProbability,
+  };
+}
+
 function rebalanceModelAgreementWeights(models = []) {
   const active = models.filter((model) => model.available && model.weight > 0 && Math.abs(Number(model.projectedUpside || 0)) >= 0.15);
   if (active.length < 3) return { majority: "mixed", agreementRatio: 0, boosted: 0 };
@@ -8707,8 +9557,22 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     riskRewardView(technicals, strategy),
     fundamentalsView(fundamentals),
   ];
+  const localSignalViews = localPythonSignalModelViews({
+    technicals,
+    analog,
+    macroSignal,
+    socialSignal,
+    factor,
+    strategy,
+    calibrationSummary,
+    preliminary: preliminaryModelConsensus(models),
+  });
+  if (localSignalViews.length) {
+    models.push(...localSignalViews);
+  }
   const performanceWeightAdjusted = applyPerformanceAndRegimeWeights(models, calibrationSummary, marketProfile);
   const agreementWeighting = rebalanceModelAgreementWeights(models);
+  const optimizedWeighting = applyOptimizedEnsembleWeights(models, calibrationSummary);
   const available = models.filter((model) => model.available && model.weight > 0);
   const totalWeight = available.reduce((sum, model) => sum + model.weight, 0) || 1;
   for (const model of models) {
@@ -8747,6 +9611,8 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     disagreementPenalty: Number(disagreementPenalty.toFixed(2)),
     evidenceBonus: Number(evidenceBonus.toFixed(2)),
     agreementWeighting,
+    optimizedWeighting,
+    weightingMethod: optimizedWeighting.applied ? "oos-optimized-simplex" : "prior-performance-regime",
     marketRegime: marketProfile,
     performanceWeightAdjusted,
     historyGate: {
@@ -8771,7 +9637,7 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   };
 }
 
-function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, targetUpside, targetConfidence, marketValidation, calibration, strategyCalibration, market }) {
+function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, targetUpside, targetConfidence, marketValidation, calibration, strategyCalibration, walkForwardCalibration, market }) {
   const availableModelCount = Number(ensemble.availableModelCount || 0);
   const consensus = Number(ensemble.consensusAgreement || 0);
   const upsideAgreement = Number(ensemble.upsideAgreement || 0);
@@ -8795,6 +9661,35 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     && strategyHitProbability >= strategyProbabilityTarget
     && historyReliability >= 52
     && !historyGate.blocksUpside;
+  const walkValues = walkForwardCalibration?.values || {};
+  const walkSamples = Number(walkValues.samples || 0);
+  const walkHitRate = Number(walkValues.hitRate || 0);
+  const walkStopRate = Number(walkValues.stopRate || 0);
+  const walkAvgReturn = Number(walkValues.avgReturn || 0);
+  const minWalkSamples = stricterMarket ? 12 : 8;
+  const walkBacktestPassed = walkSamples >= minWalkSamples
+    && walkHitRate >= Math.max(52, strategyProbabilityTarget - 8)
+    && walkStopRate <= 46
+    && walkAvgReturn > -0.15;
+  const oosBacktestPassed = historyOkForBuy
+    && historyReliability >= 52
+    && strategyHitProbability >= strategyProbabilityTarget
+    && historySamplePower >= 0.32;
+  const positiveNeedsBacktest = Number(projectedUpsideRaw || 0) > 0;
+  const backtestPassed = !positiveNeedsBacktest || walkBacktestPassed || oosBacktestPassed;
+  const noTradeEvidence = localNoTradeEvidenceFromEnsemble(ensemble);
+  const stopRiskLimit = stricterMarket ? 62 : 68;
+  const minTradeQuality = Math.max(stricterMarket ? 55 : 50, strategyProbabilityTarget - (stricterMarket ? 8 : 10));
+  const noTradeReasons = [];
+  let noTradeBlocked = false;
+  if (noTradeEvidence.stopRiskProbability != null && Number(noTradeEvidence.stopRiskProbability) >= stopRiskLimit) {
+    noTradeBlocked = true;
+    noTradeReasons.push(`本地止损风险模型过高 ${Number(noTradeEvidence.stopRiskProbability).toFixed(0)}% / 上限 ${stopRiskLimit}%`);
+  }
+  if (noTradeEvidence.tradeQualityProbability != null && Number(noTradeEvidence.tradeQualityProbability) < minTradeQuality) {
+    noTradeBlocked = true;
+    noTradeReasons.push(`本地交易质量不足 ${Number(noTradeEvidence.tradeQualityProbability).toFixed(0)}% / 要求 ${minTradeQuality.toFixed(0)}%`);
+  }
 
   let shrink = 0.68;
   if (consensus >= 82 && upsideAgreement >= 70) shrink += 0.14;
@@ -8810,6 +9705,18 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   if (Number(projectedUpsideRaw || 0) > 0 && historySamplePower >= 0.25) {
     if (historyOkForBuy) shrink += 0.05;
     else shrink -= stricterMarket ? 0.24 : 0.18;
+  }
+  if (positiveNeedsBacktest && !backtestPassed) shrink -= stricterMarket ? 0.24 : 0.18;
+  if (positiveNeedsBacktest && walkSamples >= minWalkSamples && walkHitRate < 50) shrink -= 0.12;
+  if (positiveNeedsBacktest && walkStopRate > 48) shrink -= 0.08;
+  if (positiveNeedsBacktest && noTradeBlocked) shrink -= stricterMarket ? 0.18 : 0.14;
+  if (
+    positiveNeedsBacktest
+    && !noTradeBlocked
+    && noTradeEvidence.stopRiskProbability != null
+    && Number(noTradeEvidence.stopRiskProbability) >= stopRiskLimit - 6
+  ) {
+    shrink -= 0.07;
   }
   shrink = clampNumber(shrink, stricterMarket ? 0.36 : 0.42, 0.9);
 
@@ -8862,6 +9769,30 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     if (historyReliability > 0 && historyReliability < 45) confidenceCap = Math.min(confidenceCap, 58);
     reasons.push(`策略达标概率不足 ${strategyHitProbability ? `${strategyHitProbability.toFixed(0)}%` : "样本不足"} / 目标 ${strategyProbabilityTarget.toFixed(0)}%`);
   }
+  if (positiveNeedsBacktest && !backtestPassed) {
+    confidenceCap = Math.min(confidenceCap, walkSamples >= minWalkSamples ? 58 : 55);
+    reasons.push(walkSamples >= minWalkSamples
+      ? `本地walk-forward回测未达标：${walkHitRate.toFixed(0)}%命中、${walkStopRate.toFixed(0)}%先止损`
+      : `本地walk-forward回测样本不足：${walkSamples}/${minWalkSamples}`);
+  }
+  if (positiveNeedsBacktest && walkSamples >= minWalkSamples && walkHitRate < 50) {
+    confidenceCap = Math.min(confidenceCap, 52);
+    reasons.push(`回测命中率低于50%，禁止高置信正向预测`);
+  }
+  if (positiveNeedsBacktest && walkStopRate > 52) {
+    confidenceCap = Math.min(confidenceCap, 54);
+    reasons.push(`历史同类信号先止损率过高 ${walkStopRate.toFixed(0)}%`);
+  }
+  if (noTradeBlocked) {
+    confidenceCap = Math.min(confidenceCap, stricterMarket ? 54 : 58);
+    reasons.push(...noTradeReasons);
+  } else if (
+    noTradeEvidence.stopRiskProbability != null
+    && Number(noTradeEvidence.stopRiskProbability) >= stopRiskLimit - 6
+  ) {
+    confidenceCap = Math.min(confidenceCap, 66);
+    reasons.push(`本地止损风险接近上限 ${Number(noTradeEvidence.stopRiskProbability).toFixed(0)}%`);
+  }
 
   let confidenceBonus = 0;
   if (consensus >= 76 && availableModelCount >= 5 && disagreement <= 4) confidenceBonus += 2;
@@ -8878,7 +9809,9 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     && availableModelCount >= 4
     && disagreement <= maxBuyDisagreement
     && strategyHitProbability >= strategyProbabilityTarget
-    && historyOkForBuy;
+    && historyOkForBuy
+    && backtestPassed
+    && !noTradeBlocked;
 
   return {
     confidence,
@@ -8897,11 +9830,33 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     minBuyConsensus,
     minBuyUpsideAgreement,
     maxBuyDisagreement,
+    noTradeGate: {
+      active: noTradeEvidence.active,
+      blocked: noTradeBlocked,
+      stopRiskProbability: noTradeEvidence.stopRiskProbability == null ? null : Number(Number(noTradeEvidence.stopRiskProbability).toFixed(1)),
+      tradeQualityProbability: noTradeEvidence.tradeQualityProbability == null ? null : Number(Number(noTradeEvidence.tradeQualityProbability).toFixed(1)),
+      stopRiskLimit,
+      minTradeQuality: Number(minTradeQuality.toFixed(1)),
+      reasons: noTradeReasons,
+      framework: "python-local-no-trade-meta-gate",
+    },
     historyGate: {
       ...historyGate,
       okForBuy: historyOkForBuy,
       strategyHitProbability: Number(strategyHitProbability.toFixed(1)),
       rawStrategyHitProbability: Number(rawStrategyHitProbability.toFixed(1)),
+    },
+    backtestGate: {
+      passed: backtestPassed,
+      walkForwardPassed: walkBacktestPassed,
+      oosPassed: oosBacktestPassed,
+      samples: walkSamples,
+      minSamples: minWalkSamples,
+      hitRate: Number(walkHitRate.toFixed(1)),
+      stopRate: Number(walkStopRate.toFixed(1)),
+      avgReturn: Number(walkAvgReturn.toFixed(2)),
+      requiredHitRate: Number(Math.max(52, strategyProbabilityTarget - 8).toFixed(1)),
+      reason: backtestPassed ? "passed" : "positive forecast blocked until walk-forward/OOS validation improves",
     },
   };
 }
@@ -9112,6 +10067,7 @@ function localAnalysis(input) {
     marketValidation,
     calibration,
     strategyCalibration,
+    walkForwardCalibration: factors?.calibration,
     market,
   });
   const calibratedScore = conservative.confidence;
@@ -9168,6 +10124,7 @@ function localAnalysis(input) {
       adaptivePatternPenalty: adaptive.patternPenalty,
       adaptiveMatchedPatterns: adaptive.matchedPatterns,
       strategyProbabilityTarget: conservative.strategyProbabilityTarget,
+      noTradeGate: conservative.noTradeGate,
       magnitudeHitProbability: magnitude.probability,
       magnitudeBasis: magnitude.basis,
       projectedMaxUpside: maxUpside.projectedMaxUpside,
@@ -9200,6 +10157,10 @@ function localAnalysis(input) {
       `Model cross-check: evidence bonus ${finiteNumber(ensemble.evidenceBonus, 0).toFixed(1)}%, disagreement penalty ${finiteNumber(ensemble.disagreementPenalty, 0).toFixed(1)}%.`,
       adaptive.reasons.length ? `Adaptive learning: ${adaptive.reasons.join("；")}。旧预测会保留到周期结束并持续校准短/中/长期参数。` : "Adaptive learning: no material penalty from prior forecast outcomes yet.",
       `Conservative calibration: projected upside shrink ${conservative.shrink}x, confidence cap ${conservative.confidenceCap}%, ${conservative.buyEligible ? "high-conviction gate passed" : `high-conviction gate blocked (${conservative.reasons.join("、") || "证据仍不足"})`}.`,
+      conservative.noTradeGate?.active
+        ? `No-Trade meta gate: ${conservative.noTradeGate.blocked ? "blocked" : "passed"}; stop-risk ${conservative.noTradeGate.stopRiskProbability == null ? "n/a" : `${Number(conservative.noTradeGate.stopRiskProbability).toFixed(0)}%`} / limit ${conservative.noTradeGate.stopRiskLimit}%, trade-quality ${conservative.noTradeGate.tradeQualityProbability == null ? "n/a" : `${Number(conservative.noTradeGate.tradeQualityProbability).toFixed(0)}%`} / required ${Number(conservative.noTradeGate.minTradeQuality || 0).toFixed(0)}%.`
+        : "No-Trade meta gate: local stop-risk/trade-quality heads are still collecting samples.",
+      `Backtest gate: ${conservative.backtestGate?.passed ? "passed" : "blocked"}; local walk-forward ${conservative.backtestGate?.samples || 0}/${conservative.backtestGate?.minSamples || 0} samples, hit ${Number(conservative.backtestGate?.hitRate || 0).toFixed(0)}%, stop-first ${Number(conservative.backtestGate?.stopRate || 0).toFixed(0)}%. Positive forecasts cannot become buy signals unless walk-forward/OOS validation passes.`,
       `Final-return label: expected ${projectedUpside >= 0 ? "+" : ""}${projectedUpside.toFixed(2)}% by day ${Number(strategy?.horizonDays || 15)}, final-return hit probability ${magnitude.probability.toFixed(0)}% (${magnitude.basis}).`,
       `Max-upside label: expected intraperiod high touch ${maxUpside.projectedMaxUpside.toFixed(2)}%, touch probability ${maxUpside.probability.toFixed(0)}% (${maxUpside.basis}, analog ${maxUpside.analogHitRate == null ? "n/a" : `${maxUpside.analogHitRate.toFixed(0)}%`}, model ${maxUpside.modelProbability == null ? "n/a" : `${maxUpside.modelProbability.toFixed(0)}%`}).`,
       `Strategy target label: target-before-stop probability ${Number(conservative.strategyHitProbability || 0).toFixed(0)}% / required ${Number(conservative.strategyProbabilityTarget || 0).toFixed(0)}%; ${strategyCalibration?.sampleCount >= 5 ? strategyCalibration.message : "strategy probability calibration is still collecting resolved samples"}.`,
@@ -10623,7 +11584,7 @@ async function handleApi(req, res, url) {
     const market = marketFromUrl(url);
     if (req.method === "GET") {
       const samples = await readPredictionSamples(market);
-      sendJson(res, 200, summarizePredictionSamples(samples, market));
+      sendJson(res, 200, await summarizePredictionSamplesWithLocalModel(samples, market));
       return;
     }
     if (req.method === "POST") {
@@ -10636,6 +11597,7 @@ async function handleApi(req, res, url) {
         cancelSymbols: payload.cancelSymbols,
       });
       await writeModelCalibrationSnapshot(market, summary).catch(() => null);
+      await appendAdaptiveModelAdjustmentLog(market, summary).catch(() => null);
       sendJson(res, 200, summary);
       return;
     }
@@ -10827,8 +11789,50 @@ async function handleApi(req, res, url) {
     const strategy = {
       horizonDays: Number(url.searchParams.get("horizonDays") || 15),
       targetUpside: Number(url.searchParams.get("targetUpside") || 5),
+      stopLoss: Number(url.searchParams.get("stopLoss") || 4),
     };
     sendJson(res, 200, await fetchFactorLayer(symbol, strategy, market));
+    return;
+  }
+
+  if (url.pathname === "/api/historical-backtest" && req.method === "GET") {
+    const market = marketFromUrl(url);
+    const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
+    const range = url.searchParams.get("range") || "5y";
+    const strategy = {
+      horizonDays: Number(url.searchParams.get("horizonDays") || 15),
+      targetUpside: Number(url.searchParams.get("targetUpside") || 5),
+      stopLoss: Number(url.searchParams.get("stopLoss") || 4),
+    };
+    const marketData = await fetchBacktestCandlesForSymbol(symbol, market, range);
+    const result = await historicalBacktestForCandles({
+      market,
+      symbol,
+      candles: marketData.candles,
+      strategy,
+      source: marketData.source,
+    });
+    sendJson(res, 200, { ...result, range, dataSource: marketData });
+    return;
+  }
+
+  if (url.pathname === "/api/historical-backtest-batch" && req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body || "{}");
+    const market = safeMarket(payload.market || marketFromUrl(url));
+    const strategy = {
+      horizonDays: Number(payload.horizonDays || payload.strategy?.horizonDays || 15),
+      targetUpside: Number(payload.targetUpside || payload.strategy?.targetUpside || 5),
+      stopLoss: Number(payload.stopLoss || payload.strategy?.stopLoss || 4),
+    };
+    sendJson(res, 200, await historicalBacktestBatch({
+      market,
+      symbols: payload.symbols || [],
+      strategy,
+      range: payload.range || "5y",
+      limit: payload.limit || 20,
+    }));
     return;
   }
 

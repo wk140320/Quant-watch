@@ -486,7 +486,10 @@ CBA,20,118.50</textarea>
         <section class="portfolio-board accuracy-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <h2>预测学习与准确率</h2>
-            <button id="refreshAccuracy" class="secondary" type="button">更新</button>
+            <div class="inline-actions">
+              <button id="runHistoricalBacktest" class="secondary" type="button">5年历史预测校准</button>
+              <button id="refreshAccuracy" class="secondary" type="button">更新</button>
+            </div>
           </div>
           <div id="accuracyPanel" class="accuracy-panel">
             <p class="muted">刷新后会保存预测样本；达到策略周期或触及目标/止损后自动统计命中率，并显示失败后的模型调整。</p>
@@ -575,6 +578,6 @@ CBA,20,118.50</textarea>
       </footer>
     </div>
 
-    <script src="/app.js?v=20260624-reddit-bg-cache"></script>
+    <script src="/app.js?v=20260626-python-local-model"></script>
   </body>
 </html>
