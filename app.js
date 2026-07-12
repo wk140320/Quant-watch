@@ -216,6 +216,7 @@ const MARKET_UNIVERSES = {
 const MANUAL_WATCH_SOURCES = new Set(["manual", "holding", "csv", "text", "screenshot", "app-buy"]);
 const AI_PICK_COUNT = 15;
 const AI_PICK_UNIVERSE_LIMIT = 180;
+const PREDICTION_TRAINING_UNIVERSE_LIMIT = 80;
 const LEGACY_WRONG_MARKET_HOLDINGS = {
   US: new Set(["TCL"]),
 };
@@ -292,10 +293,23 @@ function isMarketNativeAutoSymbol(symbol, market) {
   return true;
 }
 
+function isLikelyForeignMarketSymbol(symbol, market) {
+  const key = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, key);
+  if (!normalized || normalized.startsWith("^") || /^(SH000|SZ399)\d{3}$/.test(normalized)) return false;
+  const asxKnown = marketUniverseSet("ASX").has(normalized) || marketDefaultSet("ASX").has(normalized) || OBVIOUS_ASX_ONLY_SYMBOLS.has(normalized);
+  const usKnown = marketUniverseSet("US").has(normalized) || marketDefaultSet("US").has(normalized) || OBVIOUS_US_SYMBOLS.has(normalized);
+  if (key === "US") return asxKnown && !usKnown;
+  if (key === "ASX") return usKnown && !asxKnown;
+  if (key === "CN") return !/^\d{6}$/.test(normalized);
+  return false;
+}
+
 function allowWatchSymbolForMarket(symbol, market, source = "saved") {
   const key = safeMarket(market);
   const normalized = normalizeSymbolForMarket(symbol, key);
   if (!normalized) return "";
+  if (isLikelyForeignMarketSymbol(normalized, key)) return "";
   if (isManualWatchSource(source)) return normalized;
   return isMarketNativeAutoSymbol(normalized, key) ? normalized : "";
 }
@@ -406,6 +420,7 @@ const state = {
   autoRefreshEnabled: safeStorage.getItem("autoRefreshEnabled") === "true",
   nextAutoRefreshAt: null,
   isRefreshing: false,
+  refreshToken: 0,
   aiRefreshToken: 0,
   clockTimer: null,
   snapshotUpdatedAt: safeStorage.getItem(`analysisSnapshotTime:${initialMarket}`) || (initialMarket === "ASX" ? safeStorage.getItem("analysisSnapshotTime") : null),
@@ -413,6 +428,7 @@ const state = {
   notifiedAlerts: readJsonStorage("notifiedAlerts", {}),
   notificationsEnabled: safeStorage.getItem("notificationsEnabled") === "true",
   latestAlerts: [],
+  backendMonitorSyncTimer: null,
   apiCache: new Map(),
   marketCache: new Map(),
   forecastCache: new Map(),
@@ -687,8 +703,8 @@ function deferMarketStepAsync(token, label, task, delay = 0, options = {}) {
   }, delay, options);
 }
 
-function activeMarketConfig() {
-  return MARKET_CONFIG[state.market] || MARKET_CONFIG.ASX;
+function activeMarketConfig(market = state.market) {
+  return MARKET_CONFIG[safeMarket(market)] || MARKET_CONFIG.ASX;
 }
 
 function snapshotKey(market = state.market) {
@@ -726,8 +742,8 @@ function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function marketParts(date = new Date()) {
-  const config = activeMarketConfig();
+function marketParts(date = new Date(), market = state.market) {
+  const config = activeMarketConfig(market);
   const parts = new Intl.DateTimeFormat("en-AU", {
     timeZone: config.timezone,
     weekday: "short",
@@ -742,9 +758,9 @@ function marketParts(date = new Date()) {
   return Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
 }
 
-function marketState(date = new Date()) {
-  const config = activeMarketConfig();
-  const parts = marketParts(date);
+function marketState(date = new Date(), market = state.market) {
+  const config = activeMarketConfig(market);
+  const parts = marketParts(date, market);
   const weekday = parts.weekday;
   const minutes = Number(parts.hour) * 60 + Number(parts.minute);
   const isWeekday = !["Sat", "Sun"].includes(weekday);
@@ -757,9 +773,9 @@ function marketState(date = new Date()) {
   return { ...parts, dateKey, minutes, isWeekday, isTrading, canRefresh, open, close, refreshClose };
 }
 
-function minutesUntilNextRefreshWindow(date = new Date()) {
+function minutesUntilNextRefreshWindow(date = new Date(), market = state.market) {
   for (let minute = 1; minute <= 60 * 24 * 10; minute += 1) {
-    if (marketState(new Date(date.getTime() + minute * 60000)).canRefresh) return minute;
+    if (marketState(new Date(date.getTime() + minute * 60000), market).canRefresh) return minute;
   }
   return 180;
 }
@@ -1070,9 +1086,9 @@ function sanitizePortfolioByMarket() {
   return state.portfolio;
 }
 
-function activePortfolio() {
+function activePortfolio(market = state.market) {
   return state.portfolio.filter((holding) => {
-    return holdingAllowedInMarket(holding, state.market);
+    return holdingAllowedInMarket(holding, market);
   });
 }
 
@@ -1099,6 +1115,79 @@ function getCapital() {
   return { baseCapital, totalCapital, investedPct, availablePct, investedValue, costValue, unrealizedPnl, availableCash, reserveCashPct, reservedCash, availableForNewTrades };
 }
 
+function backendMonitorPayload() {
+  const markets = Object.fromEntries(Object.keys(MARKET_CONFIG).map((market) => {
+    const watchlist = market === state.market
+      ? sanitizeSymbolsForMarket(state.watchlist, market)
+      : sanitizeSymbolsForMarket(state.watchlistsByMarket[market] || [], market);
+    return [
+      market,
+      {
+        watchlist,
+        portfolio: state.portfolio
+          .filter((holding) => holding.market === market)
+          .map((holding) => ({
+            symbol: holding.symbol,
+            market,
+            qty: holding.qty,
+            avgPrice: holding.avgPrice,
+            entryDate: holding.entryDate,
+            source: holding.source || "frontend-sync",
+            updatedAt: new Date().toISOString(),
+          })),
+      },
+    ];
+  }));
+  return {
+    source: "frontend-sync",
+    enabled: true,
+    strategy: getStrategy(),
+    capital: getCapital(),
+    refresh: {
+      holdingMs: 5 * 60 * 1000,
+      watchMs: 15 * 60 * 1000,
+      trainingMs: 5 * 60 * 1000,
+    },
+    training: {
+      enabled: true,
+      symbolLimit: 3,
+      interval: "5m",
+      range: "5d",
+    },
+    notifications: {
+      desktop: true,
+      mobile: true,
+    },
+    watchlistsByMarket: state.watchlistsByMarket,
+    portfolioByMarket: portfolioByMarketRows(),
+    portfolio: state.portfolio,
+    markets,
+  };
+}
+
+function syncBackendMonitorConfig(options = {}) {
+  if (state.backendMonitorSyncTimer) {
+    clearTimeout(state.backendMonitorSyncTimer);
+    state.backendMonitorSyncTimer = null;
+  }
+  const run = () => {
+    const body = JSON.stringify(backendMonitorPayload());
+    fetch("/api/backend-monitor/config", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      keepalive: body.length < 60000,
+    }).catch((error) => {
+      console.warn("Backend monitor sync failed", error);
+    });
+  };
+  if (options.immediate) {
+    run();
+    return;
+  }
+  state.backendMonitorSyncTimer = setTimeout(run, 450);
+}
+
 function saveState() {
   sanitizeActiveMarketState();
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
@@ -1120,6 +1209,7 @@ function saveState() {
   safeStorage.setItem("marketUniverseByMarket", JSON.stringify(state.marketUniverseByMarket));
   safeStorage.setItem("universeStatusByMarket", JSON.stringify(state.universeStatusByMarket));
   saveRuntimeSettings();
+  syncBackendMonitorConfig();
 }
 
 function syncCapitalFields() {
@@ -1449,6 +1539,27 @@ function forwardStrategyOutcome(rows, startIndex, horizon = 15, strategy = {}) {
   };
 }
 
+function analogCoverageFromDistances(distances = [], sampleCount = 0) {
+  const clean = distances.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  if (!clean.length) {
+    return { nearestDistance: 9.99, avgNeighborDistance: 9.99, p75NeighborDistance: 9.99, coverageScore: 0, coverageWeight: 0.2, oodRisk: 1 };
+  }
+  const nearestDistance = clean[0];
+  const avgNeighborDistance = clean.reduce((sum, value) => sum + value, 0) / clean.length;
+  const p75NeighborDistance = clean[Math.min(clean.length - 1, Math.max(0, Math.floor((clean.length - 1) * 0.75)))] || avgNeighborDistance;
+  const sampleBonus = Math.min(8, Math.log10(Math.max(1, sampleCount)) * 3.5);
+  const coverageScore = clamp(104 - nearestDistance * 24 - avgNeighborDistance * 31 - p75NeighborDistance * 11 + sampleBonus, 0, 100);
+  const coverageWeight = clamp(0.22 + coverageScore / 100 * 0.78, 0.22, 1);
+  return {
+    nearestDistance,
+    avgNeighborDistance,
+    p75NeighborDistance,
+    coverageScore,
+    coverageWeight,
+    oodRisk: clamp(1 - coverageScore / 100, 0, 1),
+  };
+}
+
 function computeHistoricalAnalog(candles, lookback = 15, horizon = 15, strategy = getStrategy()) {
   const rows = normalizeCandles(candles);
   if (rows.length < lookback * 3 + horizon) {
@@ -1462,6 +1573,9 @@ function computeHistoricalAnalog(candles, lookback = 15, horizon = 15, strategy 
       targetHitRate: 0,
       finalReturnHitRate: 0,
       maxUpsideHitRate: 0,
+      coverageScore: 0,
+      coverageWeight: 0.2,
+      oodRisk: 1,
       examples: [],
     };
   }
@@ -1495,6 +1609,7 @@ function computeHistoricalAnalog(candles, lookback = 15, horizon = 15, strategy 
     });
   }
   const best = matches.sort((a, b) => a.distance - b.distance).slice(0, 8);
+  const coverage = analogCoverageFromDistances(best.map((item) => item.distance), matches.length);
   const averageForwardReturn = best.reduce((sum, item) => sum + item.forwardReturn, 0) / best.length;
   const averageMaxUpside = best.reduce((sum, item) => sum + Math.max(0, item.maxUpside), 0) / best.length;
   const averageRiskAdjustedReturn = best.reduce((sum, item) => sum + item.riskAdjustedReturn, 0) / best.length;
@@ -1504,7 +1619,8 @@ function computeHistoricalAnalog(candles, lookback = 15, horizon = 15, strategy 
   const downsideRate = best.filter((item) => item.forwardReturn < 0 || item.stopWins).length / best.length * 100;
   const directionalHitRate = averageRiskAdjustedReturn >= 0 ? winRate : downsideRate;
   const strategyHitProbability = averageRiskAdjustedReturn >= 0 ? targetHitRate : Math.max(stopRate, downsideRate);
-  const confidence = clamp(34 + directionalHitRate * 0.42 + strategyHitProbability * 0.12 + Math.abs(averageRiskAdjustedReturn) * 1.6 - (best[0]?.distance || 0) * 8, 0, 95);
+  const rawConfidence = clamp(34 + directionalHitRate * 0.42 + strategyHitProbability * 0.12 + Math.abs(averageRiskAdjustedReturn) * 1.6 - (best[0]?.distance || 0) * 8, 0, 95);
+  const confidence = clamp(rawConfidence * (0.72 + coverage.coverageWeight * 0.28) - Math.max(0, 45 - coverage.coverageScore) * 0.22, 0, 95);
   const model = computeSelfSupervisedForecast(rows, horizon, strategy);
   const blendedFinalReturn = model.sampleCount
     ? averageForwardReturn * 0.6 + model.predictedReturn * 0.4
@@ -1542,6 +1658,7 @@ function computeHistoricalAnalog(candles, lookback = 15, horizon = 15, strategy 
     directionalHitRate,
     strategyHitProbability,
     averageRiskAdjustedReturn: blendedRiskAdjustedReturn,
+    ...coverage,
     model,
     examples: best.slice(0, 8),
   };
@@ -1683,13 +1800,15 @@ function computeSelfSupervisedForecast(candles, horizon, strategy = getStrategy(
     forwardReturn: sample.forwardReturn,
     maxUpside: sample.maxUpside,
   })).sort((a, b) => a.distance - b.distance).slice(0, 24);
+  const coverage = analogCoverageFromDistances(distanceRows.map((row) => row.distance), samples.length);
   const distanceWeightSum = distanceRows.reduce((sum, row) => sum + 1 / Math.max(0.08, row.distance), 0) || 1;
   const metaLabelProbability = distanceRows.reduce((sum, row) => sum + (row.targetWins ? 1 : 0) / Math.max(0.08, row.distance), 0) / distanceWeightSum * 100;
   const metaDirectionalProbability = distanceRows.reduce((sum, row) => sum + ((predictedReturn >= 0 ? row.forwardReturn >= 0 : row.forwardReturn < 0) ? 1 : 0) / Math.max(0.08, row.distance), 0) / distanceWeightSum * 100;
   const metaMaxUpsideProbability = distanceRows.reduce((sum, row) => sum + ((Math.max(0, row.maxUpside) >= Math.max(0.25, predictedMaxUpside * 0.82)) ? 1 : 0) / Math.max(0.08, row.distance), 0) / distanceWeightSum * 100;
   const sampleBonus = clamp(Math.log10(samples.length) * 5, 0, 14);
   const uncertaintyPenalty = clamp(p80Error * 0.9 + Math.max(0, p90Error - Math.abs(predictedReturn)) * 0.35, 0, 18);
-  const confidence = clamp(30 + directionalAccuracy * 0.34 + metaDirectionalProbability * 0.18 + targetHitAccuracy * 0.08 + Math.min(8, Math.abs(predictedReturn) * 0.75) - mae * 1.25 - uncertaintyPenalty * 0.35 + sampleBonus, 0, 95);
+  const rawConfidence = 30 + directionalAccuracy * 0.34 + metaDirectionalProbability * 0.18 + targetHitAccuracy * 0.08 + Math.min(8, Math.abs(predictedReturn) * 0.75) - mae * 1.25 - uncertaintyPenalty * 0.35 + sampleBonus;
+  const confidence = clamp(rawConfidence * (0.7 + coverage.coverageWeight * 0.3) - Math.max(0, 45 - coverage.coverageScore) * 0.18, 0, 95);
   const result = {
     sampleCount: samples.length,
     oosSampleCount: validationRows.length,
@@ -1711,6 +1830,7 @@ function computeSelfSupervisedForecast(candles, horizon, strategy = getStrategy(
     metaLabelProbability,
     metaDirectionalProbability,
     metaMaxUpsideProbability,
+    ...coverage,
     conformalP80Error: p80Error,
     conformalP90Error: p90Error,
     predictionInterval: {
@@ -3478,12 +3598,70 @@ function drawFactorLabOverlayChart(result = state.latestFactorLab) {
   }
 }
 
+function dynamicFactorResearchHtml(research = {}) {
+  if (!research || research.available === false) {
+    return `
+      <div class="validation-report factor-research-panel">
+        <div class="quant-result-head">
+          <div>
+            <h3>动态因子权重模型</h3>
+            <p class="muted small-text">${escapeHtml(research?.reason || "样本不足，暂未生成动态因子准入和 ML 组合回测。")}</p>
+          </div>
+          <span class="tag warn">research pending</span>
+        </div>
+      </div>
+    `;
+  }
+  const live = research.live_signal || {};
+  const ml = research.ml_backtest || {};
+  const weights = Array.isArray(research.weights) ? research.weights : [];
+  const candidates = Array.isArray(research.candidates) ? research.candidates : [];
+  const topRejected = candidates.filter((row) => row.status === "watchlist").slice(0, 8);
+  return `
+    <div class="validation-report factor-research-panel">
+      <div class="quant-result-head">
+        <div>
+          <h3>动态因子权重模型</h3>
+          <p class="muted small-text">${escapeHtml(research.framework || "dynamic-factor-admission-and-ml-weighting")} · 候选 ${formatCompactNumber(research.candidate_count, 0)} · 准入 ${formatCompactNumber(research.admitted_count, 0)} · ${escapeHtml(research.weight_formula || "")}</p>
+        </div>
+        <span class="tag ${Number(live.score || 0) > 2.5 ? "good" : Number(live.score || 0) < -2.5 ? "danger" : "warn"}">实时因子 ${formatCompactNumber(live.score, 2)} · ${Math.round(Number(live.confidence || 0))}%</span>
+      </div>
+      <div class="training-control-grid">
+        <div><span>Holdout方向</span><strong>${ml.available ? formatPct(ml.test?.direction_hit_rate_pct) : "样本不足"}</strong></div>
+        <div><span>Holdout IC</span><strong>${ml.available ? formatCompactNumber(ml.test?.ic, 4) : "n/a"}</strong></div>
+        <div><span>相对基准提升</span><strong>${ml.available ? `${formatCompactNumber(ml.direction_lift_pct, 2)}pct` : "n/a"}</strong></div>
+        <div><span>模型状态</span><strong class="${ml.active ? "good-text" : "muted"}">${ml.active ? "可参与权重" : "仅研究/降权"}</strong></div>
+        <div><span>Purge / Embargo</span><strong>${formatCompactNumber(ml.purge_samples, 0)} / ${formatCompactNumber(ml.embargo_samples, 0)}</strong></div>
+        <div><span>切分</span><strong>${formatCompactNumber(ml.split?.train, 0)} / ${formatCompactNumber(ml.split?.validation, 0)} / ${formatCompactNumber(ml.split?.test, 0)}</strong></div>
+      </div>
+      <div class="factor-research-grid">
+        <section>
+          <h4>已准入权重</h4>
+          ${weights.length ? `<div class="factor-research-weight-list">${weights.slice(0, 14).map((row) => `
+            <div>
+              <strong>${escapeHtml(row.name)}</strong>
+              <span>${formatPct(row.weight_pct)}</span>
+              <small>${escapeHtml(row.reason || "")}</small>
+            </div>
+          `).join("")}</div>` : `<p class="muted">暂无准入权重。</p>`}
+        </section>
+        <section>
+          <h4>观察/拒绝原因</h4>
+          ${topRejected.length ? `<ul class="quant-note-list">${topRejected.map((row) => `<li><strong>${escapeHtml(row.name)}</strong>：${escapeHtml((row.reasons || []).join(" · "))}</li>`).join("")}</ul>` : `<p class="muted">当前没有明显被拒绝的候选因子。</p>`}
+        </section>
+      </div>
+      <p class="muted small-text">${escapeHtml(research.leakage_control || "")}</p>
+    </div>
+  `;
+}
+
 function renderFactorLab(result) {
   const panel = $("factorLabPanel");
   if (!panel) return;
   state.latestFactorLab = result;
   const factors = Array.isArray(result?.factors) ? result.factors : [];
   const qualityGate = result?.quality_gate || {};
+  const dynamicResearch = result?.factor_research || result?.dynamic_factor_weights || {};
   const qlib = result?.qlib_readiness || {};
   const overlaps = Array.isArray(result?.high_overlap) ? result.high_overlap : [];
   const validation = result?.validation || {};
@@ -3525,6 +3703,7 @@ function renderFactorLab(result) {
         </div>
       `).join("")}
     </div>
+    ${dynamicFactorResearchHtml(dynamicResearch)}
     <div class="feature-overlay-card factor-lab-overlay-card">
       <div class="quant-result-head">
         <div>
@@ -3542,11 +3721,12 @@ function renderFactorLab(result) {
       <div class="scroll-fold-body tall">
         <div class="quant-table-wrap fold-scroll">
           <table class="quant-data-table factor-lab-table">
-            <thead><tr><th>因子</th><th>六项闸门</th><th>方向</th><th>评分</th><th>收盘 IC</th><th>收盘 Rank IC</th><th>窗口 VWAP IC</th><th>股价相关</th><th>预测相关</th><th>滚动 IC</th><th>正 IC 窗口</th><th>稳定性</th><th>最新值</th><th>建议权重</th></tr></thead>
+            <thead><tr><th>因子</th><th>六项闸门</th><th>准入</th><th>方向</th><th>评分</th><th>收盘 IC</th><th>收盘 Rank IC</th><th>窗口 VWAP IC</th><th>股价相关</th><th>预测相关</th><th>滚动 IC</th><th>正 IC 窗口</th><th>稳定性</th><th>最新值</th><th>建议权重</th><th>动态权重</th><th>ML权重</th></tr></thead>
             <tbody>${factors.map((factor) => `
               <tr>
                 <td><strong>${escapeHtml(factor.name)}</strong><span class="factor-formula-inline">${escapeHtml(factor.formula || "")}</span></td>
                 <td class="factor-gate-cell">${factorQualityGateHtml(factor)}</td>
+                <td><span class="tag ${factor.admission_status === "admitted" ? "good" : factor.admission_status === "research_only" ? "warn" : "danger"}">${escapeHtml(factor.admission_status || "watchlist")}</span><br><small>${escapeHtml((factor.admission_reasons || []).slice(0, 2).join(" · "))}</small></td>
                 <td class="${factor.direction_label === "positive" ? "good-text" : "danger-text"}">${factor.direction_label === "positive" ? "Positive" : "Negative"}<br><small>${escapeHtml(factor.long_short_usage || "")}</small></td>
                 <td><strong>${formatCompactNumber(factor.score, 1)}</strong></td>
                 <td class="${Number(factor.ic) >= 0 ? "good-text" : "danger-text"}">${formatCompactNumber(factor.ic, 4)}</td>
@@ -3559,6 +3739,8 @@ function renderFactorLab(result) {
                 <td>${formatCompactNumber(factor.stability, 3)}</td>
                 <td>${formatCompactNumber(factor.latest_value, 4)}</td>
                 <td>${formatPct(factor.suggested_weight_pct)}</td>
+                <td>${formatPct(factor.dynamic_weight_pct)}</td>
+                <td>${formatPct(factor.ml_weight_hint_pct)}</td>
               </tr>
             `).join("")}</tbody>
           </table>
@@ -4472,7 +4654,7 @@ function tagClass(value, goodAt, badAt) {
 
 function factorTotal(factors) {
   if (!factors) return 0;
-  return ["announcements", "shortInterest", "macro", "sector", "socialMedia", "flowOptions", "marketRegime", "relativeStrength", "liquidity", "calibration"]
+  return ["announcements", "shortInterest", "macro", "sector", "socialMedia", "minuteLearning", "flowOptions", "marketRegime", "relativeStrength", "liquidity", "calibration", "factorResearch"]
     .reduce((sum, key) => sum + Number(factors[key]?.available === false ? 0 : factors[key]?.score || 0), 0);
 }
 
@@ -4510,32 +4692,37 @@ function factorScoreForItem(item) {
   return Number.isFinite(proxy) ? proxy : 0;
 }
 
-function factorRows(factors) {
+function factorRows(factors, market = state.market) {
   if (!factors) return [];
+  const key = safeMarket(market);
   return [
-    [state.market === "US" ? "SEC/公告" : "公告", factors.announcements],
-    [state.market === "ASX" ? "空头" : "资金/空头", factors.shortInterest],
+    [key === "US" ? "SEC/公告" : "公告", factors.announcements],
+    [key === "ASX" ? "空头" : "资金/空头", factors.shortInterest],
     ["宏观", factors.macro],
     ["行业", factors.sector],
     ["Reddit社媒", factors.socialMedia],
-    [state.market === "US" ? "期权隐波" : state.market === "CN" ? "两融/北向" : "资金/期权", factors.flowOptions],
+    ["分钟学习", factors.minuteLearning],
+    [key === "US" ? "期权隐波" : key === "CN" ? "两融/北向" : "资金/期权", factors.flowOptions],
     ["市场状态", factors.marketRegime],
     ["相对强弱", factors.relativeStrength],
     ["流动性", factors.liquidity],
     ["回测校准", factors.calibration],
+    ["动态因子ML", factors.factorResearch],
   ].filter(([, factor]) => factor);
 }
 
-async function fetchMarket(symbol) {
-  const normalized = normalizeSymbol(symbol);
-  const key = `market:${state.market}:${normalized}`;
+async function fetchMarket(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey);
+  if (!normalized) throw new Error(`${symbol || ""} 不是 ${activeMarketConfig(marketKey).label} 有效代码`);
+  const key = `market:${marketKey}:${normalized}`;
   const cached = state.marketCache.get(key);
   if (cached && Date.now() - cached.time < 60 * 1000) return cached.value;
-  const response = await fetch(`/api/market/${encodeURIComponent(normalized || symbol)}?market=${encodeURIComponent(state.market)}&range=9mo&interval=1d`);
+  const response = await fetch(`/api/market/${encodeURIComponent(normalized)}?market=${encodeURIComponent(marketKey)}&range=9mo&interval=1d`);
   if (!response.ok) throw new Error((await response.json()).error || `无法读取 ${symbol}`);
   const value = await response.json();
-  if (safeMarket(value.market || state.market) !== state.market) throw new Error(`${symbol} 返回了错误市场 ${value.market}`);
-  const returnedSymbol = normalizeSymbolForMarket(value.symbol || symbol, state.market);
+  if (safeMarket(value.market || marketKey) !== marketKey) throw new Error(`${symbol} 返回了错误市场 ${value.market}`);
+  const returnedSymbol = normalizeSymbolForMarket(value.symbol || symbol, marketKey);
   if (!returnedSymbol || returnedSymbol !== normalized) throw new Error(`${symbol} 返回了跨市场或不匹配代码 ${value.symbol || ""}`);
   value.candles = normalizeCandles(value.candles);
   state.marketCache.set(key, { time: Date.now(), value });
@@ -4728,27 +4915,30 @@ function marketIndexStartupHint() {
   return "休市中仅使用本地快照；若快照不完整，请打开“休市也允许刷新免 API 源”后手动更新大盘。";
 }
 
-function loadMarketIndexSnapshot() {
-  const payload = readJsonStorage(indexSnapshotKey(), null);
-  if (!payload || payload.market !== state.market || !Array.isArray(payload.rows)) return false;
+function loadMarketIndexSnapshot(market = state.market) {
+  const marketKey = safeMarket(market);
+  const payload = readJsonStorage(indexSnapshotKey(marketKey), null);
+  if (!payload || payload.market !== marketKey || !Array.isArray(payload.rows)) return false;
   if (!marketIndexRowsComplete(payload.rows)) {
-    safeStorage.removeItem(indexSnapshotKey());
+    safeStorage.removeItem(indexSnapshotKey(marketKey));
     return false;
   }
+  if (marketKey !== state.market) return false;
   state.marketIndexes = payload.rows;
   state.marketIndexSignal = payload.signal || indexSignalFromRows(payload.rows);
   renderMarketIndexPanel();
   return true;
 }
 
-function saveMarketIndexSnapshot(rows, signal) {
+function saveMarketIndexSnapshot(rows, signal, market = state.market) {
+  const marketKey = safeMarket(market);
   const payload = {
-    market: state.market,
+    market: marketKey,
     updatedAt: new Date().toISOString(),
     rows,
     signal,
   };
-  safeStorage.setItem(indexSnapshotKey(), JSON.stringify(payload));
+  safeStorage.setItem(indexSnapshotKey(marketKey), JSON.stringify(payload));
 }
 
 function indexChartRangeCount(range = state.indexChartRange) {
@@ -5158,19 +5348,20 @@ function bindIndexChartEvents(row, candles) {
   });
 }
 
-async function fetchIndexMarket(index) {
-  const strictCashIndex = ["ASX", "US"].includes(state.market) && index.unit === "points";
+async function fetchIndexMarket(index, market = state.market) {
+  const marketKey = safeMarket(market);
+  const strictCashIndex = ["ASX", "US"].includes(marketKey) && index.unit === "points";
   const rawCandidates = strictCashIndex
     ? [index.symbol]
     : [index.symbol, ...(index.fallbackSymbols || [])];
-  const candidates = sanitizeSymbolsForMarket(rawCandidates, state.market);
+  const candidates = sanitizeSymbolsForMarket(rawCandidates, marketKey);
   const errors = [];
   for (const symbol of candidates) {
     try {
-      const market = await fetchMarket(symbol);
-      const fallbackUsed = symbol !== normalizeSymbolForMarket(index.symbol, state.market);
+      const marketData = await fetchMarket(symbol, marketKey);
+      const fallbackUsed = symbol !== normalizeSymbolForMarket(index.symbol, marketKey);
       return {
-        market,
+        market: marketData,
         usedSymbol: symbol,
         fallbackUsed,
       };
@@ -5184,24 +5375,26 @@ async function fetchIndexMarket(index) {
   throw new Error(errors.join(" | ") || `${index.label} 无可用真实指数/ETF代理`);
 }
 
-async function refreshMarketIndexes(force = false) {
-  const cached = readJsonStorage(indexSnapshotKey(), null);
-  const cachedIsComplete = cached?.market === state.market && marketIndexRowsComplete(cached.rows);
+async function refreshMarketIndexes(force = false, market = state.market) {
+  const marketKey = safeMarket(market);
+  const cached = readJsonStorage(indexSnapshotKey(marketKey), null);
+  const cachedIsComplete = cached?.market === marketKey && marketIndexRowsComplete(cached.rows);
   const previousRows = Array.isArray(state.marketIndexes) ? state.marketIndexes : [];
   const previousIsComplete = marketIndexRowsComplete(previousRows);
   const previousSignal = state.marketIndexSignal || indexSignalFromRows(previousRows);
-  state.marketIndexUsedSnapshotFallback = false;
+  if (marketKey === state.market) state.marketIndexUsedSnapshotFallback = false;
   if (!force && cachedIsComplete && Date.now() - new Date(cached.updatedAt || 0).getTime() < 3 * 60 * 1000) {
+    if (marketKey !== state.market) return cached.rows;
     state.marketIndexes = cached.rows;
     state.marketIndexSignal = cached.signal || indexSignalFromRows(cached.rows);
     renderMarketIndexPanel();
     return state.marketIndexes;
   }
-  if (!force && !marketState().canRefresh && loadMarketIndexSnapshot()) return state.marketIndexes;
+  if (!force && !marketState(new Date(), marketKey).canRefresh && loadMarketIndexSnapshot(marketKey)) return state.marketIndexes;
 
-  const config = activeMarketConfig();
+  const config = activeMarketConfig(marketKey);
   const results = await Promise.allSettled((config.indexes || []).map(async (index) => {
-    const indexMarket = await fetchIndexMarket(index);
+    const indexMarket = await fetchIndexMarket(index, marketKey);
     const market = indexMarket.market;
     const candles = normalizeCandles(market.candles);
     if (!candles.length) throw new Error(`${index.label} 无真实点位`);
@@ -5226,7 +5419,7 @@ async function refreshMarketIndexes(force = false) {
       change1d,
       projectedUpside,
       confidence,
-      unit: index.unit || (state.market === "US" && String(index.symbol || "").startsWith("^") ? "points" : ""),
+      unit: index.unit || (marketKey === "US" && String(index.symbol || "").startsWith("^") ? "points" : ""),
       source: market.source,
       warning: [
         indexMarket.fallbackUsed ? `${index.symbol} 暂不可用，已使用 ${indexMarket.usedSymbol} 真实代理` : "",
@@ -5271,16 +5464,19 @@ async function refreshMarketIndexes(force = false) {
         row.warning || "",
       ].filter(Boolean).join(" | "),
     }));
-    state.marketIndexes = fallbackRows;
-    state.marketIndexSignal = previousIsComplete ? previousSignal : cached.signal || indexSignalFromRows(fallbackRows);
-    state.marketIndexUsedSnapshotFallback = true;
-    renderMarketIndexPanel();
+    if (marketKey === state.market) {
+      state.marketIndexes = fallbackRows;
+      state.marketIndexSignal = previousIsComplete ? previousSignal : cached.signal || indexSignalFromRows(fallbackRows);
+      state.marketIndexUsedSnapshotFallback = true;
+      renderMarketIndexPanel();
+    }
     return fallbackRows;
   }
+  if (marketKey !== state.market) return rows;
   state.marketIndexes = rows;
   state.marketIndexSignal = indexSignalFromRows(rows);
   if (marketIndexRowsComplete(rows)) {
-    saveMarketIndexSnapshot(rows, state.marketIndexSignal);
+    saveMarketIndexSnapshot(rows, state.marketIndexSignal, marketKey);
   }
   renderMarketIndexPanel();
   return rows;
@@ -5357,17 +5553,19 @@ function dedupeNewsClient(items = []) {
   });
 }
 
-async function fetchNews(symbol, mode = "auto") {
-  const encodedMarket = encodeURIComponent(state.market);
-  const encodedSymbol = encodeURIComponent(symbol);
+async function fetchNews(symbol, mode = "auto", market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey) || symbol;
+  const encodedMarket = encodeURIComponent(marketKey);
+  const encodedSymbol = encodeURIComponent(normalized);
   const safeMode = ["local", "auto", "refresh", "live"].includes(String(mode || "").toLowerCase()) ? String(mode || "auto").toLowerCase() : "auto";
-  const cacheKey = `news:${state.market}:${symbol}:all`;
+  const cacheKey = `news:${marketKey}:${normalized}:all`;
   const url = `/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=all&mode=${encodeURIComponent(safeMode)}`;
   try {
     const payload = await requestJson(url);
     state.apiCache.set(cacheKey, { time: Date.now(), value: payload });
-    if (payload.scope === "macro") state.apiCache.set(`news:${state.market}:__macro__`, { time: Date.now(), value: payload });
-    safeStorage.setItem(`lastNewsOpen:${state.market}`, new Date().toISOString());
+    if (payload.scope === "macro") state.apiCache.set(`news:${marketKey}:__macro__`, { time: Date.now(), value: payload });
+    safeStorage.setItem(`lastNewsOpen:${marketKey}`, new Date().toISOString());
     return dedupeNewsClient(payload.news || []);
   } catch (error) {
     try {
@@ -5375,13 +5573,13 @@ async function fetchNews(symbol, mode = "auto") {
         requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=macro&mode=${encodeURIComponent(safeMode)}`),
         requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=stock&mode=${encodeURIComponent(safeMode)}`),
       ]);
-      state.apiCache.set(`news:${state.market}:__macro__`, { time: Date.now(), value: macro });
-      state.apiCache.set(`news:${state.market}:${symbol}:stock`, { time: Date.now(), value: stock });
+      state.apiCache.set(`news:${marketKey}:__macro__`, { time: Date.now(), value: macro });
+      state.apiCache.set(`news:${marketKey}:${normalized}:stock`, { time: Date.now(), value: stock });
       return dedupeNewsClient([...(macro.news || []), ...(stock.news || [])]);
     } catch (fallbackError) {
       try {
         const payload = await requestJson(`/api/news?market=${encodedMarket}&symbol=${encodedSymbol}&scope=stock&mode=local`);
-        state.apiCache.set(`news:${state.market}:${symbol}`, { time: Date.now(), value: payload });
+        state.apiCache.set(`news:${marketKey}:${normalized}`, { time: Date.now(), value: payload });
         return dedupeNewsClient(payload.news || []);
       } catch (localError) {
         return [];
@@ -5433,22 +5631,25 @@ async function refreshDueNewsOnOpen() {
   return true;
 }
 
-function redditWarmupSymbolsForMarket(limit = 60) {
-  const portfolioSymbols = activePortfolio().map((holding) => holding.symbol);
-  const analysisSymbols = [...state.analyses.keys()];
-  const defaults = activeMarketConfig().defaultSymbols || [];
-  return [...new Set([...portfolioSymbols, ...state.watchlist, ...analysisSymbols, ...defaults]
-    .map((symbol) => normalizeSymbolForMarket(symbol, state.market))
+function redditWarmupSymbolsForMarket(limit = 60, market = state.market) {
+  const marketKey = safeMarket(market);
+  const portfolioSymbols = activePortfolio(marketKey).map((holding) => holding.symbol);
+  const analysisSymbols = marketKey === state.market ? [...state.analyses.keys()] : [...(state.analysesByMarket.get(marketKey) || new Map()).keys()];
+  const watchlist = marketKey === state.market ? state.watchlist : state.watchlistsByMarket[marketKey] || MARKET_CONFIG[marketKey].defaultSymbols;
+  const defaults = activeMarketConfig(marketKey).defaultSymbols || [];
+  return [...new Set([...portfolioSymbols, ...watchlist, ...analysisSymbols, ...defaults]
+    .map((symbol) => normalizeSymbolForMarket(symbol, marketKey))
     .filter(Boolean)
     .filter((symbol) => !String(symbol).startsWith("^")))]
     .slice(0, limit);
 }
 
 async function queueRedditSocialWarmup(reason = "auto", options = {}) {
-  const symbols = redditWarmupSymbolsForMarket(options.maxSymbols || 60);
+  const marketKey = safeMarket(options.market || state.market);
+  const symbols = redditWarmupSymbolsForMarket(options.maxSymbols || 60, marketKey);
   if (!symbols.length) return null;
   const params = new URLSearchParams({
-    market: state.market,
+    market: marketKey,
     symbols: symbols.join(","),
     limit: String(options.limit || 10),
     maxSymbols: String(options.maxSymbols || 60),
@@ -5471,60 +5672,71 @@ async function queueRedditSocialWarmup(reason = "auto", options = {}) {
 
 function scheduleRedditSocialWarmup(reason = "auto", delay = 1800, options = {}) {
   if (state.redditWarmupTimer) clearTimeout(state.redditWarmupTimer);
+  const marketKey = safeMarket(options.market || state.market);
   state.redditWarmupTimer = setTimeout(() => {
     state.redditWarmupTimer = null;
-    queueRedditSocialWarmup(reason, options);
+    queueRedditSocialWarmup(reason, { ...options, market: marketKey });
   }, Math.max(0, delay));
 }
 
-function cachedNewsValue(symbol) {
-  const all = cachedSignalValue(`news:${state.market}:${symbol}:all`, { news: [] }).news || [];
+function cachedNewsValue(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey) || symbol;
+  const all = cachedSignalValue(`news:${marketKey}:${normalized}:all`, { news: [] }).news || [];
   if (all.length) return dedupeNewsClient(all);
-  const legacyStock = cachedSignalValue(`news:${state.market}:${symbol}`, { news: [] }).news || [];
+  const legacyStock = cachedSignalValue(`news:${marketKey}:${normalized}`, { news: [] }).news || [];
   if (legacyStock.length) return dedupeNewsClient(legacyStock);
-  const macro = cachedSignalValue(`news:${state.market}:__macro__`, { news: [] }).news || [];
-  const stock = cachedSignalValue(`news:${state.market}:${symbol}:stock`, { news: [] }).news || [];
+  const macro = cachedSignalValue(`news:${marketKey}:__macro__`, { news: [] }).news || [];
+  const stock = cachedSignalValue(`news:${marketKey}:${normalized}:stock`, { news: [] }).news || [];
   return dedupeNewsClient([...macro, ...stock]);
 }
 
-async function fetchFundamentals(symbol) {
+async function fetchFundamentals(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey) || symbol;
   try {
-    const payload = await cachedJson(`fundamentals:${state.market}:${symbol}`, `/api/fundamentals?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, 60 * 60 * 1000);
+    const payload = await cachedJson(`fundamentals:${marketKey}:${normalized}`, `/api/fundamentals?market=${encodeURIComponent(marketKey)}&symbol=${encodeURIComponent(normalized)}`, 60 * 60 * 1000);
     return payload.fundamentals || null;
   } catch (error) {
     return null;
   }
 }
 
-async function fetchX(symbol) {
+async function fetchX(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey) || symbol;
   try {
-    const payload = await cachedJson(`x:${state.market}:${symbol}`, `/api/x?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, 10 * 60 * 1000);
+    const payload = await cachedJson(`x:${marketKey}:${normalized}`, `/api/x?market=${encodeURIComponent(marketKey)}&symbol=${encodeURIComponent(normalized)}`, 10 * 60 * 1000);
     return payload.posts || [];
   } catch (error) {
     return [];
   }
 }
 
-async function fetchYouTube(symbol) {
+async function fetchYouTube(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey) || symbol;
   try {
-    const payload = await cachedJson(`youtube:${state.market}:${symbol}`, `/api/youtube?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}`, 15 * 60 * 1000);
+    const payload = await cachedJson(`youtube:${marketKey}:${normalized}`, `/api/youtube?market=${encodeURIComponent(marketKey)}&symbol=${encodeURIComponent(normalized)}`, 15 * 60 * 1000);
     return payload.videos || [];
   } catch (error) {
     return [];
   }
 }
 
-async function fetchFactors(symbol) {
+async function fetchFactors(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey) || symbol;
   try {
     const strategy = getStrategy();
     const payload = await cachedJson(
-      `factors:${state.market}:${symbol}:${strategy.horizonDays}:${strategy.targetUpside}`,
-      `/api/factors?market=${encodeURIComponent(state.market)}&symbol=${encodeURIComponent(symbol)}&horizonDays=${encodeURIComponent(strategy.horizonDays)}&targetUpside=${encodeURIComponent(strategy.targetUpside)}`,
+      `factors:${marketKey}:${normalized}:${strategy.horizonDays}:${strategy.targetUpside}`,
+      `/api/factors?market=${encodeURIComponent(marketKey)}&symbol=${encodeURIComponent(normalized)}&horizonDays=${encodeURIComponent(strategy.horizonDays)}&targetUpside=${encodeURIComponent(strategy.targetUpside)}`,
       10 * 60 * 1000
     );
     return payload.factors || null;
   } catch (error) {
-    console.warn(`Factor layer unavailable for ${symbol}`, error);
+    console.warn(`Factor layer unavailable for ${marketKey}:${normalized}`, error);
     return null;
   }
 }
@@ -5564,48 +5776,56 @@ function proxyFactorsForItem(item, reason = "factor-provider-unavailable") {
   };
 }
 
-async function fetchAccuracySummary(force = false) {
+async function fetchAccuracySummary(force = false, market = state.market) {
+  const marketKey = safeMarket(market);
   try {
-    const key = `accuracy:${state.market}`;
+    const key = `accuracy:${marketKey}`;
     if (!force) {
       const cached = state.apiCache.get(key);
       if (cached && Date.now() - cached.time < 2 * 60 * 1000) {
-        state.accuracySummary = cached.value;
-        renderAccuracyPanel();
+        if (marketKey === state.market) {
+          state.accuracySummary = cached.value;
+          renderAccuracyPanel();
+        }
         return cached.value;
       }
     }
     if (force) {
-      const synced = await syncPredictionUniverse();
+      const synced = await syncPredictionUniverse(undefined, marketKey);
       if (synced) return synced;
     }
-    const activeSymbols = predictionActiveSymbols();
+    const activeSymbols = predictionActiveSymbols(marketKey);
     const query = activeSymbols.length ? `&activeSymbols=${encodeURIComponent(activeSymbols.join(","))}` : "";
-    const response = await fetch(`/api/accuracy?market=${encodeURIComponent(state.market)}${query}`);
+    const response = await fetch(`/api/accuracy?market=${encodeURIComponent(marketKey)}${query}`);
     if (!response.ok) throw new Error((await response.json()).error || "无法读取准确率");
     const value = await response.json();
     state.apiCache.set(key, { time: Date.now(), value });
-    state.accuracySummary = value;
-    renderAccuracyPanel();
+    if (marketKey === state.market) {
+      state.accuracySummary = value;
+      renderAccuracyPanel();
+    }
     return value;
   } catch (error) {
     console.warn("Unable to fetch accuracy summary", error);
-    state.accuracySummary = null;
-    renderAccuracyPanel();
+    if (marketKey === state.market) {
+      state.accuracySummary = null;
+      renderAccuracyPanel();
+    }
     return null;
   }
 }
 
 async function runHistoricalBacktest() {
   const button = $("runHistoricalBacktest");
-  const symbols = predictionActiveSymbols().slice(0, 20);
+  const activeSymbols = predictionActiveSymbols();
+  const symbols = predictionTrainingSymbols(state.market, PREDICTION_TRAINING_UNIVERSE_LIMIT);
   if (!symbols.length) {
-    setStatus("请先添加关注股票或持仓股票，再运行历史预测校准");
+    setStatus("当前市场没有可用于训练的股票池，请先添加关注股票或加载股票池");
     return null;
   }
   try {
     if (button) button.disabled = true;
-    setStatus(`正在运行 ${activeMarketConfig().label} 5年历史预测校准（短/中/长期，${symbols.length}只）...`);
+    setStatus(`正在运行 ${activeMarketConfig().label} 5年大样本历史预测校准（训练池 ${symbols.length} 只，关注/持仓 ${activeSymbols.length} 只，短/中/长期）...`);
     const strategy = getStrategy();
     const result = await requestJson(`/api/historical-backtest-batch?market=${encodeURIComponent(state.market)}`, {
       method: "POST",
@@ -5614,7 +5834,8 @@ async function runHistoricalBacktest() {
         market: state.market,
         symbols,
         range: "5y",
-        limit: 20,
+        limit: PREDICTION_TRAINING_UNIVERSE_LIMIT,
+        largeSample: true,
         horizonDays: strategy.horizonDays,
         targetUpside: strategy.targetUpside,
         stopLoss: strategy.stopLoss,
@@ -5625,7 +5846,8 @@ async function runHistoricalBacktest() {
       state.accuracySummary.historicalPredictionModel = result.savedModel;
     }
     renderAccuracyPanel();
-    setStatus(`历史预测校准完成：${result.sampleTotal || 0} 个历史切片，${(result.horizonCalibrations || []).length || 1} 套周期权重`);
+    const trainingCount = result.trainingSymbols?.length || result.symbolCount || symbols.length;
+    setStatus(`历史预测校准完成：训练池 ${trainingCount} 只，${result.sampleTotal || 0} 个历史切片，${(result.horizonCalibrations || []).length || 1} 套周期权重`);
     return result;
   } catch (error) {
     console.warn("Historical backtest failed", error);
@@ -5801,29 +6023,50 @@ async function persistPredictionSamples(results) {
   }
 }
 
-function predictionActiveSymbols() {
+function predictionActiveSymbols(market = state.market) {
+  const marketKey = safeMarket(market);
+  const watchlist = marketKey === state.market
+    ? state.watchlist
+    : state.watchlistsByMarket[marketKey] || MARKET_CONFIG[marketKey].defaultSymbols;
   return [...new Set([
-    ...state.watchlist,
-    ...activePortfolio().map((holding) => holding.symbol),
-  ].map((symbol) => normalizeSymbolForMarket(symbol, state.market)).filter(Boolean))];
+    ...watchlist,
+    ...activePortfolio(marketKey).map((holding) => holding.symbol),
+  ].map((symbol) => normalizeSymbolForMarket(symbol, marketKey)).filter(Boolean))];
 }
 
-async function syncPredictionUniverse(cancelSymbols = []) {
+function predictionTrainingSymbols(market = state.market, limit = PREDICTION_TRAINING_UNIVERSE_LIMIT) {
+  const marketKey = safeMarket(market);
+  const activeSymbols = predictionActiveSymbols(marketKey);
+  const cachedUniverse = normalizeUniverseRows(state.marketUniverseByMarket?.[universeStorageKey(marketKey)] || [], marketKey)
+    .map((row) => row.symbol);
+  const curatedUniverse = sanitizeSymbolsForMarket(MARKET_UNIVERSES[marketKey] || MARKET_CONFIG[marketKey].defaultSymbols, marketKey);
+  const merged = [...new Set([
+    ...activeSymbols,
+    ...curatedUniverse,
+    ...cachedUniverse,
+  ].map((symbol) => normalizeSymbolForMarket(symbol, marketKey)).filter(Boolean))];
+  return merged.slice(0, Math.max(3, Math.min(180, Number(limit || PREDICTION_TRAINING_UNIVERSE_LIMIT))));
+}
+
+async function syncPredictionUniverse(cancelSymbols = [], market = state.market) {
+  const marketKey = safeMarket(market);
   try {
-    const response = await fetch(`/api/accuracy?market=${encodeURIComponent(state.market)}`, {
+    const response = await fetch(`/api/accuracy?market=${encodeURIComponent(marketKey)}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         samples: [],
-        activeSymbols: predictionActiveSymbols(),
-        cancelSymbols: cancelSymbols.map((symbol) => normalizeSymbolForMarket(symbol, state.market)).filter(Boolean),
+        activeSymbols: predictionActiveSymbols(marketKey),
+        cancelSymbols: cancelSymbols.map((symbol) => normalizeSymbolForMarket(symbol, marketKey)).filter(Boolean),
       }),
     });
     if (!response.ok) throw new Error((await response.json()).error || "无法同步预测样本");
     const value = await response.json();
-    state.accuracySummary = value;
-    state.apiCache.set(`accuracy:${state.market}`, { time: Date.now(), value });
-    renderAccuracyPanel();
+    state.apiCache.set(`accuracy:${marketKey}`, { time: Date.now(), value });
+    if (marketKey === state.market) {
+      state.accuracySummary = value;
+      renderAccuracyPanel();
+    }
     return value;
   } catch (error) {
     console.warn("Unable to sync prediction universe", error);
@@ -5915,8 +6158,24 @@ async function optionalWithin(promise, ms, fallback) {
   }
 }
 
-function findHolding(symbol) {
-  return activePortfolio().find((holding) => holding.symbol === normalizeSymbol(symbol)) || null;
+async function runLimited(items, limit, worker) {
+  const rows = Array.isArray(items) ? items : [];
+  const concurrency = Math.max(1, Math.min(rows.length || 1, Number(limit || 1)));
+  let cursor = 0;
+  const runners = Array.from({ length: concurrency }, async () => {
+    while (cursor < rows.length) {
+      const index = cursor;
+      cursor += 1;
+      await worker(rows[index], index);
+    }
+  });
+  await Promise.allSettled(runners);
+}
+
+function findHolding(symbol, market = state.market) {
+  const marketKey = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey);
+  return activePortfolio(marketKey).find((holding) => holding.symbol === normalized) || null;
 }
 
 function holdingDays(holding) {
@@ -6103,12 +6362,13 @@ async function useSnapshotOrFetch(reason, allowFetchWhenMissing = false) {
   return true;
 }
 
-function buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, youtubeItems, news, factors, market) {
-  const holding = findHolding(symbol);
-  const config = activeMarketConfig();
+function buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, youtubeItems, news, factors, marketData, market = state.market) {
+  const marketKey = safeMarket(market);
+  const holding = findHolding(symbol, marketKey);
+  const config = activeMarketConfig(marketKey);
   return {
     symbol,
-    market: state.market,
+    market: marketKey,
     marketLabel: config.label,
     currency: config.currency,
     strategy: getStrategy(),
@@ -6122,9 +6382,9 @@ function buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, yo
     news,
     factors,
     researchConfig: {
-      factorConfig: researchConfigForMarket().factorConfig,
+      factorConfig: researchConfigForMarket(marketKey).factorConfig,
     },
-    marketValidation: market.validation,
+    marketValidation: marketData.validation,
     calibrationSummary: state.accuracySummary,
   };
 }
@@ -6138,37 +6398,94 @@ function signalTimeouts(options = {}) {
 
 async function prepareSymbol(symbol, options = {}) {
   const includeSignals = Boolean(options.includeSignals);
-  const market = await fetchMarket(symbol);
+  const marketKey = safeMarket(options.market || state.market);
+  const normalized = normalizeSymbolForMarket(symbol, marketKey);
+  if (!normalized) throw new Error(`${symbol || ""} 不是 ${activeMarketConfig(marketKey).label} 有效代码`);
+  const market = await fetchMarket(normalized, marketKey);
   const candles = normalizeCandles(market.candles);
-  if (candles.length < 35) throw new Error(`${symbol} 历史数据不足`);
+  const minimumUsableCandles = 10;
+  const fullHistoryCandles = 35;
+  const shortHistory = candles.length < fullHistoryCandles;
+  if (candles.length < minimumUsableCandles) {
+    throw new Error(`${normalized} 历史数据不足：仅 ${candles.length} 根真实K线，至少需要 ${minimumUsableCandles} 根才能进入新上市观察模式`);
+  }
   const technicals = computeTechnicals(candles);
-  const analog = computeHistoricalAnalog(candles, getStrategy().horizonDays, getStrategy().horizonDays);
-  const factorKey = `factors:${state.market}:${symbol}:${getStrategy().horizonDays}:${getStrategy().targetUpside}`;
+  const analog = shortHistory
+    ? {
+      count: 0,
+      confidence: 0,
+      averageForwardReturn: 0,
+      averageFinalReturn: 0,
+      averageMaxUpside: 0,
+      winRate: 0,
+      targetHitRate: 0,
+      finalReturnHitRate: 0,
+      maxUpsideHitRate: 0,
+      stopRate: 0,
+      downsideRate: 0,
+      directionalHitRate: 0,
+      strategyHitProbability: 0,
+      averageRiskAdjustedReturn: 0,
+      nearestDistance: 9.99,
+      avgNeighborDistance: 9.99,
+      p75NeighborDistance: 9.99,
+      coverageScore: 0,
+      coverageWeight: 0.2,
+      oodRisk: 1,
+      model: {
+        sampleCount: 0,
+        confidence: 0,
+        coverageScore: 0,
+        coverageWeight: 0.2,
+        reason: `short history: ${candles.length}/${fullHistoryCandles} candles; full analog/self-supervised backtest disabled`,
+      },
+      examples: [],
+      shortHistory: true,
+      reason: `新上市/短历史模式：仅 ${candles.length} 根真实K线，未启用历史相似样本和自监督回测。`,
+    }
+    : computeHistoricalAnalog(candles, getStrategy().horizonDays, getStrategy().horizonDays);
+  const factorKey = `factors:${marketKey}:${normalized}:${getStrategy().horizonDays}:${getStrategy().targetUpside}`;
   const timeouts = signalTimeouts(options);
   const [news, fundamentals, xPosts, youtubeItems, fetchedFactors] = includeSignals
     ? await Promise.all([
-      optionalWithin(fetchNews(symbol), timeouts.news, cachedNewsValue(symbol)),
-      optionalWithin(fetchFundamentals(symbol), timeouts.fundamentals, cachedSignalValue(`fundamentals:${state.market}:${symbol}`, { fundamentals: null }).fundamentals || null),
-      optionalWithin(fetchX(symbol), timeouts.x, cachedSignalValue(`x:${state.market}:${symbol}`, { posts: [] }).posts || []),
-      optionalWithin(fetchYouTube(symbol), timeouts.youtube, cachedSignalValue(`youtube:${state.market}:${symbol}`, { videos: [] }).videos || []),
-      optionalWithin(fetchFactors(symbol), timeouts.factors, cachedSignalValue(factorKey, { factors: null }).factors || null),
+      optionalWithin(fetchNews(normalized, "auto", marketKey), timeouts.news, cachedNewsValue(normalized, marketKey)),
+      optionalWithin(fetchFundamentals(normalized, marketKey), timeouts.fundamentals, cachedSignalValue(`fundamentals:${marketKey}:${normalized}`, { fundamentals: null }).fundamentals || null),
+      optionalWithin(fetchX(normalized, marketKey), timeouts.x, cachedSignalValue(`x:${marketKey}:${normalized}`, { posts: [] }).posts || []),
+      optionalWithin(fetchYouTube(normalized, marketKey), timeouts.youtube, cachedSignalValue(`youtube:${marketKey}:${normalized}`, { videos: [] }).videos || []),
+      optionalWithin(fetchFactors(normalized, marketKey), timeouts.factors, cachedSignalValue(factorKey, { factors: null }).factors || null),
     ])
     : [
-      cachedNewsValue(symbol),
-      cachedSignalValue(`fundamentals:${state.market}:${symbol}`, { fundamentals: null }).fundamentals || null,
-      cachedSignalValue(`x:${state.market}:${symbol}`, { posts: [] }).posts || [],
-      cachedSignalValue(`youtube:${state.market}:${symbol}`, { videos: [] }).videos || [],
+      cachedNewsValue(normalized, marketKey),
+      cachedSignalValue(`fundamentals:${marketKey}:${normalized}`, { fundamentals: null }).fundamentals || null,
+      cachedSignalValue(`x:${marketKey}:${normalized}`, { posts: [] }).posts || [],
+      cachedSignalValue(`youtube:${marketKey}:${normalized}`, { videos: [] }).videos || [],
       cachedSignalValue(factorKey, { factors: null }).factors || null,
     ];
-  const baseItemForFactors = { symbol, technicals, analog };
+  const baseItemForFactors = { symbol: normalized, market: marketKey, technicals, analog };
   const factors = fetchedFactors || proxyFactorsForItem(baseItemForFactors, includeSignals ? "provider-timeout-or-error" : "cached-provider-empty");
-  const input = buildAnalysisInput(symbol, technicals, analog, fundamentals, xPosts, youtubeItems, news, factors, market);
+  const marketValidation = shortHistory
+    ? {
+      ...(market.validation || {}),
+      ok: Boolean(market.validation?.ok),
+      degraded: true,
+      shortHistory: true,
+      candleCount: candles.length,
+      minFullHistoryCandles: fullHistoryCandles,
+      status: "short_history",
+      message: `新上市/短历史模式：仅 ${candles.length}/${fullHistoryCandles} 根真实K线，完整历史回测和高置信买入门槛已禁用。`,
+    }
+    : market.validation;
+  const marketForInput = { ...market, validation: marketValidation };
+  const shortHistoryWarning = shortHistory
+    ? `新上市/短历史模式：仅 ${candles.length}/${fullHistoryCandles} 根真实K线，完整历史回测不足，预测置信度会被压低。`
+    : "";
+  const input = buildAnalysisInput(normalized, technicals, analog, fundamentals, xPosts, youtubeItems, news, factors, marketForInput, marketKey);
   return {
-    symbol,
+    symbol: normalized,
     input,
     result: {
-      symbol,
-      market: state.market,
+      symbol: normalized,
+      market: marketKey,
       candles,
       technicals,
       quote: market.quote || null,
@@ -6179,19 +6496,21 @@ async function prepareSymbol(symbol, options = {}) {
       news,
       factors,
       marketSource: market.source,
-      marketWarning: market.warning,
+      marketWarning: [market.warning, shortHistoryWarning].filter(Boolean).join(" "),
       quoteWarning: market.quoteWarning,
-      marketValidation: market.validation,
+      marketValidation,
     },
   };
 }
 
 function commitAnalysisResults(results, options = {}) {
+  const marketKey = safeMarket(options.market || results?.[0]?.market || state.market);
+  if (options.requireActive !== false && marketKey !== state.market) return [];
   const adjusted = results
     .map((result) => {
-      const symbol = allowWatchSymbolForMarket(result?.symbol, state.market, watchlistOriginFor(result?.symbol, state.market, "analysis"));
-      if (!symbol || (result?.market && safeMarket(result.market) !== state.market)) return null;
-      return applyPostModelAdjustments({ ...result, symbol, market: state.market });
+      const symbol = allowWatchSymbolForMarket(result?.symbol, marketKey, watchlistOriginFor(result?.symbol, marketKey, "analysis"));
+      if (!symbol || (result?.market && safeMarket(result.market) !== marketKey)) return null;
+      return applyPostModelAdjustments({ ...result, symbol, market: marketKey });
     })
     .filter(Boolean);
   adjusted.forEach((result) => {
@@ -6203,13 +6522,14 @@ function commitAnalysisResults(results, options = {}) {
   }
   else trainAgentsWithResults(adjusted);
   evaluateAlerts();
-  persistAnalysisSnapshot("analysis-commit");
+  if (marketKey === state.market) persistAnalysisSnapshot("analysis-commit");
   persistPredictionSamples(adjusted);
   storeForecastMemory(adjusted);
   return adjusted;
 }
 
 async function requestBatchAnalysis(preparedItems, options = {}) {
+  const marketKey = safeMarket(options.market || preparedItems?.[0]?.result?.market || preparedItems?.[0]?.input?.market || state.market);
   const response = await fetch("/api/analyze-batch", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -6219,18 +6539,18 @@ async function requestBatchAnalysis(preparedItems, options = {}) {
     }),
   });
   if (!response.ok) {
-    if (response.status === 404) return requestParallelSingleAnalysis(preparedItems, options);
+    if (response.status === 404) return requestParallelSingleAnalysis(preparedItems, { ...options, market: marketKey });
     throw new Error((await response.json()).error || "批量 AI 分析失败");
   }
   const payload = await response.json();
   const rows = Array.isArray(payload.results) ? payload.results : [];
-  const bySymbol = new Map(rows.map((row) => [normalizeSymbolForMarket(row.symbol, state.market), row]).filter(([symbol]) => symbol));
+  const bySymbol = new Map(rows.map((row) => [normalizeSymbolForMarket(row.symbol, marketKey), row]).filter(([symbol]) => symbol));
   const results = [];
   const missing = [];
   preparedItems.forEach((item, index) => {
-    const expected = normalizeSymbolForMarket(item.symbol, state.market);
+    const expected = normalizeSymbolForMarket(item.symbol, marketKey);
     const indexed = rows[index];
-    const indexedSymbol = normalizeSymbolForMarket(indexed?.symbol, state.market);
+    const indexedSymbol = normalizeSymbolForMarket(indexed?.symbol, marketKey);
     const row = bySymbol.get(expected) || (indexedSymbol === expected ? indexed : null);
     if (!row?.analysis) {
       missing.push({ item, index, expected });
@@ -6239,7 +6559,7 @@ async function requestBatchAnalysis(preparedItems, options = {}) {
     results[index] = {
       ...item.result,
       symbol: expected,
-      market: state.market,
+      market: marketKey,
       analysis: row.analysis,
       source: row.source || payload.source,
     };
@@ -6256,26 +6576,27 @@ async function requestBatchAnalysis(preparedItems, options = {}) {
     if (!fallbackResponse.ok) throw new Error((await fallbackResponse.json()).error || `${missing[0].item.symbol} 本地模型未返回分析`);
     const fallbackPayload = await fallbackResponse.json();
     const fallbackRows = Array.isArray(fallbackPayload.results) ? fallbackPayload.results : [];
-    const fallbackBySymbol = new Map(fallbackRows.map((row) => [normalizeSymbolForMarket(row.symbol, state.market), row]).filter(([symbol]) => symbol));
+    const fallbackBySymbol = new Map(fallbackRows.map((row) => [normalizeSymbolForMarket(row.symbol, marketKey), row]).filter(([symbol]) => symbol));
     missing.forEach(({ item, index, expected }, fallbackIndex) => {
       const indexed = fallbackRows[fallbackIndex];
-      const indexedSymbol = normalizeSymbolForMarket(indexed?.symbol, state.market);
+      const indexedSymbol = normalizeSymbolForMarket(indexed?.symbol, marketKey);
       const row = fallbackBySymbol.get(expected) || (indexedSymbol === expected ? indexed : null);
       if (!row?.analysis) throw new Error(`${item.symbol} 未返回本地分析`);
       results[index] = {
         ...item.result,
         symbol: expected,
-        market: state.market,
+        market: marketKey,
         analysis: row.analysis,
         source: `${payload.source || "batch"}+${row.source || fallbackPayload.source || "local-fallback"}`,
       };
     });
   }
-  if (options.commit !== false) return commitAnalysisResults(results, options);
+  if (options.commit !== false) return commitAnalysisResults(results, { ...options, market: marketKey });
   return results;
 }
 
 async function requestParallelSingleAnalysis(preparedItems, options = {}) {
+  const marketKey = safeMarket(options.market || preparedItems?.[0]?.result?.market || preparedItems?.[0]?.input?.market || state.market);
   const settled = await Promise.allSettled(preparedItems.map(async (item) => {
     const response = await fetch("/api/analyze", {
       method: "POST",
@@ -6286,6 +6607,7 @@ async function requestParallelSingleAnalysis(preparedItems, options = {}) {
     const payload = await response.json();
     const result = {
       ...item.result,
+      market: marketKey,
       analysis: payload.analysis,
       source: `${payload.source || "openai"}-parallel-fallback`,
     };
@@ -6296,7 +6618,7 @@ async function requestParallelSingleAnalysis(preparedItems, options = {}) {
     setSymbolError(preparedItems[index].symbol, entry.reason);
     return null;
   }).filter(Boolean);
-  if (options.commit !== false) return commitAnalysisResults(results, options);
+  if (options.commit !== false) return commitAnalysisResults(results, { ...options, market: marketKey });
   return results;
 }
 
@@ -6307,15 +6629,22 @@ async function analyzeSymbol(symbol) {
   return result;
 }
 
-function orderedSymbolsForRefresh() {
-  state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
-  const portfolioSymbols = activePortfolio().map((holding) => normalizeSymbol(holding.symbol)).filter(Boolean);
-  return [...new Set([...portfolioSymbols, ...state.watchlist])];
+function orderedSymbolsForRefresh(market = state.market) {
+  const marketKey = safeMarket(market);
+  const watchlist = marketKey === state.market
+    ? sanitizeSymbolsForMarket(state.watchlist, marketKey)
+    : sanitizeSymbolsForMarket(state.watchlistsByMarket[marketKey] || MARKET_CONFIG[marketKey].defaultSymbols, marketKey);
+  if (marketKey === state.market) state.watchlist = watchlist;
+  const portfolioSymbols = activePortfolio(marketKey).map((holding) => normalizeSymbolForMarket(holding.symbol, marketKey)).filter(Boolean);
+  return [...new Set([...portfolioSymbols, ...watchlist])].filter((symbol) => allowWatchSymbolForMarket(symbol, marketKey, watchlistOriginFor(symbol, marketKey, "refresh")));
 }
 
-function mergePreparedSignalsIntoAnalysis(prepared) {
+function mergePreparedSignalsIntoAnalysis(prepared, market = state.market) {
+  const marketKey = safeMarket(market);
+  if (marketKey !== state.market) return null;
   const result = prepared?.result || prepared;
-  const symbol = normalizeSymbolForMarket(result?.symbol, state.market);
+  if (result?.market && safeMarket(result.market) !== marketKey) return null;
+  const symbol = normalizeSymbolForMarket(result?.symbol, marketKey);
   if (!symbol) return null;
   const existing = state.analyses.get(symbol);
   if (!existing || normalizeAnalysis(existing.analysis).action === "ERROR") return null;
@@ -6332,17 +6661,18 @@ function mergePreparedSignalsIntoAnalysis(prepared) {
     signalRefreshedAt: new Date().toISOString(),
   };
   state.analyses.set(symbol, merged);
-  state.analysesByMarket.set(state.market, new Map(state.analyses));
+  state.analysesByMarket.set(marketKey, new Map(state.analyses));
   return merged;
 }
 
-async function runBackgroundSignalAi(preparedItems, token) {
+async function runBackgroundSignalAi(preparedItems, token, market = state.market) {
+  const marketKey = safeMarket(market);
   const enrichedSettled = await Promise.allSettled(preparedItems.map((item) => (
-    preparedHasSignals(item) ? item : prepareSymbol(item.symbol, { includeSignals: true, backgroundSignals: true })
+    preparedHasSignals(item) ? item : prepareSymbol(item.symbol, { includeSignals: true, backgroundSignals: true, market: marketKey })
   )));
-  if (state.aiRefreshToken !== token) return;
+  if (state.aiRefreshToken !== token || state.market !== marketKey) return;
   const enriched = enrichedSettled.map((entry, index) => entry.status === "fulfilled" ? entry.value : preparedItems[index]);
-  const signalMerged = enriched.map(mergePreparedSignalsIntoAnalysis).filter(Boolean);
+  const signalMerged = enriched.map((item) => mergePreparedSignalsIntoAnalysis(item, marketKey)).filter(Boolean);
   if (signalMerged.length) {
     persistAnalysisSnapshot("background-signal-merge");
     queueMainRender(["cards", "summary", "detail"]);
@@ -6351,15 +6681,15 @@ async function runBackgroundSignalAi(preparedItems, token) {
   }
   let results = [];
   try {
-    results = await requestBatchAnalysis(enriched, { commit: false });
+    results = await requestBatchAnalysis(enriched, { commit: false, market: marketKey });
   } catch (error) {
-    if (state.aiRefreshToken !== token) return;
+    if (state.aiRefreshToken !== token || state.market !== marketKey) return;
     console.error(error);
     setStatus(`后台新闻/因子已更新；AI 复核未完成：${error.message}`);
     return;
   }
-  if (state.aiRefreshToken !== token) return;
-  const adjusted = commitAnalysisResults(results, { agentStep: false });
+  if (state.aiRefreshToken !== token || state.market !== marketKey) return;
+  const adjusted = commitAnalysisResults(results, { agentStep: false, market: marketKey });
   const buyAlerts = adjusted.filter((item) => isBuyAction(item.analysis?.action)).length;
   renderAnalysisPanelsNow();
   setStatus(`后台新闻/AI 复核完成：${buyAlerts} 个买入/轻仓关注提醒`);
@@ -6900,16 +7230,24 @@ function predictionCalibrationSummaryHtml(source = null) {
   const calibration = source.predictionCalibration || null;
   const horizons = Array.isArray(source.horizonCalibrations) ? source.horizonCalibrations : [];
   const rows = horizons.length ? horizons : calibration ? [calibration] : [];
+  const trainingSymbolCount = Array.isArray(source.trainingSymbols)
+    ? source.trainingSymbols.length
+    : Number(source.trainingUniverse?.trainingSymbols?.length || source.symbolCount || 0);
+  const requestedSymbolCount = Array.isArray(source.requestedSymbols)
+    ? source.requestedSymbols.length
+    : Number(source.trainingUniverse?.requestedSymbols?.length || 0);
   const cards = rows.map((row) => {
     const weights = Object.entries(row.optimizedWeights || {})
       .sort(([, a], [, b]) => Number(b || 0) - Number(a || 0))
       .slice(0, 5);
     const test = row.test || {};
     const baseline = row.baselines || {};
+    const stability = row.stability || {};
     return `
       <div class="boost-row">
         <strong>${escapeHtml(row.horizonLabel || row.horizonBucket || "预测周期")} · ${row.horizonDays || "-"}日 · ${row.active ? "已通过" : row.status || "研究中"}</strong>
         <span>样本 ${formatCompactNumber(row.sampleCount || 0, 0)} · 测试方向 ${pctOrPending(test.directionHitRate)} · 等权 ${pctOrPending(baseline.equalWeightDirectionHitRate ?? baseline.equalWeight?.directionHitRate)} · 动量 ${pctOrPending(baseline.momentumOnlyDirectionHitRate ?? baseline.momentumOnly?.directionHitRate)}</span>
+        ${stability.available ? `<span>稳定性 ${stability.pass ? "通过" : "不稳定"} · ${stability.foldCount || 0} 折 · 分数 ${numberOrPending(stability.stabilityScore, 0)} · 方向lift ${deltaText(stability.avgDirectionLiftPct, 1)} · 权重漂移 ${numberOrPending(stability.weightDrift, 2)}</span>` : `<span>稳定性样本收集中</span>`}
         <p>${escapeHtml(row.reason || "按时间序列切分学习预测头权重；样本外没有打赢基准时只保留为研究证据。")}</p>
         ${weights.length ? `<p class="muted small-text">权重：${weights.map(([name, value]) => `${escapeHtml(name)} ${Math.round(Number(value || 0) * 100)}%`).join(" · ")}</p>` : ""}
       </div>
@@ -6919,7 +7257,7 @@ function predictionCalibrationSummaryHtml(source = null) {
     <div class="boost-plan">
       <div class="boost-row">
         <strong>预测准确率校准模型</strong>
-        <span>${escapeHtml(source.framework || "prediction-weight-calibration")} · 保存 ${source.savedAt ? new Date(source.savedAt).toLocaleString() : source.generatedAt ? new Date(source.generatedAt).toLocaleString() : "本次运行"} · 股票 ${source.availableCount || source.symbolCount || 0}/${source.symbolCount || 0}</span>
+        <span>${escapeHtml(source.framework || "prediction-weight-calibration")} · 保存 ${source.savedAt ? new Date(source.savedAt).toLocaleString() : source.generatedAt ? new Date(source.generatedAt).toLocaleString() : "本次运行"} · 训练股票 ${source.availableCount || source.symbolCount || 0}/${trainingSymbolCount || source.symbolCount || 0} · 用户输入 ${requestedSymbolCount || 0} · 样本 ${formatCompactNumber(source.sampleTotal || 0, 0)}</span>
         <p>目标是校准“预测方法本身”的准确率，不等同于买入策略回测；短期、中期、长期分别学习权重，避免把长期逻辑硬套到隔日/短线预测。</p>
       </div>
       ${cards || `<div class="boost-row"><strong>样本不足</strong><span>等待更多历史切片</span><p>需要更多真实K线切片才能分周期学习权重。</p></div>`}
@@ -6934,27 +7272,70 @@ function historicalBacktestHtml(summary = null) {
       <div class="learning-section">
         <h4>历史预测校准</h4>
         ${savedModel ? predictionCalibrationSummaryHtml(savedModel) : `<p class="muted">点击“5年历史预测校准”后，会用过去每个可用交易日模拟当时预测，只用该日以前的数据训练，再按短/中/长期验证预测头权重是否优于等权和动量基线。</p>`}
+        ${savedModel?.crossSectionalFactorResearch ? crossSectionalFactorResearchHtml(savedModel.crossSectionalFactorResearch) : ""}
       </div>
     `;
   }
   const metrics = summary.metrics || {};
+  const dataQuality = summary.dataQuality || summary.savedModel?.dataQuality || {};
+  const regimeCalibration = summary.regimeCalibration || summary.savedModel?.regimeCalibration || {};
+  const regimeMatched = regimeCalibration.matchedCurrentRegime || regimeCalibration.matchedBucket || {};
+  const regimeCurrent = regimeCalibration.current || {};
+  const conformalCalibration = summary.conformalCalibration || summary.savedModel?.conformalCalibration || {};
+  const conformalOverall = conformalCalibration.overall || {};
+  const conformalCurrent = conformalCalibration.currentRegimeSummary || conformalOverall;
   const results = Array.isArray(summary.results) ? summary.results : [];
   const availableRows = results.filter((row) => row.available);
   const unavailableRows = results.filter((row) => !row.available);
+  const trainingSymbolCount = Array.isArray(summary.trainingSymbols)
+    ? summary.trainingSymbols.length
+    : Number(summary.trainingUniverse?.trainingSymbols?.length || summary.symbolCount || 0);
+  const requestedSymbolCount = Array.isArray(summary.requestedSymbols)
+    ? summary.requestedSymbols.length
+    : Number(summary.trainingUniverse?.requestedSymbols?.length || 0);
   return `
     <div class="learning-section">
       <h4>历史预测校准</h4>
       ${predictionCalibrationSummaryHtml(summary.savedModel || summary)}
       <div class="accuracy-grid">
         <div class="accuracy-metric"><span>股票 / 可用</span><strong>${summary.symbolCount || 0} / ${summary.availableCount || 0}</strong></div>
+        <div class="accuracy-metric"><span>训练池 / 输入</span><strong>${trainingSymbolCount || summary.symbolCount || 0} / ${requestedSymbolCount || 0}</strong></div>
         <div class="accuracy-metric"><span>历史切片样本</span><strong>${summary.sampleTotal || 0}</strong></div>
+        <div class="accuracy-metric"><span>有效样本权重</span><strong>${numberOrPending(metrics.effectiveSamples, 1)}</strong></div>
         <div class="accuracy-metric"><span>买入信号</span><strong>${summary.buySignalTotal || 0}</strong></div>
+        <div class="accuracy-metric"><span>标签置信</span><strong>${metrics.avgLabelConfidence == null ? "n/a" : pctOrPending(Number(metrics.avgLabelConfidence) * 100)}</strong></div>
+        <div class="accuracy-metric"><span>标签噪声</span><strong>${numberOrPending(metrics.avgLabelNoiseScore, 0)}</strong></div>
+        <div class="accuracy-metric"><span>高噪声切片</span><strong>${pctOrPending(metrics.highNoiseSamplePct)}</strong></div>
+        <div class="accuracy-metric"><span>顺序未知</span><strong>${pctOrPending(metrics.ambiguousBarrierPct)}</strong></div>
+        <div class="accuracy-metric"><span>样本覆盖</span><strong>${numberOrPending(metrics.avgCoverageScore, 0)}</strong></div>
+        <div class="accuracy-metric"><span>低覆盖切片</span><strong>${pctOrPending(metrics.lowCoverageSamplePct)}</strong></div>
+        <div class="accuracy-metric"><span>当前状态</span><strong>${escapeHtml(regimeCurrent.label || regimeMatched.label || "聚合")}</strong></div>
+        <div class="accuracy-metric"><span>同状态达标</span><strong>${pctOrPending(regimeMatched.targetHitRate)}</strong></div>
+        <div class="accuracy-metric"><span>同状态止损</span><strong>${pctOrPending(regimeMatched.stopRate)}</strong></div>
+        <div class="accuracy-metric"><span>P80误差</span><strong>${conformalCurrent.finalReturnAbsErrorP80 == null ? "n/a" : `±${Number(conformalCurrent.finalReturnAbsErrorP80).toFixed(2)}%`}</strong></div>
+        <div class="accuracy-metric"><span>P90误差</span><strong>${conformalCurrent.finalReturnAbsErrorP90 == null ? "n/a" : `±${Number(conformalCurrent.finalReturnAbsErrorP90).toFixed(2)}%`}</strong></div>
+        <div class="accuracy-metric"><span>数据质量</span><strong>${dataQuality.avgScore == null ? "n/a" : Number(dataQuality.avgScore).toFixed(1)}</strong></div>
+        <div class="accuracy-metric"><span>退化K线</span><strong>${pctOrPending(dataQuality.degradedRowPct)}</strong></div>
         <div class="accuracy-metric"><span>方向命中</span><strong>${pctOrPending(metrics.directionHitRate)}</strong></div>
         <div class="accuracy-metric"><span>达标命中</span><strong>${pctOrPending(metrics.targetHitRate)}</strong></div>
         <div class="accuracy-metric"><span>先止损率</span><strong>${pctOrPending(metrics.stopRate)}</strong></div>
         <div class="accuracy-metric"><span>平均收益</span><strong>${metrics.avgForwardReturn == null ? "n/a" : formatPct(metrics.avgForwardReturn)}</strong></div>
         <div class="accuracy-metric"><span>目标Brier</span><strong>${numberOrPending(metrics.brierTarget, 3)}</strong></div>
       </div>
+      ${regimeCalibration.framework ? `
+        <div class="boost-row">
+          <strong>行情状态分桶校准</strong>
+          <span>${escapeHtml(regimeCalibration.framework)} · 股票/状态 ${regimeCalibration.symbolCount || regimeCalibration.matchedSymbolCount || results.length || 0} · 同状态样本 ${numberOrPending(regimeMatched.effectiveSamples, 1)} · 收益 ${regimeMatched.avgReturn == null ? "n/a" : formatPct(regimeMatched.avgReturn)}</span>
+          <p>${escapeHtml(regimeCalibration.policy || "按当时可见趋势、波动、量能、RSI 和样本覆盖分桶；当前状态历史表现弱时会降低置信度。")}</p>
+        </div>
+      ` : ""}
+      ${conformalCalibration.framework ? `
+        <div class="boost-row">
+          <strong>共形误差区间校准</strong>
+          <span>${escapeHtml(conformalCalibration.framework)} · 样本 ${formatCompactNumber(conformalCurrent.samples || conformalOverall.samples || 0, 0)} · P80 ${conformalCurrent.finalReturnAbsErrorP80 == null ? "n/a" : `±${Number(conformalCurrent.finalReturnAbsErrorP80).toFixed(2)}%`} · P90 ${conformalCurrent.finalReturnAbsErrorP90 == null ? "n/a" : `±${Number(conformalCurrent.finalReturnAbsErrorP90).toFixed(2)}%`} · 不确定性 ${numberOrPending(conformalCurrent.uncertaintyScore ?? conformalOverall.uncertaintyScore, 0)}</span>
+          <p>${escapeHtml(conformalCalibration.policy || "按历史预测残差估计未来标签误差带；误差带过宽时降低高置信幅度预测。")}</p>
+        </div>
+      ` : ""}
       <div class="bucket-list">
         ${availableRows.length ? availableRows
           .sort((a, b) => Number(b.metrics?.samples || 0) - Number(a.metrics?.samples || 0))
@@ -6964,7 +7345,11 @@ function historicalBacktestHtml(summary = null) {
               <strong>${escapeHtml(row.symbol || "-")}</strong>
               <span>K线 ${row.candleCount || 0}</span>
               <span>切片 ${row.metrics?.samples || 0}</span>
+              <span>有效 ${row.metrics?.effectiveSamples == null ? "n/a" : Number(row.metrics.effectiveSamples).toFixed(1)}</span>
               <span>训练中位 ${formatCompactNumber(row.dataDepth?.trainSamplesMedian || 0, 0)}</span>
+              <span>质量 ${row.dataQuality?.avgScore == null ? "n/a" : Number(row.dataQuality.avgScore).toFixed(0)}</span>
+              <span>标签 ${row.metrics?.avgLabelConfidence == null ? "n/a" : pctOrPending(Number(row.metrics.avgLabelConfidence) * 100)}</span>
+              <span>噪声 ${row.metrics?.avgLabelNoiseScore == null ? "n/a" : Number(row.metrics.avgLabelNoiseScore).toFixed(0)}</span>
               <span>买入 ${row.metrics?.buySignals || 0}</span>
               <span>达标 ${pctOrPending(row.metrics?.acceptedTargetRate ?? row.metrics?.targetHitRate)}</span>
               <span>止损 ${pctOrPending(row.metrics?.stopRate)}</span>
@@ -6973,7 +7358,65 @@ function historicalBacktestHtml(summary = null) {
           `).join("") : `<p class="muted">没有股票拥有足够历史K线完成回测。</p>`}
         ${unavailableRows.length ? `<p class="muted small-text">不可用 ${unavailableRows.length} 只：${unavailableRows.slice(0, 8).map((row) => escapeHtml(row.symbol || "-")).join("、")}${unavailableRows.length > 8 ? "..." : ""}</p>` : ""}
       </div>
+      ${dataQuality.framework ? `
+        <div class="boost-row">
+          <strong>数据质量与标签可信度</strong>
+          <span>${escapeHtml(dataQuality.framework)} · 股票 ${dataQuality.symbolCount || availableRows.length || 0} · 高质量K线 ${pctOrPending(dataQuality.highQualityPct)} · 平均样本权重 ${numberOrPending(dataQuality.avgSampleWeight, 3)} · 标签噪声 ${numberOrPending(metrics.avgLabelNoiseScore, 0)}</span>
+          <p>${escapeHtml(dataQuality.learningPolicy || "训练和校准使用数据质量/标签置信加权，降低异常行情、零成交、疑似拆股/数据源跳变对模型的影响。")}</p>
+          ${dataQuality.issueCounts ? `<p class="muted small-text">主要数据问题：${Object.entries(dataQuality.issueCounts).slice(0, 6).map(([name, count]) => `${escapeHtml(name)} ${count}`).join(" · ") || "暂无"}</p>` : ""}
+        </div>
+      ` : ""}
       <p class="muted small-text">方法：${escapeHtml(summary.framework || "historical-walk-forward-backtest-batch")} · range ${escapeHtml(summary.range || "5y")} · ${summary.generatedAt ? new Date(summary.generatedAt).toLocaleString() : "刚刚运行"}</p>
+      ${crossSectionalFactorResearchHtml(summary.crossSectionalFactorResearch || summary.savedModel?.crossSectionalFactorResearch)}
+    </div>
+  `;
+}
+
+function crossSectionalFactorResearchHtml(research = null) {
+  if (!research) return "";
+  const available = research.available !== false;
+  const aggregate = Array.isArray(research.aggregate_weights) ? research.aggregate_weights : Array.isArray(research.aggregateWeights) ? research.aggregateWeights : [];
+  const horizons = Array.isArray(research.horizon_results) ? research.horizon_results : Array.isArray(research.horizonResults) ? research.horizonResults : [];
+  return `
+    <div class="cross-factor-panel">
+      <div class="quant-result-head">
+        <div>
+          <h4>市场级横截面因子研究</h4>
+          <p class="muted small-text">${escapeHtml(research.framework || "market-cross-sectional-factor-research")} · 股票 ${formatCompactNumber(research.symbol_count ?? research.symbolCount, 0)} · ${available ? "已生成市场因子权重" : escapeHtml(research.reason || "样本不足")}</p>
+        </div>
+        <span class="tag ${available ? "good" : "warn"}">${available ? "cross-section ready" : "research pending"}</span>
+      </div>
+      ${aggregate.length ? `
+        <div class="factor-research-weight-list">
+          ${aggregate.slice(0, 12).map((row) => `
+            <div>
+              <strong>${escapeHtml(row.name)}</strong>
+              <span>${formatPct(row.weight_pct)}</span>
+              <small>市场级聚合权重</small>
+            </div>
+          `).join("")}
+        </div>
+      ` : `<p class="muted">还没有足够横截面样本生成聚合权重。</p>`}
+      <div class="bucket-list">
+        ${horizons.length ? horizons.map((row) => {
+          const ml = row.ml_backtest || row.mlBacktest || {};
+          const test = ml.test || {};
+          const topWeights = Array.isArray(row.weights) ? row.weights.slice(0, 5) : [];
+          return `
+            <div class="bucket-row cross-factor-row">
+              <strong>${formatCompactNumber(row.horizon_days ?? row.horizonDays, 0)}日</strong>
+              <span>行 ${formatCompactNumber(row.row_count ?? row.rowCount, 0)}</span>
+              <span>日期 ${formatCompactNumber(row.date_count ?? row.dateCount, 0)}</span>
+              <span>股票 ${formatCompactNumber(row.symbol_count ?? row.symbolCount, 0)}</span>
+              <span>准入 ${formatCompactNumber(row.admitted_count ?? row.admittedCount, 0)}</span>
+              <span>Holdout方向 ${ml.available ? pctOrPending(test.direction_hit_rate_pct ?? test.directionHitRate) : "样本不足"}</span>
+              <span>RankIC ${ml.available ? numberOrPending(test.rank_ic ?? test.rankIc, 4) : "n/a"}</span>
+              <span>${topWeights.map((item) => `${escapeHtml(item.name)} ${Math.round(Number(item.weight_pct || item.weightPct || 0))}%`).join(" · ")}</span>
+            </div>
+          `;
+        }).join("") : `<p class="muted">暂无周期拆分结果。</p>`}
+      </div>
+      <p class="muted small-text">${escapeHtml(research.leakage_control || research.leakageControl || "横截面因子使用 t 时点以前数据，未来收益只作为历史标签。")}</p>
     </div>
   `;
 }
@@ -7035,6 +7478,58 @@ function optimizedWeightLearningHtml(optimization = null) {
           <span>学习权重 ${Math.round(Number(weight || 0) * 100)}%</span>
         </div>
       `).join("") : `<p class="muted">权重向量仍在收集中。</p>`}
+    </div>
+  `;
+}
+
+function modelZooCommitteeHtml(modelZoo = null) {
+  if (!modelZoo) return `<p class="muted">模型委员会尚未返回；当前只使用现有 ensemble 与本地模型头。</p>`;
+  const test = modelZoo.test || {};
+  const baselines = modelZoo.baselines || {};
+  const reject = modelZoo.rejectGate || {};
+  const candidates = Array.isArray(modelZoo.candidates) ? modelZoo.candidates : [];
+  const adapters = Array.isArray(modelZoo.externalAdapters) ? modelZoo.externalAdapters : [];
+  const statusText = modelZoo.active
+    ? `已接入实时 ensemble · 样本 ${modelZoo.sampleCount || 0} · 候选 ${modelZoo.activeCandidateCount || 0}/${modelZoo.candidateCount || 0}`
+    : `${modelZoo.status || "collecting"} · 样本 ${modelZoo.sampleCount || 0}/${modelZoo.minSamples || 48}`;
+  return `
+    <div class="boost-plan">
+      <div class="boost-row">
+        <strong>多模型预测委员会 · ${modelZoo.active ? "样本外通过" : "研究观察"}</strong>
+        <span>${escapeHtml(statusText)} · 测试方向 ${pctOrPending(test.directionHitRate)} · MSE ${numberOrPending(test.mse, 3)}</span>
+        <p>${escapeHtml(modelZoo.reason || "候选模型必须先在验证集学习权重，再到后面的测试集打赢基准；没有通过时不会提高实时置信率。")}</p>
+      </div>
+      <div class="boost-row">
+        <strong>拒绝预测闸门</strong>
+        <span>阈值 ${numberOrPending(reject.threshold, 2)} · 接受 ${reject.acceptedSamples || 0} · 拒绝 ${reject.rejectedSamples || 0} · 接受后方向 ${pctOrPending(reject.acceptedDirectionHitRate)}</span>
+        <p>${escapeHtml(reject.reason || "当候选模型分歧过大，系统会降低置信度或拒绝高置信买入，而不是硬给方向。")}</p>
+      </div>
+      <div class="boost-row">
+        <strong>基准对照</strong>
+        <span>等权方向 ${pctOrPending(baselines.equalWeight?.directionHitRate)} · 旧模型方向 ${pctOrPending(baselines.storedEnsemble?.directionHitRate)} · vs等权 ${modelZoo.testImprovementVsEqualPct == null ? "n/a" : `${Number(modelZoo.testImprovementVsEqualPct).toFixed(1)}%`} · vs旧模型 ${modelZoo.testImprovementVsStoredPct == null ? "n/a" : `${Number(modelZoo.testImprovementVsStoredPct).toFixed(1)}%`}</span>
+        <p>这里校准的是“预测方法本身”的准确率，不是简单交易收益；方向、幅度、达标和止损会被分开评估。</p>
+      </div>
+    </div>
+    <div class="bucket-list model-zoo-list">
+      ${candidates.length ? candidates.map((candidate) => `
+        <div class="bucket-row model-zoo-row">
+          <strong>${escapeHtml(candidate.label || candidate.name || "-")}</strong>
+          <span>${escapeHtml(candidate.family || candidate.kind || "model")} · ${candidate.active ? "active" : candidate.status || "research"}</span>
+          <span>权重 ${Math.round(Number(candidate.weight || 0) * 100)}%</span>
+          <span>测试方向 ${pctOrPending(candidate.test?.directionHitRate)}</span>
+          <span>MSE ${numberOrPending(candidate.test?.mse, 3)}</span>
+          <span>${escapeHtml(candidate.reason || "")}</span>
+        </div>
+      `).join("") : `<p class="muted">候选模型仍在收集样本。</p>`}
+    </div>
+    <div class="bucket-list">
+      ${adapters.length ? adapters.map((row) => `
+        <div class="bucket-row">
+          <strong>${escapeHtml(row.id || "-")}</strong>
+          <span>${escapeHtml(row.status || "pending")}</span>
+          <span>${escapeHtml(row.role || "")}</span>
+        </div>
+      `).join("") : ""}
     </div>
   `;
 }
@@ -7114,6 +7609,13 @@ function collectModelFeatureRows(summary = {}) {
     lightgbm.tripleBarrierHead,
   ].filter(Boolean).forEach((head) => {
     (head.topFeatures || []).forEach((row) => addFeature(row.feature, Number(row.importance || 0) / 100, head.name || head.kind, head.active ? "active" : head.status));
+  });
+  const modelZoo = summary.modelZoo || {};
+  (modelZoo.candidates || []).filter(Boolean).forEach((candidate) => {
+    (candidate.model?.topCoefficients || []).forEach((row) => addFeature(row.feature, row.coef, candidate.label || candidate.name || "model-zoo", candidate.active ? "active" : candidate.status));
+    (candidate.targetModel?.topCoefficients || []).forEach((row) => addFeature(row.feature, row.coef, `${candidate.label || candidate.name || "model-zoo"} target`, candidate.active ? "active" : candidate.status));
+    (candidate.stopModel?.topCoefficients || []).forEach((row) => addFeature(row.feature, row.coef, `${candidate.label || candidate.name || "model-zoo"} stop`, candidate.active ? "active" : candidate.status));
+    (candidate.topFeatures || []).forEach((row) => addFeature(row.feature, Number(row.importance || 0) / 100, candidate.label || candidate.name || "model-zoo", candidate.active ? "active" : candidate.status));
   });
   return [...rows.values()]
     .sort((a, b) => b.weight - a.weight)
@@ -7476,6 +7978,10 @@ function renderAccuracyPanel() {
     <div class="learning-section">
       <h4>学习型最优权重</h4>
       ${optimizedWeightLearningHtml(summary.ensembleWeightOptimization)}
+    </div>
+    <div class="learning-section">
+      <h4>模型委员会与拒绝预测</h4>
+      ${modelZooCommitteeHtml(summary.modelZoo)}
     </div>
     <div class="learning-section">
       <h4>Python本地模型头</h4>
@@ -10689,13 +11195,14 @@ function renderDetailUnsafe() {
       <span>证据奖励 ${Number(ensemble.evidenceBonus || 0).toFixed(1)} / 分歧扣分 ${Number(ensemble.disagreementPenalty || 0).toFixed(1)}</span>
       <span>策略达标 ${Math.round(targetProb)}% / 门槛 ${Math.round(targetProbRequired)}%</span>
       <span>动态调权 ${Math.round(ensemble.performanceWeightAdjusted || 0)} 个模型</span>
+      <span>外部复核 ${ensemble.doubleCheckWeighting?.externalModelCount ? `${Number(ensemble.doubleCheckWeighting.externalShare || 0).toFixed(1)}% / 上限 ${Math.round(Number(ensemble.doubleCheckWeighting.maxExternalShare || 0.18) * 100)}%` : "未占权重"}</span>
       <span>${ensemble.optimizedWeighting?.applied ? `样本外优化权重已启用 · ${Math.round(Number(ensemble.optimizedWeighting.deploymentBlend || 0) * 100)}%` : `权重模式 ${ensemble.weightingMethod || "prior-performance-regime"}`}</span>
     </div>
     <div class="ensemble-grid">
       ${ensembleModels.length ? ensembleModels.map((model) => `
         <div class="ensemble-card ${model.available === false ? "muted-factor" : ""}">
           <div><strong>${model.name || "模型"}</strong><span class="${Number(model.projectedUpside || 0) >= 0 ? "good-text" : "danger-text"}">${formatPct(model.projectedUpside || 0)}</span></div>
-          <p>置信 ${Math.round(model.confidence || 0)}% · 权重 ${Math.round((model.normalizedWeight || model.weight || 0) * 100)}%${model.values?.optimizedEnsembleWeight != null ? ` · 学习权重 ${Math.round(Number(model.values.optimizedEnsembleWeight || 0) * 100)}%` : ""}${model.values?.performanceWeightMultiplier ? ` · 表现权重 ${Math.round(model.values.performanceWeightMultiplier * 100)}%` : ""}${model.values?.regimeWeightMultiplier ? ` · 环境权重 ${Math.round(model.values.regimeWeightMultiplier * 100)}%` : ""}</p>
+          <p>置信 ${Math.round(model.confidence || 0)}% · 权重 ${Math.round((model.normalizedWeight || model.weight || 0) * 100)}%${model.values?.doubleCheckOnly ? " · 仅复核" : ""}${model.values?.optimizedEnsembleWeight != null ? ` · 学习权重 ${Math.round(Number(model.values.optimizedEnsembleWeight || 0) * 100)}%` : ""}${model.values?.performanceWeightMultiplier ? ` · 表现权重 ${Math.round(model.values.performanceWeightMultiplier * 100)}%` : ""}${model.values?.regimeWeightMultiplier ? ` · 环境权重 ${Math.round(model.values.regimeWeightMultiplier * 100)}%` : ""}</p>
           <p>${model.reason || ""}</p>
         </div>
       `).join("") : `<p class="muted">集成模型正在等待分析结果。</p>`}
@@ -12307,15 +12814,20 @@ async function refreshAll() {
     if (state.autoRefreshEnabled) scheduleNextAutoRefresh();
     return;
   }
+  const marketKey = state.market;
+  const config = activeMarketConfig(marketKey);
+  const switchToken = state.marketSwitchToken;
+  const refreshToken = ++state.refreshToken;
+  const isStaleRefresh = () => state.market !== marketKey || state.marketSwitchToken !== switchToken || state.refreshToken !== refreshToken;
   const startedAt = new Date();
   const preparedItems = [];
   let symbols = [];
   let runtime = getRuntimeSettings();
   try {
-    const session = marketState();
+    const session = marketState(new Date(), marketKey);
     runtime = getRuntimeSettings();
     if (!session.canRefresh && !runtime.allowOffHoursFetch) {
-      const shouldStop = await useSnapshotOrFetch(`当前不在 ${activeMarketConfig().code} 交易/收盘刷新窗口`, true);
+      const shouldStop = await useSnapshotOrFetch(`当前不在 ${config.code} 交易/收盘刷新窗口`, true);
       if (shouldStop) {
         safeUiStep("安排下一次自动刷新", scheduleNextAutoRefresh);
         return;
@@ -12329,55 +12841,63 @@ async function refreshAll() {
     safeUiStep("保存刷新状态", saveState);
     const refreshButton = $("refreshAll");
     if (refreshButton) refreshButton.disabled = true;
-    symbols = orderedSymbolsForRefresh();
-    safeUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-start", 250, { maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
-    await safeUiStepAsync("同步预测准确率", () => fetchAccuracySummary(true));
-    await refreshMarketIndexes(true).catch((error) => {
+    symbols = orderedSymbolsForRefresh(marketKey);
+    safeUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-start", 250, { market: marketKey, maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
+    const accuracyPromise = safeUiStepAsync("同步预测准确率", () => fetchAccuracySummary(true, marketKey));
+    await optionalWithin(accuracyPromise, runtime.fastInitialRefresh ? 1200 : 2500, null);
+    const indexPromise = refreshMarketIndexes(true, marketKey).catch((error) => {
       console.warn("Unable to refresh market indexes", error);
-      safeUiStep("恢复本地大盘快照", loadMarketIndexSnapshot);
+      if (!isStaleRefresh()) safeUiStep("恢复本地大盘快照", () => loadMarketIndexSnapshot(marketKey));
     });
+    if (!runtime.fastInitialRefresh) await optionalWithin(indexPromise, 3500, null);
+    if (isStaleRefresh()) return;
     setStatus(runtime.fastInitialRefresh
       ? `快速并行读取 ${symbols.length} 只股票真实行情；新闻/AI 后台复核...`
       : `并行读取 ${symbols.length} 只股票真实行情、新闻和因子；持仓股优先...`);
-    const tasks = symbols.map(async (symbol) => {
+    const concurrency = Math.max(3, Math.min(14, Number(runtime.refreshConcurrency || safeStorage.getItem("refreshConcurrency") || (runtime.fastInitialRefresh ? 10 : 6))));
+    await runLimited(symbols, concurrency, async (symbol) => {
+      if (isStaleRefresh()) return;
       try {
-        const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh });
+        const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh, market: marketKey });
+        if (isStaleRefresh()) return;
         preparedItems.push(prepared);
         setStatusThrottled(`${symbol} 数据准备完成 · ${preparedItems.length}/${symbols.length}`);
       } catch (error) {
         console.error(error);
-        safeUiStep(`${symbol} 写入失败状态`, () => setSymbolError(symbol, error));
+        if (!isStaleRefresh()) safeUiStep(`${symbol} 写入失败状态`, () => setSymbolError(symbol, error));
       } finally {
-        queueMainRender(["cards", "summary", "detail"]);
+        if (!isStaleRefresh()) queueMainRender(["cards", "summary", "detail"]);
       }
     });
-    await Promise.allSettled(tasks);
+    if (isStaleRefresh()) return;
     preparedItems.sort((a, b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
     if (preparedItems.length) {
       try {
         setStatus(runtime.fastInitialRefresh
           ? `快速本地融合 ${preparedItems.length} 只股票，先给出技术/历史/自监督结论...`
           : `本地模型融合 ${preparedItems.length} 只股票，已纳入新闻/因子，AI 批量分析后台更新...`);
-        const results = await requestBatchAnalysis(preparedItems, { localOnly: true });
+        const results = await requestBatchAnalysis(preparedItems, { localOnly: true, market: marketKey });
+        if (isStaleRefresh()) return;
         const buyAlerts = results.filter((item) => isBuyAction(item.analysis?.action)).length;
         setStatus(`本地融合完成：${buyAlerts} 个买入/轻仓关注提醒，新闻/因子/AI 正在后台复核`);
       } catch (error) {
         console.error(error);
-        preparedItems.forEach((item) => safeUiStep(`${item.symbol} 写入本地模型失败`, () => setSymbolError(item.symbol, error)));
+        if (!isStaleRefresh()) preparedItems.forEach((item) => safeUiStep(`${item.symbol} 写入本地模型失败`, () => setSymbolError(item.symbol, error)));
       } finally {
-        renderAnalysisPanelsNow();
+        if (!isStaleRefresh()) renderAnalysisPanelsNow();
       }
     }
+    if (isStaleRefresh()) return;
     const seconds = ((Date.now() - startedAt.getTime()) / 1000).toFixed(1);
     setStatus(`刷新完成：${preparedItems.length}/${symbols.length} 只股票，用时 ${seconds}s；后台复核继续更新新闻、因子和 AI`);
-    safeUiStep("刷新后排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-complete", 1200, { maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
+    safeUiStep("刷新后排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-complete", 1200, { market: marketKey, maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
     safeUiStep("安排下一次自动刷新", scheduleNextAutoRefresh);
     if (preparedItems.length) {
       const token = Date.now();
       state.aiRefreshToken = token;
-      runBackgroundSignalAi(preparedItems, token)
+      runBackgroundSignalAi(preparedItems, token, marketKey)
         .catch((error) => {
-          if (state.aiRefreshToken !== token) return;
+          if (state.aiRefreshToken !== token || state.market !== marketKey) return;
           console.error(error);
           setStatus(`后台新闻/AI 复核未完成：${error.message}`);
         });
@@ -12389,8 +12909,10 @@ async function refreshAll() {
     safeUiStep("刷新失败后安排自动刷新", scheduleNextAutoRefresh);
   } finally {
     const refreshButton = $("refreshAll");
-    if (refreshButton) refreshButton.disabled = false;
-    state.isRefreshing = false;
+    if (state.refreshToken === refreshToken) {
+      if (refreshButton) refreshButton.disabled = false;
+      state.isRefreshing = false;
+    }
   }
 }
 
@@ -12484,6 +13006,15 @@ async function switchMarket(nextMarket) {
   const market = safeMarket(nextMarket);
   if (market === state.market) return;
   const token = ++state.marketSwitchToken;
+  state.refreshToken += 1;
+  state.aiRefreshToken += 1;
+  state.isRefreshing = false;
+  if (state.redditWarmupTimer) {
+    clearTimeout(state.redditWarmupTimer);
+    state.redditWarmupTimer = null;
+  }
+  const refreshButton = $("refreshAll");
+  if (refreshButton) refreshButton.disabled = false;
   safeUiStep("保存当前市场状态", stashActiveMarketState);
   state.market = market;
   state.watchlist = sanitizeSymbolsForMarket(initialWatchlistForMarket(market), market);
@@ -12837,6 +13368,7 @@ function boot() {
     renderPortfolioSummary();
     renderCards();
     renderDetail();
+    syncBackendMonitorConfig();
   });
 
   bind("toggleAutoRefresh", "click", () => {
@@ -12928,7 +13460,14 @@ function boot() {
 
   bind("refreshAll", "click", refreshAll);
   if (state.autoRefreshEnabled) startAutoRefresh(false);
+  syncBackendMonitorConfig({ immediate: true });
 }
+
+window.addEventListener("pagehide", () => syncBackendMonitorConfig({ immediate: true }));
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") syncBackendMonitorConfig({ immediate: true });
+});
 
 window.addEventListener("unhandledrejection", (event) => {
   console.error("Unhandled async error", event.reason);

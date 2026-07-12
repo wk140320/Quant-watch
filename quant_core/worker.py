@@ -7,7 +7,7 @@ import sys
 from typing import Any
 
 from alpha_mining import analyze_alpha_evolution
-from features import analyze_factors, analyze_features
+from features import analyze_cross_sectional_factors, analyze_factors, analyze_features
 from historical_backtest import batch_historical_backtest, run_historical_backtest
 from local_model import train_local_model_suite
 from provider_budget import provider_plan
@@ -233,6 +233,31 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "framework": "quantaalpha_inspired_local_evolution",
             }
         return result
+    if operation == "factor-research":
+        result = analyze_factors(
+            payload.get("candles") or [],
+            horizon=int(payload.get("horizon_days") or 15),
+            market=str(payload.get("market") or "ASX"),
+            symbol=str(payload.get("symbol") or ""),
+        )
+        research = result.get("factor_research") or {}
+        return {
+            "market": result.get("market"),
+            "symbol": result.get("symbol"),
+            "horizon_days": result.get("horizon_days"),
+            "sample_count": result.get("sample_count"),
+            "framework": research.get("framework", "dynamic-factor-admission-and-ml-weighting"),
+            "factor_research": research,
+            "top_factors": result.get("factors", [])[:12],
+            "quality_gate": result.get("quality_gate"),
+        }
+    if operation == "cross-sectional-factor-research":
+        return analyze_cross_sectional_factors(
+            payload.get("items") or [],
+            market=str(payload.get("market") or "ASX"),
+            horizons=payload.get("horizons") or payload.get("horizon_days") or payload.get("horizonDays") or [5, 15, 30],
+            min_symbols=int(payload.get("min_symbols", payload.get("minSymbols", 4)) or 4),
+        )
     if operation == "alpha-evolution":
         return analyze_alpha_evolution(
             payload.get("candles") or [],

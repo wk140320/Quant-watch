@@ -1395,3 +1395,390 @@ CPU 这次亏损暴露的问题：
 最终原则：
 
 **宁可少给买入提醒，也不能在回测证据不足时给高置信买入。**
+
+## 18. 新增：多模型预测委员会
+
+为了解决“预测过度依赖当日涨跌”和“单一模型说涨就抬高置信”的问题，系统新增 `python-local-model-zoo-committee`。
+
+它不是人工再加一组固定权重，而是把多个候选模型放到同一场样本外比赛：
+
+| 候选模型 | 作用 | 上线条件 |
+|---|---|---|
+| 当前线上综合预测 | 作为旧系统基准 | 永远只作为对照 |
+| 技术面 ridge | 学习趋势、动量、RSI、成交量、风险 | 测试集优于基准才给权重 |
+| 因子/新闻 ridge | 学习新闻、社媒、宏观、行业、流动性、校准因子 | 测试集优于基准才给权重 |
+| 订单流/成交密集区 ridge | 学习买压、量能加速度、VWAP/POC 偏离 | 测试集优于基准才给权重 |
+| 全特征 ridge | 学习稳定的跨域组合 | 正则化更强，防止过拟合 |
+| 目标-止损 meta | 预测目标先触达与止损先触发 | 只作为 expected return 输入 |
+| 序列状态代理 | LSTM/Transformer 前的轻量状态模型 | 研究证据，等大样本后替换深度头 |
+| LightGBM/树模型 | 可选非线性基线 | 本地可导入且样本外通过才参与 |
+
+统一输出口径：
+
+```text
+P(target-before-stop)
+P(stop-first)
+E(final return)
+E(max upside touch)
+E(max drawdown)
+calibration error
+```
+
+实际训练时采用：
+
+```text
+train -> validation -> test
+候选模型只在 train 训练
+权重只在 validation 学习
+最终是否上线只看 test
+```
+
+动态权重目标：
+
+```text
+committeePrediction = sum(weight_i * candidatePrediction_i)
+minimize mean((committeePrediction - actualForwardReturn)^2)
+subject to weight_i >= 0 and sum(weight_i) = 1
+```
+
+它还保存：
+
+- 每个候选模型的测试集方向命中、MSE、MAE、相关性。
+- 与等权模型的提升。
+- 与旧线上综合预测的提升。
+- 候选模型残差相关性，避免多个高度相似模型制造“假共识”。
+- 拒绝预测闸门：候选模型分歧过大时降低置信或阻断高置信买入。
+
+前端位置：
+
+```text
+预测学习与准确率 -> 周期与校准 -> 模型委员会与拒绝预测
+预测学习与准确率 -> 模型调整 -> 模型可解释性与参数地图
+```
+
+实时预测中，模型委员会只在 `active=true` 后作为 `模型委员会-OOS` 加入 ensemble。若委员会未通过样本外门槛，它会展示原因，但不会提高买入置信率。
+
+权重主次关系：
+
+```text
+自研/本地模型 = 主预测
+开源项目/外部方法 = double check
+```
+
+具体上限：
+
+```text
+实时 ensemble:
+  外部/开源蒸馏模型总权重 <= 18%
+  单个外部模型权重 <= 6%
+  自研模型权重 >= 82%
+
+model-zoo 内部:
+  外部/open-source challenger 总权重 <= 12%
+  单个外部 challenger <= 8%
+  自研/本地模型权重 >= 88%
+```
+
+所以 Freqtrade、LEAN、Backtrader、FinRL、Hummingbot、Qlib/LightGBM 这类方法的作用是复核、提醒分歧、触发降置信或拒绝预测。它们不会反客为主，不能单独把一只股票推成买入信号。
+
+## 19. 这次优化如何避免过拟合
+
+新增机制的核心不是“模型更多”，而是“模型必须打擂”：
+
+1. 旧模型、等权模型、简单动量都作为基准。
+2. 任何候选模型不能只看训练集表现。
+3. 权重不能直接在测试集上调。
+4. 过高分歧会触发拒绝预测。
+5. 树模型/深度模型不会因为名字更高级就自动上线。
+6. 残差高度相关的模型会被视为冗余，而不是独立证据。
+
+这会让系统更少给出“看起来很高但没有样本外证据”的置信率。短期副作用是买入提醒可能减少；长期目标是提高高置信提醒的质量。
+
+## 20. 数据质量与标签置信升级
+
+这次升级把准确率提升从“多加模型”前移到“数据本身是否值得学习”。历史回测现在会先对每根 K 线做质量门，再对每个未来标签窗口做标签置信度。
+
+K 线质量分：
+
+```text
+candleScore = 100
+  - bad OHLC range penalty
+  - zero volume penalty
+  - stale close with low volume penalty
+  - large calendar gap penalty
+  - extreme return penalty
+  - possible split/provider jump penalty
+```
+
+标签置信度：
+
+```text
+labelConfidence =
+  current candle quality
+  + future window quality
+  - near target/stop boundary penalty
+  - both target and stop touched penalty
+  - incomplete future window penalty
+```
+
+最终样本权重：
+
+```text
+sampleWeight = min(candleQualityWeight, labelConfidence)
+```
+
+这些权重进入：
+
+- Ridge 回归损失函数。
+- Logistic target-before-stop / stop-first 分类。
+- KNN 历史相似走势样本均值。
+- 预测头权重优化。
+- Brier、方向命中、达标命中等校准指标。
+
+关键原则：
+
+```text
+异常数据不直接删除，而是保留时间顺序并降权。
+疑似拆股、供应商跳变、零成交、低质量标签不会和高质量样本等权。
+目标价/止损线附近的模糊标签不会被模型当作强真值学习。
+```
+
+这样做的目的不是让历史回测数字更好看，而是让“高置信标签”更有证据含义：高置信应该来自高质量数据、高可靠标签、样本外有效权重，而不是来自单日涨跌或噪声样本。
+
+## 21. 多折稳定性与新上市股票保护
+
+预测权重现在增加第二道门控：多折 walk-forward 稳定性检测。单一 train/validation/test 切分不再足以让权重上线。
+
+流程：
+
+```text
+predictionCuts = 历史上每个当时可见的预测切片
+
+for each rolling fold:
+  train = fold 之前的 predictionCuts
+  validation = train 尾部一小段
+  test = fold 当前未来段
+  weights = 在 train/validation 中学习
+  compare(weights, equalWeight, momentumOnly) on test
+```
+
+上线要求：
+
+```text
+holdout improvement passed
+and rolling-fold stabilityScore >= 52
+and avgDirectionLift >= -1.5 pct
+and avgMseImprovement >= -1.5%
+and minDirectionHitRate >= 42%
+and weightDrift <= 0.52
+```
+
+如果某个权重只在最近一段行情有效，但跨多个后续折不稳定，它会被标记为 `research_only`，不能提高实盘置信度。
+
+新上市或短历史股票也新增保护模式：
+
+```text
+candleCount < 10:
+  拒绝分析，真实样本过少
+
+10 <= candleCount < 35:
+  允许进入新上市观察模式
+  禁用历史相似样本和自监督回测
+  marketValidation.shortHistory = true
+  confidenceCap <= 55
+  buyEligible = false
+```
+
+例如 SPCX 这种 2026-06-12 才开始交易、当前只有约 19 根真实日线的股票，可以显示走势图和有限技术面，但不能被系统判定为高置信买入。这样避免 IPO 初期波动、指数纳入、锁定期新闻等短样本噪声污染模型。
+
+## 22. 样本覆盖与分布外检测
+
+新增 `sampleCoverage` 门控，用来回答一个更基础的问题：当前这只股票的形态，历史训练集中到底有没有足够相似的样本？
+
+以前的风险是：
+
+```text
+模型有很多历史样本
+但当前形态可能和历史样本都不相似
+=> 仍然可能被模型误判为高置信
+```
+
+现在 KNN/自监督层会记录最近邻距离：
+
+```text
+nearestDistance = 最近历史样本距离
+avgNeighborDistance = TopK 平均距离
+p75NeighborDistance = TopK 第75分位距离
+```
+
+覆盖分：
+
+```text
+coverageScore =
+  104
+  - nearestDistance * 24
+  - avgNeighborDistance * 31
+  - p75NeighborDistance * 11
+  + sampleBonus
+```
+
+覆盖权重：
+
+```text
+coverageWeight = 0.22 + coverageScore / 100 * 0.78
+```
+
+它进入三层：
+
+1. 历史回测预测切片的 `sampleWeight` 会乘以 `coverageWeight`。
+2. `coverageScore < 45` 的切片不能触发历史买入信号。
+3. 实时分析中，history sample power 会被 coverage multiplier 折扣；coverage 低于 45 时，不能支持高置信买入。
+
+这能减少一种常见误差：模型对“没见过的行情结构”过度自信。高置信标签必须同时满足数据质量、标签置信、样本外稳定性和样本覆盖。
+
+## 23. 行情状态分桶校准
+
+新增 `regimeCalibration`，解决另一个大问题：同一个因子组合在不同市场状态下表现可能完全不同。上涨趋势里的放量突破，和高波动下跌里的放量反抽，不能混成一个平均胜率。
+
+每个历史预测切片都会按当时可见数据分桶：
+
+```text
+low_coverage     样本覆盖不足/分布外
+volatile         高波动、异常放量或短线大幅波动
+overextended     RSI/短线涨幅过热
+uptrend          趋势和动量同步向上
+downtrend        趋势向下
+volume_breakout  放量突破
+range            震荡/均衡
+```
+
+分桶只使用预测日当时可见的信息：
+
+```text
+trendScore
+momentumScore
+riskScore
+5日/20日涨跌
+volumeRatio
+RSI
+coverageScore
+```
+
+每个 bucket 单独统计：
+
+```text
+directionHitRate
+targetHitRate
+stopRate
+avgReturn
+avgCoverageScore
+avgLabelConfidence
+```
+
+实时分析时，系统会找到当前股票的当前 bucket，并查看该 bucket 在历史 walk-forward 中的表现：
+
+```text
+if same-regime targetHitRate low
+or same-regime stopRate high
+or same-regime avgReturn negative:
+  lower historical backtest factor score
+  reduce confidence
+```
+
+这一步的意义是避免“整体回测不错，但当前行情状态历史上很差”仍然给出高置信标签。高置信必须在当前 regime 下也有证据。
+
+## 24. 共形残差与预测区间校准
+
+新增 `conformalCalibration`，用于回答：过去同类预测的误差到底有多宽？
+
+系统会保存每个历史预测切片的预测值和真实未来结果：
+
+```text
+finalReturnError = abs(predictedFinalReturn - actualFinalReturn)
+riskAdjustedError = abs(predictedRiskAdjustedReturn - actualRiskAdjustedReturn)
+maxUpsideError = abs(predictedMaxUpside - actualMaxUpside)
+```
+
+然后计算带样本权重的残差分位：
+
+```text
+P50 error
+P80 error
+P90 error
+```
+
+输出：
+
+```text
+finalReturnAbsErrorP80
+finalReturnAbsErrorP90
+maxUpsideAbsErrorP80
+directionMissRate
+uncertaintyScore
+```
+
+使用方式：
+
+```text
+预测 +5%
+历史 P80 误差 ±4%
+=> 这个标签不能被当成非常窄的高置信涨幅
+
+预测 +5%
+历史 P80 误差 ±1.2%
+=> 幅度标签更可信
+```
+
+后端会把 P80/P90 残差接入历史回测因子评分：
+
+```text
+if finalReturnAbsErrorP80 too wide:
+  lower historical factor score
+  widen expected move interpretation
+  reduce high-confidence magnitude labels
+```
+
+这一步的重点是让“置信度”和“误差带”分开：方向可能对，但幅度误差很大时，不允许系统把涨幅标签说得过准。
+
+## 25. 路径噪声与标签稳定性
+
+历史训练不只是“样本越多越好”，还要判断这些样本的标签是否干净。新增 `labelNoiseScore`，用于识别未来窗口里容易误导模型的样本。
+
+典型高噪声标签：
+
+```text
+同一根日K同时触发目标价和止损价，日线无法知道真实先后顺序
+最终收益接近 0，但盘中曾大幅上探或下杀
+未来窗口内反复上下穿越成本线，方向多次翻转
+总波动很大，但最终收益很小，属于高 chop 路径
+上探幅度和回撤幅度都接近阈值，标签对微小价格误差敏感
+```
+
+新增路径指标：
+
+```text
+pathVolatility
+pathChopRatio
+twoSidedExcursionRatio
+directionFlips
+ambiguousBarrierOrder
+labelNoiseScore
+```
+
+训练权重处理：
+
+```text
+sampleWeight = min(candleQualityWeight, labelConfidence)
+
+labelConfidence 会被以下情况降低：
+  same_bar_barrier_order_unknown
+  high_path_chop
+  two_sided_excursion
+  final_return_inconclusive
+  frequent_direction_flips
+  high_path_volatility
+```
+
+如果同一根 K 线最高价达到目标、最低价也达到止损，系统不再默认目标先触发；它会标记为 `ambiguousBarrierOrder=true`，不把它计为明确成功样本。这可以减少日线回测里的乐观偏差。
+
+泄漏控制：这些路径噪声指标只在历史窗口已经完整结束后用于训练标签和回测校准；实时预测当日不会计算未来路径噪声，因此不会偷看未来。

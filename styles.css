@@ -1865,9 +1865,26 @@ select:focus {
   background: linear-gradient(90deg, #16a6a1, #f0b44c);
 }
 
+.model-zoo-list {
+  max-height: 360px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.model-zoo-row {
+  grid-template-columns: minmax(150px, 0.95fr) minmax(140px, 0.8fr) minmax(86px, 0.42fr) minmax(110px, 0.55fr) minmax(92px, 0.42fr) minmax(260px, 1.5fr);
+}
+
+.model-zoo-row span {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 920px) {
   .model-family-row,
-  .model-feature-row {
+  .model-feature-row,
+  .model-zoo-row {
     grid-template-columns: 1fr;
   }
 
@@ -6058,7 +6075,101 @@ button.danger-soft,
   max-width: 76px;
 }
 
-/* Final header containment: seven page buttons stay inside one adaptive frame. */
+.factor-research-panel {
+  background:
+    linear-gradient(135deg, rgba(95, 211, 255, 0.08), transparent 46%),
+    linear-gradient(180deg, rgba(7, 19, 31, 0.95), rgba(5, 13, 24, 0.94));
+}
+
+.factor-research-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.factor-research-grid section {
+  min-width: 0;
+  border: 1px solid rgba(104, 142, 170, 0.18);
+  border-radius: 8px;
+  background: rgba(4, 12, 23, 0.62);
+  padding: 12px;
+}
+
+.factor-research-grid h4 {
+  margin: 0 0 8px;
+}
+
+.factor-research-weight-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.factor-research-weight-list > div {
+  min-width: 0;
+  border: 1px solid rgba(95, 211, 255, 0.16);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(7, 20, 34, 0.78);
+}
+
+.factor-research-weight-list strong,
+.factor-research-weight-list span,
+.factor-research-weight-list small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.factor-research-weight-list span {
+  color: #43e08a;
+  font-weight: 700;
+}
+
+.factor-research-weight-list small {
+  color: #8fb0c6;
+  font-size: 11px;
+}
+
+.cross-factor-panel {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid rgba(95, 211, 255, 0.16);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, rgba(67, 224, 138, 0.08), transparent 44%),
+    rgba(5, 16, 28, 0.76);
+}
+
+.cross-factor-row {
+  grid-template-columns: minmax(72px, 0.42fr) repeat(6, minmax(86px, 0.55fr)) minmax(260px, 1.5fr);
+}
+
+.cross-factor-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.factor-lab-table {
+  min-width: 2140px;
+}
+
+@media (max-width: 840px) {
+  .factor-research-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .cross-factor-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Final header containment: page buttons stay inside one adaptive frame. */
 .terminal-header {
   grid-template-columns: minmax(250px, 330px) minmax(0, 1fr);
   overflow: hidden;
@@ -6081,7 +6192,7 @@ button.danger-soft,
 .terminal-header .side-workspace-nav {
   grid-column: auto;
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   align-items: stretch;
   gap: 4px;
   padding: 5px;
@@ -6091,7 +6202,8 @@ button.danger-soft,
     linear-gradient(180deg, rgba(6, 18, 31, 0.88), rgba(2, 8, 15, 0.9));
 }
 
-.terminal-header .workspace-nav button {
+.terminal-header .workspace-nav button,
+.terminal-header .workspace-nav .monitor-entry {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -6106,13 +6218,26 @@ button.danger-soft,
   text-overflow: ellipsis;
 }
 
+.terminal-header .workspace-nav .monitor-entry {
+  border: 1px solid rgba(47, 214, 201, 0.28);
+  color: #c8f7ff;
+  background: rgba(47, 214, 201, 0.1);
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.terminal-header .workspace-nav .monitor-entry:hover {
+  border-color: rgba(47, 214, 201, 0.58);
+  background: rgba(47, 214, 201, 0.18);
+}
+
 @media (max-width: 1450px) {
   .terminal-header {
     grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
   }
 
   .terminal-header .side-workspace-nav {
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(8, minmax(0, 1fr));
   }
 }
 

@@ -9,8 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "quant_core"))
 
 from alpha_mining import analyze_alpha_evolution  # noqa: E402
-from features import analyze_factors, analyze_features  # noqa: E402
-from historical_backtest import run_historical_backtest  # noqa: E402
+from data_quality import assess_candle_quality  # noqa: E402
+from features import analyze_cross_sectional_factors, analyze_factors, analyze_features  # noqa: E402
+from historical_backtest import outcome_window, run_historical_backtest  # noqa: E402
 from local_model import train_local_model_suite  # noqa: E402
 from provider_budget import provider_plan  # noqa: E402
 from risk import assess_portfolio, build_paper_order_intent  # noqa: E402
@@ -34,6 +35,42 @@ def candles(count=140):
                 "low": close - 0.9,
                 "close": close,
                 "volume": 1000 + index * 12,
+            }
+        )
+    return rows
+
+
+def panel_candles(count=220, drift=0.08, phase=0):
+    rows = []
+    close = 45.0 + phase * 3
+    for index in range(count):
+        cycle = ((index + phase * 3) % 17 - 8) * 0.035
+        pulse = 0.22 if (index + phase) % 31 < 5 else -0.06 if (index + phase) % 29 < 4 else 0.0
+        close = max(1, close + drift + cycle + pulse)
+        spread = 0.55 + (phase % 3) * 0.05
+        rows.append(
+            {
+                "date": f"2025-{(index // 28) % 12 + 1:02d}-{(index % 28) + 1:02d}",
+                "open": close - (drift + cycle) * 0.45,
+                "high": close + spread,
+                "low": close - spread * 0.9,
+                "close": close,
+                "volume": 1200 + index * (8 + phase) + (phase % 4) * 150,
+            }
+        )
+    return rows
+
+
+def panel_items(count=220):
+    rows = []
+    sectors = ["Tech", "Materials", "Banks", "Energy", "Tech", "Healthcare"]
+    for index, symbol in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"]):
+        rows.append(
+            {
+                "symbol": symbol,
+                "sector": sectors[index],
+                "source": "unit",
+                "candles": panel_candles(count, drift=0.03 + index * 0.018, phase=index),
             }
         )
     return rows
@@ -182,6 +219,8 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("series", result)
         self.assertGreater(len(result["series"]["rows"]), 20)
         self.assertIn("momentum_5", result["series"]["factor_names"])
+        self.assertIn("volume_accel_5_20", result["series"]["factor_names"])
+        self.assertIn("volume_profile_closeness", result["series"]["factor_names"])
         self.assertIn("future_return_pct", result["series"]["rows"][0])
         self.assertIn("factors", result["series"]["rows"][0])
         self.assertEqual(result["validation"]["status"], "ready")
@@ -196,6 +235,15 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("bollinger_percent_b", factor_names)
         self.assertIn("fvg_pressure", factor_names)
         self.assertIn("wyckoff_phase_score", factor_names)
+        self.assertIn("factor_research", result)
+        research = result["factor_research"]
+        self.assertEqual(research["framework"], "dynamic-factor-admission-and-ml-weighting")
+        self.assertGreater(research["candidate_count"], 10)
+        self.assertGreater(len(research["weights"]), 0)
+        self.assertIn("ml_backtest", research)
+        self.assertIn("leakage_control", research)
+        self.assertIn("admission_status", result["factors"][0])
+        self.assertIn("dynamic_weight_pct", result["factors"][0])
 
     def test_alpha_evolution_generates_audited_candidates(self):
         result = analyze_alpha_evolution(candles(180), horizon=10, symbol="TEST", market="US")
@@ -213,6 +261,18 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("overfit_penalty", first)
         self.assertIn("overfit_flag", first)
         self.assertNotIn("_values", first)
+
+    def test_cross_sectional_factor_research_generates_market_weights(self):
+        result = analyze_cross_sectional_factors(panel_items(230), market="US", horizons=[5, 10, 30], min_symbols=4)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["framework"], "market-cross-sectional-factor-research")
+        self.assertGreater(len(result["aggregate_weights"]), 0)
+        available = [row for row in result["horizon_results"] if row["available"]]
+        self.assertGreaterEqual(len(available), 2)
+        first = available[0]
+        self.assertIn("ml_backtest", first)
+        self.assertIn("weights", first)
+        self.assertIn("leakage_control", result)
 
     def test_qlib_readiness_operation_is_optional(self):
         result = dispatch({"operation": "qlib-readiness"})
@@ -249,6 +309,13 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("noTradeGate", result["signalModels"])
         self.assertIn("lightgbm", result)
         self.assertIn("tripleBarrier", result)
+        self.assertIn("modelZoo", result)
+        self.assertEqual(result["modelZoo"]["framework"], "python-local-model-zoo-committee")
+        self.assertGreaterEqual(result["modelZoo"]["candidateCount"], 4)
+        self.assertIn("rejectGate", result["modelZoo"])
+        self.assertIn("deploymentWeights", result["modelZoo"])
+        self.assertIn("doubleCheckPolicy", result["modelZoo"])
+        self.assertGreaterEqual(result["modelZoo"]["doubleCheckPolicy"]["selfModelMinShare"], 0.8)
 
     def test_historical_backtest_uses_point_in_time_slices(self):
         result = run_historical_backtest(
@@ -269,6 +336,61 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("leakageControl", result["model"])
         self.assertIn("values", result)
         self.assertIn("hitRate", result["values"])
+        self.assertIn("dataQuality", result)
+        self.assertIn("effectivePredictionCuts", result["dataDepth"])
+        self.assertIn("avgLabelConfidence", result["metrics"])
+        self.assertIn("stability", result["predictionCalibration"])
+        self.assertEqual(result["predictionCalibration"]["stability"]["framework"], "purged-walk-forward-weight-stability")
+        self.assertIn("avgCoverageScore", result["metrics"])
+        self.assertIn("lowCoverageSamplePct", result["metrics"])
+        self.assertIn("coverageScore", result["recentPredictions"][-1])
+        self.assertIn("regimeCalibration", result)
+        self.assertEqual(result["regimeCalibration"]["framework"], "point-in-time-regime-bucket-calibration")
+        self.assertIn("regimeBucket", result["recentPredictions"][-1])
+        self.assertIn("conformalCalibration", result)
+        self.assertEqual(result["conformalCalibration"]["framework"], "conformal-residual-calibration")
+        self.assertIn("finalReturnAbsErrorP80", result["conformalCalibration"]["overall"])
+        self.assertIn("avgLabelNoiseScore", result["metrics"])
+        self.assertIn("labelNoiseScore", result["recentPredictions"][-1])
+        self.assertIn("ambiguousBarrierPct", result["values"])
+
+    def test_data_quality_gate_downweights_suspicious_candles_and_labels(self):
+        rows = candles(260)
+        rows[100]["close"] = rows[99]["close"] * 1.55
+        rows[100]["high"] = rows[100]["close"] * 1.01
+        rows[100]["low"] = rows[100]["close"] * 0.99
+        rows[101]["volume"] = 0
+        quality = assess_candle_quality(rows)
+        self.assertIn("possible_split_or_provider_jump", quality["issueCounts"])
+        self.assertGreater(quality["degradedRowPct"], 0)
+        result = run_historical_backtest(
+            rows,
+            market="US",
+            symbol="UNIT",
+            horizon=10,
+            target_upside=2,
+            stop_loss=3,
+            min_train=80,
+            step=3,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["dataQuality"]["framework"], "point-in-time-candle-quality-gate")
+        self.assertLess(result["metrics"]["effectiveSamples"], result["metrics"]["samples"])
+        self.assertGreater(result["dataQuality"]["issueCounts"]["possible_split_or_provider_jump"], 0)
+
+    def test_same_bar_target_and_stop_is_order_ambiguous_not_target_win(self):
+        rows = [
+            {"date": "2026-01-01", "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1000},
+            {"date": "2026-01-02", "open": 100, "high": 106, "low": 95, "close": 101, "volume": 1200},
+            {"date": "2026-01-03", "open": 101, "high": 102, "low": 100, "close": 101, "volume": 1100},
+        ]
+        outcome = outcome_window(rows, 0, 2, target_upside=5, stop_loss=4)
+        self.assertTrue(outcome["hitTarget"])
+        self.assertTrue(outcome["hitStop"])
+        self.assertTrue(outcome["ambiguousBarrierOrder"])
+        self.assertEqual(outcome["firstBarrierEvent"], "ambiguous")
+        self.assertFalse(outcome["targetWins"])
+        self.assertFalse(outcome["stopWins"])
 
     def test_worker_dispatch_exposes_local_model_train(self):
         result = dispatch({"operation": "local-model-train", "market": "US", "samples": prediction_samples()})
@@ -276,6 +398,33 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("ensembleWeightOptimization", result)
         self.assertIn("signalModels", result)
         self.assertIn("lightgbm", result)
+        self.assertIn("modelZoo", result)
+
+    def test_worker_dispatch_exposes_factor_research(self):
+        result = dispatch({
+            "operation": "factor-research",
+            "market": "US",
+            "symbol": "UNIT",
+            "candles": candles(190),
+            "horizon_days": 10,
+        })
+        self.assertEqual(result["framework"], "dynamic-factor-admission-and-ml-weighting")
+        self.assertIn("factor_research", result)
+        self.assertGreater(result["factor_research"]["candidate_count"], 10)
+        self.assertIn("live_signal", result["factor_research"])
+        self.assertIn("quality_gate", result)
+
+    def test_worker_dispatch_exposes_cross_sectional_factor_research(self):
+        result = dispatch({
+            "operation": "cross-sectional-factor-research",
+            "market": "US",
+            "items": panel_items(220),
+            "horizons": [5, 10],
+            "min_symbols": 4,
+        })
+        self.assertTrue(result["available"])
+        self.assertGreater(len(result["aggregate_weights"]), 0)
+        self.assertEqual(result["framework"], "market-cross-sectional-factor-research")
 
     def test_worker_dispatch_exposes_historical_backtest(self):
         result = dispatch({
@@ -347,8 +496,23 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("predictionCalibration", result)
         self.assertGreaterEqual(len(result["horizonCalibrations"]), 2)
         self.assertIn("sampling", result)
+        self.assertIn("dataQuality", result)
+        self.assertEqual(result["dataQuality"]["framework"], "batch-point-in-time-candle-quality-gate")
+        self.assertIn("avgLabelConfidence", result["metrics"])
+        self.assertIn("avgCoverageScore", result["metrics"])
+        self.assertIn("lowCoverageSamplePct", result["metrics"])
+        self.assertIn("regimeCalibration", result)
+        self.assertEqual(result["regimeCalibration"]["framework"], "aggregate-point-in-time-regime-bucket-calibration")
+        self.assertIn("conformalCalibration", result)
+        self.assertEqual(result["conformalCalibration"]["framework"], "aggregate-conformal-residual-calibration")
+        self.assertIn("finalReturnAbsErrorP80", result["conformalCalibration"]["overall"])
+        self.assertIn("avgLabelNoiseScore", result["metrics"])
+        self.assertIn("highNoiseSamplePct", result["metrics"])
+        self.assertIn("stability", result["predictionCalibration"])
+        self.assertEqual(result["predictionCalibration"]["stability"]["framework"], "aggregate-purged-walk-forward-weight-stability")
         for row in result["horizonCalibrations"]:
             self.assertIn("optimizedWeights", row)
+            self.assertIn("stability", row)
             self.assertGreater(row["sampleCount"], 0)
 
     def test_provider_plan_limits_limited_sources(self):

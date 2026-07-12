@@ -682,6 +682,448 @@ def _percentile(values: list[float], pct: float) -> float:
     return rows[lower] + (rows[upper] - rows[lower]) * (position - lower)
 
 
+def _quantile_spread(values: list[float], labels: list[float], direction: int, buckets: int = 5) -> float:
+    paired = sorted(
+        [(number(value), number(label)) for value, label in zip(values, labels) if math.isfinite(number(value)) and math.isfinite(number(label))],
+        key=lambda item: item[0],
+    )
+    if len(paired) < buckets * 4:
+        return 0.0
+    bucket_size = max(1, len(paired) // buckets)
+    low = [label for _, label in paired[:bucket_size]]
+    high = [label for _, label in paired[-bucket_size:]]
+    return (mean(high) - mean(low)) * (1 if direction >= 0 else -1)
+
+
+def _turnover_proxy(values: list[float]) -> float:
+    if len(values) < 3:
+        return 0.0
+    scale = stddev(values) or 1.0
+    return mean(abs(number(values[index]) - number(values[index - 1])) / scale for index in range(1, len(values)))
+
+
+def _factor_cluster_map(names: list[str], matrix: dict[str, dict[str, float]], threshold: float = 0.72) -> dict[str, dict[str, Any]]:
+    parent = {name: name for name in names}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1:]:
+            if abs(number(matrix.get(left, {}).get(right))) >= threshold:
+                union(left, right)
+
+    grouped: dict[str, list[str]] = {}
+    for name in names:
+        grouped.setdefault(find(name), []).append(name)
+    cluster_lookup: dict[str, dict[str, Any]] = {}
+    for cluster_index, members in enumerate(grouped.values(), start=1):
+        cluster_id = f"cluster-{cluster_index}"
+        for name in members:
+            cluster_lookup[name] = {
+                "cluster": cluster_id,
+                "members": sorted(members),
+                "size": len(members),
+            }
+    return cluster_lookup
+
+
+def _factor_prediction_metrics(predictions: list[float], actuals: list[float]) -> dict[str, float]:
+    if not predictions or not actuals:
+        return {"samples": 0, "mae": 0.0, "rmse": 0.0, "direction_hit_rate_pct": 0.0, "ic": 0.0, "rank_ic": 0.0}
+    rows = list(zip(predictions, actuals))
+    errors = [prediction - actual for prediction, actual in rows]
+    hits = sum(1 for prediction, actual in rows if (prediction >= 0 and actual >= 0) or (prediction < 0 and actual < 0))
+    return {
+        "samples": len(rows),
+        "mae": round(mean(abs(error) for error in errors), 4),
+        "rmse": round(math.sqrt(mean(error * error for error in errors)), 4),
+        "direction_hit_rate_pct": round(hits / len(rows) * 100, 2),
+        "ic": round(_pearson(predictions, actuals), 4),
+        "rank_ic": round(_spearman(predictions, actuals), 4),
+    }
+
+
+def _fit_factor_ridge(
+    factor_series: dict[str, list[float]],
+    labels: list[float],
+    names: list[str],
+    train_indexes: list[int],
+    penalty: float,
+    epochs: int = 90,
+) -> dict[str, Any]:
+    centers = {name: mean(factor_series[name][index] for index in train_indexes) for name in names}
+    scales = {name: stddev(factor_series[name][index] for index in train_indexes) or 1.0 for name in names}
+    label_center = mean(labels[index] for index in train_indexes)
+    label_scale = stddev(labels[index] for index in train_indexes) or 1.0
+    weights = [0.0] * len(names)
+    bias = 0.0
+    learning_rate = 0.035
+
+    def normalized_vector(index: int) -> list[float]:
+        return [
+            clamp((factor_series[name][index] - centers[name]) / scales[name], -6, 6)
+            for name in names
+        ]
+
+    for epoch in range(epochs):
+        decay = 1.0 / (1.0 + epoch * 0.015)
+        for index in train_indexes:
+            x = normalized_vector(index)
+            target = clamp((labels[index] - label_center) / label_scale, -6, 6)
+            prediction = bias + sum(weight * value for weight, value in zip(weights, x))
+            error = prediction - target
+            for position, value in enumerate(x):
+                gradient = error * value + penalty * weights[position]
+                weights[position] -= learning_rate * decay * clamp(gradient, -4, 4)
+            bias -= learning_rate * decay * clamp(error, -4, 4)
+
+    def predict(index: int) -> float:
+        normalized = bias + sum(weight * value for weight, value in zip(weights, normalized_vector(index)))
+        return normalized * label_scale + label_center
+
+    return {
+        "weights": weights,
+        "bias": bias,
+        "centers": centers,
+        "scales": scales,
+        "label_center": label_center,
+        "label_scale": label_scale,
+        "predict": predict,
+    }
+
+
+def _equal_factor_baseline(
+    factor_series: dict[str, list[float]],
+    labels: list[float],
+    names: list[str],
+    train_indexes: list[int],
+    test_indexes: list[int],
+) -> list[float]:
+    directions = {
+        name: 1 if _pearson([factor_series[name][index] for index in train_indexes], [labels[index] for index in train_indexes]) >= 0 else -1
+        for name in names
+    }
+    centers = {name: mean(factor_series[name][index] for index in train_indexes) for name in names}
+    scales = {name: stddev(factor_series[name][index] for index in train_indexes) or 1.0 for name in names}
+    train_predictions = []
+    for index in train_indexes:
+        train_predictions.append(mean(
+            clamp((factor_series[name][index] - centers[name]) / scales[name], -6, 6) * directions[name]
+            for name in names
+        ))
+    scale = (stddev(labels[index] for index in train_indexes) or 1.0) / (stddev(train_predictions) or 1.0)
+    center = mean(labels[index] for index in train_indexes)
+    pred_center = mean(train_predictions)
+    return [
+        (mean(
+            clamp((factor_series[name][index] - centers[name]) / scales[name], -6, 6) * directions[name]
+            for name in names
+        ) - pred_center) * scale + center
+        for index in test_indexes
+    ]
+
+
+def _factor_ml_combo_validation(
+    factor_series: dict[str, list[float]],
+    labels: list[float],
+    horizon: int,
+    candidate_names: list[str] | None = None,
+) -> dict[str, Any]:
+    names = [name for name in (candidate_names or list(factor_series)) if name in factor_series]
+    sample_count = len(labels)
+    purge = max(1, horizon)
+    embargo = max(2, horizon // 3)
+    train_end = int(sample_count * 0.62)
+    validation_start = train_end + purge
+    validation_end = int(sample_count * 0.80)
+    test_start = validation_end + embargo
+    if len(names) < 2 or train_end < 55 or validation_end - validation_start < 10 or sample_count - test_start < 10:
+        return {
+            "available": False,
+            "framework": "factor-ridge-ml-combination",
+            "reason": "Not enough samples or factors for purged train/validation/test factor-combo learning.",
+            "sample_count": sample_count,
+            "factor_count": len(names),
+        }
+
+    train_indexes = list(range(0, train_end))
+    validation_indexes = list(range(validation_start, validation_end))
+    test_indexes = list(range(test_start, sample_count))
+    selected: dict[str, Any] | None = None
+    for penalty in [0.01, 0.03, 0.08, 0.16, 0.32, 0.64]:
+        model = _fit_factor_ridge(factor_series, labels, names, train_indexes, penalty)
+        predictions = [model["predict"](index) for index in validation_indexes]
+        metrics = _factor_prediction_metrics(predictions, [labels[index] for index in validation_indexes])
+        score = metrics["direction_hit_rate_pct"] + max(0.0, metrics["ic"]) * 35 - metrics["mae"] * 1.6
+        candidate = {"penalty": penalty, "model": model, "validation": metrics, "score": score}
+        if selected is None or candidate["score"] > selected["score"]:
+            selected = candidate
+    assert selected is not None
+
+    deployment_train = list(range(0, validation_end))
+    deployment = _fit_factor_ridge(factor_series, labels, names, deployment_train, selected["penalty"], epochs=110)
+    test_predictions = [deployment["predict"](index) for index in test_indexes]
+    test_actuals = [labels[index] for index in test_indexes]
+    equal_predictions = _equal_factor_baseline(factor_series, labels, names, deployment_train, test_indexes)
+    momentum_name = "momentum_20" if "momentum_20" in names else names[0]
+    momentum_direction = 1 if _pearson(
+        [factor_series[momentum_name][index] for index in deployment_train],
+        [labels[index] for index in deployment_train],
+    ) >= 0 else -1
+    momentum_center = mean(factor_series[momentum_name][index] for index in deployment_train)
+    momentum_scale = stddev(factor_series[momentum_name][index] for index in deployment_train) or 1.0
+    label_center = mean(labels[index] for index in deployment_train)
+    label_scale = stddev(labels[index] for index in deployment_train) or 1.0
+    momentum_predictions = [
+        ((factor_series[momentum_name][index] - momentum_center) / momentum_scale) * momentum_direction * label_scale * 0.35 + label_center
+        for index in test_indexes
+    ]
+    test_metrics = _factor_prediction_metrics(test_predictions, test_actuals)
+    equal_metrics = _factor_prediction_metrics(equal_predictions, test_actuals)
+    momentum_metrics = _factor_prediction_metrics(momentum_predictions, test_actuals)
+    direction_lift = test_metrics["direction_hit_rate_pct"] - max(50.0, equal_metrics["direction_hit_rate_pct"], momentum_metrics["direction_hit_rate_pct"])
+    mae_lift = min(equal_metrics["mae"], momentum_metrics["mae"]) - test_metrics["mae"]
+    active = direction_lift >= -1.0 and (direction_lift > 0.5 or mae_lift > 0.05 or test_metrics["ic"] > max(0.0, equal_metrics["ic"], momentum_metrics["ic"]))
+    abs_total = sum(abs(weight) for weight in deployment["weights"]) or 1.0
+    coefficients = [
+        {
+            "name": name,
+            "coefficient": round(deployment["weights"][index], 6),
+            "abs_weight_pct": round(abs(deployment["weights"][index]) / abs_total * 100, 2),
+            "direction": "positive" if deployment["weights"][index] >= 0 else "negative",
+        }
+        for index, name in enumerate(names)
+    ]
+    coefficients.sort(key=lambda row: row["abs_weight_pct"], reverse=True)
+    return {
+        "available": True,
+        "active": active,
+        "framework": "factor-ridge-ml-combination",
+        "method": "Purged chronological train/validation/test ridge factor-combination model; penalty selected on validation only.",
+        "sample_count": sample_count,
+        "factor_count": len(names),
+        "horizon_days": horizon,
+        "purge_samples": purge,
+        "embargo_samples": embargo,
+        "split": {
+            "train": len(train_indexes),
+            "validation": len(validation_indexes),
+            "test": len(test_indexes),
+            "rule": "validation/test rows occur after train rows; labels inside the prediction horizon are purged before the next split.",
+        },
+        "selected_penalty": selected["penalty"],
+        "validation": selected["validation"],
+        "test": test_metrics,
+        "benchmarks": [
+            {"name": "random_direction", "direction_hit_rate_pct": 50.0},
+            {"name": "equal_weight_quality_factors", **equal_metrics},
+            {"name": f"single_{momentum_name}", **momentum_metrics},
+        ],
+        "direction_lift_pct": round(direction_lift, 3),
+        "mae_lift_pct": round(mae_lift, 4),
+        "coefficients": coefficients,
+        "model_risk": "active" if active else "research_only",
+        "guardrail": "A learned factor-combo weight is advisory unless it beats simple baselines on the holdout window.",
+    }
+
+
+def _dynamic_factor_research(
+    factor_rows: list[dict[str, Any]],
+    factor_series: dict[str, list[float]],
+    labels: list[float],
+    matrix: dict[str, dict[str, float]],
+    horizon: int,
+) -> dict[str, Any]:
+    row_by_name = {row["name"]: row for row in factor_rows}
+    names = list(factor_series)
+    clusters = _factor_cluster_map(names, matrix, threshold=0.72)
+    leaders: dict[str, str] = {}
+    for name, cluster in clusters.items():
+        cluster_id = cluster["cluster"]
+        members = cluster["members"]
+        leaders[cluster_id] = max(members, key=lambda item: number(row_by_name.get(item, {}).get("score")))
+
+    ml_names = [
+        row["name"]
+        for row in factor_rows
+        if row.get("quality_pass") and number(row.get("score")) >= 8
+    ] or [
+        row["name"]
+        for row in factor_rows[: min(10, len(factor_rows))]
+    ]
+    ml_backtest = _factor_ml_combo_validation(factor_series, labels, horizon, ml_names)
+    ml_weight_lookup = {
+        row["name"]: number(row.get("abs_weight_pct")) / 100
+        for row in ml_backtest.get("coefficients", [])
+    } if ml_backtest.get("available") else {}
+
+    candidates: list[dict[str, Any]] = []
+    for row in factor_rows:
+        name = row["name"]
+        values = factor_series[name]
+        direction = int(number(row.get("direction"), 1)) or 1
+        rolling = [number(value) for value in row.get("rolling_ic") or []]
+        latest_rolling = mean(rolling[-3:]) if rolling else 0.0
+        long_rolling = mean(rolling) if rolling else 0.0
+        decay_penalty = max(0.0, abs(long_rolling) - abs(latest_rolling)) * 8
+        if latest_rolling and long_rolling and latest_rolling * long_rolling < 0:
+            decay_penalty += 5
+        turnover_penalty = min(8.0, _turnover_proxy(values) * 1.2)
+        cluster = clusters.get(name, {"cluster": "solo", "members": [name], "size": 1})
+        cluster_leader = leaders.get(cluster["cluster"], name)
+        redundant = name != cluster_leader and cluster.get("size", 1) > 1
+        redundancy_penalty = 12.0 if redundant else 0.0
+        quantile_spread = _quantile_spread(values, labels, direction)
+        model_gain = ml_weight_lookup.get(name, 0.0) * 18 if ml_backtest.get("active") else ml_weight_lookup.get(name, 0.0) * 8
+        quality_bonus = number(row.get("quality_score")) / 100 * 6
+        stability_bonus = min(8.0, number(row.get("stability")) * 2.4)
+        base_score = (
+            abs(number(row.get("ic"))) * 30
+            + abs(number(row.get("rank_ic"))) * 24
+            + max(0.0, quantile_spread) * 1.8
+            + stability_bonus
+            + max(0.0, number(row.get("positive_window_share_pct")) - 50) * 0.08
+            + model_gain
+            + quality_bonus
+            - turnover_penalty
+            - redundancy_penalty
+            - decay_penalty
+            - max(0.0, number(row.get("quality_gate", {}).get("max_overlap_correlation")) - 0.72) * 16
+        )
+        reasons: list[str] = []
+        if not row.get("quality_pass"):
+            reasons.append("six_gate_not_all_passed")
+        if number(row.get("score")) < 8:
+            reasons.append("weak_single_factor_score")
+        if redundant:
+            reasons.append(f"redundant_with_{cluster_leader}")
+        if decay_penalty >= 5:
+            reasons.append("recent_ic_decay")
+        if turnover_penalty >= 5:
+            reasons.append("high_turnover_cost_proxy")
+        if ml_backtest.get("available") and not ml_backtest.get("active") and ml_weight_lookup.get(name, 0.0) < 0.03:
+            reasons.append("ml_combo_holdout_not_supportive")
+        admitted = not reasons or (
+            row.get("quality_pass")
+            and not redundant
+            and number(row.get("score")) >= 14
+            and (not ml_backtest.get("available") or ml_weight_lookup.get(name, 0.0) >= 0.03 or abs(number(row.get("ic"))) >= 0.08)
+        )
+        candidate = {
+            "name": name,
+            "formula": row.get("formula", ""),
+            "direction": direction,
+            "status": "admitted" if admitted else "watchlist",
+            "base_score": round(base_score, 4),
+            "quality_pass": bool(row.get("quality_pass")),
+            "quality_score": number(row.get("quality_score")),
+            "ic": row.get("ic"),
+            "rank_ic": row.get("rank_ic"),
+            "quantile_spread_pct": round(quantile_spread, 4),
+            "model_weight_hint_pct": round(ml_weight_lookup.get(name, 0.0) * 100, 3),
+            "turnover_penalty": round(turnover_penalty, 3),
+            "decay_penalty": round(decay_penalty, 3),
+            "redundancy_penalty": round(redundancy_penalty, 3),
+            "redundancy": {
+                "cluster": cluster.get("cluster"),
+                "leader": cluster_leader,
+                "cluster_size": cluster.get("size", 1),
+                "members": cluster.get("members", [name]),
+            },
+            "reasons": reasons or ["passed_dynamic_admission"],
+            "latest_value": row.get("latest_value"),
+        }
+        candidates.append(candidate)
+
+    admitted_rows = [row for row in candidates if row["status"] == "admitted" and row["base_score"] > 0]
+    if not admitted_rows:
+        admitted_rows = sorted([row for row in candidates if row["base_score"] > 0], key=lambda item: item["base_score"], reverse=True)[:5]
+        for row in admitted_rows:
+            row["status"] = "research_only"
+            if "fallback_top_candidate" not in row["reasons"]:
+                row["reasons"].append("fallback_top_candidate")
+    temperature = max(4.0, stddev(row["base_score"] for row in admitted_rows) or 6.0)
+    exp_rows = [(row, math.exp(clamp(row["base_score"] / temperature, -8, 8))) for row in admitted_rows]
+    exp_total = sum(value for _, value in exp_rows) or 1.0
+    weights = []
+    for row, exp_value in exp_rows:
+        pct = exp_value / exp_total * 100
+        row["dynamic_weight_pct"] = round(pct, 3)
+        weights.append({
+            "name": row["name"],
+            "weight_pct": round(pct, 3),
+            "status": row["status"],
+            "direction": "positive" if row["direction"] >= 0 else "negative",
+            "base_score": row["base_score"],
+            "reason": ", ".join(row["reasons"][:3]),
+        })
+
+    live_components = []
+    live_score = 0.0
+    for row in admitted_rows:
+        name = row["name"]
+        values = factor_series[name]
+        recent = values[-min(120, len(values)):]
+        z_value = clamp((values[-1] - mean(recent)) / (stddev(recent) or 1.0), -4, 4)
+        normalized_weight = number(row.get("dynamic_weight_pct")) / 100
+        contribution = z_value * row["direction"] * normalized_weight * 7
+        live_score += contribution
+        live_components.append({
+            "name": name,
+            "z_value": round(z_value, 4),
+            "weight_pct": row.get("dynamic_weight_pct", 0),
+            "direction": "positive" if row["direction"] >= 0 else "negative",
+            "contribution": round(contribution, 4),
+        })
+
+    live_score = clamp(live_score, -12, 12)
+    confidence = clamp(
+        42
+        + max(0.0, number(ml_backtest.get("test", {}).get("direction_hit_rate_pct")) - 50) * 1.4
+        + max(0.0, number(ml_backtest.get("direction_lift_pct"))) * 1.8
+        + min(12, len(admitted_rows) * 1.1)
+        - max(0, len(candidates) - len(admitted_rows)) * 0.08,
+        0,
+        86,
+    )
+    return {
+        "framework": "dynamic-factor-admission-and-ml-weighting",
+        "available": bool(candidates),
+        "horizon_days": horizon,
+        "candidate_count": len(candidates),
+        "admitted_count": len(admitted_rows),
+        "watchlist_count": len([row for row in candidates if row["status"] == "watchlist"]),
+        "redundancy_threshold": 0.72,
+        "weight_formula": "softmax(IC + RankIC + quantile spread + stability + ML holdout weight - turnover - redundancy - decay penalties)",
+        "leakage_control": "Factor values use candles at or before t; future returns only form labels. ML split uses purged chronological train/validation/test.",
+        "candidates": sorted(candidates, key=lambda item: item["base_score"], reverse=True),
+        "weights": sorted(weights, key=lambda item: item["weight_pct"], reverse=True),
+        "ml_backtest": ml_backtest,
+        "live_signal": {
+            "score": round(live_score, 3),
+            "stance": "supportive" if live_score > 2.5 else "risk-off" if live_score < -2.5 else "mixed",
+            "confidence": round(confidence, 1),
+            "components": sorted(live_components, key=lambda item: abs(item["contribution"]), reverse=True)[:12],
+        },
+        "admission_rules": [
+            "Six-gate factor quality must pass or remain research-only.",
+            "Highly correlated factors share a cluster; only the best generalizing factor receives full admission.",
+            "ML combo weights are selected only on validation and reported on a later holdout test.",
+            "Recent IC decay, turnover proxy, and redundancy reduce active weight.",
+        ],
+    }
+
+
 def _factor_quality_gate(
     name: str,
     values: list[float],
@@ -1043,6 +1485,14 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         "wyckoff_phase_score": [],
         "orderflow_pressure": [],
         "effort_vs_result": [],
+        "volume_accel_5_20": [],
+        "trend_efficiency_20": [],
+        "downside_volatility_20": [],
+        "macd_volume_confirmation": [],
+        "gap_followthrough": [],
+        "liquidity_absorption": [],
+        "volume_profile_closeness": [],
+        "value_area_position": [],
     }
     labels: list[float] = []
     vwap_labels: list[float] = []
@@ -1063,6 +1513,14 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         "wyckoff_phase_score": "markup=1, accumulation=0.45, range=0, distribution=-0.45, markdown=-1",
         "orderflow_pressure": "0.55 * candle_direction + 0.45 * close_location",
         "effort_vs_result": "volume_ratio / (abs(return_pct) + 0.25)",
+        "volume_accel_5_20": "mean(volume_5d) / mean(volume_20d) - 1",
+        "trend_efficiency_20": "abs(close / close[t-20] - 1) / sum(abs(return_1d), 20d)",
+        "downside_volatility_20": "-std(min(return_1d, 0), 20d)",
+        "macd_volume_confirmation": "zscore(macd_hist_pct, 20d) * zscore(volume_ratio_20, 20d)",
+        "gap_followthrough": "overnight_gap_pct * intraday_return_pct",
+        "liquidity_absorption": "volume_ratio_20 * close_location - abs(return_pct)",
+        "volume_profile_closeness": "-abs(close / point_of_control_60d - 1)",
+        "value_area_position": "(close - value_area_low_60d) / (value_area_high_60d - value_area_low_60d)",
     }
     factor_usage = {
         "momentum_5": "短线顺势因子，正相关时适合跟随强势拉升，负相关时说明短线过热容易回撤。",
@@ -1081,6 +1539,14 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         "wyckoff_phase_score": "Wyckoff 阶段代理，把吸筹/拉升/派发/下跌转成可回测的方向分数。",
         "orderflow_pressure": "K 线方向与收盘位置推断的主动买卖压力代理。",
         "effort_vs_result": "成交努力相对价格结果，数值高代表放量但推进有限，需结合方向判断吸收或派发。",
+        "volume_accel_5_20": "短期成交量相对 20 日成交均值的加速度，用于识别新增关注是否持续。",
+        "trend_efficiency_20": "20 日方向位移相对日内波动总和，衡量趋势是否干净，避免只追逐噪声涨跌。",
+        "downside_volatility_20": "只惩罚下行波动，避免把健康上涨波动和下跌风险混在一起。",
+        "macd_volume_confirmation": "MACD 动能与成交异常的交互项，检验动能是否由真实放量确认。",
+        "gap_followthrough": "隔夜跳空后日内是否继续同向，识别消息驱动是否被市场接受。",
+        "liquidity_absorption": "放量但收盘位置强弱与收益不匹配时的吸收/派发代理。",
+        "volume_profile_closeness": "价格越接近 60 日成交密集 POC，越可能出现承接或阻力，需要用样本外结果决定方向。",
+        "value_area_position": "价格在 60 日价值区内的位置，用于识别低位承接、高位突破或追高风险。",
     }
 
     for index in range(20, len(rows) - horizon):
@@ -1093,16 +1559,31 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         high_20 = max(row["high"] for row in recent)
         low_20 = min(row["low"] for row in recent)
         volume_mean_20 = mean(volumes[index - 19 : index + 1])
+        volume_mean_5 = mean(volumes[index - 4 : index + 1])
         bollinger_current = _bollinger_series(rows[: index + 1])[-1]
         fibonacci_current = _fibonacci_snapshot(rows[: index + 1])
         fib_618_price = next((item["price"] for item in fibonacci_current.get("levels", []) if item["label"] == "61.8%"), close)
         wyckoff_current = _wyckoff_proxy(rows[: index + 1])
+        volume_profile_current = _volume_profile(rows[max(0, index - 59) : index + 1], bucket_count=16)
+        profile_poc = number((volume_profile_current.get("point_of_control") or {}).get("mid"), close)
+        value_area = volume_profile_current.get("value_area") or {}
+        value_low = number(value_area.get("low"), low_20)
+        value_high = number(value_area.get("high"), high_20)
+        value_span = max(value_high - value_low, close * 0.0001)
         price_range = max(rows[index]["high"] - rows[index]["low"], close * 0.0001)
         candle_direction = clamp((close - rows[index]["open"]) / price_range, -1, 1)
         close_location = clamp(((close - rows[index]["low"]) / price_range) * 2 - 1, -1, 1)
         orderflow_pressure = clamp(candle_direction * 0.55 + close_location * 0.45, -1, 1)
         current_return = pct_change(closes[index - 1], close) if index else 0.0
+        previous_close = closes[index - 1] if index else close
+        overnight_gap_pct = pct_change(previous_close, rows[index]["open"]) if previous_close else 0.0
+        intraday_return_pct = pct_change(rows[index]["open"], close)
         volume_ratio = volumes[index] / volume_mean_20 if volume_mean_20 else 0.0
+        raw_returns_20 = [pct_change(closes[pos - 1], closes[pos]) for pos in range(index - 19, index + 1) if pos > 0]
+        total_abs_return_20 = sum(abs(value) for value in raw_returns_20) or 1.0
+        trend_efficiency = abs(pct_change(closes[index - 20], close)) / total_abs_return_20 if index >= 20 else 0.0
+        downside_returns = [min(0.0, value) for value in raw_returns_20]
+        macd_proxy = pct_change(mean(closes[index - 11 : index + 1]), mean(closes[index - 25 : index + 1])) if index >= 25 else 0.0
         factor_series["momentum_5"].append(pct_change(closes[index - 5], close))
         factor_series["momentum_20"].append(pct_change(closes[index - 20], close))
         factor_series["reversal_5"].append(-pct_change(closes[index - 5], close))
@@ -1119,6 +1600,14 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         factor_series["wyckoff_phase_score"].append(number(wyckoff_current.get("phase_score")))
         factor_series["orderflow_pressure"].append(orderflow_pressure)
         factor_series["effort_vs_result"].append(volume_ratio / (abs(current_return) + 0.25))
+        factor_series["volume_accel_5_20"].append(volume_mean_5 / volume_mean_20 - 1 if volume_mean_20 else 0.0)
+        factor_series["trend_efficiency_20"].append(trend_efficiency)
+        factor_series["downside_volatility_20"].append(-stddev(downside_returns))
+        factor_series["macd_volume_confirmation"].append(macd_proxy * (volume_ratio - 1))
+        factor_series["gap_followthrough"].append(overnight_gap_pct * intraday_return_pct / 100)
+        factor_series["liquidity_absorption"].append(volume_ratio * close_location - abs(current_return) * 0.15)
+        factor_series["volume_profile_closeness"].append(-abs(pct_change(profile_poc, close)))
+        factor_series["value_area_position"].append(clamp((close - value_low) / value_span, -1.5, 2.5))
         labels.append(pct_change(close, closes[index + horizon]))
         future_rows = rows[index + 1 : index + horizon + 1]
         future_notional = sum(((row["high"] + row["low"] + row["close"]) / 3) * row["volume"] for row in future_rows)
@@ -1194,6 +1683,18 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
     quality_pass_count = sum(1 for row in quality_rows if row["pass"])
     validation = _walk_forward_factor_validation(factor_series, labels, horizon)
     training_controls = _gradient_accumulation_training(factor_series, labels, horizon, accumulation_batches=3)
+    factor_research = _dynamic_factor_research(factor_rows, factor_series, labels, matrix, horizon)
+    research_by_name = {row["name"]: row for row in factor_research.get("candidates", [])}
+    weight_by_name = {row["name"]: row for row in factor_research.get("weights", [])}
+    for row in factor_rows:
+        candidate = research_by_name.get(row["name"], {})
+        weight_row = weight_by_name.get(row["name"], {})
+        row["admission_status"] = candidate.get("status", "watchlist")
+        row["admission_reasons"] = candidate.get("reasons", [])
+        row["dynamic_weight_pct"] = round(number(weight_row.get("weight_pct")), 3)
+        row["ml_weight_hint_pct"] = candidate.get("model_weight_hint_pct", 0)
+        row["redundancy_cluster"] = candidate.get("redundancy", {}).get("cluster", "")
+        row["redundancy_leader"] = candidate.get("redundancy", {}).get("leader", "")
     factor_view_rows: list[dict[str, Any]] = []
     for offset, index in enumerate(range(20, len(rows) - horizon)):
         row = rows[index]
@@ -1251,6 +1752,8 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         },
         "validation": validation,
         "training_controls": training_controls,
+        "factor_research": factor_research,
+        "dynamic_factor_weights": factor_research,
         "guardrails": [
             "不使用未来数据构造因子；标签只用于样本外评分。",
             "因子进入模型前必须通过无量纲、丰富度、未来函数、缺失值、极端值、标准化六项闸门。",
@@ -1258,8 +1761,517 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
             "最新检查点若明显弱于最佳检查点，则建议回滚而不是继续使用退化权重。",
             "单标的时间序列 IC 不能替代完整横截面 IC，后续会扩展为市场级横截面评估。",
             "高相关因子不重复满权，优先保留样本外稳定性更强者。",
+            "动态因子权重来自 IC/Rank IC/分组收益/ML holdout/去重/衰减/换手成本惩罚，不再只依赖人工固定权重。",
             "训练模型按时间顺序切分训练/验证/测试集，累计 3 个小批次后才更新参数，并使用验证集早停与最佳检查点回滚。",
             "借鉴 Qlib/FinRL/NeuralForecast/TFT 一类时间序列项目：只在训练窗拟合 scaler，用滚动样本外验证选择检查点，深度模型启用 dropout/weight decay，并用独立测试窗约束泛化。",
             "如果训练窗明显强于验证/测试窗，界面会优先降低泛化评分，而不是把样本内高胜率当成实盘置信率。",
+        ],
+    }
+
+
+PANEL_FACTOR_FORMULAS = {
+    "momentum_5": "close / close[t-5] - 1",
+    "momentum_20": "close / close[t-20] - 1",
+    "reversal_5": "-(close / close[t-5] - 1)",
+    "volatility_10": "-std(return_10d)",
+    "volume_ratio_20": "volume / mean(volume_20d)",
+    "trend_gap_20": "close / mean(close_20d) - 1",
+    "vwap_gap": "close / rolling_vwap_20d - 1",
+    "range_position": "(close - low_20d) / (high_20d - low_20d)",
+    "volume_accel_5_20": "mean(volume_5d) / mean(volume_20d) - 1",
+    "trend_efficiency_20": "abs(close / close[t-20] - 1) / sum(abs(return_1d), 20d)",
+    "downside_volatility_20": "-std(min(return_1d, 0), 20d)",
+    "macd_volume_confirmation": "zscore(macd_hist_pct, 20d) * zscore(volume_ratio_20, 20d)",
+    "gap_followthrough": "overnight_gap_pct * intraday_return_pct",
+    "liquidity_absorption": "volume_ratio_20 * close_location - abs(return_pct)",
+    "volume_profile_closeness": "-abs(close / point_of_control_60d - 1)",
+    "value_area_position": "(close - value_area_low_60d) / (value_area_high_60d - value_area_low_60d)",
+}
+
+
+def _panel_factor_rows(candles: list[dict[str, Any]], horizon: int, symbol: str, sector: str = "") -> list[dict[str, Any]]:
+    rows = sanitize_candles(candles)
+    if len(rows) < max(85, horizon + 65):
+        return []
+    closes = [row["close"] for row in rows]
+    volumes = [row["volume"] for row in rows]
+    out: list[dict[str, Any]] = []
+    start_index = 60
+    for index in range(start_index, len(rows) - horizon):
+        close = closes[index]
+        recent20 = rows[index - 19:index + 1]
+        recent60 = rows[index - 59:index + 1]
+        volume_mean_20 = mean(volumes[index - 19:index + 1])
+        volume_mean_5 = mean(volumes[index - 4:index + 1])
+        high20 = max(row["high"] for row in recent20)
+        low20 = min(row["low"] for row in recent20)
+        typical_notional = sum(((row["high"] + row["low"] + row["close"]) / 3) * row["volume"] for row in recent20)
+        volume_sum = sum(row["volume"] for row in recent20)
+        vwap = typical_notional / volume_sum if volume_sum else close
+        raw_returns_20 = [pct_change(closes[pos - 1], closes[pos]) for pos in range(index - 19, index + 1) if pos > 0]
+        returns_10 = raw_returns_20[-10:]
+        current_return = pct_change(closes[index - 1], close) if index else 0.0
+        previous_close = closes[index - 1] if index else close
+        overnight_gap_pct = pct_change(previous_close, rows[index]["open"]) if previous_close else 0.0
+        intraday_return_pct = pct_change(rows[index]["open"], close)
+        volume_ratio = volumes[index] / volume_mean_20 if volume_mean_20 else 0.0
+        total_abs_return_20 = sum(abs(value) for value in raw_returns_20) or 1.0
+        trend_efficiency = abs(pct_change(closes[index - 20], close)) / total_abs_return_20 if index >= 20 else 0.0
+        downside_returns = [min(0.0, value) for value in raw_returns_20]
+        price_range = max(rows[index]["high"] - rows[index]["low"], close * 0.0001)
+        close_location = clamp(((close - rows[index]["low"]) / price_range) * 2 - 1, -1, 1)
+        macd_proxy = pct_change(mean(closes[index - 11:index + 1]), mean(closes[index - 25:index + 1])) if index >= 25 else 0.0
+        profile = _volume_profile(recent60, bucket_count=16)
+        poc = number((profile.get("point_of_control") or {}).get("mid"), close)
+        value_area = profile.get("value_area") or {}
+        value_low = number(value_area.get("low"), low20)
+        value_high = number(value_area.get("high"), high20)
+        value_span = max(value_high - value_low, close * 0.0001)
+        factors = {
+            "momentum_5": pct_change(closes[index - 5], close),
+            "momentum_20": pct_change(closes[index - 20], close),
+            "reversal_5": -pct_change(closes[index - 5], close),
+            "volatility_10": -stddev(returns_10),
+            "volume_ratio_20": volume_ratio,
+            "trend_gap_20": pct_change(mean(closes[index - 19:index + 1]), close),
+            "vwap_gap": pct_change(vwap, close),
+            "range_position": (close - low20) / (high20 - low20) if high20 > low20 else 0.5,
+            "volume_accel_5_20": volume_mean_5 / volume_mean_20 - 1 if volume_mean_20 else 0.0,
+            "trend_efficiency_20": trend_efficiency,
+            "downside_volatility_20": -stddev(downside_returns),
+            "macd_volume_confirmation": macd_proxy * (volume_ratio - 1),
+            "gap_followthrough": overnight_gap_pct * intraday_return_pct / 100,
+            "liquidity_absorption": volume_ratio * close_location - abs(current_return) * 0.15,
+            "volume_profile_closeness": -abs(pct_change(poc, close)),
+            "value_area_position": clamp((close - value_low) / value_span, -1.5, 2.5),
+        }
+        future = rows[index + 1:index + horizon + 1]
+        future_high = max((row["high"] for row in future), default=close)
+        future_low = min((row["low"] for row in future), default=close)
+        out.append({
+            "date": rows[index]["date"][:10],
+            "symbol": symbol,
+            "sector": sector or "Unknown",
+            "close": close,
+            "label": pct_change(close, closes[index + horizon]),
+            "max_upside": pct_change(close, future_high),
+            "max_drawdown": pct_change(close, future_low),
+            "factors": factors,
+        })
+    return out
+
+
+def _group_by_date(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("date") or ""), []).append(row)
+    return grouped
+
+
+def _panel_factor_metrics(
+    rows: list[dict[str, Any]],
+    factor_name: str,
+    min_symbols: int,
+) -> dict[str, Any]:
+    by_date = _group_by_date(rows)
+    daily: list[dict[str, Any]] = []
+    for date, date_rows in sorted(by_date.items()):
+        clean = [
+            row for row in date_rows
+            if math.isfinite(number(row.get("factors", {}).get(factor_name))) and math.isfinite(number(row.get("label")))
+        ]
+        if len(clean) < min_symbols:
+            continue
+        values = [number(row["factors"][factor_name]) for row in clean]
+        labels = [number(row["label"]) for row in clean]
+        if stddev(values) <= 1e-10 or stddev(labels) <= 1e-10:
+            continue
+        ordered = sorted(zip(values, labels), key=lambda item: item[0])
+        bucket = max(1, len(ordered) // 5)
+        low_return = mean(label for _, label in ordered[:bucket])
+        high_return = mean(label for _, label in ordered[-bucket:])
+        daily.append({
+            "date": date,
+            "symbols": len(clean),
+            "ic": _pearson(values, labels),
+            "rank_ic": _spearman(values, labels),
+            "high_minus_low": high_return - low_return,
+        })
+
+    values_all = [number(row["factors"].get(factor_name)) for row in rows if factor_name in row.get("factors", {})]
+    labels_all = [number(row["label"]) for row in rows if factor_name in row.get("factors", {})]
+    full_ic = _pearson(values_all, labels_all)
+    full_rank_ic = _spearman(values_all, labels_all)
+    direction = 1 if (mean(row["rank_ic"] for row in daily) or full_rank_ic or full_ic) >= 0 else -1
+    directed_spreads = [row["high_minus_low"] * direction for row in daily]
+    positive_days = sum(1 for row in daily if row["rank_ic"] * direction > 0)
+
+    residual_values: list[float] = []
+    residual_labels: list[float] = []
+    for date_rows in by_date.values():
+        sector_groups: dict[str, list[dict[str, Any]]] = {}
+        for row in date_rows:
+            sector_groups.setdefault(str(row.get("sector") or "Unknown"), []).append(row)
+        for sector_rows in sector_groups.values():
+            clean = [row for row in sector_rows if factor_name in row.get("factors", {})]
+            if len(clean) < 2:
+                continue
+            factor_center = mean(number(row["factors"].get(factor_name)) for row in clean)
+            label_center = mean(number(row.get("label")) for row in clean)
+            residual_values.extend(number(row["factors"].get(factor_name)) - factor_center for row in clean)
+            residual_labels.extend(number(row.get("label")) - label_center for row in clean)
+
+    sector_neutral_ic = _pearson(residual_values, residual_labels)
+    sector_neutral_rank_ic = _spearman(residual_values, residual_labels)
+    return {
+        "name": factor_name,
+        "formula": PANEL_FACTOR_FORMULAS.get(factor_name, ""),
+        "direction": direction,
+        "direction_label": "positive" if direction >= 0 else "negative",
+        "ic": round(full_ic, 4),
+        "rank_ic": round(full_rank_ic, 4),
+        "daily_ic_mean": round(mean(row["ic"] for row in daily), 4),
+        "daily_rank_ic_mean": round(mean(row["rank_ic"] for row in daily), 4),
+        "sector_neutral_ic": round(sector_neutral_ic, 4),
+        "sector_neutral_rank_ic": round(sector_neutral_rank_ic, 4),
+        "quantile_spread_pct": round(mean(directed_spreads), 4),
+        "positive_day_share_pct": round(positive_days / max(1, len(daily)) * 100, 2),
+        "date_count": len(daily),
+        "sample_count": len(values_all),
+        "latest_rank_ic": round(mean(row["rank_ic"] for row in daily[-12:]), 4) if daily else 0.0,
+        "stability": round(abs(mean(row["rank_ic"] for row in daily)) / (stddev(row["rank_ic"] for row in daily) + 0.05), 4) if daily else 0.0,
+    }
+
+
+def _fit_panel_ridge(rows: list[dict[str, Any]], factor_names: list[str], penalty: float, epochs: int = 80) -> dict[str, Any]:
+    centers = {name: mean(row["factors"].get(name, 0.0) for row in rows) for name in factor_names}
+    scales = {name: stddev(row["factors"].get(name, 0.0) for row in rows) or 1.0 for name in factor_names}
+    label_center = mean(row["label"] for row in rows)
+    label_scale = stddev(row["label"] for row in rows) or 1.0
+    weights = [0.0] * len(factor_names)
+    bias = 0.0
+    learning_rate = 0.028
+
+    def vector(row: dict[str, Any]) -> list[float]:
+        return [
+            clamp((number(row["factors"].get(name)) - centers[name]) / scales[name], -6, 6)
+            for name in factor_names
+        ]
+
+    for epoch in range(epochs):
+        decay = 1.0 / (1.0 + epoch * 0.02)
+        for row in rows:
+            x = vector(row)
+            target = clamp((number(row["label"]) - label_center) / label_scale, -6, 6)
+            prediction = bias + sum(weight * value for weight, value in zip(weights, x))
+            error = prediction - target
+            for position, value in enumerate(x):
+                weights[position] -= learning_rate * decay * clamp(error * value + penalty * weights[position], -4, 4)
+            bias -= learning_rate * decay * clamp(error, -4, 4)
+
+    def predict(row: dict[str, Any]) -> float:
+        normalized = bias + sum(weight * value for weight, value in zip(weights, vector(row)))
+        return normalized * label_scale + label_center
+
+    return {"weights": weights, "bias": bias, "predict": predict}
+
+
+def _panel_equal_baseline(train_rows: list[dict[str, Any]], test_rows: list[dict[str, Any]], factor_names: list[str]) -> list[float]:
+    directions = {}
+    centers = {}
+    scales = {}
+    for name in factor_names:
+        values = [number(row["factors"].get(name)) for row in train_rows]
+        labels = [number(row["label"]) for row in train_rows]
+        directions[name] = 1 if _spearman(values, labels) >= 0 else -1
+        centers[name] = mean(values)
+        scales[name] = stddev(values) or 1.0
+    train_scores = [
+        mean(clamp((number(row["factors"].get(name)) - centers[name]) / scales[name], -6, 6) * directions[name] for name in factor_names)
+        for row in train_rows
+    ]
+    label_center = mean(row["label"] for row in train_rows)
+    scale = (stddev(row["label"] for row in train_rows) or 1.0) / (stddev(train_scores) or 1.0)
+    score_center = mean(train_scores)
+    return [
+        (mean(clamp((number(row["factors"].get(name)) - centers[name]) / scales[name], -6, 6) * directions[name] for name in factor_names) - score_center) * scale + label_center
+        for row in test_rows
+    ]
+
+
+def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], horizon: int) -> dict[str, Any]:
+    dates = sorted({row["date"] for row in rows})
+    purge = max(1, min(20, horizon))
+    embargo = max(1, min(10, horizon // 2))
+    train_end = int(len(dates) * 0.58)
+    validation_start = train_end + purge
+    validation_end = int(len(dates) * 0.78)
+    test_start = validation_end + embargo
+    if len(factor_names) < 2 or train_end < 40 or validation_end - validation_start < 8 or len(dates) - test_start < 8:
+        return {
+            "available": False,
+            "framework": "cross-sectional-factor-ridge",
+            "reason": "Not enough dates/factors for purged cross-sectional train/validation/test.",
+            "date_count": len(dates),
+            "factor_count": len(factor_names),
+        }
+    train_dates = set(dates[:train_end])
+    validation_dates = set(dates[validation_start:validation_end])
+    test_dates = set(dates[test_start:])
+    train_rows = [row for row in rows if row["date"] in train_dates]
+    validation_rows = [row for row in rows if row["date"] in validation_dates]
+    test_rows = [row for row in rows if row["date"] in test_dates]
+    selected: dict[str, Any] | None = None
+    for penalty in [0.01, 0.03, 0.08, 0.16, 0.32, 0.64]:
+        model = _fit_panel_ridge(train_rows, factor_names, penalty)
+        predictions = [model["predict"](row) for row in validation_rows]
+        metrics = _factor_prediction_metrics(predictions, [row["label"] for row in validation_rows])
+        score = metrics["direction_hit_rate_pct"] + max(0.0, metrics["rank_ic"]) * 35 - metrics["mae"] * 1.4
+        candidate = {"penalty": penalty, "model": model, "validation": metrics, "score": score}
+        if selected is None or candidate["score"] > selected["score"]:
+            selected = candidate
+    assert selected is not None
+    deployment_rows = [row for row in rows if row["date"] in set(dates[:validation_end])]
+    deployment = _fit_panel_ridge(deployment_rows, factor_names, selected["penalty"], epochs=100)
+    predictions = [deployment["predict"](row) for row in test_rows]
+    actuals = [row["label"] for row in test_rows]
+    test_metrics = _factor_prediction_metrics(predictions, actuals)
+    equal_predictions = _panel_equal_baseline(deployment_rows, test_rows, factor_names)
+    equal_metrics = _factor_prediction_metrics(equal_predictions, actuals)
+    momentum_name = "momentum_20" if "momentum_20" in factor_names else factor_names[0]
+    momentum_predictions = _panel_equal_baseline(deployment_rows, test_rows, [momentum_name])
+    momentum_metrics = _factor_prediction_metrics(momentum_predictions, actuals)
+    direction_lift = test_metrics["direction_hit_rate_pct"] - max(50.0, equal_metrics["direction_hit_rate_pct"], momentum_metrics["direction_hit_rate_pct"])
+    abs_total = sum(abs(value) for value in deployment["weights"]) or 1.0
+    coefficients = [
+        {
+            "name": name,
+            "coefficient": round(deployment["weights"][index], 6),
+            "abs_weight_pct": round(abs(deployment["weights"][index]) / abs_total * 100, 3),
+            "direction": "positive" if deployment["weights"][index] >= 0 else "negative",
+        }
+        for index, name in enumerate(factor_names)
+    ]
+    coefficients.sort(key=lambda row: row["abs_weight_pct"], reverse=True)
+    active = direction_lift > 0.5 or test_metrics["rank_ic"] > max(0.0, equal_metrics["rank_ic"], momentum_metrics["rank_ic"])
+    return {
+        "available": True,
+        "active": active,
+        "framework": "cross-sectional-factor-ridge",
+        "method": "Date-split cross-sectional ridge model with purge/embargo; factor scalers fit on train dates only.",
+        "horizon_days": horizon,
+        "selected_penalty": selected["penalty"],
+        "split": {
+            "train_dates": len(train_dates),
+            "validation_dates": len(validation_dates),
+            "test_dates": len(test_dates),
+            "train_rows": len(train_rows),
+            "validation_rows": len(validation_rows),
+            "test_rows": len(test_rows),
+        },
+        "purge_dates": purge,
+        "embargo_dates": embargo,
+        "validation": selected["validation"],
+        "test": test_metrics,
+        "benchmarks": [
+            {"name": "random_direction", "direction_hit_rate_pct": 50.0},
+            {"name": "equal_weight_cross_section", **equal_metrics},
+            {"name": f"single_{momentum_name}", **momentum_metrics},
+        ],
+        "direction_lift_pct": round(direction_lift, 3),
+        "coefficients": coefficients,
+        "guardrail": "Inactive unless holdout direction/rank IC beats simple baselines.",
+    }
+
+
+def analyze_cross_sectional_factors(
+    items: list[dict[str, Any]],
+    market: str = "ASX",
+    horizons: list[int] | int | float | None = None,
+    min_symbols: int = 4,
+) -> dict[str, Any]:
+    if horizons is not None and not isinstance(horizons, list):
+        horizons = [int(number(horizons, 15))]
+    horizons = [max(1, min(60, int(number(value, 15)))) for value in (horizons or [5, 15, 30])]
+    horizons = list(dict.fromkeys(horizons))
+    min_symbols = max(3, int(min_symbols or 4))
+    prepared = [
+        {
+            "symbol": str(item.get("symbol") or ""),
+            "sector": str(item.get("sector") or item.get("industry") or "Unknown"),
+            "candles": item.get("candles") or [],
+            "source": str(item.get("source") or ""),
+        }
+        for item in items or []
+        if item.get("symbol") and item.get("candles")
+    ]
+    horizon_results: list[dict[str, Any]] = []
+    aggregate_weights: dict[str, float] = {}
+    aggregate_samples: dict[str, float] = {}
+    factor_names = list(PANEL_FACTOR_FORMULAS)
+    for horizon in horizons:
+        panel_rows: list[dict[str, Any]] = []
+        symbol_depths: list[dict[str, Any]] = []
+        for item in prepared:
+            rows = _panel_factor_rows(item["candles"], horizon, item["symbol"], item["sector"])
+            if rows:
+                panel_rows.extend(rows)
+            symbol_depths.append({
+                "symbol": item["symbol"],
+                "sector": item["sector"],
+                "rows": len(rows),
+                "source": item["source"],
+            })
+        date_groups = _group_by_date(panel_rows)
+        usable_dates = [date for date, rows in date_groups.items() if len({row["symbol"] for row in rows}) >= min_symbols]
+        panel_rows = [row for row in panel_rows if row["date"] in set(usable_dates)]
+        if len(panel_rows) < min_symbols * 20:
+            horizon_results.append({
+                "available": False,
+                "horizon_days": horizon,
+                "reason": "Not enough synchronized cross-sectional rows.",
+                "row_count": len(panel_rows),
+                "symbol_depths": symbol_depths,
+            })
+            continue
+        matrix = {
+            left: {
+                right: round(_pearson(
+                    [number(row["factors"].get(left)) for row in panel_rows],
+                    [number(row["factors"].get(right)) for row in panel_rows],
+                ), 4)
+                for right in factor_names
+            }
+            for left in factor_names
+        }
+        clusters = _factor_cluster_map(factor_names, matrix, threshold=0.72)
+        stats = [_panel_factor_metrics(panel_rows, name, min_symbols) for name in factor_names]
+        ml_names = [
+            row["name"] for row in stats
+            if row["date_count"] >= 12 and abs(number(row["daily_rank_ic_mean"])) >= 0.005
+        ] or [row["name"] for row in sorted(stats, key=lambda item: abs(number(item["daily_rank_ic_mean"])), reverse=True)[:8]]
+        ml = _panel_ml_backtest(panel_rows, ml_names[:12], horizon)
+        ml_lookup = {
+            row["name"]: number(row.get("abs_weight_pct")) / 100
+            for row in ml.get("coefficients", [])
+        } if ml.get("available") else {}
+        leaders: dict[str, str] = {}
+        stats_by_name = {row["name"]: row for row in stats}
+        for name, cluster in clusters.items():
+            leaders[cluster["cluster"]] = max(cluster["members"], key=lambda member: abs(number(stats_by_name.get(member, {}).get("daily_rank_ic_mean"))))
+        candidates = []
+        for row in stats:
+            name = row["name"]
+            cluster = clusters.get(name, {"cluster": "solo", "members": [name], "size": 1})
+            leader = leaders.get(cluster["cluster"], name)
+            redundant = cluster.get("size", 1) > 1 and name != leader
+            decay_penalty = max(0.0, abs(number(row["daily_rank_ic_mean"])) - abs(number(row["latest_rank_ic"]))) * 18
+            if number(row["daily_rank_ic_mean"]) and number(row["latest_rank_ic"]) and number(row["daily_rank_ic_mean"]) * number(row["latest_rank_ic"]) < 0:
+                decay_penalty += 5
+            redundancy_penalty = 10 if redundant else 0
+            model_gain = ml_lookup.get(name, 0.0) * (16 if ml.get("active") else 7)
+            base_score = (
+                abs(number(row["daily_rank_ic_mean"])) * 42
+                + abs(number(row["sector_neutral_rank_ic"])) * 28
+                + max(0.0, number(row["quantile_spread_pct"])) * 1.9
+                + max(0.0, number(row["positive_day_share_pct"]) - 50) * 0.12
+                + min(8.0, number(row["stability"]) * 3.2)
+                + model_gain
+                - redundancy_penalty
+                - decay_penalty
+            )
+            reasons = []
+            if row["date_count"] < 12:
+                reasons.append("too_few_cross_section_dates")
+            if abs(number(row["daily_rank_ic_mean"])) < 0.005 and abs(number(row["sector_neutral_rank_ic"])) < 0.005:
+                reasons.append("weak_cross_section_rank_ic")
+            if redundant:
+                reasons.append(f"redundant_with_{leader}")
+            if decay_penalty >= 4:
+                reasons.append("recent_cross_section_decay")
+            admitted = not reasons and base_score > 0
+            candidate = {
+                **row,
+                "status": "admitted" if admitted else "watchlist",
+                "base_score": round(base_score, 4),
+                "dynamic_weight_pct": 0.0,
+                "ml_weight_hint_pct": round(ml_lookup.get(name, 0.0) * 100, 3),
+                "redundancy": {
+                    "cluster": cluster.get("cluster"),
+                    "leader": leader,
+                    "members": cluster.get("members", [name]),
+                },
+                "reasons": reasons or ["passed_cross_section_admission"],
+            }
+            candidates.append(candidate)
+        active_candidates = [row for row in candidates if row["status"] == "admitted" and row["base_score"] > 0]
+        if not active_candidates:
+            active_candidates = sorted([row for row in candidates if row["base_score"] > 0], key=lambda item: item["base_score"], reverse=True)[:6]
+            for row in active_candidates:
+                row["status"] = "research_only"
+                row["reasons"].append("fallback_top_cross_section_candidate")
+        temperature = max(4.0, stddev(row["base_score"] for row in active_candidates) or 6.0)
+        exp_rows = [(row, math.exp(clamp(row["base_score"] / temperature, -8, 8))) for row in active_candidates]
+        exp_total = sum(value for _, value in exp_rows) or 1.0
+        weights = []
+        for row, exp_value in exp_rows:
+            pct = exp_value / exp_total * 100
+            row["dynamic_weight_pct"] = round(pct, 3)
+            weights.append({
+                "name": row["name"],
+                "weight_pct": round(pct, 3),
+                "direction": row["direction_label"],
+                "status": row["status"],
+                "score": row["base_score"],
+            })
+            aggregate_weights[row["name"]] = aggregate_weights.get(row["name"], 0.0) + pct * len(panel_rows)
+            aggregate_samples[row["name"]] = aggregate_samples.get(row["name"], 0.0) + len(panel_rows)
+        horizon_results.append({
+            "available": True,
+            "horizon_days": horizon,
+            "row_count": len(panel_rows),
+            "date_count": len(usable_dates),
+            "symbol_count": len({row["symbol"] for row in panel_rows}),
+            "min_symbols_per_date": min_symbols,
+            "factor_count": len(factor_names),
+            "admitted_count": len(active_candidates),
+            "weights": sorted(weights, key=lambda item: item["weight_pct"], reverse=True),
+            "factors": sorted(candidates, key=lambda item: item["base_score"], reverse=True),
+            "ml_backtest": ml,
+            "correlation_matrix": matrix,
+            "high_overlap": sorted([
+                {"left": left, "right": right, "correlation": matrix[left][right]}
+                for left_index, left in enumerate(factor_names)
+                for right in factor_names[left_index + 1:]
+                if abs(matrix[left][right]) >= 0.72
+            ], key=lambda item: abs(item["correlation"]), reverse=True)[:30],
+            "symbol_depths": symbol_depths,
+        })
+    aggregate = [
+        {
+            "name": name,
+            "weight_pct": round(total / max(1.0, aggregate_samples.get(name, 1.0)), 3),
+        }
+        for name, total in aggregate_weights.items()
+    ]
+    total_weight = sum(row["weight_pct"] for row in aggregate) or 1.0
+    for row in aggregate:
+        row["weight_pct"] = round(row["weight_pct"] / total_weight * 100, 3)
+    return {
+        "available": any(row.get("available") for row in horizon_results),
+        "framework": "market-cross-sectional-factor-research",
+        "market": market,
+        "horizons": horizons,
+        "symbol_count": len(prepared),
+        "min_symbols_per_date": min_symbols,
+        "factor_library": [{"name": name, "formula": formula} for name, formula in PANEL_FACTOR_FORMULAS.items()],
+        "aggregate_weights": sorted(aggregate, key=lambda item: item["weight_pct"], reverse=True),
+        "horizon_results": horizon_results,
+        "leakage_control": "For each date, factors use only candles at or before t; labels are future returns. ML split is chronological by date with purge/embargo between train, validation, and test.",
+        "admission_policy": [
+            "Prefer factors with stable daily Rank IC across the market.",
+            "Require sector-neutral evidence when sector labels are available.",
+            "Penalize highly correlated duplicate factors and recent IC decay.",
+            "Use ML holdout coefficients only when they beat equal-weight and momentum baselines.",
         ],
     }

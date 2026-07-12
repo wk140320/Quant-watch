@@ -20,6 +20,12 @@ const {
   sanitizeUniverseRows,
   scoreRedditSocialPosts,
   fetchRedditSocialFactor,
+  backendMarketSession,
+  backendMonitorBudgetLimits,
+  computeServerTechnicals,
+  intradaySampleRows,
+  sanitizeBackendMonitorConfig,
+  trainIntradayLinearModel,
   stockAnalysisHistoryRows,
   tradeFootprintRows,
   tushareRows,
@@ -364,4 +370,65 @@ test("Reddit disabled status and factor fallback do not throw", async () => {
     if (previous === undefined) delete process.env.REDDIT_ENABLED;
     else process.env.REDDIT_ENABLED = previous;
   }
+});
+
+test("Backend monitor config persists holdings at 5m and watchlist at 15m cadence", () => {
+  const config = sanitizeBackendMonitorConfig({
+    strategy: { horizonDays: 15, confidence: 80, targetUpside: 5, stopLoss: 4, maxPosition: 20 },
+    capital: { baseCapital: 5000 },
+    markets: {
+      ASX: {
+        watchlist: ["BHP", "CPU", "AAPL"],
+        portfolio: [{ symbol: "CPU", market: "ASX", qty: 20, avgPrice: 18.5, entryDate: "2026-07-01" }],
+      },
+      US: {
+        watchlist: ["AAPL", "MSFT"],
+        portfolio: [{ symbol: "AAPL", market: "US", qty: 2, avgPrice: 200 }],
+      },
+    },
+  });
+  assert.equal(config.refresh.holdingMs, 5 * 60 * 1000);
+  assert.equal(config.refresh.watchMs, 15 * 60 * 1000);
+  assert.ok(config.markets.ASX.watchlist.includes("CPU.AX"));
+  assert.ok(config.markets.ASX.watchlist.includes("BHP.AX"));
+  assert.ok(!config.markets.ASX.watchlist.includes("AAPL"));
+  assert.equal(config.markets.US.portfolio[0].symbol, "AAPL");
+  assert.equal(config.training.symbolLimit, 3);
+});
+
+test("Backend market session recognises regular market hours", () => {
+  const asxOpen = backendMarketSession("ASX", new Date("2026-07-03T02:00:00Z"));
+  const asxClosed = backendMarketSession("ASX", new Date("2026-07-03T08:00:00Z"));
+  assert.equal(asxOpen.open, true);
+  assert.equal(asxClosed.open, false);
+});
+
+test("Backend technicals and intraday model train from completed minute bars", () => {
+  const candles = Array.from({ length: 90 }, (_, index) => {
+    const close = 100 + Math.sin(index / 5) * 1.5 + index * 0.03;
+    return {
+      date: `2026-07-03T${String(10 + Math.floor(index / 12)).padStart(2, "0")}:${String((index % 12) * 5).padStart(2, "0")}:00+10:00`,
+      open: close - 0.1,
+      high: close + 0.3,
+      low: close - 0.4,
+      close,
+      volume: 10000 + index * 80,
+    };
+  });
+  const technicals = computeServerTechnicals(candles);
+  assert.ok(technicals.close > 0);
+  assert.ok(Number.isFinite(technicals.rsi));
+  const samples = intradaySampleRows("ASX", "CPU", candles, 3);
+  assert.ok(samples.length > 40);
+  assert.ok(samples.every((sample) => sample.timestamp < candles.at(-3).date));
+  const model = trainIntradayLinearModel(samples);
+  assert.equal(model.available, true);
+  assert.ok(model.sampleCount >= samples.length);
+  assert.ok(model.test.count > 0);
+});
+
+test("Backend monitor budget defaults reserve quota for minute training", () => {
+  const limits = backendMonitorBudgetLimits();
+  assert.ok(limits.marketCalls > limits.trainingMarketReserve);
+  assert.ok(limits.trainingCalls > 0);
 });

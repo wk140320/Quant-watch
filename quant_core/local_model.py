@@ -5,6 +5,7 @@ from typing import Any
 
 MAX_ENSEMBLE_ROWS = 600
 MAX_SUPERVISED_ROWS = 720
+MODEL_ZOO_MIN_ROWS = 48
 TRIPLE_BARRIER_CLASSES = {"stop": 0, "timeout": 1, "target": 2}
 DEFAULT_EMBARGO_FRACTION = 0.025
 FEATURE_CATALOG = {
@@ -47,6 +48,28 @@ def clamp(value: float, low: float, high: float) -> float:
 def mean(values: list[float]) -> float:
     rows = [value for value in values if math.isfinite(value)]
     return sum(rows) / len(rows) if rows else 0.0
+
+
+def percentile(values: list[float], q: float) -> float:
+    rows = sorted(value for value in values if math.isfinite(value))
+    if not rows:
+        return 0.0
+    index = min(len(rows) - 1, max(0, int(round((len(rows) - 1) * clamp(q, 0.0, 1.0)))))
+    return rows[index]
+
+
+def pearson(left: list[float], right: list[float]) -> float:
+    pairs = [(a, b) for a, b in zip(left, right) if math.isfinite(a) and math.isfinite(b)]
+    if len(pairs) < 3:
+        return 0.0
+    left_mean = mean([row[0] for row in pairs])
+    right_mean = mean([row[1] for row in pairs])
+    covariance = mean([(a - left_mean) * (b - right_mean) for a, b in pairs])
+    left_var = mean([(a - left_mean) ** 2 for a, _ in pairs])
+    right_var = mean([(b - right_mean) ** 2 for _, b in pairs])
+    if left_var <= 1e-12 or right_var <= 1e-12:
+        return 0.0
+    return clamp(covariance / math.sqrt(left_var * right_var), -1.0, 1.0)
 
 
 def tail_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -1014,6 +1037,681 @@ def train_lightgbm_suite(rows: list[dict[str, Any]], market: str = "ASX") -> dic
     }
 
 
+MODEL_ZOO_LABELS = {
+    "stored_ensemble": "当前线上综合预测",
+    "technical_ridge": "技术面线性挑战者",
+    "factor_ridge": "因子/新闻线性挑战者",
+    "orderflow_profile_ridge": "订单流/成交密集区挑战者",
+    "wide_regularized_ridge": "全特征正则挑战者",
+    "target_stop_meta": "目标-止损Meta挑战者",
+    "sequence_state_proxy": "序列状态代理挑战者",
+    "tree_boosting_return": "LightGBM/树模型挑战者",
+}
+
+
+def model_zoo_feature_groups() -> dict[str, list[str]]:
+    return {
+        "technical_ridge": [
+            "trend",
+            "momentum",
+            "change5d",
+            "change20d",
+            "volumeRatio",
+            "rsi",
+            "volume",
+            "risk",
+            "gap",
+        ],
+        "factor_ridge": [
+            "factor",
+            "socialScore",
+            "macroScore",
+            "sectorScore",
+            "flowScore",
+            "liquidityScore",
+            "relativeStrengthScore",
+            "calibrationScore",
+            "announcementScore",
+            "analogConfidence",
+            "modelConfidence",
+            "newsCount",
+            "factorCount",
+        ],
+        "orderflow_profile_ridge": [
+            "buyPressure",
+            "buyPressure5",
+            "pressureChange",
+            "volumeAccel",
+            "profileDistance",
+            "liquidityShock",
+            "volumeRatio",
+            "risk",
+            "change5d",
+        ],
+        "wide_regularized_ridge": [
+            "trend",
+            "momentum",
+            "change5d",
+            "change20d",
+            "volumeRatio",
+            "rsi",
+            "volume",
+            "risk",
+            "factor",
+            "gap",
+            "buyPressure",
+            "buyPressure5",
+            "pressureChange",
+            "volumeAccel",
+            "profileDistance",
+            "liquidityShock",
+            "socialScore",
+            "macroScore",
+            "sectorScore",
+            "flowScore",
+            "liquidityScore",
+            "relativeStrengthScore",
+            "calibrationScore",
+            "announcementScore",
+            "analogConfidence",
+            "modelConfidence",
+            "newsCount",
+            "factorCount",
+            "upsideAgreement",
+            "consensusAgreement",
+            "predictionConfidence",
+            "strategyHitProbability",
+            "magnitudeHitProbability",
+            "projectedFinalReturn",
+            "projectedMaxUpside",
+        ],
+        "target_stop_meta": [
+            "predictionConfidence",
+            "strategyHitProbability",
+            "magnitudeHitProbability",
+            "projectedFinalReturn",
+            "projectedMaxUpside",
+            "factor",
+            "calibrationScore",
+            "buyPressure5",
+            "profileDistance",
+            "volumeAccel",
+            "risk",
+            "volumeRatio",
+            "upsideAgreement",
+            "consensusAgreement",
+        ],
+        "sequence_state_proxy": [
+            "change5d",
+            "change20d",
+            "momentum",
+            "trend",
+            "volumeAccel",
+            "pressureChange",
+            "profileDistance",
+            "liquidityShock",
+            "upsideAgreement",
+            "consensusAgreement",
+        ],
+    }
+
+
+def sequence_state_proxy_predictions(rows: list[dict[str, Any]]) -> list[float]:
+    predictions: list[float] = []
+    for row in rows:
+        feature = row.get("features") or {}
+        trend = (number(feature.get("trend"), 50) - 50) / 50
+        momentum = (number(feature.get("momentum"), 50) - 50) / 50
+        change5 = number(feature.get("change5d"), 0) / 8
+        change20 = number(feature.get("change20d"), 0) / 18
+        volume_accel = number(feature.get("volumeAccel"), 0)
+        pressure = number(feature.get("pressureChange"), 0) + number(feature.get("buyPressure5"), 0) * 0.7
+        profile = -number(feature.get("profileDistance"), 0) / 5
+        liquidity = -max(0.0, number(feature.get("liquidityShock"), 0)) * 0.18
+        agreement = (number(feature.get("upsideAgreement"), 50) - 50) / 50
+        prediction = (
+            trend * 1.1
+            + momentum * 1.0
+            + change20 * 1.2
+            + change5 * 0.7
+            + volume_accel * 0.42
+            + pressure * 0.95
+            + profile * 0.55
+            + agreement * 0.65
+            + liquidity
+        )
+        predictions.append(clamp(prediction, -18.0, 18.0))
+    return predictions
+
+
+def target_stop_meta_predictions(target_model: dict[str, Any], stop_model: dict[str, Any], rows: list[dict[str, Any]], feature_names: list[str]) -> list[float]:
+    target_probabilities = predict_logistic(target_model, rows, feature_names)
+    stop_probabilities = predict_logistic(stop_model, rows, feature_names)
+    predictions: list[float] = []
+    for index, row in enumerate(rows):
+        target_prob = clamp(number(target_probabilities[index]), 0.0, 1.0)
+        stop_prob = clamp(number(stop_probabilities[index]), 0.0, 1.0)
+        target_upside = max(0.5, number(row.get("target_upside"), 5.0))
+        stop_loss = max(0.8, abs(number(row.get("stop_loss"), 4.0)))
+        expected = (
+            (target_prob - 0.5) * target_upside * 2.25
+            - max(0.0, stop_prob - 0.35) * stop_loss * 1.35
+            + (target_prob - stop_prob) * 0.8
+        )
+        predictions.append(clamp(expected, -18.0, 18.0))
+    return predictions
+
+
+def evaluate_zoo_candidate(rows: list[dict[str, Any]], predictions: list[float], baseline_predictions: list[float] | None = None) -> dict[str, Any]:
+    if not rows or not predictions:
+        return {"samples": 0, "mse": None, "mae": None, "directionHitRate": None, "targetPrecision": None, "improvementPct": None}
+    targets = [number(row.get("actual_return"), 0.0) for row in rows]
+    errors = [number(predictions[index]) - targets[index] for index in range(len(rows))]
+    mse = mean([error * error for error in errors])
+    baseline_mse = None
+    improvement = None
+    if baseline_predictions:
+        baseline_errors = [number(baseline_predictions[index]) - targets[index] for index in range(min(len(rows), len(baseline_predictions)))]
+        baseline_mse = mean([error * error for error in baseline_errors])
+        improvement = improvement_pct(mse, baseline_mse)
+    direction_hits = sum(
+        1
+        for index, target in enumerate(targets)
+        if (number(predictions[index]) >= 0 and target >= 0) or (number(predictions[index]) < 0 and target < 0)
+    )
+    positive_indexes = [index for index, value in enumerate(predictions) if number(value) > 0.15]
+    target_precision = (
+        sum(1 for index in positive_indexes if number(rows[index].get("target_label")) >= 0.5) / len(positive_indexes) * 100
+        if positive_indexes
+        else None
+    )
+    return {
+        "samples": len(rows),
+        "mse": mse,
+        "mae": mean([abs(error) for error in errors]),
+        "directionHitRate": direction_hits / len(rows) * 100,
+        "targetPrecision": target_precision,
+        "baselineMse": baseline_mse,
+        "improvementPct": improvement,
+        "avgPrediction": mean(predictions),
+        "avgActualReturn": mean(targets),
+        "correlation": pearson(predictions, targets),
+    }
+
+
+def zoo_weight_rows(rows: list[dict[str, Any]], predictions_by_name: dict[str, list[float]], names: list[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        out.append({
+            "actual_return": number(row.get("actual_return")),
+            "target_wins": number(row.get("target_label")) >= 0.5,
+            "model_values": {
+                name: number((predictions_by_name.get(name) or [0.0 for _ in rows])[index])
+                for name in names
+            },
+        })
+    return out
+
+
+def prediction_dispersion(values: list[float], weights: list[float] | None = None) -> float:
+    clean = [number(value) for value in values if math.isfinite(number(value, math.nan))]
+    if not clean:
+        return 0.0
+    if weights and len(weights) == len(values):
+        normalized = normalize_weights(weights)
+        center = sum(number(values[index]) * normalized[index] for index in range(len(values)))
+        variance = sum(((number(values[index]) - center) ** 2) * normalized[index] for index in range(len(values)))
+    else:
+        center = mean(clean)
+        variance = mean([(value - center) ** 2 for value in clean])
+    return math.sqrt(max(0.0, variance))
+
+
+def evaluate_zoo_ensemble(rows: list[dict[str, Any]], predictions_by_name: dict[str, list[float]], names: list[str], weights: list[float]) -> dict[str, Any]:
+    weighted_rows = zoo_weight_rows(rows, predictions_by_name, names)
+    metrics = evaluate_weight_vector(weighted_rows, names, weights)
+    predictions = [prediction_for_weight_vector(row, names, weights) for row in weighted_rows]
+    actuals = [number(row.get("actual_return")) for row in weighted_rows]
+    metrics["correlation"] = pearson(predictions, actuals)
+    metrics["dispersionMedian"] = percentile([
+        prediction_dispersion([number((predictions_by_name.get(name) or [0.0 for _ in rows])[index]) for name in names], weights)
+        for index in range(len(rows))
+    ], 0.5)
+    metrics["dispersionP75"] = percentile([
+        prediction_dispersion([number((predictions_by_name.get(name) or [0.0 for _ in rows])[index]) for name in names], weights)
+        for index in range(len(rows))
+    ], 0.75)
+    return metrics
+
+
+def cap_model_zoo_double_check_weights(names: list[str], weights: list[float], candidates: list[dict[str, Any]]) -> tuple[list[float], dict[str, Any]]:
+    """Keep optional/open-source challengers as double-check evidence, not the main forecast driver."""
+    if not names or not weights:
+        return weights, {"applied": False, "reason": "No model-zoo weights."}
+    family_by_name = {str(candidate.get("name")): str(candidate.get("family") or "") for candidate in candidates}
+    external_indexes = [
+        index for index, name in enumerate(names)
+        if name == "tree_boosting_return" or family_by_name.get(name) in {"open_source_tree", "external_adapter"}
+    ]
+    if not external_indexes:
+        return normalize_weights(weights), {
+            "applied": False,
+            "maxExternalShare": 0.12,
+            "maxSingleExternalShare": 0.08,
+            "selfModelMinShare": 0.88,
+            "reason": "No external/open-source challenger carried deployment weight.",
+        }
+    capped = normalize_weights(weights)
+    max_single = 0.08
+    for index in external_indexes:
+        capped[index] = min(capped[index], max_single)
+    external_total = sum(capped[index] for index in external_indexes)
+    max_external = 0.12
+    if external_total > max_external:
+        scale = max_external / max(1e-12, external_total)
+        for index in external_indexes:
+            capped[index] *= scale
+    internal_indexes = [index for index in range(len(capped)) if index not in external_indexes]
+    internal_total = sum(capped[index] for index in internal_indexes)
+    leftover = max(0.0, 1.0 - sum(capped[index] for index in external_indexes))
+    if internal_indexes and internal_total > 0:
+        for index in internal_indexes:
+            capped[index] = capped[index] / internal_total * leftover
+    capped = normalize_weights(capped)
+    return capped, {
+        "applied": True,
+        "framework": "self-model-primary-double-check-cap",
+        "selfModelMinShare": 0.88,
+        "maxExternalShare": max_external,
+        "maxSingleExternalShare": max_single,
+        "externalModelNames": [names[index] for index in external_indexes],
+        "reason": "External/open-source challengers are capped as double-check evidence; local models keep the dominant committee share.",
+    }
+
+
+def average_residual_correlation(rows: list[dict[str, Any]], predictions_by_name: dict[str, list[float]], names: list[str]) -> float:
+    residuals: dict[str, list[float]] = {}
+    actuals = [number(row.get("actual_return")) for row in rows]
+    for name in names:
+        predictions = predictions_by_name.get(name) or []
+        if len(predictions) != len(rows):
+            continue
+        residuals[name] = [number(predictions[index]) - actuals[index] for index in range(len(rows))]
+    values: list[float] = []
+    keys = list(residuals)
+    for left_index, left in enumerate(keys):
+        for right in keys[left_index + 1:]:
+            values.append(abs(pearson(residuals[left], residuals[right])))
+    return mean(values)
+
+
+def build_reject_gate(rows: list[dict[str, Any]], predictions_by_name: dict[str, list[float]], names: list[str], weights: list[float]) -> dict[str, Any]:
+    if not rows or not names:
+        return {"active": False, "reason": "No model-zoo rows."}
+    dispersions = [
+        prediction_dispersion([number((predictions_by_name.get(name) or [0.0 for _ in rows])[index]) for name in names], weights)
+        for index in range(len(rows))
+    ]
+    threshold = max(0.75, percentile(dispersions, 0.72))
+    accepted_indexes = [index for index, value in enumerate(dispersions) if value <= threshold]
+    if len(accepted_indexes) < max(4, int(len(rows) * 0.35)):
+        threshold = percentile(dispersions, 0.85)
+        accepted_indexes = [index for index, value in enumerate(dispersions) if value <= threshold]
+    ensemble_rows = zoo_weight_rows(rows, predictions_by_name, names)
+    all_predictions = [prediction_for_weight_vector(row, names, weights) for row in ensemble_rows]
+    accepted_predictions = [all_predictions[index] for index in accepted_indexes]
+    accepted_rows = [rows[index] for index in accepted_indexes]
+    accepted_metrics = evaluate_zoo_candidate(accepted_rows, accepted_predictions)
+    all_metrics = evaluate_zoo_candidate(rows, all_predictions)
+    return {
+        "active": True,
+        "framework": "dispersion-abstention-gate",
+        "threshold": round(threshold, 4),
+        "acceptedSamples": len(accepted_indexes),
+        "rejectedSamples": len(rows) - len(accepted_indexes),
+        "acceptedRatio": round(len(accepted_indexes) / max(1, len(rows)) * 100, 2),
+        "allDirectionHitRate": round(number(all_metrics.get("directionHitRate")), 3),
+        "acceptedDirectionHitRate": round(number(accepted_metrics.get("directionHitRate")), 3),
+        "acceptedMse": round(number(accepted_metrics.get("mse")), 5),
+        "reason": "When model dispersion is high, the live system should lower confidence or refuse high-conviction buy signals instead of forcing a prediction.",
+    }
+
+
+def lightgbm_return_candidate(
+    train: list[dict[str, Any]],
+    validation: list[dict[str, Any]],
+    test: list[dict[str, Any]],
+    feature_names: list[str],
+    baseline_validation: list[float],
+    baseline_test: list[float],
+) -> dict[str, Any] | None:
+    if len([*train, *validation, *test]) < 80:
+        return None
+    provider = "lightgbm"
+    try:
+        import lightgbm as lgb  # type: ignore
+    except Exception:
+        try:
+            from sklearn.ensemble import GradientBoostingRegressor  # type: ignore
+
+            class SklearnRegressor:
+                @staticmethod
+                def LGBMRegressor(**kwargs: Any) -> Any:
+                    return GradientBoostingRegressor(
+                        n_estimators=int(kwargs.get("n_estimators", 70)),
+                        learning_rate=float(kwargs.get("learning_rate", 0.04)),
+                        max_depth=int(kwargs.get("max_depth", 3)),
+                        random_state=int(kwargs.get("random_state", 37)),
+                    )
+
+            lgb = SklearnRegressor()
+            provider = "sklearn-gradient-boosting-fallback"
+        except Exception:
+            return None
+    model = lgb.LGBMRegressor(
+        n_estimators=70,
+        learning_rate=0.04,
+        max_depth=3,
+        num_leaves=15,
+        min_child_samples=12,
+        subsample=0.88,
+        colsample_bytree=0.82,
+        reg_alpha=0.12,
+        reg_lambda=0.28,
+        random_state=37,
+        verbose=-1,
+    )
+    model.fit(feature_matrix(train, feature_names), [number(row["actual_return"]) for row in train])
+    validation_predictions = [float(value) for value in model.predict(feature_matrix(validation, feature_names))]
+    test_predictions = [float(value) for value in model.predict(feature_matrix(test, feature_names))]
+    return {
+        "name": "tree_boosting_return",
+        "label": MODEL_ZOO_LABELS["tree_boosting_return"],
+        "family": "open_source_tree",
+        "kind": "lightgbm_regressor",
+        "provider": provider,
+        "featureNames": feature_names,
+        "validationPredictions": validation_predictions,
+        "testPredictions": test_predictions,
+        "validation": evaluate_zoo_candidate(validation, validation_predictions, baseline_validation),
+        "test": evaluate_zoo_candidate(test, test_predictions, baseline_test),
+        "topFeatures": feature_importance_rows(model, feature_names),
+        "serializable": False,
+        "reason": "Optional LightGBM/sklearn tree challenger; used only if its validation/test evidence supports the ensemble.",
+    }
+
+
+def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str, Any]:
+    if len(rows) < MODEL_ZOO_MIN_ROWS:
+        return {
+            "framework": "python-local-model-zoo-committee",
+            "market": market,
+            "status": "collecting",
+            "active": False,
+            "sampleCount": len(rows),
+            "minSamples": MODEL_ZOO_MIN_ROWS,
+            "reason": "Need more resolved point-in-time prediction samples before running model-zoo challenger validation.",
+            "externalAdapters": [
+                {"id": "qlib_lightgbm", "status": "waiting_samples", "role": "tree challenger"},
+                {"id": "qlib_lstm_transformer", "status": "waiting_large_history", "role": "sequence challenger"},
+                {"id": "finrl_policy", "status": "adapter_schema_ready", "role": "policy challenger"},
+            ],
+        }
+    train, validation, test = split_supervised_rows(rows)
+    if len(train) < 18 or len(validation) < 6 or len(test) < 6:
+        return {
+            "framework": "python-local-model-zoo-committee",
+            "market": market,
+            "status": "collecting",
+            "active": False,
+            "sampleCount": len(rows),
+            "minSamples": MODEL_ZOO_MIN_ROWS,
+            "splitAudit": split_audit(rows),
+            "reason": "Need train/validation/test windows before candidate models can be compared without leakage.",
+        }
+
+    groups = model_zoo_feature_groups()
+    baseline_validation = [number(row.get("stored_prediction")) for row in validation]
+    baseline_test = [number(row.get("stored_prediction")) for row in test]
+    candidates: list[dict[str, Any]] = [{
+        "name": "stored_ensemble",
+        "label": MODEL_ZOO_LABELS["stored_ensemble"],
+        "family": "current_system",
+        "kind": "baseline",
+        "featureNames": [],
+        "validationPredictions": baseline_validation,
+        "testPredictions": baseline_test,
+        "validation": evaluate_zoo_candidate(validation, baseline_validation),
+        "test": evaluate_zoo_candidate(test, baseline_test),
+        "serializable": True,
+        "reason": "Current production ensemble forecast recorded at prediction time.",
+    }]
+
+    for name in ["technical_ridge", "factor_ridge", "orderflow_profile_ridge", "wide_regularized_ridge"]:
+        feature_names = groups[name]
+        model = fit_ridge_regression(train, feature_names, "actual_return", 0.12 if name != "wide_regularized_ridge" else 0.2)
+        validation_predictions = predict_regression(model, validation, feature_names)
+        test_predictions = predict_regression(model, test, feature_names)
+        candidates.append({
+            "name": name,
+            "label": MODEL_ZOO_LABELS[name],
+            "family": "local_supervised",
+            "kind": "ridge_regression",
+            "featureNames": feature_names,
+            "validationPredictions": validation_predictions,
+            "testPredictions": test_predictions,
+            "validation": evaluate_zoo_candidate(validation, validation_predictions, baseline_validation),
+            "test": evaluate_zoo_candidate(test, test_predictions, baseline_test),
+            "model": serialize_linear_model(model, feature_names),
+            "serializable": True,
+            "reason": "Regularized linear challenger trained only on the train window and scored on later windows.",
+        })
+
+    meta_features = groups["target_stop_meta"]
+    target_model = fit_logistic(train, meta_features, "target_label", 0.12)
+    stop_model = fit_logistic(train, meta_features, "stop_label", 0.12)
+    validation_predictions = target_stop_meta_predictions(target_model, stop_model, validation, meta_features)
+    test_predictions = target_stop_meta_predictions(target_model, stop_model, test, meta_features)
+    candidates.append({
+        "name": "target_stop_meta",
+        "label": MODEL_ZOO_LABELS["target_stop_meta"],
+        "family": "meta_label",
+        "kind": "target_stop_logistic",
+        "featureNames": meta_features,
+        "validationPredictions": validation_predictions,
+        "testPredictions": test_predictions,
+        "validation": evaluate_zoo_candidate(validation, validation_predictions, baseline_validation),
+        "test": evaluate_zoo_candidate(test, test_predictions, baseline_test),
+        "targetModel": serialize_linear_model(target_model, meta_features),
+        "stopModel": serialize_linear_model(stop_model, meta_features),
+        "targetValidation": evaluate_logistic_head(validation, predict_logistic(target_model, validation, meta_features), "target_label"),
+        "stopValidation": evaluate_logistic_head(validation, predict_logistic(stop_model, validation, meta_features), "stop_label", baseline_key="stored_stop_probability"),
+        "serializable": True,
+        "reason": "Transforms target-before-stop and stop-first probabilities into an expected-return challenger.",
+    })
+
+    sequence_validation = sequence_state_proxy_predictions(validation)
+    sequence_test = sequence_state_proxy_predictions(test)
+    candidates.append({
+        "name": "sequence_state_proxy",
+        "label": MODEL_ZOO_LABELS["sequence_state_proxy"],
+        "family": "sequence_proxy",
+        "kind": "formula_proxy",
+        "featureNames": groups["sequence_state_proxy"],
+        "validationPredictions": sequence_validation,
+        "testPredictions": sequence_test,
+        "validation": evaluate_zoo_candidate(validation, sequence_validation, baseline_validation),
+        "test": evaluate_zoo_candidate(test, sequence_test, baseline_test),
+        "serializable": True,
+        "reason": "A lightweight LSTM/Transformer proxy using recent trend, pressure, volume, and state features until deep heads have enough data.",
+    })
+
+    try:
+        tree_candidate = lightgbm_return_candidate(
+            train,
+            validation,
+            test,
+            groups["wide_regularized_ridge"],
+            baseline_validation,
+            baseline_test,
+        )
+        if tree_candidate:
+            candidates.append(tree_candidate)
+    except Exception as error:
+        candidates.append({
+            "name": "tree_boosting_return",
+            "label": MODEL_ZOO_LABELS["tree_boosting_return"],
+            "family": "open_source_tree",
+            "kind": "lightgbm_regressor",
+            "status": "training_error",
+            "active": False,
+            "error": str(error)[:220],
+            "validationPredictions": [],
+            "testPredictions": [],
+            "validation": {"samples": 0},
+            "test": {"samples": 0},
+            "reason": "Tree challenger failed and was excluded from the ensemble.",
+        })
+
+    usable = [
+        candidate for candidate in candidates
+        if len(candidate.get("validationPredictions") or []) == len(validation)
+        and len(candidate.get("testPredictions") or []) == len(test)
+    ]
+    names = [candidate["name"] for candidate in usable]
+    validation_map = {candidate["name"]: candidate["validationPredictions"] for candidate in usable}
+    test_map = {candidate["name"]: candidate["testPredictions"] for candidate in usable}
+    prior = normalize_weights([
+        0.18 if candidate["name"] == "stored_ensemble" else max(0.04, number(candidate.get("validation", {}).get("directionHitRate"), 50) / 100)
+        for candidate in usable
+    ])
+    validation_rows = zoo_weight_rows(validation, validation_map, names)
+    penalties = [0.02, 0.06, 0.14, 0.28]
+    weight_candidates = []
+    for penalty in penalties:
+        weights = fit_simplex_ridge_weights(validation_rows, names, prior, penalty)
+        metric = evaluate_zoo_ensemble(validation, validation_map, names, weights)
+        weight_candidates.append({
+            "penalty": penalty,
+            "weights": weights,
+            "validation": metric,
+            "rankScore": number(metric.get("mse"), 999) - number(metric.get("directionHitRate"), 0) * 0.01,
+        })
+    selected = min(weight_candidates, key=lambda item: number(item["rankScore"], 999))
+    selected_weights, double_check_policy = cap_model_zoo_double_check_weights(names, selected["weights"], usable)
+    equal_weights = [1.0 / len(names) for _ in names]
+    stored_weights = [1.0 if name == "stored_ensemble" else 0.0 for name in names]
+    selected_validation = evaluate_zoo_ensemble(validation, validation_map, names, selected_weights)
+    selected_test = evaluate_zoo_ensemble(test, test_map, names, selected_weights)
+    equal_test = evaluate_zoo_ensemble(test, test_map, names, equal_weights)
+    stored_test = evaluate_zoo_ensemble(test, test_map, names, stored_weights)
+    equal_improvement = improvement_pct(selected_test.get("mse"), equal_test.get("mse")) or 0.0
+    stored_improvement = improvement_pct(selected_test.get("mse"), stored_test.get("mse")) or 0.0
+    direction_lift_vs_equal = number(selected_test.get("directionHitRate")) - number(equal_test.get("directionHitRate"))
+    direction_lift_vs_stored = number(selected_test.get("directionHitRate")) - number(stored_test.get("directionHitRate"))
+    residual_corr = average_residual_correlation(test, test_map, names)
+    reject_gate = build_reject_gate(test, test_map, names, selected_weights)
+    active = (
+        len(test) >= 6
+        and number(selected_validation.get("directionHitRate"), 0) >= 48
+        and (
+            equal_improvement >= 1.0
+            or stored_improvement >= 1.0
+            or direction_lift_vs_equal >= 3.0
+            or direction_lift_vs_stored >= 3.0
+        )
+        and number(selected_test.get("directionHitRate"), 0) >= max(48, min(number(equal_test.get("directionHitRate"), 50), number(stored_test.get("directionHitRate"), 50)) - 1.5)
+    )
+    sample_power = clamp((len(rows) - MODEL_ZOO_MIN_ROWS) / 180, 0.0, 1.0)
+    deployment_blend = round(0.18 + sample_power * 0.34, 3) if active else 0.0
+    deployment_weights = {name: round(number(selected_weights[index]), 5) for index, name in enumerate(names)}
+    candidate_rows = []
+    for candidate in usable:
+        name = candidate["name"]
+        validation_metric = round_metrics(candidate.get("validation") or {})
+        test_metric = round_metrics(candidate.get("test") or {})
+        weight = deployment_weights.get(name, 0.0)
+        candidate_active = weight > 0.015 and number(test_metric.get("samples"), 0) > 0
+        row = {
+            "name": name,
+            "label": candidate.get("label") or name,
+            "family": candidate.get("family") or "model",
+            "kind": candidate.get("kind") or "candidate",
+            "status": "active" if active and candidate_active else "research_only",
+            "active": bool(active and candidate_active),
+            "weight": weight,
+            "featureNames": candidate.get("featureNames") or [],
+            "validation": validation_metric,
+            "test": test_metric,
+            "serializable": bool(candidate.get("serializable")),
+            "reason": candidate.get("reason") or "",
+        }
+        if candidate.get("model"):
+            row["model"] = candidate["model"]
+        if candidate.get("targetModel"):
+            row["targetModel"] = candidate["targetModel"]
+        if candidate.get("stopModel"):
+            row["stopModel"] = candidate["stopModel"]
+        if candidate.get("topFeatures"):
+            row["topFeatures"] = candidate["topFeatures"]
+        if candidate.get("provider"):
+            row["provider"] = candidate["provider"]
+        candidate_rows.append(row)
+    candidate_rows.sort(key=lambda row: (number(row.get("weight")), number(row.get("test", {}).get("directionHitRate"))), reverse=True)
+    return {
+        "framework": "python-local-model-zoo-committee",
+        "market": market,
+        "status": "active" if active else "research_only",
+        "active": active,
+        "sampleCount": len(rows),
+        "candidateCount": len(usable),
+        "activeCandidateCount": sum(1 for row in candidate_rows if row.get("active")),
+        "splitAudit": split_audit(rows),
+        "selectedLambda": selected["penalty"],
+        "deploymentBlend": deployment_blend,
+        "deploymentWeights": deployment_weights,
+        "doubleCheckPolicy": double_check_policy,
+        "validation": round_metrics(selected_validation),
+        "test": round_metrics(selected_test),
+        "baselines": {
+            "equalWeight": round_metrics(equal_test),
+            "storedEnsemble": round_metrics(stored_test),
+        },
+        "testImprovementVsEqualPct": round(equal_improvement, 4),
+        "testImprovementVsStoredPct": round(stored_improvement, 4),
+        "directionLiftVsEqualPct": round(direction_lift_vs_equal, 4),
+        "directionLiftVsStoredPct": round(direction_lift_vs_stored, 4),
+        "averageResidualCorrelation": round(residual_corr, 4),
+        "rejectGate": reject_gate,
+        "standardOutput": [
+            "P(target-before-stop)",
+            "P(stop-first)",
+            "E(final return)",
+            "E(max upside touch)",
+            "E(max drawdown)",
+            "calibration error",
+        ],
+        "candidates": candidate_rows,
+        "externalAdapters": [
+            {"id": "qlib_lightgbm", "status": "represented_by_tree_boosting_return" if any(row["name"] == "tree_boosting_return" for row in candidate_rows) else "not_available", "role": "tree challenger"},
+            {"id": "qlib_lstm_transformer", "status": "readiness_only_until_large_sequence_cache", "role": "deep sequence challenger"},
+            {"id": "finrl_policy", "status": "adapter_schema_ready_not_live_trading", "role": "policy/reward challenger"},
+            {"id": "backtrader_vectorbt", "status": "distilled_rules_plus_backtest_benchmark", "role": "indicator/backtest challenger"},
+        ],
+        "guardrails": [
+            "Weights are learned only on the validation window and judged on untouched later test rows.",
+            "Candidates that fail test evidence remain research-only and cannot lift live confidence.",
+            "High committee dispersion activates abstention/no-trade pressure instead of forcing a directional call.",
+            "Average residual correlation is monitored so redundant models do not create fake confidence.",
+        ],
+        "reason": (
+            f"Model-zoo committee passed OOS validation: test direction {number(selected_test.get('directionHitRate')):.1f}%, MSE lift vs equal {equal_improvement:.1f}%, vs stored {stored_improvement:.1f}%."
+            if active
+            else f"Model-zoo committee is research-only: test direction {number(selected_test.get('directionHitRate')):.1f}%, MSE lift vs equal {equal_improvement:.1f}%, vs stored {stored_improvement:.1f}%."
+        ),
+    }
+
+
 def train_local_signal_heads(samples: list[dict[str, Any]], market: str = "ASX") -> dict[str, Any]:
     rows = supervised_rows(samples)
     feature_names = [
@@ -1242,6 +1940,7 @@ def train_local_model_suite(samples: list[dict[str, Any]], market: str = "ASX") 
         "framework": "python-local-quant-model-suite",
         "market": market,
         "ensembleWeightOptimization": train_local_ensemble_weights(samples, market),
+        "modelZoo": train_model_zoo(supervised, market),
         "signalModels": train_local_signal_heads(samples, market),
         "lightgbm": train_lightgbm_suite(supervised, market),
         "tripleBarrier": triple_barrier_summary(supervised),

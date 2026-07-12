@@ -37,7 +37,7 @@ loadLocalEnv();
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-06-26-python-local-model-v37";
+const APP_VERSION = "2026-07-03-backend-monitor-v42";
 const SERVER_STARTED_AT = new Date().toISOString();
 const providerBackoff = new Map();
 const marketResponseCache = new Map();
@@ -51,6 +51,25 @@ const universeResponseCache = new Map();
 const secFilingsCache = new Map();
 const localModelTrainingCache = new Map();
 const snapshotBasePath = join(root, ".cache");
+const backendMonitorBasePath = join(snapshotBasePath, "backend-monitor");
+const backendMonitorConfigPath = join(backendMonitorBasePath, "config.json");
+const backendMonitorRuntimePath = join(backendMonitorBasePath, "runtime.json");
+const backendMonitorAlertPath = join(backendMonitorBasePath, "alerts.jsonl");
+const backendMonitorRunRequestPath = join(backendMonitorBasePath, "manual-run-request.json");
+let backendMonitorTimer = null;
+let backendMonitorTickRunning = false;
+const backendMonitorState = {
+  enabled: false,
+  running: false,
+  startedAt: null,
+  lastTickAt: null,
+  lastRunAt: null,
+  lastTrainingAt: null,
+  lastError: null,
+  lastAlerts: [],
+  lastAnalyses: [],
+  lastTraining: null,
+};
 const NEWS_DISK_CACHE_TTL_MS = Number(process.env.NEWS_DISK_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const NEWS_DISK_CACHE_CLEANUP_MS = Number(process.env.NEWS_DISK_CACHE_CLEANUP_MS || 7 * 24 * 60 * 60 * 1000);
 let lastNewsDiskCleanupAt = 0;
@@ -143,6 +162,36 @@ const OBVIOUS_ASX_ONLY_SYMBOLS = new Set([
   "QBE", "REA", "COH", "SHL", "CPU", "ORG", "APA", "SCG", "NST", "S32", "MIN",
   "PLS", "LYC", "SEK", "PME", "STW", "VAS", "IOZ",
 ]);
+
+const TRAINING_UNIVERSES = {
+  ASX: [
+    "BHP", "CBA", "RIO", "CSL", "NAB", "WBC", "ANZ", "MQG", "WES", "WOW",
+    "TLS", "FMG", "WDS", "GMG", "TCL", "QBE", "REA", "COH", "SHL", "CPU",
+    "ORG", "APA", "SCG", "NST", "S32", "MIN", "PLS", "LYC", "COL", "PME",
+    "ALL", "XRO", "JHX", "AMC", "CAR", "SOL", "IAG", "SUN", "SGP", "EDV",
+    "TWE", "AGL", "DXS", "BSL", "QAN", "HVN", "JBH", "ALD", "VCX", "WHC",
+    "STO", "RHC", "SEK", "DMP", "A2M", "IEL", "ALU", "MGR", "BXB", "NEM",
+    "IFT", "FPH", "RMD", "HUB", "NXT", "WEB", "ALX", "BEN", "BOQ", "SGR",
+  ],
+  US: [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "JPM",
+    "BAC", "WFC", "GS", "MS", "XOM", "CVX", "COP", "LLY", "UNH", "V",
+    "MA", "COST", "WMT", "NFLX", "CRM", "ORCL", "ADBE", "INTC", "QCOM", "KO",
+    "PEP", "PLTR", "IBM", "GE", "CAT", "BA", "RTX", "NKE", "DIS", "MCD",
+    "HD", "TMO", "ABBV", "MRK", "PFE", "NOW", "SHOP", "UBER", "PANW", "CRWD",
+    "MU", "SMCI", "ARM", "TSM", "BABA", "SBUX", "LMT", "LIN", "ISRG", "BKNG",
+    "TXN", "AMAT", "LRCX", "KLAC", "DE", "LOW", "AXP", "BLK", "SCHW", "C",
+  ],
+  CN: [
+    "600519", "300750", "002594", "000858", "601318", "600036", "601398", "000001",
+    "600900", "601899", "600276", "300760", "002475", "600030", "601012", "600309",
+    "000333", "000651", "300059", "002415", "600887", "601888", "600089", "002230",
+    "603259", "688981", "600031", "600050", "600406", "601668", "601857", "601988",
+    "601288", "601985", "600028", "600048", "600919", "002352", "002714", "300124",
+    "300274", "300308", "300347", "300498", "600438", "600660", "000063", "000725",
+    "002371", "002466", "002812", "300014", "300015", "300122", "600570", "601138",
+  ],
+};
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -1443,6 +1492,26 @@ function predictionWeightModelPathForMarket(market) {
   return join(snapshotBasePath, "models", `prediction-weight-calibration-${safeMarket(market).toLowerCase()}.json`);
 }
 
+function factorResearchModelPath(market, symbol) {
+  const key = safeMarket(market).toLowerCase();
+  const code = cleanCode(symbol, safeMarket(market)).toLowerCase() || "market";
+  return join(snapshotBasePath, "models", "factor-research", `${key}-${code}.json`);
+}
+
+function alphaEvolutionModelPath(market, symbol) {
+  const key = safeMarket(market).toLowerCase();
+  const code = cleanCode(symbol, safeMarket(market)).toLowerCase() || "market";
+  return join(snapshotBasePath, "models", "factor-research", `alpha-${key}-${code}.json`);
+}
+
+function crossSectionalFactorModelPath(market) {
+  return join(snapshotBasePath, "models", "factor-research", `cross-sectional-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function factorEvolutionSchedulerPath() {
+  return join(snapshotBasePath, "models", "factor-research", "evolution-scheduler.json");
+}
+
 function predictionRecordPathForMarket(market) {
   return join(snapshotBasePath, "records", `prediction-record-${safeMarket(market).toLowerCase()}.jsonl`);
 }
@@ -1477,6 +1546,7 @@ async function writeModelCalibrationSnapshot(market, summary = {}) {
     improvement: summary.improvement || null,
     modelStats: summary.modelStats || null,
     ensembleWeightOptimization: summary.ensembleWeightOptimization || null,
+    modelZoo: summary.modelZoo || null,
     localModelDeployment: summary.localModelDeployment || null,
     localSignalModels: summary.localSignalModels || null,
     lightgbmModel: summary.lightgbmModel || null,
@@ -1536,11 +1606,16 @@ async function writePredictionWeightModelSnapshot(market, summary = {}) {
     framework: summary.framework || "historical-walk-forward-backtest-batch",
     range: summary.range || "5y",
     requestedSymbols: summary.requestedSymbols || [],
+    trainingSymbols: summary.trainingSymbols || summary.requestedSymbols || [],
+    trainingUniverse: summary.trainingUniverse || null,
     symbolCount: summary.symbolCount || 0,
     availableCount: summary.availableCount || 0,
     sampleTotal: summary.sampleTotal || 0,
+    dataQuality: summary.dataQuality || null,
+    metrics: summary.metrics || null,
     predictionCalibration: calibration,
     horizonCalibrations,
+    crossSectionalFactorResearch: summary.crossSectionalFactorResearch?.savedModel || summary.crossSectionalFactorResearch || null,
     dataSources: (summary.dataSources || []).map((row) => ({
       symbol: row.symbol,
       source: row.source,
@@ -1551,6 +1626,112 @@ async function writePredictionWeightModelSnapshot(market, summary = {}) {
     note: "Stored locally so dashboard loads can read the latest prediction-weight model without retraining.",
   };
   await writeFile(predictionWeightModelPathForMarket(key), JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+async function readFactorResearchModelSnapshot(market, symbol) {
+  try {
+    const payload = JSON.parse(await readFile(factorResearchModelPath(market, symbol), "utf8"));
+    if (!payload || typeof payload !== "object") return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function writeFactorResearchModelSnapshot(market, symbol, result = {}) {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  const research = result.factor_research || result.dynamic_factor_weights || result.factorResearch || null;
+  if (!research || !research.available) return null;
+  await mkdir(join(snapshotBasePath, "models", "factor-research"), { recursive: true });
+  const liveSignal = research.live_signal || {};
+  const payload = {
+    market: key,
+    symbol: code,
+    savedAt: new Date().toISOString(),
+    framework: research.framework || "dynamic-factor-admission-and-ml-weighting",
+    horizonDays: research.horizon_days || result.horizon_days || null,
+    sampleCount: result.sample_count || research.sample_count || null,
+    candidateCount: research.candidate_count || 0,
+    admittedCount: research.admitted_count || 0,
+    liveSignal,
+    weights: Array.isArray(research.weights) ? research.weights.slice(0, 40) : [],
+    mlBacktest: research.ml_backtest || null,
+    leakageControl: research.leakage_control || "Factor research uses point-in-time candles and purged chronological splits.",
+    admissionRules: research.admission_rules || [],
+  };
+  await writeFile(factorResearchModelPath(key, code), JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+async function writeAlphaEvolutionModelSnapshot(market, symbol, result = {}, meta = {}) {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  if (!code || !result || result.available === false) return null;
+  await mkdir(join(snapshotBasePath, "models", "factor-research"), { recursive: true });
+  const payload = {
+    market: key,
+    symbol: code,
+    savedAt: new Date().toISOString(),
+    framework: result.framework || "quantaalpha_inspired_local_evolution",
+    horizonDays: result.horizon_days || meta.horizonDays || null,
+    rowCount: result.row_count || null,
+    sampleCount: result.sample_count || null,
+    generations: meta.generations || null,
+    population: meta.population || null,
+    range: meta.range || "",
+    mode: meta.mode || "light",
+    trajectory: Array.isArray(result.trajectory) ? result.trajectory.slice(-12) : [],
+    bestCandidates: Array.isArray(result.best_candidates) ? result.best_candidates.slice(0, 12) : [],
+    advancedModels: result.advanced_models || null,
+    qlibBridge: result.qlib_bridge || null,
+    leakageControl: "Alpha evolution uses current/past candle-derived primitives only; future returns are labels for walk-forward fitness.",
+  };
+  await writeFile(alphaEvolutionModelPath(key, code), JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+async function readCrossSectionalFactorModelSnapshot(market) {
+  try {
+    const payload = JSON.parse(await readFile(crossSectionalFactorModelPath(market), "utf8"));
+    if (!payload || typeof payload !== "object") return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCrossSectionalFactorModelSnapshot(market, result = {}) {
+  const key = safeMarket(market);
+  if (!result || result.available === false) return null;
+  await mkdir(join(snapshotBasePath, "models", "factor-research"), { recursive: true });
+  const payload = {
+    market: key,
+    savedAt: new Date().toISOString(),
+    framework: result.framework || "market-cross-sectional-factor-research",
+    available: Boolean(result.available),
+    horizons: result.horizons || [],
+    symbolCount: result.symbol_count || result.symbolCount || 0,
+    minSymbolsPerDate: result.min_symbols_per_date || result.minSymbolsPerDate || 0,
+    aggregateWeights: Array.isArray(result.aggregate_weights) ? result.aggregate_weights.slice(0, 40) : [],
+    horizonResults: (result.horizon_results || []).map((row) => ({
+      available: Boolean(row.available),
+      horizonDays: row.horizon_days,
+      rowCount: row.row_count,
+      dateCount: row.date_count,
+      symbolCount: row.symbol_count,
+      admittedCount: row.admitted_count,
+      weights: (row.weights || []).slice(0, 20),
+      mlBacktest: row.ml_backtest || null,
+      topFactors: (row.factors || []).slice(0, 16),
+      highOverlap: (row.high_overlap || []).slice(0, 16),
+      reason: row.reason || "",
+    })),
+    leakageControl: result.leakage_control,
+    admissionPolicy: result.admission_policy || [],
+  };
+  await writeFile(crossSectionalFactorModelPath(key), JSON.stringify(payload, null, 2), "utf8");
   return payload;
 }
 
@@ -1872,6 +2053,74 @@ async function fetchMarketUniverse(market = "ASX", options = {}) {
   if (key === "US") return fetchUsUniverse();
   if (key === "CN") return fetchCnUniverse();
   throw new Error(`Unsupported market universe: ${key}`);
+}
+
+function envList(name) {
+  return String(process.env[name] || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeSymbolListForMarket(symbols = [], market = "ASX") {
+  const key = safeMarket(market);
+  return [...new Set((Array.isArray(symbols) ? symbols : [])
+    .map((symbol) => normalizeMarketSymbol(symbol, key))
+    .filter(Boolean))];
+}
+
+async function cachedUniverseSymbolsForTraining(market = "ASX", limit = 200) {
+  const key = safeMarket(market);
+  try {
+    const payload = await readUniverseCache(key, Number(process.env.TRAINING_UNIVERSE_CACHE_MAX_AGE_MS || 30 * 24 * 60 * 60 * 1000));
+    return sanitizeUniverseRows(payload?.rows || [], key)
+      .map((row) => row.symbol)
+      .filter(Boolean)
+      .slice(0, Math.max(0, Number(limit || 0)));
+  } catch {
+    return [];
+  }
+}
+
+async function expandTrainingSymbolsForMarket({ market = "ASX", symbols = [], limit, largeSample = true } = {}) {
+  const key = safeMarket(market);
+  const requestedSymbols = normalizeSymbolListForMarket(symbols, key);
+  const defaultLimit = Number(
+    process.env[`HISTORICAL_BACKTEST_SYMBOL_LIMIT_${key}`] ||
+    process.env.HISTORICAL_BACKTEST_LARGE_SAMPLE_LIMIT ||
+    process.env.HISTORICAL_BACKTEST_BATCH_SYMBOL_LIMIT ||
+    80
+  );
+  const hardLimit = Number(process.env.HISTORICAL_BACKTEST_BATCH_MAX_SYMBOLS || 180);
+  const targetLimit = Math.max(3, Math.min(Math.max(3, hardLimit), Number(limit || defaultLimit || 80)));
+  const envSymbols = normalizeSymbolListForMarket([
+    ...envList(`HISTORICAL_BACKTEST_SYMBOLS_${key}`),
+    ...envList("HISTORICAL_BACKTEST_SYMBOLS"),
+  ], key);
+  const curatedSymbols = normalizeSymbolListForMarket(TRAINING_UNIVERSES[key] || [], key);
+  const cachedSymbols = largeSample
+    ? await cachedUniverseSymbolsForTraining(key, Math.max(targetLimit * 2, 120))
+    : [];
+  const merged = normalizeSymbolListForMarket([
+    ...requestedSymbols,
+    ...envSymbols,
+    ...(largeSample ? curatedSymbols : []),
+    ...cachedSymbols,
+  ], key);
+  const trainingSymbols = merged.slice(0, targetLimit);
+  return {
+    market: key,
+    requestedSymbols,
+    trainingSymbols,
+    largeSample: largeSample !== false,
+    targetLimit,
+    sourceCounts: {
+      requested: requestedSymbols.length,
+      env: envSymbols.length,
+      curated: curatedSymbols.length,
+      cachedUniverse: cachedSymbols.length,
+    },
+  };
 }
 
 function universePayload(payload = {}, options = {}) {
@@ -2572,6 +2821,1229 @@ function normalizedCandles(candles = []) {
     }))
     .filter((row) => row.date && Number.isFinite(row.close) && row.close > 0)
     .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function envBool(name, fallback = false) {
+  const value = process.env[name];
+  if (value == null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function clampFinite(value, min, max, fallback = 0) {
+  const number = Number(value);
+  return Math.max(min, Math.min(max, Number.isFinite(number) ? number : fallback));
+}
+
+function indicatorEma(values = [], period = 12) {
+  const rows = values.map(Number).filter(Number.isFinite);
+  if (!rows.length) return [];
+  const alpha = 2 / (period + 1);
+  const output = [];
+  let previous = rows[0];
+  rows.forEach((value, index) => {
+    previous = index === 0 ? value : value * alpha + previous * (1 - alpha);
+    output.push(previous);
+  });
+  return output;
+}
+
+function indicatorSma(values = [], period = 20) {
+  const rows = values.map((value) => Number(value) || 0);
+  return rows.map((_, index) => {
+    const start = Math.max(0, index - period + 1);
+    const slice = rows.slice(start, index + 1);
+    return slice.reduce((sum, value) => sum + value, 0) / Math.max(1, slice.length);
+  });
+}
+
+function indicatorRsi(values = [], period = 14) {
+  const rows = values.map(Number).filter(Number.isFinite);
+  if (rows.length <= period) return 50;
+  let gains = 0;
+  let losses = 0;
+  for (let index = rows.length - period; index < rows.length; index += 1) {
+    const change = rows[index] - rows[index - 1];
+    if (change >= 0) gains += change;
+    else losses -= change;
+  }
+  if (losses <= 0) return 100;
+  const relativeStrength = gains / losses;
+  return 100 - 100 / (1 + relativeStrength);
+}
+
+function indicatorMacdRows(candles = []) {
+  const rows = sanitizeCandleRows(candles);
+  const closes = rows.map((row) => Number(row.close || 0));
+  const ema12 = indicatorEma(closes, 12);
+  const ema26 = indicatorEma(closes, 26);
+  const macd = ema12.map((value, index) => value - (ema26[index] || value));
+  const signal = indicatorEma(macd, 9);
+  const histogram = macd.map((value, index) => value - (signal[index] || value));
+  return { macd, signal, histogram };
+}
+
+function computeServerTechnicals(candles = []) {
+  const rows = sanitizeCandleRows(candles).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  if (!rows.length) {
+    return {
+      close: 0,
+      sma20: 0,
+      sma50: 0,
+      rsi: 50,
+      macdHistogram: 0,
+      volumeRatio: 1,
+      change5d: 0,
+      change20d: 0,
+      volatility: 0,
+      trendScore: 50,
+      momentumScore: 50,
+      volumeScore: 50,
+      riskScore: 50,
+      projectedUpside: 0,
+      mainForceProxy: 50,
+    };
+  }
+  const closes = rows.map((row) => Number(row.close || 0));
+  const volumes = rows.map((row) => Number(row.volume || 0));
+  const latest = rows.at(-1) || {};
+  const close = Number(latest.close || 0);
+  const sma20 = indicatorSma(closes, 20).at(-1) || close;
+  const sma50 = indicatorSma(closes, 50).at(-1) || close;
+  const macdHistogram = indicatorMacdRows(rows).histogram.at(-1) || 0;
+  const latestRsi = indicatorRsi(closes);
+  const avgVolume20 = indicatorSma(volumes, 20).at(-1) || 1;
+  const volumeRatio = Number(latest.volume || 0) / Math.max(1, avgVolume20);
+  const change5d = pctChange(close, closes.at(-6));
+  const change20d = pctChange(close, closes.at(-21));
+  const recentReturns = closes.slice(-21).map((value, index, arr) => index ? pctChange(value, arr[index - 1]) : 0);
+  const volatility = Math.sqrt(recentReturns.reduce((sum, value) => sum + value ** 2, 0) / Math.max(1, recentReturns.length));
+  const boundedChange5d = clampFinite(change5d, -6, 6);
+  const overextensionPenalty = Math.max(0, change5d - 4) * 0.35 + Math.max(0, latestRsi - 72) * 0.12;
+  const trendScore = clampFinite(50 + (close > sma20 ? 12 : -9) + (sma20 > sma50 ? 11 : -10) + clampFinite(change20d * 0.62, -9, 9), 0, 100, 50);
+  const momentumScore = clampFinite(50 + macdHistogram * 92 + (latestRsi - 50) * 0.55 + boundedChange5d * 0.35 + clampFinite(change20d * 0.12, -3, 3), 0, 100, 50);
+  const volumeScore = clampFinite(45 + (volumeRatio - 1) * 28, 0, 100, 50);
+  const riskScore = clampFinite(82 - volatility * 8, 0, 100, 50);
+  const projectedUpside = clampFinite(
+    (trendScore - 50) * 0.045
+      + (momentumScore - 50) * 0.035
+      + (volumeScore - 50) * 0.02
+      + (riskScore - 50) * 0.015
+      - overextensionPenalty,
+    -10,
+    12,
+  );
+  const mainForceProxy = clampFinite(50 + (volumeRatio - 1) * 18 + macdHistogram * 70 + boundedChange5d * 0.45 - overextensionPenalty * 1.2, 0, 100, 50);
+  return {
+    close,
+    sma20,
+    sma50,
+    rsi: latestRsi,
+    macdHistogram,
+    volumeRatio,
+    change5d,
+    change20d,
+    volatility,
+    trendScore,
+    momentumScore,
+    volumeScore,
+    riskScore,
+    projectedUpside,
+    mainForceProxy,
+  };
+}
+
+function serverForwardOutcome(rows, startIndex, horizon = 15, strategy = {}) {
+  const entry = Number(rows[startIndex]?.close || 0);
+  const targetUpside = Math.max(0.5, Number(strategy.targetUpside || 5));
+  const stopLoss = Math.max(0.8, Math.abs(Number(strategy.stopLoss || 4)));
+  const endIndex = Math.min(rows.length - 1, startIndex + Math.max(1, Number(horizon || 15)));
+  if (!entry || startIndex >= endIndex) return { forwardReturn: 0, maxUpside: 0, maxDrawdown: 0, targetWins: false, stopWins: false, riskAdjustedReturn: 0 };
+  let maxHigh = entry;
+  let minLow = entry;
+  let firstEvent = null;
+  for (let index = startIndex + 1; index <= endIndex; index += 1) {
+    const row = rows[index];
+    const highReturn = pctChange(row.high || row.close, entry);
+    const lowReturn = pctChange(row.low || row.close, entry);
+    maxHigh = Math.max(maxHigh, Number(row.high || row.close));
+    minLow = Math.min(minLow, Number(row.low || row.close));
+    if (!firstEvent && highReturn >= targetUpside) firstEvent = "target";
+    if (!firstEvent && lowReturn <= -stopLoss) firstEvent = "stop";
+  }
+  const forwardReturn = pctChange(rows[endIndex].close, entry);
+  const maxUpside = pctChange(maxHigh, entry);
+  const maxDrawdown = pctChange(minLow, entry);
+  const targetWins = maxUpside >= targetUpside && (maxDrawdown > -stopLoss || firstEvent === "target");
+  const stopWins = maxDrawdown <= -stopLoss && (maxUpside < targetUpside || firstEvent === "stop");
+  return {
+    forwardReturn,
+    maxUpside,
+    maxDrawdown,
+    targetWins,
+    stopWins,
+    riskAdjustedReturn: targetWins ? Math.min(maxUpside, targetUpside) : stopWins ? -stopLoss : forwardReturn,
+  };
+}
+
+function computeServerHistoricalAnalog(candles = [], lookback = 15, horizon = 15, strategy = {}) {
+  const rows = sanitizeCandleRows(candles).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  if (rows.length < lookback * 3 + horizon) {
+    return {
+      count: 0,
+      confidence: 0,
+      averageForwardReturn: 0,
+      averageFinalReturn: 0,
+      averageMaxUpside: 0,
+      winRate: 0,
+      targetHitRate: 0,
+      finalReturnHitRate: 0,
+      maxUpsideHitRate: 0,
+      stopRate: 0,
+      downsideRate: 0,
+      directionalHitRate: 0,
+      strategyHitProbability: 0,
+      averageRiskAdjustedReturn: 0,
+      model: { sampleCount: 0, confidence: 0 },
+      examples: [],
+    };
+  }
+  const closes = rows.map((row) => Number(row.close || 0));
+  const volumes = rows.map((row) => Number(row.volume || 0));
+  const avgVolume = indicatorSma(volumes, 20);
+  const vectorAt = (end) => {
+    const out = [];
+    for (let index = end - lookback + 1; index <= end; index += 1) {
+      out.push(pctChange(closes[index], closes[index - 1]) / 4);
+      out.push(((volumes[index] || 0) / Math.max(1, avgVolume[index] || 1) - 1) / 3);
+    }
+    return out.map((value) => Number.isFinite(value) ? value : 0);
+  };
+  const target = vectorAt(rows.length - 1);
+  const distance = (a, b) => Math.sqrt(a.reduce((sum, value, index) => sum + (value - b[index]) ** 2, 0) / Math.max(1, a.length));
+  const matches = [];
+  for (let end = lookback; end < rows.length - horizon - 1; end += 1) {
+    const outcome = serverForwardOutcome(rows, end, horizon, strategy);
+    matches.push({
+      date: rows[end].date,
+      distance: distance(target, vectorAt(end)),
+      forwardReturn: outcome.forwardReturn,
+      maxUpside: outcome.maxUpside,
+      maxDrawdown: outcome.maxDrawdown,
+      targetWins: outcome.targetWins,
+      stopWins: outcome.stopWins,
+      riskAdjustedReturn: outcome.riskAdjustedReturn,
+      close: closes[end],
+    });
+  }
+  const best = matches.sort((a, b) => a.distance - b.distance).slice(0, 10);
+  if (!best.length) return computeServerHistoricalAnalog([], lookback, horizon, strategy);
+  const averageForwardReturn = best.reduce((sum, item) => sum + item.forwardReturn, 0) / best.length;
+  const averageMaxUpside = best.reduce((sum, item) => sum + Math.max(0, item.maxUpside), 0) / best.length;
+  const averageRiskAdjustedReturn = best.reduce((sum, item) => sum + item.riskAdjustedReturn, 0) / best.length;
+  const winRate = best.filter((item) => item.forwardReturn > 0).length / best.length * 100;
+  const targetHitRate = best.filter((item) => item.targetWins).length / best.length * 100;
+  const stopRate = best.filter((item) => item.stopWins).length / best.length * 100;
+  const downsideRate = best.filter((item) => item.forwardReturn < 0 || item.stopWins).length / best.length * 100;
+  const directionalHitRate = averageRiskAdjustedReturn >= 0 ? winRate : downsideRate;
+  const strategyHitProbability = averageRiskAdjustedReturn >= 0 ? targetHitRate : Math.max(stopRate, downsideRate);
+  const confidence = clampFinite(34 + directionalHitRate * 0.42 + strategyHitProbability * 0.12 + Math.abs(averageRiskAdjustedReturn) * 1.6 - (best[0]?.distance || 0) * 8, 0, 95);
+  const finalReturnTarget = Math.abs(averageForwardReturn);
+  const finalReturnHitRate = finalReturnTarget >= 0.25
+    ? best.filter((item) => averageForwardReturn >= 0 ? item.forwardReturn >= finalReturnTarget * 0.88 : item.forwardReturn <= -finalReturnTarget * 0.88).length / best.length * 100
+    : directionalHitRate;
+  const maxUpsideHitRate = averageMaxUpside >= 0.25
+    ? best.filter((item) => Math.max(0, item.maxUpside) >= averageMaxUpside * 0.88).length / best.length * 100
+    : targetHitRate;
+  return {
+    count: best.length,
+    confidence,
+    averageForwardReturn,
+    averageFinalReturn: averageForwardReturn,
+    averageMaxUpside: Math.max(0, averageMaxUpside),
+    winRate,
+    targetHitRate,
+    finalReturnHitRate,
+    maxUpsideHitRate,
+    stopRate,
+    downsideRate,
+    directionalHitRate,
+    strategyHitProbability,
+    averageRiskAdjustedReturn,
+    model: { sampleCount: matches.length, confidence, predictedReturn: averageForwardReturn, predictedMaxUpside: averageMaxUpside, directionalAccuracy: directionalHitRate, targetHitAccuracy: targetHitRate, maxUpsideHitAccuracy: maxUpsideHitRate },
+    examples: best.slice(0, 8),
+  };
+}
+
+function zonedDateParts(date = new Date(), timeZone = "Australia/Sydney") {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    weekday: map.weekday,
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    hour: Number(map.hour),
+    minute: Number(map.minute),
+    second: Number(map.second),
+    date: `${map.year}-${map.month}-${map.day}`,
+  };
+}
+
+function backendMarketSession(market = "ASX", now = new Date()) {
+  const key = safeMarket(market);
+  const timeZone = { ASX: "Australia/Sydney", US: "America/New_York", CN: "Asia/Shanghai" }[key] || "Australia/Sydney";
+  const local = zonedDateParts(now, timeZone);
+  const weekend = ["Sat", "Sun"].includes(local.weekday);
+  const minute = local.hour * 60 + local.minute;
+  const ranges = {
+    ASX: [[10 * 60, 16 * 60 + 10]],
+    US: [[9 * 60 + 30, 16 * 60]],
+    CN: [[9 * 60 + 30, 11 * 60 + 30], [13 * 60, 15 * 60]],
+  }[key];
+  const open = !weekend && ranges.some(([start, end]) => minute >= start && minute <= end);
+  return { market: key, open, weekend, localTime: `${local.date} ${String(local.hour).padStart(2, "0")}:${String(local.minute).padStart(2, "0")}`, timeZone, ranges };
+}
+
+function backendMonitorDefaults() {
+  return {
+    enabled: envBool("BACKEND_MONITOR_ENABLED", true),
+    refresh: {
+      holdingMs: Math.max(60_000, Number(process.env.BACKEND_MONITOR_HOLDING_REFRESH_MS || 5 * 60_000)),
+      watchMs: Math.max(60_000, Number(process.env.BACKEND_MONITOR_WATCH_REFRESH_MS || 15 * 60_000)),
+      trainingMs: Math.max(60_000, Number(process.env.BACKEND_MONITOR_TRAINING_REFRESH_MS || 5 * 60_000)),
+      checkMs: Math.max(10_000, Number(process.env.BACKEND_MONITOR_CHECK_MS || 30_000)),
+    },
+    training: {
+      enabled: envBool("BACKEND_MONITOR_TRAINING_ENABLED", true),
+      symbolLimit: Math.max(1, Math.min(5, Number(process.env.BACKEND_MONITOR_TRAINING_SYMBOL_LIMIT || 3))),
+      interval: process.env.BACKEND_MONITOR_TRAINING_INTERVAL || "5m",
+      range: process.env.BACKEND_MONITOR_TRAINING_RANGE || "5d",
+    },
+    notifications: {
+      desktop: envBool("BACKEND_MONITOR_DESKTOP_NOTIFICATIONS", true),
+      mobile: envBool("BACKEND_MONITOR_MOBILE_NOTIFICATIONS", true),
+    },
+    quota: backendMonitorBudgetLimits(),
+  };
+}
+
+function backendMonitorBudgetLimits() {
+  return {
+    marketCalls: Math.max(0, Number(process.env.BACKEND_MONITOR_DAILY_MARKET_CALL_LIMIT || 520)),
+    factorCalls: Math.max(0, Number(process.env.BACKEND_MONITOR_DAILY_FACTOR_CALL_LIMIT || 120)),
+    aiCalls: Math.max(0, Number(process.env.BACKEND_MONITOR_DAILY_AI_CALL_LIMIT || 30)),
+    trainingCalls: Math.max(0, Number(process.env.BACKEND_MONITOR_DAILY_TRAINING_CALL_LIMIT || 96)),
+    notifications: Math.max(0, Number(process.env.BACKEND_MONITOR_DAILY_NOTIFICATION_LIMIT || 120)),
+    trainingMarketReserve: Math.max(0, Number(process.env.BACKEND_MONITOR_TRAINING_MARKET_RESERVE || 90)),
+  };
+}
+
+function backendBudgetDate() {
+  return zonedDateParts(new Date(), "Australia/Sydney").date;
+}
+
+function backendMonitorBudgetPath(date = backendBudgetDate()) {
+  return join(backendMonitorBasePath, `budget-${date}.json`);
+}
+
+async function readBackendMonitorBudget(date = backendBudgetDate()) {
+  try {
+    const payload = JSON.parse(await readFile(backendMonitorBudgetPath(date), "utf8"));
+    return payload && typeof payload === "object" ? payload : { date, used: {} };
+  } catch {
+    return { date, used: {} };
+  }
+}
+
+async function writeBackendMonitorBudget(payload) {
+  await mkdir(backendMonitorBasePath, { recursive: true });
+  await writeFile(backendMonitorBudgetPath(payload.date || backendBudgetDate()), JSON.stringify(payload, null, 2), "utf8");
+}
+
+async function takeBackendMonitorBudget(bucket, units = 1, options = {}) {
+  const limits = backendMonitorBudgetLimits();
+  const limit = Number(limits[bucket] || 0);
+  if (limit <= 0) return { ok: false, bucket, limit, used: 0, reason: `${bucket} budget disabled` };
+  const budget = await readBackendMonitorBudget();
+  budget.used = budget.used || {};
+  const used = Number(budget.used[bucket] || 0);
+  const reserve = bucket === "marketCalls" && !options.training ? Number(limits.trainingMarketReserve || 0) : 0;
+  const effectiveLimit = Math.max(0, limit - reserve);
+  if (used + units > effectiveLimit) {
+    return { ok: false, bucket, limit, effectiveLimit, used, units, reserve, reason: `${bucket} daily budget would be exceeded` };
+  }
+  budget.used[bucket] = used + units;
+  budget.updatedAt = new Date().toISOString();
+  await writeBackendMonitorBudget(budget);
+  return { ok: true, bucket, limit, effectiveLimit, used: budget.used[bucket], units, reserve };
+}
+
+function normalizeBackendHolding(holding = {}, fallbackMarket = "ASX") {
+  const market = safeMarket(holding.market || fallbackMarket);
+  const symbol = normalizeMarketSymbol(holding.symbol, market);
+  const qty = Number(holding.qty || holding.quantity || 0);
+  const avgPrice = Number(holding.avgPrice || holding.averagePrice || holding.avg_price || 0);
+  if (!symbol || !Number.isFinite(qty) || qty <= 0 || !Number.isFinite(avgPrice) || avgPrice <= 0) return null;
+  return {
+    symbol,
+    market,
+    qty,
+    avgPrice,
+    entryDate: /^\d{4}-\d{2}-\d{2}$/.test(String(holding.entryDate || "")) ? holding.entryDate : new Date().toISOString().slice(0, 10),
+    source: String(holding.source || "backend-sync").slice(0, 80),
+    updatedAt: holding.updatedAt || new Date().toISOString(),
+  };
+}
+
+function normalizeBackendStrategy(strategy = {}) {
+  return {
+    horizonDays: clampFinite(strategy.horizonDays, 1, 90, 15),
+    confidence: clampFinite(strategy.confidence, 1, 99, 80),
+    targetUpside: clampFinite(strategy.targetUpside, 0.1, 100, 5),
+    stopLoss: clampFinite(strategy.stopLoss, 0.1, 80, 4),
+    maxPosition: clampFinite(strategy.maxPosition, 1, 100, 20),
+    reserveCashPct: clampFinite(strategy.reserveCashPct, 0, 95, 15),
+    text: String(strategy.text || "").slice(0, 1200),
+  };
+}
+
+function sanitizeBackendMonitorConfig(payload = {}) {
+  const defaults = backendMonitorDefaults();
+  const rawMarkets = payload.markets && typeof payload.markets === "object" ? payload.markets : {};
+  const watchlistsByMarket = payload.watchlistsByMarket && typeof payload.watchlistsByMarket === "object" ? payload.watchlistsByMarket : {};
+  const portfolioByMarket = payload.portfolioByMarket && typeof payload.portfolioByMarket === "object" ? payload.portfolioByMarket : {};
+  const flatPortfolio = Array.isArray(payload.portfolio) ? payload.portfolio : [];
+  const markets = {};
+  for (const market of Object.keys(MARKET_CONFIG)) {
+    const raw = rawMarkets[market] || {};
+    const rawWatchlist = Array.isArray(raw.watchlist) ? raw.watchlist : Array.isArray(watchlistsByMarket[market]) ? watchlistsByMarket[market] : [];
+    const rawHoldings = Array.isArray(raw.portfolio)
+      ? raw.portfolio
+      : Array.isArray(portfolioByMarket[market])
+        ? portfolioByMarket[market]
+        : flatPortfolio.filter((holding) => safeMarket(holding?.market || market) === market);
+    const portfolio = rawHoldings.map((holding) => normalizeBackendHolding(holding, market)).filter(Boolean);
+    const holdingSymbols = portfolio.map((holding) => holding.symbol);
+    const watchlist = [...new Set([
+      ...holdingSymbols,
+      ...rawWatchlist.map((symbol) => normalizeMarketSymbol(symbol, market)).filter(Boolean),
+    ])].filter((symbol) => isValidMarketCode(symbol, market));
+    markets[market] = { watchlist, portfolio };
+  }
+  const capitalInput = payload.capital && typeof payload.capital === "object" ? payload.capital : {};
+  return {
+    enabled: payload.enabled == null ? defaults.enabled : payload.enabled !== false,
+    version: APP_VERSION,
+    updatedAt: new Date().toISOString(),
+    source: String(payload.source || "frontend-sync").slice(0, 80),
+    strategy: normalizeBackendStrategy(payload.strategy || {}),
+    capital: {
+      baseCapital: Math.max(0, Number(capitalInput.baseCapital ?? capitalInput.totalCapital ?? 0) || 0),
+      totalCapital: Math.max(0, Number(capitalInput.totalCapital ?? capitalInput.baseCapital ?? 0) || 0),
+      availableCash: Math.max(0, Number(capitalInput.availableCash || 0) || 0),
+      reserveCashPct: clampFinite(capitalInput.reserveCashPct, 0, 95, normalizeBackendStrategy(payload.strategy || {}).reserveCashPct),
+    },
+    refresh: {
+      holdingMs: Math.max(60_000, Number(payload.refresh?.holdingMs || defaults.refresh.holdingMs)),
+      watchMs: Math.max(60_000, Number(payload.refresh?.watchMs || defaults.refresh.watchMs)),
+      trainingMs: Math.max(60_000, Number(payload.refresh?.trainingMs || defaults.refresh.trainingMs)),
+      checkMs: Math.max(10_000, Number(payload.refresh?.checkMs || defaults.refresh.checkMs)),
+    },
+    training: {
+      enabled: payload.training?.enabled == null ? defaults.training.enabled : payload.training.enabled !== false,
+      symbolLimit: Math.max(1, Math.min(5, Number(payload.training?.symbolLimit || defaults.training.symbolLimit))),
+      interval: String(payload.training?.interval || defaults.training.interval || "5m"),
+      range: String(payload.training?.range || defaults.training.range || "5d"),
+    },
+    notifications: {
+      desktop: payload.notifications?.desktop == null ? defaults.notifications.desktop : payload.notifications.desktop !== false,
+      mobile: payload.notifications?.mobile == null ? defaults.notifications.mobile : payload.notifications.mobile !== false,
+    },
+    markets,
+  };
+}
+
+async function readBackendMonitorConfig() {
+  try {
+    const payload = JSON.parse(await readFile(backendMonitorConfigPath, "utf8"));
+    return sanitizeBackendMonitorConfig(payload);
+  } catch {
+    const markets = {};
+    let hasSnapshotRows = false;
+    for (const market of Object.keys(MARKET_CONFIG)) {
+      const snapshot = await readServerSnapshotForMarket(market).catch(() => null);
+      const watchlist = Array.isArray(snapshot?.watchlist) ? snapshot.watchlist : [];
+      const portfolio = Array.isArray(snapshot?.portfolio) ? snapshot.portfolio : [];
+      if (watchlist.length || portfolio.length) hasSnapshotRows = true;
+      markets[market] = { watchlist, portfolio };
+    }
+    return sanitizeBackendMonitorConfig({ source: hasSnapshotRows ? "snapshot-fallback" : "defaults", markets });
+  }
+}
+
+async function writeBackendMonitorConfig(payload = {}) {
+  const config = sanitizeBackendMonitorConfig(payload);
+  await mkdir(backendMonitorBasePath, { recursive: true });
+  await writeFile(backendMonitorConfigPath, JSON.stringify(config, null, 2), "utf8");
+  return config;
+}
+
+async function readBackendMonitorRuntime() {
+  try {
+    const payload = JSON.parse(await readFile(backendMonitorRuntimePath, "utf8"));
+    return payload && typeof payload === "object" ? payload : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeBackendMonitorRuntime(runtime = {}) {
+  await mkdir(backendMonitorBasePath, { recursive: true });
+  await writeFile(backendMonitorRuntimePath, JSON.stringify(runtime, null, 2), "utf8");
+}
+
+async function consumeBackendMonitorRunRequest() {
+  try {
+    const payload = JSON.parse(await readFile(backendMonitorRunRequestPath, "utf8"));
+    await unlink(backendMonitorRunRequestPath).catch(() => null);
+    return payload && typeof payload === "object" ? payload : { source: "desktop-app" };
+  } catch {
+    return null;
+  }
+}
+
+function holdingDaysFromEntry(holding = {}) {
+  const entry = Date.parse(`${holding.entryDate || ""}T00:00:00Z`);
+  if (!Number.isFinite(entry)) return 0;
+  return Math.max(0, Math.floor((Date.now() - entry) / 86400000));
+}
+
+function backendPortfolioForMarket(config = {}, market = "ASX") {
+  const key = safeMarket(market);
+  return Array.isArray(config.markets?.[key]?.portfolio) ? config.markets[key].portfolio : [];
+}
+
+function backendCapitalForMarket(config = {}, market = "ASX", livePrices = new Map()) {
+  const portfolio = backendPortfolioForMarket(config, market);
+  const costValue = portfolio.reduce((sum, holding) => sum + Number(holding.avgPrice || 0) * Number(holding.qty || 0), 0);
+  const investedValue = portfolio.reduce((sum, holding) => {
+    const close = Number(livePrices.get(holding.symbol) || holding.avgPrice || 0);
+    return sum + close * Number(holding.qty || 0);
+  }, 0);
+  const baseCapital = Number(config.capital?.baseCapital || config.capital?.totalCapital || 0);
+  const unrealizedPnl = investedValue - costValue;
+  const totalCapital = Math.max(0, baseCapital + unrealizedPnl);
+  const reserveCashPct = Number(config.strategy?.reserveCashPct ?? config.capital?.reserveCashPct ?? 15);
+  const availableCash = Math.max(0, baseCapital - costValue);
+  const reservedCash = totalCapital * reserveCashPct / 100;
+  return {
+    baseCapital,
+    totalCapital,
+    investedValue,
+    costValue,
+    unrealizedPnl,
+    investedPct: totalCapital > 0 ? investedValue / totalCapital * 100 : 0,
+    availablePct: totalCapital > 0 ? Math.max(0, 100 - investedValue / totalCapital * 100) : 0,
+    availableCash,
+    reserveCashPct,
+    reservedCash,
+    availableForNewTrades: Math.max(0, availableCash - reservedCash),
+  };
+}
+
+function backendDueMonitorJobs(config = {}, runtime = {}, now = Date.now()) {
+  const jobs = [];
+  const allowOffHours = envBool("BACKEND_MONITOR_ALLOW_OFF_HOURS_FETCH", false);
+  const maxPerTick = Math.max(1, Math.min(40, Number(process.env.BACKEND_MONITOR_MAX_SYMBOLS_PER_TICK || 10)));
+  for (const market of Object.keys(MARKET_CONFIG)) {
+    const session = backendMarketSession(market);
+    if (!allowOffHours && !session.open) continue;
+    const marketConfig = config.markets?.[market] || {};
+    const portfolio = Array.isArray(marketConfig.portfolio) ? marketConfig.portfolio : [];
+    const holdings = new Map(portfolio.map((holding) => [holding.symbol, holding]));
+    const watchlist = Array.isArray(marketConfig.watchlist) ? marketConfig.watchlist : [];
+    for (const holding of portfolio) {
+      const lastKey = `${market}:${holding.symbol}:holding`;
+      const due = now - Number(runtime.lastSymbolChecks?.[lastKey] || 0) >= Number(config.refresh?.holdingMs || 5 * 60_000);
+      if (due) jobs.push({ market, symbol: holding.symbol, tier: "holding", priority: 100, holding });
+    }
+    for (const symbol of watchlist) {
+      if (holdings.has(symbol)) continue;
+      const lastKey = `${market}:${symbol}:watch`;
+      const due = now - Number(runtime.lastSymbolChecks?.[lastKey] || 0) >= Number(config.refresh?.watchMs || 15 * 60_000);
+      if (due) jobs.push({ market, symbol, tier: "watch", priority: 40 });
+    }
+  }
+  return jobs
+    .filter((job) => isValidMarketCode(job.symbol, job.market))
+    .sort((a, b) => b.priority - a.priority || a.symbol.localeCompare(b.symbol))
+    .slice(0, maxPerTick);
+}
+
+function intradayModelPathForMarket(market = "ASX") {
+  return join(backendMonitorBasePath, `intraday-model-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function intradaySamplesPathForMarket(market = "ASX") {
+  return join(backendMonitorBasePath, `intraday-samples-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function intradayBarsPathForSymbol(market = "ASX", symbol = "") {
+  const key = safeMarket(market);
+  return join(backendMonitorBasePath, "intraday-bars", key.toLowerCase(), `${safeCachePart(cleanCode(symbol, key))}.json`);
+}
+
+async function writeIntradayBarsCache(market, symbol, candles = [], meta = {}) {
+  const key = safeMarket(market);
+  const rows = sanitizeCandleRows(candles, { preserveTimestamp: true })
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .slice(-1000);
+  if (rows.length < 5) return null;
+  await mkdir(join(backendMonitorBasePath, "intraday-bars", key.toLowerCase()), { recursive: true });
+  const payload = {
+    market: key,
+    symbol: normalizeMarketSymbol(symbol, key),
+    source: meta.source || "backend-monitor-intraday",
+    interval: meta.interval || "5m",
+    savedAt: new Date().toISOString(),
+    candles: rows,
+  };
+  await writeFile(intradayBarsPathForSymbol(key, symbol), JSON.stringify(payload), "utf8");
+  return payload;
+}
+
+async function readIntradayBarsCache(market, symbol) {
+  try {
+    const payload = JSON.parse(await readFile(intradayBarsPathForSymbol(market, symbol), "utf8"));
+    return sanitizeCandleRows(payload.candles || [], { preserveTimestamp: true });
+  } catch {
+    return [];
+  }
+}
+
+async function readIntradayModel(market = "ASX") {
+  try {
+    return JSON.parse(await readFile(intradayModelPathForMarket(market), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function readIntradaySamples(market = "ASX") {
+  try {
+    const payload = JSON.parse(await readFile(intradaySamplesPathForMarket(market), "utf8"));
+    return Array.isArray(payload.samples) ? payload.samples : [];
+  } catch {
+    return [];
+  }
+}
+
+function intradayFeatureVector(rows = [], index = rows.length - 1) {
+  const slice = rows.slice(0, index + 1);
+  const closes = slice.map((row) => Number(row.close || 0));
+  const volumes = slice.map((row) => Number(row.volume || 0));
+  const latest = slice.at(-1) || {};
+  const close = Number(latest.close || 0);
+  const macd = indicatorMacdRows(slice).histogram.at(-1) || 0;
+  const avgVolume20 = indicatorSma(volumes, 20).at(-1) || 1;
+  const vwapNumerator = slice.slice(-30).reduce((sum, row) => sum + Number(row.close || 0) * Number(row.volume || 0), 0);
+  const vwapDenominator = slice.slice(-30).reduce((sum, row) => sum + Number(row.volume || 0), 0) || 1;
+  const vwap = vwapNumerator / vwapDenominator;
+  const range = Math.max(0.000001, Number(latest.high || close) - Number(latest.low || close));
+  return {
+    ret1: pctChange(close, closes.at(-2)) / 2,
+    ret3: pctChange(close, closes.at(-4)) / 4,
+    ret6: pctChange(close, closes.at(-7)) / 6,
+    ret12: pctChange(close, closes.at(-13)) / 8,
+    volumeRatio: ((Number(latest.volume || 0) / Math.max(1, avgVolume20)) - 1),
+    rsi: (indicatorRsi(closes) - 50) / 50,
+    macdPct: close > 0 ? macd / close * 100 : 0,
+    vwapGap: close > 0 ? pctChange(close, vwap) / 4 : 0,
+    rangePosition: ((close - Number(latest.low || close)) / range - 0.5),
+  };
+}
+
+function intradaySampleRows(market, symbol, candles = [], horizonBars = 3) {
+  const rows = sanitizeCandleRows(candles, { preserveTimestamp: true })
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const samples = [];
+  for (let index = 35; index < rows.length - horizonBars - 1; index += 1) {
+    const current = rows[index];
+    const future = rows[index + horizonBars];
+    const close = Number(current.close || 0);
+    if (!close || !future?.close) continue;
+    const feature = intradayFeatureVector(rows, index);
+    const returnPct = pctChange(Number(future.close || 0), close);
+    samples.push({
+      id: `${safeMarket(market)}:${normalizeMarketSymbol(symbol, market)}:${current.date}:${horizonBars}`,
+      market: safeMarket(market),
+      symbol: normalizeMarketSymbol(symbol, market),
+      timestamp: current.date,
+      horizonBars,
+      close,
+      returnPct,
+      label: returnPct > 0 ? 1 : 0,
+      feature,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  return samples;
+}
+
+function trainIntradayLinearModel(samples = []) {
+  const rows = samples.filter((sample) => sample?.feature && Number.isFinite(Number(sample.returnPct)));
+  const featureNames = ["ret1", "ret3", "ret6", "ret12", "volumeRatio", "rsi", "macdPct", "vwapGap", "rangePosition"];
+  if (rows.length < 40) {
+    return { available: false, sampleCount: rows.length, reason: "intraday model needs at least 40 completed minute-bar samples" };
+  }
+  const train = rows.slice(0, Math.floor(rows.length * 0.78));
+  const test = rows.slice(train.length);
+  const means = {};
+  const scales = {};
+  featureNames.forEach((name) => {
+    const values = train.map((row) => Number(row.feature[name] || 0)).filter(Number.isFinite);
+    const mean = values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
+    const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, values.length);
+    means[name] = mean;
+    scales[name] = Math.sqrt(variance) || 1;
+  });
+  const weights = Object.fromEntries(featureNames.map((name) => [name, 0]));
+  let intercept = 0;
+  const lr = 0.018;
+  const ridge = 0.004;
+  const scoreRow = (row) => intercept + featureNames.reduce((sum, name) => sum + weights[name] * ((Number(row.feature[name] || 0) - means[name]) / scales[name]), 0);
+  for (let epoch = 0; epoch < 80; epoch += 1) {
+    for (const row of train) {
+      const pred = scoreRow(row);
+      const error = pred - Number(row.returnPct || 0);
+      intercept -= lr * error * 0.15;
+      featureNames.forEach((name) => {
+        const z = (Number(row.feature[name] || 0) - means[name]) / scales[name];
+        weights[name] -= lr * (error * z + ridge * weights[name]);
+      });
+    }
+  }
+  const evaluate = (dataset) => {
+    if (!dataset.length) return { count: 0, directionalAccuracy: 0, mae: 0, avgReturn: 0 };
+    let hits = 0;
+    let mae = 0;
+    let avgReturn = 0;
+    dataset.forEach((row) => {
+      const pred = scoreRow(row);
+      const actual = Number(row.returnPct || 0);
+      if ((pred >= 0) === (actual >= 0)) hits += 1;
+      mae += Math.abs(pred - actual);
+      avgReturn += actual;
+    });
+    return {
+      count: dataset.length,
+      directionalAccuracy: hits / dataset.length * 100,
+      mae: mae / dataset.length,
+      avgReturn: avgReturn / dataset.length,
+    };
+  };
+  return {
+    available: true,
+    framework: "local-minute-ridge-no-future-labels",
+    sampleCount: rows.length,
+    featureNames,
+    means,
+    scales,
+    weights,
+    intercept,
+    train: evaluate(train),
+    test: evaluate(test),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function evaluateIntradayModel(model, feature = {}) {
+  if (!model?.available || !Array.isArray(model.featureNames)) return null;
+  const score = Number(model.intercept || 0) + model.featureNames.reduce((sum, name) => {
+    const raw = Number(feature[name] || 0);
+    const mean = Number(model.means?.[name] || 0);
+    const scale = Math.max(1e-9, Number(model.scales?.[name] || 1));
+    return sum + Number(model.weights?.[name] || 0) * ((raw - mean) / scale);
+  }, 0);
+  return score;
+}
+
+async function minuteLearningFactorFor(symbol, market = "ASX", intradayCandles = null) {
+  const key = safeMarket(market);
+  const model = await readIntradayModel(key);
+  if (!model?.available) {
+    return { available: false, source: "minute-learning-pending", score: 0, confidence: 0, thesis: ["分钟级本地模型仍在收集训练样本。"] };
+  }
+  let candles = intradayCandles;
+  if (!candles?.length) {
+    candles = await readIntradayBarsCache(key, symbol);
+  }
+  const rows = sanitizeCandleRows(candles || [], { preserveTimestamp: true }).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  if (rows.length < 36) {
+    return {
+      available: true,
+      source: "minute-learning-model-no-live-bars",
+      score: 0,
+      confidence: Math.max(0, Math.min(65, Number(model.test?.directionalAccuracy || 0))),
+      thesis: [`分钟级模型已训练 ${model.sampleCount || 0} 个样本，但当前股票缺少足够分钟K线，暂不施加强方向。`],
+      values: { model },
+    };
+  }
+  const feature = intradayFeatureVector(rows, rows.length - 1);
+  const predicted = evaluateIntradayModel(model, feature);
+  const testAccuracy = Number(model.test?.directionalAccuracy || 0);
+  const score = clampFinite(Number(predicted || 0) * 10, -8, 8);
+  return {
+    available: true,
+    source: "minute-learning-local-ridge",
+    score,
+    weight: Math.min(8, Math.max(1, Number(model.sampleCount || 0) / 120)),
+    confidence: clampFinite(35 + Math.max(0, testAccuracy - 50) * 1.2 + Math.min(10, Number(model.sampleCount || 0) / 80), 0, 78),
+    thesis: [
+      `分钟级学习模型：${model.sampleCount || 0} 个无未来函数样本，测试方向命中 ${testAccuracy.toFixed(0)}%，预测未来数根K线收益 ${Number(predicted || 0).toFixed(3)}%。`,
+      "该因子只作为短线执行/入场 timing 辅助，不覆盖日线级策略判断。",
+    ],
+    values: { predictedReturnPct: Number(Number(predicted || 0).toFixed(4)), feature, modelUpdatedAt: model.updatedAt, test: model.test },
+  };
+}
+
+async function runBackendIntradayTraining(config = {}, runtime = {}) {
+  if (config.training?.enabled === false) return null;
+  const now = Date.now();
+  const last = Number(runtime.lastTrainingAt || 0);
+  if (now - last < Number(config.refresh?.trainingMs || 5 * 60_000)) return null;
+  const allowOffHours = envBool("BACKEND_MONITOR_ALLOW_OFF_HOURS_FETCH", false);
+  const results = [];
+  for (const market of Object.keys(MARKET_CONFIG)) {
+    const session = backendMarketSession(market);
+    if (!allowOffHours && !session.open) continue;
+    const portfolio = backendPortfolioForMarket(config, market);
+    const watchlist = config.markets?.[market]?.watchlist || [];
+    const symbols = [...new Set([
+      ...portfolio.map((holding) => holding.symbol),
+      ...watchlist,
+    ])].slice(0, Number(config.training?.symbolLimit || 3));
+    if (!symbols.length) continue;
+    const collected = [];
+    for (const symbol of symbols) {
+      const trainingBudget = await takeBackendMonitorBudget("trainingCalls", 1, { training: true });
+      const marketBudget = await takeBackendMonitorBudget("marketCalls", 1, { training: true });
+      if (!trainingBudget.ok || !marketBudget.ok) {
+        results.push({ market, symbol, skipped: true, reason: trainingBudget.reason || marketBudget.reason });
+        continue;
+      }
+      try {
+        const marketData = await fetchMarketCandles(symbol, config.training?.range || "5d", config.training?.interval || "5m", market);
+        await writeIntradayBarsCache(market, symbol, marketData.candles || [], { source: marketData.source, interval: config.training?.interval || "5m" }).catch(() => null);
+        const samples = intradaySampleRows(market, symbol, marketData.candles || [], 3);
+        collected.push(...samples);
+        results.push({ market, symbol, candles: marketData.candles?.length || 0, samples: samples.length, source: marketData.source });
+      } catch (error) {
+        results.push({ market, symbol, error: error.message || String(error) });
+      }
+    }
+    const previous = await readIntradaySamples(market);
+    const byId = new Map([...previous, ...collected].map((sample) => [sample.id, sample]));
+    const maxSamples = Math.max(500, Number(process.env.BACKEND_MONITOR_INTRADAY_SAMPLE_LIMIT || 6000));
+    const samples = [...byId.values()].sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp))).slice(0, maxSamples).reverse();
+    const model = trainIntradayLinearModel(samples);
+    await mkdir(backendMonitorBasePath, { recursive: true });
+    await writeFile(intradaySamplesPathForMarket(market), JSON.stringify({ market, updatedAt: new Date().toISOString(), samples }, null, 2), "utf8");
+    await writeFile(intradayModelPathForMarket(market), JSON.stringify({ market, ...model, updatedAt: new Date().toISOString() }, null, 2), "utf8");
+    if (model.available) {
+      await appendModelChangeLogFile(market, {
+        event_type: "model-change-log-minute-learning",
+        entity_id: `${market}:minute-learning:${new Date().toISOString()}`,
+        payload: {
+          title: "分钟级本地模型已后台更新",
+          type: "minute-learning",
+          market,
+          sampleCount: model.sampleCount,
+          test: model.test,
+          featureNames: model.featureNames,
+          guardrails: ["只使用已完成K线生成标签", "最新K线只用于推理不用于标签", "默认仅辅助加权，避免过拟合"],
+        },
+      }).catch(() => null);
+    }
+  }
+  const summary = { updatedAt: new Date().toISOString(), results };
+  backendMonitorState.lastTrainingAt = summary.updatedAt;
+  backendMonitorState.lastTraining = summary;
+  runtime.lastTrainingAt = now;
+  return summary;
+}
+
+function backendAlertKey(alert = {}) {
+  return `${backendBudgetDate()}:${alert.market}:${alert.type}:${alert.symbol}`;
+}
+
+async function appendBackendAlert(alert = {}) {
+  await mkdir(backendMonitorBasePath, { recursive: true });
+  await appendFile(backendMonitorAlertPath, `${JSON.stringify({ createdAt: new Date().toISOString(), ...alert })}\n`, "utf8");
+}
+
+async function sendDesktopNotification(title, body) {
+  if (!envBool("BACKEND_MONITOR_DESKTOP_NOTIFICATIONS", true)) return { ok: false, skipped: true, reason: "desktop notifications disabled" };
+  return new Promise((resolve) => {
+    const script = `display notification ${JSON.stringify(String(body || "").slice(0, 260))} with title ${JSON.stringify(String(title || "Quant Watch").slice(0, 80))}`;
+    const child = spawn("osascript", ["-e", script], { stdio: "ignore" });
+    child.on("close", (code) => resolve({ ok: code === 0, code }));
+    child.on("error", (error) => resolve({ ok: false, error: error.message }));
+  });
+}
+
+async function postJsonNotification(url, payload, headers = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Number(process.env.BACKEND_MONITOR_PUSH_TIMEOUT_MS || 4500));
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(payload),
+    });
+    return { ok: response.ok, status: response.status };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function sendMobileNotification(alert = {}) {
+  if (!envBool("BACKEND_MONITOR_MOBILE_NOTIFICATIONS", true)) return { ok: false, skipped: true, reason: "mobile notifications disabled" };
+  const payload = {
+    title: alert.title,
+    body: alert.message,
+    market: alert.market,
+    symbol: alert.symbol,
+    action: alert.action,
+    severity: alert.severity,
+    price: alert.price,
+    generatedAt: alert.generatedAt,
+  };
+  const results = [];
+  if (process.env.MOBILE_PUSH_WEBHOOK_URL) {
+    results.push({ provider: "webhook", ...(await postJsonNotification(process.env.MOBILE_PUSH_WEBHOOK_URL, payload).catch((error) => ({ ok: false, error: error.message }))) });
+  }
+  if (process.env.BARK_PUSH_URL) {
+    const base = process.env.BARK_PUSH_URL.replace(/\/$/, "");
+    const url = `${base}/${encodeURIComponent(alert.title || "Quant Watch")}/${encodeURIComponent(alert.message || "")}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Number(process.env.BACKEND_MONITOR_PUSH_TIMEOUT_MS || 4500));
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      results.push({ provider: "bark", ok: response.ok, status: response.status });
+    } catch (error) {
+      results.push({ provider: "bark", ok: false, error: error.message });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (process.env.PUSHPLUS_TOKEN) {
+    results.push({ provider: "pushplus", ...(await postJsonNotification("https://www.pushplus.plus/send", {
+      token: process.env.PUSHPLUS_TOKEN,
+      title: alert.title,
+      content: alert.message,
+      template: "txt",
+    }).catch((error) => ({ ok: false, error: error.message }))) });
+  }
+  if (process.env.SERVERCHAN_SENDKEY) {
+    results.push({ provider: "serverchan", ...(await postJsonNotification(`https://sctapi.ftqq.com/${process.env.SERVERCHAN_SENDKEY}.send`, {
+      title: alert.title,
+      desp: alert.message,
+    }).catch((error) => ({ ok: false, error: error.message }))) });
+  }
+  if (!results.length) return { ok: false, skipped: true, reason: "no mobile push provider configured" };
+  return { ok: results.some((row) => row.ok), results };
+}
+
+function backendAlertFromAnalysis(result = {}, input = {}) {
+  const analysis = result.analysis || {};
+  const technicals = result.technicals || input.technicals || {};
+  const holding = input.holding || null;
+  const strategy = input.strategy || {};
+  const action = String(analysis.action || "HOLD_WATCH");
+  const price = Number(technicals.close || 0);
+  if (["STRONG_BUY", "WATCH_BUY", "LIGHT_BUY"].includes(action)) {
+    return {
+      type: holding ? "ADD" : "BUY",
+      severity: "buy",
+      title: `${result.symbol} ${action === "STRONG_BUY" ? "强买入" : holding ? "补仓观察" : "买入提醒"}`,
+      message: `后端监控触发：周期结束 ${Number(analysis.projectedFinalReturn ?? analysis.projectedUpside ?? 0).toFixed(2)}%，策略达标 ${Number(analysis.strategyHitProbability || 0).toFixed(0)}%，综合置信 ${Number(analysis.confidence || 0).toFixed(0)}%，现价 ${price.toFixed(3)}。`,
+    };
+  }
+  if (holding && action === "CRITICAL_SELL") {
+    return {
+      type: "SELL_CRITICAL",
+      severity: "sell",
+      title: `${result.symbol} 后端卖出警报`,
+      message: `后端监控触发：${result.symbol} 出现最严风险信号，现价 ${price.toFixed(3)}，均价 ${Number(holding.avgPrice || 0).toFixed(3)}，下跌风险 ${Number(analysis.downsideConfidence || 0).toFixed(0)}%。`,
+    };
+  }
+  if (holding && price > 0 && Number(holding.avgPrice || 0) > 0) {
+    const pnlPct = pctChange(price, Number(holding.avgPrice || 0));
+    if (pnlPct <= -Math.abs(Number(strategy.stopLoss || 4))) {
+      return {
+        type: "SELL_STOP",
+        severity: "sell",
+        title: `${result.symbol} 止损卖出提醒`,
+        message: `后端监控触发：现价 ${price.toFixed(3)}，相对均价 ${pnlPct.toFixed(2)}%，已触发 ${Number(strategy.stopLoss || 4).toFixed(1)}% 止损线。`,
+      };
+    }
+  }
+  return null;
+}
+
+async function maybeSendBackendAlert(alert = {}, runtime = {}) {
+  if (!alert?.title) return null;
+  const dedupeMs = Math.max(60_000, Number(process.env.BACKEND_MONITOR_ALERT_DEDUPE_MS || 2 * 60 * 60_000));
+  const key = backendAlertKey(alert);
+  runtime.sentAlerts = runtime.sentAlerts || {};
+  const last = Number(runtime.sentAlerts[key] || 0);
+  if (Date.now() - last < dedupeMs) return { skipped: true, reason: "deduped", key };
+  const budget = await takeBackendMonitorBudget("notifications", 1);
+  if (!budget.ok) return { skipped: true, reason: budget.reason, key };
+  runtime.sentAlerts[key] = Date.now();
+  const generated = { ...alert, key, generatedAt: new Date().toISOString() };
+  await appendBackendAlert(generated).catch(() => null);
+  const [desktop, mobile] = await Promise.all([
+    sendDesktopNotification(generated.title, generated.message).catch((error) => ({ ok: false, error: error.message })),
+    sendMobileNotification(generated).catch((error) => ({ ok: false, error: error.message })),
+  ]);
+  const sent = { ...generated, desktop, mobile };
+  backendMonitorState.lastAlerts = [sent, ...(backendMonitorState.lastAlerts || [])].slice(0, 20);
+  return sent;
+}
+
+async function prepareBackendMonitorSymbol(job = {}, config = {}) {
+  const market = safeMarket(job.market);
+  const symbol = normalizeMarketSymbol(job.symbol, market);
+  const strategy = normalizeBackendStrategy(config.strategy || {});
+  const marketBudget = await takeBackendMonitorBudget("marketCalls", 1);
+  if (!marketBudget.ok) throw new Error(marketBudget.reason);
+  let marketData;
+  let marketError = null;
+  try {
+    marketData = await fetchMarketCandles(symbol, process.env.BACKEND_MONITOR_DAILY_RANGE || "9mo", "1d", market);
+  } catch (error) {
+    marketError = error;
+    marketData = await fetchCachedMarketHistory(symbol, process.env.BACKEND_MONITOR_DAILY_RANGE || "9mo", "1d", market, error);
+  }
+  if (!marketData?.candles?.length) throw marketError || new Error(`No monitor candles for ${symbol}`);
+  const candles = sanitizeCandleRows(marketData.candles).sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const technicals = computeServerTechnicals(candles);
+  const analog = computeServerHistoricalAnalog(candles, Number(strategy.horizonDays || 15), Number(strategy.horizonDays || 15), strategy);
+  const livePrices = new Map([[symbol, technicals.close]]);
+  const holding = (backendPortfolioForMarket(config, market)).find((row) => row.symbol === symbol) || null;
+  const factorBudget = await takeBackendMonitorBudget("factorCalls", 1).catch((error) => ({ ok: false, reason: error.message }));
+  let factorLayer = null;
+  if (factorBudget.ok) {
+    factorLayer = await fetchFactorLayer(symbol, strategy, market).catch((error) => ({
+      factors: {
+        minuteLearning: { available: false, source: "factor-layer-unavailable", score: 0, confidence: 0, thesis: [`Factor layer unavailable: ${error.message || error}`] },
+      },
+      warning: error.message || String(error),
+    }));
+  }
+  const minuteFactor = await minuteLearningFactorFor(symbol, market).catch((error) => ({
+    available: false,
+    source: "minute-learning-unavailable",
+    score: 0,
+    confidence: 0,
+    thesis: [`Minute learning unavailable: ${error.message || error}`],
+  }));
+  const factors = { ...(factorLayer?.factors || {}), minuteLearning: minuteFactor };
+  const newsBundle = await fetchNewsItems(symbol, market, "all", { mode: "local" }).catch(() => ({ news: [] }));
+  const calibrationSummary = await summarizePredictionSamplesWithLocalModel(await readPredictionSamples(market), market).catch(() => null);
+  const input = {
+    symbol,
+    market,
+    marketLabel: MARKET_CONFIG[market].label,
+    currency: MARKET_CONFIG[market].currency,
+    strategy,
+    capital: backendCapitalForMarket(config, market, livePrices),
+    holding: holding ? { ...holding, holdingDays: holdingDaysFromEntry(holding) } : null,
+    technicals,
+    analog,
+    fundamentals: null,
+    xPosts: [],
+    youtubeItems: [],
+    news: newsBundle.news || [],
+    factors,
+    researchConfig: {},
+    marketValidation: marketData.validation || null,
+    calibrationSummary,
+  };
+  const local = localAnalysisEnvelope(input, "backend-monitor-local");
+  let analysis = local.analysis;
+  let source = local.source;
+  const aiEnabled = envBool("BACKEND_MONITOR_AI_ENABLED", false);
+  const highImpact = ["STRONG_BUY", "WATCH_BUY", "CRITICAL_SELL", "STRONG_AVOID"].includes(analysis.action);
+  if (aiEnabled && highImpact) {
+    const aiBudget = await takeBackendMonitorBudget("aiCalls", 1).catch((error) => ({ ok: false, reason: error.message }));
+    if (aiBudget.ok) {
+      const ai = await openAiBatchAnalysis([input]).catch(() => null);
+      const row = ai?.results?.[0];
+      if (row?.analysis) {
+        analysis = row.analysis;
+        source = row.source || ai.source || "backend-monitor-ai";
+      }
+    }
+  }
+  return {
+    symbol,
+    market,
+    tier: job.tier,
+    source,
+    marketSource: marketData.source,
+    marketWarning: marketData.warning || "",
+    candles,
+    technicals,
+    analog,
+    factors,
+    news: newsBundle.news || [],
+    analysis,
+    input,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function runBackendMonitorTick(reason = "interval") {
+  if (backendMonitorTickRunning) return { skipped: true, reason: "already-running" };
+  backendMonitorTickRunning = true;
+  backendMonitorState.running = true;
+  backendMonitorState.lastTickAt = new Date().toISOString();
+  const runtime = await readBackendMonitorRuntime();
+  runtime.lastSymbolChecks = runtime.lastSymbolChecks || {};
+  try {
+    const config = await readBackendMonitorConfig();
+    backendMonitorState.enabled = Boolean(config.enabled);
+    if (!config.enabled) return { skipped: true, reason: "backend monitor disabled" };
+    const training = await runBackendIntradayTraining(config, runtime).catch((error) => {
+      backendMonitorState.lastError = `training: ${error.message || error}`;
+      return null;
+    });
+    const jobs = backendDueMonitorJobs(config, runtime);
+    const concurrency = Math.max(1, Math.min(6, Number(process.env.BACKEND_MONITOR_CONCURRENCY || 2)));
+    const results = [];
+    let cursor = 0;
+    async function worker() {
+      while (cursor < jobs.length) {
+        const job = jobs[cursor];
+        cursor += 1;
+        try {
+          const result = await prepareBackendMonitorSymbol(job, config);
+          results.push(result);
+          runtime.lastSymbolChecks[`${job.market}:${job.symbol}:${job.tier}`] = Date.now();
+          const alert = backendAlertFromAnalysis(result, result.input);
+          if (alert) {
+            await maybeSendBackendAlert({
+              ...alert,
+              market: job.market,
+              symbol: result.symbol,
+              action: result.analysis?.action,
+              price: result.technicals?.close,
+              tier: job.tier,
+              reason,
+            }, runtime);
+          }
+        } catch (error) {
+          results.push({ market: job.market, symbol: job.symbol, tier: job.tier, error: error.message || String(error), updatedAt: new Date().toISOString() });
+          runtime.lastSymbolChecks[`${job.market}:${job.symbol}:${job.tier}`] = Date.now();
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length || 1) }, () => worker()));
+    runtime.lastRunAt = new Date().toISOString();
+    runtime.lastReason = reason;
+    runtime.lastTrainingAt = runtime.lastTrainingAt || 0;
+    runtime.lastResults = results.slice(-40).map((row) => ({
+      market: row.market,
+      symbol: row.symbol,
+      tier: row.tier,
+      action: row.analysis?.action || null,
+      confidence: row.analysis?.confidence ?? null,
+      projectedFinalReturn: row.analysis?.projectedFinalReturn ?? row.analysis?.projectedUpside ?? null,
+      price: row.technicals?.close ?? null,
+      source: row.source || null,
+      error: row.error || null,
+      updatedAt: row.updatedAt,
+    }));
+    if (training) runtime.lastTrainingSummary = training;
+    await writeBackendMonitorRuntime(runtime);
+    backendMonitorState.lastRunAt = runtime.lastRunAt;
+    backendMonitorState.lastAnalyses = runtime.lastResults;
+    backendMonitorState.lastTraining = runtime.lastTrainingSummary || backendMonitorState.lastTraining;
+    backendMonitorState.lastError = null;
+    return { ok: true, reason, jobs: jobs.length, results: runtime.lastResults, training };
+  } catch (error) {
+    backendMonitorState.lastError = error.message || String(error);
+    await writeBackendMonitorRuntime({ ...runtime, lastError: backendMonitorState.lastError, lastErrorAt: new Date().toISOString() }).catch(() => null);
+    return { ok: false, error: backendMonitorState.lastError };
+  } finally {
+    backendMonitorState.running = false;
+    backendMonitorTickRunning = false;
+  }
+}
+
+async function runBackendMonitorScheduledTick() {
+  const request = await consumeBackendMonitorRunRequest();
+  if (request) return runBackendMonitorTick(request.reason || "manual-file");
+  return runBackendMonitorTick("interval");
+}
+
+async function backendMonitorStatus() {
+  const [config, runtime, budget] = await Promise.all([
+    readBackendMonitorConfig(),
+    readBackendMonitorRuntime(),
+    readBackendMonitorBudget(),
+  ]);
+  const sessions = Object.fromEntries(Object.keys(MARKET_CONFIG).map((market) => [market, backendMarketSession(market)]));
+  const due = backendDueMonitorJobs(config, runtime).length;
+  const intradayModels = {};
+  for (const market of Object.keys(MARKET_CONFIG)) {
+    const model = await readIntradayModel(market);
+    intradayModels[market] = model ? {
+      available: Boolean(model.available),
+      sampleCount: model.sampleCount || 0,
+      updatedAt: model.updatedAt || null,
+      test: model.test || null,
+      reason: model.reason || "",
+    } : { available: false, sampleCount: 0, updatedAt: null, reason: "not trained yet" };
+  }
+  return {
+    ok: true,
+    version: APP_VERSION,
+    state: backendMonitorState,
+    config,
+    runtime: {
+      lastRunAt: runtime.lastRunAt || null,
+      lastTrainingAt: runtime.lastTrainingAt ? new Date(runtime.lastTrainingAt).toISOString() : null,
+      lastResults: runtime.lastResults || [],
+      lastError: runtime.lastError || null,
+    },
+    sessions,
+    dueJobs: due,
+    budget,
+    budgetLimits: backendMonitorBudgetLimits(),
+    intradayModels,
+    push: {
+      desktopConfigured: true,
+      mobileWebhookConfigured: Boolean(process.env.MOBILE_PUSH_WEBHOOK_URL),
+      barkConfigured: Boolean(process.env.BARK_PUSH_URL),
+      pushPlusConfigured: Boolean(process.env.PUSHPLUS_TOKEN),
+      serverChanConfigured: Boolean(process.env.SERVERCHAN_SENDKEY),
+    },
+  };
 }
 
 async function readPredictionSamples(market = "ASX") {
@@ -3850,6 +5322,9 @@ function attachLocalModelSuite(summary, suite) {
   summary.localModelDeployment = suite;
   if (suite.ensembleWeightOptimization) {
     summary.ensembleWeightOptimization = suite.ensembleWeightOptimization;
+  }
+  if (suite.modelZoo) {
+    summary.modelZoo = suite.modelZoo;
   }
   if (suite.signalModels) {
     summary.localSignalModels = suite.signalModels;
@@ -5704,11 +7179,13 @@ const FACTOR_LAYER_KEYS = [
   "macro",
   "sector",
   "socialMedia",
+  "minuteLearning",
   "flowOptions",
   "marketRegime",
   "relativeStrength",
   "liquidity",
   "calibration",
+  "factorResearch",
 ];
 
 function researchFactorValue(name, technicals = {}) {
@@ -8352,14 +9829,51 @@ function historicalBacktestFactor(result) {
   const stopRate = Number(values.stopRate ?? result.metrics?.stopRate ?? 0);
   const avgReturn = Number(values.avgReturn ?? result.metrics?.avgForwardReturn ?? 0);
   const brier = Number(values.brierTarget ?? result.metrics?.brierTarget ?? 0);
+  const dataQuality = result.dataQuality || {};
+  const dataQualityScore = Number(dataQuality.avgScore || 0);
+  const labelConfidence = Number(result.metrics?.avgLabelConfidence || 0);
+  const labelNoiseScore = Number(result.metrics?.avgLabelNoiseScore ?? values.avgLabelNoiseScore ?? 0);
+  const highNoisePct = Number(result.metrics?.highNoiseSamplePct ?? values.highNoiseSamplePct ?? 0);
+  const ambiguousBarrierPct = Number(result.metrics?.ambiguousBarrierPct ?? values.ambiguousBarrierPct ?? 0);
+  const qualityPenalty = dataQualityScore > 0 ? Math.max(0, 78 - dataQualityScore) * 0.05 : 0;
+  const labelNoisePenalty = Math.max(0, labelNoiseScore - 42) * 0.035 + Math.max(0, highNoisePct - 18) * 0.025 + Math.max(0, ambiguousBarrierPct - 4) * 0.04;
+  const coverageScore = Number(result.metrics?.avgCoverageScore ?? values.avgCoverageScore ?? 100);
+  const coveragePenalty = Math.max(0, 55 - coverageScore) * 0.055;
+  const regimeCalibration = result.regimeCalibration || {};
+  const matchedRegime = regimeCalibration.matchedBucket || regimeCalibration.matchedCurrentRegime || {};
+  const regimeSamples = Number(matchedRegime.effectiveSamples || matchedRegime.count || 0);
+  const regimeTargetHit = Number(matchedRegime.targetHitRate || 0);
+  const regimeStopRate = Number(matchedRegime.stopRate || 0);
+  const regimeAvgReturn = Number(matchedRegime.avgReturn || 0);
+  const regimePenalty = regimeSamples >= 8
+    ? Math.max(0, 50 - regimeTargetHit) * 0.045 + Math.max(0, regimeStopRate - 48) * 0.035 + Math.max(0, -regimeAvgReturn) * 0.18
+    : 0.45;
+  const conformalCalibration = result.conformalCalibration || {};
+  const conformalOverall = conformalCalibration.overall || conformalCalibration.currentRegimeSummary || {};
+  const conformalCurrent = conformalCalibration.currentRegimeSummary || conformalOverall;
+  const finalP80Error = Number(conformalCurrent.finalReturnAbsErrorP80 ?? conformalOverall.finalReturnAbsErrorP80 ?? values.currentRegimeP80Error ?? values.finalReturnP80Error ?? 0);
+  const finalP90Error = Number(conformalCurrent.finalReturnAbsErrorP90 ?? conformalOverall.finalReturnAbsErrorP90 ?? values.finalReturnP90Error ?? 0);
+  const conformalPenalty = finalP80Error > 0
+    ? Math.max(0, finalP80Error - 2.4) * 0.22 + Math.max(0, finalP90Error - 4.2) * 0.12
+    : 0.2;
   const predictionCalibration = result.predictionCalibration || {};
   const predictionDirection = Number(predictionCalibration.test?.directionHitRate || 0);
   const predictionLift = Number(predictionCalibration.directionLiftPct || 0);
   const predictionActive = !!predictionCalibration.active;
+  const stability = predictionCalibration.stability || {};
+  const stabilityScore = Number(stability.stabilityScore || 0);
+  const stabilityPassed = Boolean(stability.pass);
   const predictionScore = predictionCalibration.available
-    ? clampNumber((predictionDirection - 50) / 3.6 + predictionLift * 0.12 + (predictionActive ? 1.2 : -0.6), -4, 4)
+    ? clampNumber(
+      (predictionDirection - 50) / 3.6
+        + predictionLift * 0.12
+        + (predictionActive ? 1.2 : -0.6)
+        + (stability.available ? (stabilityPassed ? 0.75 : -0.9) : -0.25),
+      -4,
+      4,
+    )
     : 0;
-  const score = clampNumber((hitRate - 52) / 3.2 + avgReturn * 0.28 - stopRate * 0.04 - Math.max(0, brier - 0.25) * 10 + predictionScore, -12, 12);
+  const score = clampNumber((hitRate - 52) / 3.2 + avgReturn * 0.28 - stopRate * 0.04 - Math.max(0, brier - 0.25) * 10 + predictionScore - qualityPenalty - labelNoisePenalty - coveragePenalty - regimePenalty - conformalPenalty, -12, 12);
   return {
     available: predictionCuts >= 12,
     source: "historical-walk-forward-backtest",
@@ -8371,6 +9885,20 @@ function historicalBacktestFactor(result) {
       predictionCalibration.available
         ? `Prediction-weight calibration: ${predictionCalibration.horizonLabel || ""}${predictionCalibration.horizonDays || ""}d ${predictionCalibration.status || "research"}; holdout direction ${predictionDirection.toFixed(0)}%, lift ${predictionLift.toFixed(1)}pct.`
         : "Prediction-weight calibration is still collecting historical cuts.",
+      stability.available
+        ? `Weight stability gate: ${stability.status || "unknown"} score ${stabilityScore.toFixed(0)}, rolling-fold direction lift ${Number(stability.avgDirectionLiftPct || 0).toFixed(1)}pct, weight drift ${Number(stability.weightDrift || 0).toFixed(2)}.`
+        : "Weight stability gate is collecting multi-fold evidence.",
+      dataQualityScore
+        ? `Data-quality gate: ${dataQuality.grade || "batch"} score ${dataQualityScore.toFixed(1)}, degraded rows ${Number(dataQuality.degradedRowPct || 0).toFixed(1)}%, label confidence ${labelConfidence ? (labelConfidence * 100).toFixed(0) + "%" : "collecting"}.`
+        : "Data-quality gate is collecting candle quality evidence.",
+      `Label-noise gate: path-noise ${labelNoiseScore.toFixed(0)}/100, high-noise cuts ${highNoisePct.toFixed(1)}%, same-bar target/stop ambiguity ${ambiguousBarrierPct.toFixed(1)}%; noisy labels cannot lift historical confidence.`,
+      `Sample coverage gate: average coverage ${coverageScore.toFixed(0)}/100, low-coverage cuts ${Number(result.metrics?.lowCoverageSamplePct || 0).toFixed(1)}%; OOD-like setups are down-weighted.`,
+      regimeCalibration.framework
+        ? `Regime bucket calibration: current ${regimeCalibration.current?.label || regimeCalibration.framework}, matched samples ${regimeSamples.toFixed(1)}, target-hit ${regimeTargetHit.toFixed(0)}%, stop-first ${regimeStopRate.toFixed(0)}%, avg return ${regimeAvgReturn.toFixed(2)}%.`
+        : "Regime bucket calibration is collecting point-in-time market-state evidence.",
+      conformalCalibration.framework
+        ? `Conformal residual calibration: final-return P80 error ±${finalP80Error.toFixed(2)}%, P90 ±${finalP90Error.toFixed(2)}%; wide residual bands reduce high-confidence magnitude labels.`
+        : "Conformal residual calibration is collecting historical prediction errors.",
     ],
     values: {
       ...values,
@@ -8387,6 +9915,23 @@ function historicalBacktestFactor(result) {
       predictionCalibrationActive: predictionActive,
       predictionCalibrationDirectionHitRate: predictionDirection,
       predictionCalibrationLiftPct: predictionLift,
+      weightStabilityScore: stabilityScore,
+      weightStabilityPassed: stabilityPassed,
+      dataQualityScore,
+      avgLabelConfidence: labelConfidence,
+      avgLabelNoiseScore: labelNoiseScore,
+      highNoiseSamplePct: highNoisePct,
+      ambiguousBarrierPct,
+      degradedRowPct: Number(dataQuality.degradedRowPct || 0),
+      avgCoverageScore: coverageScore,
+      lowCoverageSamplePct: Number(result.metrics?.lowCoverageSamplePct || 0),
+      currentRegime: regimeCalibration.current?.bucket || values.currentRegime || null,
+      currentRegimeTargetHitRate: regimeTargetHit || Number(values.currentRegimeTargetHitRate || 0),
+      currentRegimeStopRate: regimeStopRate || Number(values.currentRegimeStopRate || 0),
+      currentRegimeAvgReturn: regimeAvgReturn || Number(values.currentRegimeAvgReturn || 0),
+      finalReturnP80Error,
+      finalReturnP90Error,
+      conformalUncertaintyScore: Number(conformalCurrent.uncertaintyScore ?? conformalOverall.uncertaintyScore ?? 0),
     },
     backtest: {
       framework: result.framework,
@@ -8395,7 +9940,10 @@ function historicalBacktestFactor(result) {
       benchmarks: result.benchmarks,
       model: result.model,
       dateRange: result.dateRange,
+      dataQuality,
       predictionCalibration,
+      regimeCalibration,
+      conformalCalibration,
     },
   };
 }
@@ -8422,9 +9970,61 @@ async function fetchBacktestCandlesForSymbol(symbol, market, range = "5y") {
   }
 }
 
-async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy = {}, range = "5y", limit = 20 } = {}) {
+async function crossSectionalFactorResearchForItems({ market = "ASX", items = [], horizons = [5, 15, 30] } = {}) {
   const key = safeMarket(market);
-  const uniqueSymbols = [...new Set((symbols || []).map((symbol) => normalizeMarketSymbol(symbol, key)).filter(Boolean))].slice(0, Math.max(1, Math.min(80, Number(limit || 20))));
+  const usableItems = (items || [])
+    .filter((item) => item?.candles?.length)
+    .map((item) => {
+      const code = normalizeMarketSymbol(item.symbol || "", key);
+      const context = sectorContext(code, key);
+      return {
+        market: key,
+        symbol: code,
+        sector: item.sector || context.sector || "Unknown",
+        source: item.source || "",
+        candles: sanitizeCandleRows(item.candles || []),
+      };
+    })
+    .filter((item) => item.symbol && item.candles.length);
+  if (usableItems.length < 3) {
+    return {
+      available: false,
+      framework: "market-cross-sectional-factor-research",
+      market: key,
+      reason: "Need at least three symbols with real historical candles for cross-sectional factor research.",
+      symbolCount: usableItems.length,
+    };
+  }
+  const result = await runPythonQuantCore("cross-sectional-factor-research", {
+    market: key,
+    items: usableItems,
+    horizons,
+    min_symbols: Number(process.env.CROSS_SECTION_MIN_SYMBOLS || Math.min(6, Math.max(3, Math.floor(usableItems.length * 0.45)))),
+  }, Number(process.env.CROSS_SECTION_FACTOR_TIMEOUT_MS || 90000));
+  const saved = await writeCrossSectionalFactorModelSnapshot(key, result).catch(() => null);
+  if (saved) {
+    await appendModelChangeLogFile(key, {
+      event_type: "model-change-log-cross-sectional-factor-research",
+      entity_id: `${key}:cross-sectional-factor:${saved.savedAt}`,
+      payload: {
+        title: "市场级横截面因子权重已更新",
+        type: "cross-sectional-factor-research",
+        market: key,
+        framework: saved.framework,
+        symbolCount: saved.symbolCount,
+        horizons: saved.horizons,
+        aggregateWeights: saved.aggregateWeights,
+        leakageControl: saved.leakageControl,
+      },
+    }).catch(() => null);
+  }
+  return { ...result, savedModel: saved };
+}
+
+async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy = {}, range = "5y", limit, largeSample = true } = {}) {
+  const key = safeMarket(market);
+  const trainingUniverse = await expandTrainingSymbolsForMarket({ market: key, symbols, limit, largeSample });
+  const uniqueSymbols = trainingUniverse.trainingSymbols;
   const concurrency = Math.max(1, Math.min(5, Number(process.env.HISTORICAL_BACKTEST_FETCH_CONCURRENCY || 4)));
   const items = [];
   let cursor = 0;
@@ -8460,12 +10060,22 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     retrain_interval: Number(process.env.HISTORICAL_BACKTEST_RETRAIN_INTERVAL || 60),
     max_train_window: Number(process.env.HISTORICAL_BACKTEST_TRAIN_WINDOW || 240),
     knn_window: Number(process.env.HISTORICAL_BACKTEST_KNN_WINDOW || 260),
-  }, Number(process.env.HISTORICAL_BACKTEST_BATCH_TIMEOUT_MS || 65000));
+  }, Number(process.env.HISTORICAL_BACKTEST_BATCH_TIMEOUT_MS || 180000));
+  const crossSectionalFactorResearch = process.env.CROSS_SECTION_FACTOR_RESEARCH === "false"
+    ? { available: false, framework: "market-cross-sectional-factor-research", reason: "Disabled by CROSS_SECTION_FACTOR_RESEARCH=false." }
+    : await crossSectionalFactorResearchForItems({ market: key, items, horizons }).catch((error) => ({
+      available: false,
+      framework: "market-cross-sectional-factor-research",
+      reason: error.message || String(error),
+    }));
   const finalResult = {
     ...result,
     range,
     horizons,
-    requestedSymbols: uniqueSymbols,
+    crossSectionalFactorResearch,
+    requestedSymbols: trainingUniverse.requestedSymbols,
+    trainingSymbols: uniqueSymbols,
+    trainingUniverse,
     dataSources: items.map((item) => ({
       symbol: item.symbol,
       source: item.source,
@@ -8491,6 +10101,302 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     }).catch(() => null);
   }
   return { ...finalResult, savedModel };
+}
+
+const factorEvolutionScheduler = {
+  running: false,
+  activeMode: "",
+  lastStartedAt: null,
+  lastFinishedAt: null,
+  lastError: "",
+  lastResult: null,
+};
+
+function factorEvolutionConfig() {
+  const markets = envList("FACTOR_EVOLUTION_MARKETS").length
+    ? envList("FACTOR_EVOLUTION_MARKETS").map(safeMarket)
+    : ["ASX", "US", "CN"];
+  return {
+    enabled: process.env.FACTOR_EVOLUTION_AUTO_ENABLED !== "false",
+    markets: [...new Set(markets)],
+    lightIntervalMs: Math.max(30 * 60 * 1000, Number(process.env.FACTOR_EVOLUTION_LIGHT_INTERVAL_HOURS || 12) * 60 * 60 * 1000),
+    heavyIntervalMs: Math.max(24 * 60 * 60 * 1000, Number(process.env.FACTOR_EVOLUTION_HEAVY_INTERVAL_HOURS || 168) * 60 * 60 * 1000),
+    lightSymbolLimit: Math.max(1, Math.min(40, Number(process.env.FACTOR_EVOLUTION_LIGHT_SYMBOL_LIMIT || 12))),
+    heavySymbolLimit: Math.max(3, Math.min(180, Number(process.env.FACTOR_EVOLUTION_HEAVY_SYMBOL_LIMIT || process.env.HISTORICAL_BACKTEST_LARGE_SAMPLE_LIMIT || 80))),
+    range: process.env.FACTOR_EVOLUTION_RANGE || "5y",
+    horizonDays: Math.max(1, Math.min(60, Number(process.env.FACTOR_EVOLUTION_HORIZON_DAYS || 15))),
+    targetUpside: Number(process.env.FACTOR_EVOLUTION_TARGET_UPSIDE || 5),
+    stopLoss: Number(process.env.FACTOR_EVOLUTION_STOP_LOSS || 4),
+    lightGenerations: Math.max(1, Math.min(12, Number(process.env.FACTOR_EVOLUTION_LIGHT_GENERATIONS || 6))),
+    lightPopulation: Math.max(8, Math.min(80, Number(process.env.FACTOR_EVOLUTION_LIGHT_POPULATION || 36))),
+    checkIntervalMs: Math.max(60 * 1000, Number(process.env.FACTOR_EVOLUTION_CHECK_INTERVAL_MS || 10 * 60 * 1000)),
+    startupDelayMs: Math.max(0, Number(process.env.FACTOR_EVOLUTION_STARTUP_DELAY_MS || 90 * 1000)),
+  };
+}
+
+async function readFactorEvolutionSchedulerState() {
+  try {
+    const payload = JSON.parse(await readFile(factorEvolutionSchedulerPath(), "utf8"));
+    return payload && typeof payload === "object" ? payload : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeFactorEvolutionSchedulerState(patch = {}) {
+  await mkdir(join(snapshotBasePath, "models", "factor-research"), { recursive: true });
+  const previous = await readFactorEvolutionSchedulerState();
+  const payload = {
+    ...previous,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeFile(factorEvolutionSchedulerPath(), JSON.stringify(payload, null, 2), "utf8");
+  return payload;
+}
+
+function isFactorEvolutionDue(state = {}, key = "light", intervalMs = 12 * 60 * 60 * 1000, options = {}) {
+  const last = new Date(state?.[`${key}LastFinishedAt`] || state?.[`${key}LastStartedAt`] || 0).getTime();
+  if (!last && options.requirePreviousRun) return false;
+  return !last || Date.now() - last >= intervalMs;
+}
+
+async function runAlphaEvolutionForSymbol({ market, symbol, range, horizonDays, generations, population, mode }) {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  const marketData = await fetchBacktestCandlesForSymbol(code, key, range);
+  if (!marketData.candles?.length) {
+    return {
+      symbol: code,
+      available: false,
+      reason: marketData.warning || marketData.error || "No real candles returned.",
+    };
+  }
+  const result = await runPythonQuantCore("alpha-evolution", {
+    market: key,
+    symbol: code,
+    candles: sanitizeCandleRows(marketData.candles || []),
+    horizon_days: horizonDays,
+    generations,
+    population,
+  }, Number(process.env.FACTOR_EVOLUTION_TIMEOUT_MS || 32000));
+  const saved = await writeAlphaEvolutionModelSnapshot(key, code, result, {
+    mode,
+    range,
+    horizonDays,
+    generations,
+    population,
+  }).catch(() => null);
+  if (saved) {
+    await appendModelChangeLogFile(key, {
+      event_type: "model-change-log-alpha-evolution",
+      entity_id: `${key}:${code}:alpha-evolution:${saved.savedAt}`,
+      payload: {
+        title: "自进化 Alpha 候选已更新",
+        type: "alpha-evolution",
+        mode,
+        market: key,
+        symbol: code,
+        framework: saved.framework,
+        sampleCount: saved.sampleCount,
+        generations,
+        population,
+        topCandidate: saved.bestCandidates?.[0]?.name || "",
+        topFitness: saved.bestCandidates?.[0]?.fitness ?? null,
+        leakageControl: saved.leakageControl,
+      },
+    }).catch(() => null);
+  }
+  return {
+    symbol: code,
+    available: true,
+    source: marketData.source,
+    candles: marketData.candles.length,
+    savedAt: saved?.savedAt || null,
+    topCandidate: saved?.bestCandidates?.[0]?.name || result.best_candidates?.[0]?.name || "",
+    topFitness: saved?.bestCandidates?.[0]?.fitness ?? result.best_candidates?.[0]?.fitness ?? null,
+  };
+}
+
+async function runFactorEvolutionCycle(mode = "light", options = {}) {
+  const config = factorEvolutionConfig();
+  if (factorEvolutionScheduler.running) {
+    return {
+      accepted: false,
+      running: true,
+      activeMode: factorEvolutionScheduler.activeMode,
+      reason: "Factor evolution is already running.",
+    };
+  }
+  const runMode = mode === "heavy" ? "heavy" : "light";
+  factorEvolutionScheduler.running = true;
+  factorEvolutionScheduler.activeMode = runMode;
+  factorEvolutionScheduler.lastStartedAt = new Date().toISOString();
+  factorEvolutionScheduler.lastError = "";
+  await writeFactorEvolutionSchedulerState({
+    [`${runMode}LastStartedAt`]: factorEvolutionScheduler.lastStartedAt,
+    runningMode: runMode,
+  }).catch(() => null);
+  try {
+    const marketResults = [];
+    if (runMode === "heavy") {
+      for (const market of config.markets) {
+        const result = await historicalBacktestBatch({
+          market,
+          symbols: [],
+          strategy: {
+            horizonDays: config.horizonDays,
+            targetUpside: config.targetUpside,
+            stopLoss: config.stopLoss,
+          },
+          range: config.range,
+          limit: Number(options.limit || config.heavySymbolLimit),
+          largeSample: true,
+        });
+        marketResults.push({
+          market,
+          mode: runMode,
+          symbolCount: result.symbolCount,
+          availableCount: result.availableCount,
+          sampleTotal: result.sampleTotal,
+          crossSectionalAvailable: result.crossSectionalFactorResearch?.available !== false,
+        });
+      }
+    } else {
+      for (const market of config.markets) {
+        const trainingUniverse = await expandTrainingSymbolsForMarket({
+          market,
+          symbols: [],
+          limit: Number(options.limit || config.lightSymbolLimit),
+          largeSample: true,
+        });
+        const symbolResults = [];
+        for (const symbol of trainingUniverse.trainingSymbols) {
+          try {
+            symbolResults.push(await runAlphaEvolutionForSymbol({
+              market,
+              symbol,
+              range: config.range,
+              horizonDays: config.horizonDays,
+              generations: Number(options.generations || config.lightGenerations),
+              population: Number(options.population || config.lightPopulation),
+              mode: runMode,
+            }));
+          } catch (error) {
+            symbolResults.push({
+              symbol,
+              available: false,
+              reason: String(error.message || error).slice(0, 280),
+            });
+          }
+        }
+        marketResults.push({
+          market,
+          mode: runMode,
+          trainingSymbols: trainingUniverse.trainingSymbols,
+          sourceCounts: trainingUniverse.sourceCounts,
+          availableCount: symbolResults.filter((row) => row.available).length,
+          failedCount: symbolResults.filter((row) => !row.available).length,
+          symbols: symbolResults,
+        });
+      }
+    }
+    const finishedAt = new Date().toISOString();
+    const summary = {
+      mode: runMode,
+      startedAt: factorEvolutionScheduler.lastStartedAt,
+      finishedAt,
+      markets: marketResults,
+      config: {
+        markets: config.markets,
+        lightIntervalHours: Number((config.lightIntervalMs / 3600000).toFixed(2)),
+        heavyIntervalHours: Number((config.heavyIntervalMs / 3600000).toFixed(2)),
+        lightSymbolLimit: config.lightSymbolLimit,
+        heavySymbolLimit: config.heavySymbolLimit,
+        range: config.range,
+        horizonDays: config.horizonDays,
+      },
+    };
+    factorEvolutionScheduler.lastFinishedAt = finishedAt;
+    factorEvolutionScheduler.lastResult = summary;
+    await writeFactorEvolutionSchedulerState({
+      runningMode: "",
+      [`${runMode}LastFinishedAt`]: finishedAt,
+      lastResult: summary,
+      lastError: "",
+    });
+    return summary;
+  } catch (error) {
+    const message = String(error.message || error).slice(0, 500);
+    factorEvolutionScheduler.lastError = message;
+    await writeFactorEvolutionSchedulerState({
+      runningMode: "",
+      [`${runMode}LastErrorAt`]: new Date().toISOString(),
+      lastError: message,
+    }).catch(() => null);
+    throw error;
+  } finally {
+    factorEvolutionScheduler.running = false;
+    factorEvolutionScheduler.activeMode = "";
+  }
+}
+
+async function factorEvolutionSchedulerStatus() {
+  const config = factorEvolutionConfig();
+  const state = await readFactorEvolutionSchedulerState();
+  return {
+    enabled: config.enabled,
+    running: factorEvolutionScheduler.running,
+    activeMode: factorEvolutionScheduler.activeMode,
+    lastStartedAt: factorEvolutionScheduler.lastStartedAt || state.lightLastStartedAt || state.heavyLastStartedAt || null,
+    lastFinishedAt: factorEvolutionScheduler.lastFinishedAt || state.lightLastFinishedAt || state.heavyLastFinishedAt || null,
+    lightLastFinishedAt: state.lightLastFinishedAt || null,
+    heavyLastFinishedAt: state.heavyLastFinishedAt || null,
+    lastError: factorEvolutionScheduler.lastError || state.lastError || "",
+    lastResult: factorEvolutionScheduler.lastResult || state.lastResult || null,
+    config: {
+      markets: config.markets,
+      lightIntervalHours: Number((config.lightIntervalMs / 3600000).toFixed(2)),
+      heavyIntervalHours: Number((config.heavyIntervalMs / 3600000).toFixed(2)),
+      lightSymbolLimit: config.lightSymbolLimit,
+      heavySymbolLimit: config.heavySymbolLimit,
+      lightGenerations: config.lightGenerations,
+      lightPopulation: config.lightPopulation,
+      range: config.range,
+      horizonDays: config.horizonDays,
+      startupDelayMs: config.startupDelayMs,
+      checkIntervalMs: config.checkIntervalMs,
+    },
+    next: {
+      lightDue: isFactorEvolutionDue(state, "light", config.lightIntervalMs),
+      heavyDue: isFactorEvolutionDue(state, "heavy", config.heavyIntervalMs, {
+        requirePreviousRun: process.env.FACTOR_EVOLUTION_RUN_HEAVY_ON_FIRST_START !== "true",
+      }),
+    },
+  };
+}
+
+async function tickFactorEvolutionScheduler(reason = "timer") {
+  const config = factorEvolutionConfig();
+  if (!config.enabled || factorEvolutionScheduler.running) return;
+  const state = await readFactorEvolutionSchedulerState();
+  const heavyDue = isFactorEvolutionDue(state, "heavy", config.heavyIntervalMs, {
+    requirePreviousRun: process.env.FACTOR_EVOLUTION_RUN_HEAVY_ON_FIRST_START !== "true",
+  });
+  const lightDue = isFactorEvolutionDue(state, "light", config.lightIntervalMs);
+  if (!heavyDue && !lightDue) return;
+  const mode = heavyDue ? "heavy" : "light";
+  console.log(`Factor evolution scheduler running ${mode} cycle (${reason}).`);
+  runFactorEvolutionCycle(mode)
+    .then((result) => {
+      console.log(`Factor evolution ${mode} cycle finished: ${JSON.stringify({
+        markets: result.markets?.length || 0,
+        finishedAt: result.finishedAt,
+      })}`);
+    })
+    .catch((error) => {
+      console.warn(`Factor evolution ${mode} cycle failed: ${error.message || error}`);
+    });
 }
 
 function marketRegimeFactor(candles) {
@@ -8523,6 +10429,128 @@ function marketRegimeFactor(candles) {
   };
 }
 
+async function fetchFactorResearchFactor(symbol, strategy = {}, market = "ASX", candles = []) {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  const rows = sanitizeCandleRows(candles || []);
+  if (rows.length < 90) {
+    const snapshot = await readFactorResearchModelSnapshot(key, code);
+    if (snapshot?.liveSignal) {
+      return {
+        available: true,
+        source: "cached-factor-research-ml",
+        score: clampNumber(Number(snapshot.liveSignal.score || 0), -12, 12),
+        weight: Math.max(0, Number(snapshot.admittedCount || 0)),
+        confidence: clampNumber(Number(snapshot.liveSignal.confidence || 0), 0, 86),
+        thesis: [
+          `Cached factor ML weights: ${snapshot.admittedCount || 0}/${snapshot.candidateCount || 0} admitted factors; score ${Number(snapshot.liveSignal.score || 0).toFixed(1)}.`,
+          "Current candle depth is too short for fresh factor ML validation; using persisted local factor-research snapshot.",
+        ],
+        values: {
+          cached: true,
+          savedAt: snapshot.savedAt,
+          admittedCount: snapshot.admittedCount,
+          candidateCount: snapshot.candidateCount,
+          components: snapshot.liveSignal.components || [],
+        },
+        model: snapshot,
+      };
+    }
+    return {
+      available: false,
+      source: "factor-research-insufficient-history",
+      score: 0,
+      confidence: 0,
+      thesis: [`Factor ML research requires at least 90 real daily candles; current ${rows.length}.`],
+      values: { samples: rows.length },
+    };
+  }
+  const result = await runPythonQuantCore("factor-research", {
+    market: key,
+    symbol: code,
+    horizon_days: Math.max(1, Number(strategy.horizonDays || 15)),
+    candles: rows,
+  }, Number(process.env.FACTOR_RESEARCH_TIMEOUT_MS || 14000));
+  const research = result.factor_research || {};
+  const live = research.live_signal || {};
+  const saved = await writeFactorResearchModelSnapshot(key, code, result).catch(() => null);
+  if (saved) {
+    await appendModelChangeLogFile(key, {
+      event_type: "model-change-log-factor-research",
+      entity_id: `${key}:${code}:factor-research:${saved.savedAt}`,
+      payload: {
+        title: "动态因子权重已更新",
+        type: "factor-research-ml",
+        market: key,
+        symbol: code,
+        framework: saved.framework,
+        candidateCount: saved.candidateCount,
+        admittedCount: saved.admittedCount,
+        liveScore: saved.liveSignal?.score,
+        holdout: saved.mlBacktest?.test || null,
+        leakageControl: saved.leakageControl,
+      },
+    }).catch(() => null);
+  }
+  const crossSectional = await readCrossSectionalFactorModelSnapshot(key);
+  const crossWeights = new Map((crossSectional?.aggregateWeights || []).map((row) => [row.name, Number(row.weight_pct || 0) / 100]));
+  const crossComponents = (live.components || [])
+    .map((component) => {
+      const weight = crossWeights.get(component.name) || 0;
+      const direction = component.direction === "negative" ? -1 : 1;
+      const contribution = Number(component.z_value || 0) * direction * weight * 7;
+      return weight > 0 ? { ...component, crossWeightPct: Number((weight * 100).toFixed(3)), crossContribution: Number(contribution.toFixed(4)) } : null;
+    })
+    .filter(Boolean);
+  const crossScore = crossComponents.length
+    ? clampNumber(crossComponents.reduce((sum, row) => sum + Number(row.crossContribution || 0), 0), -12, 12)
+    : null;
+  const blendedScore = crossScore == null
+    ? clampNumber(Number(live.score || 0), -12, 12)
+    : clampNumber(Number(live.score || 0) * 0.62 + crossScore * 0.38, -12, 12);
+  const blendedConfidence = clampNumber(Number(live.confidence || 0) + (crossScore == null ? 0 : Math.min(6, crossComponents.length * 0.8)), 0, 88);
+  return {
+    available: Boolean(research.available),
+    source: crossScore == null ? "factor-research-ml" : "factor-research-ml+cross-sectional",
+    score: blendedScore,
+    weight: Math.max(0, Number(research.admitted_count || 0)),
+    confidence: blendedConfidence,
+    thesis: [
+      `Factor ML research: ${research.admitted_count || 0}/${research.candidate_count || 0} factors admitted; live stance ${live.stance || "mixed"}, score ${Number(live.score || 0).toFixed(1)}, confidence ${Number(live.confidence || 0).toFixed(0)}%.`,
+      crossScore == null
+        ? "Market cross-sectional factor weights are not available yet; run the 5-year historical calibration or factor research batch to enable market-level double-check."
+        : `Market cross-sectional overlay: score ${crossScore.toFixed(1)} from ${crossComponents.length} shared factors; blended factor score ${blendedScore.toFixed(1)}.`,
+      research.ml_backtest?.available
+        ? `Holdout combo: direction ${Number(research.ml_backtest.test?.direction_hit_rate_pct || 0).toFixed(0)}%, IC ${Number(research.ml_backtest.test?.ic || 0).toFixed(3)}, lift ${Number(research.ml_backtest.direction_lift_pct || 0).toFixed(1)}pct.`
+        : "Factor ML combo is still collecting enough samples for holdout validation.",
+    ],
+    values: {
+      savedAt: saved?.savedAt || null,
+      sampleCount: result.sample_count || 0,
+      admittedCount: research.admitted_count || 0,
+      candidateCount: research.candidate_count || 0,
+      liveStance: live.stance || "mixed",
+      components: live.components || [],
+      crossSectional: crossSectional ? {
+        savedAt: crossSectional.savedAt,
+        framework: crossSectional.framework,
+        symbolCount: crossSectional.symbolCount,
+        aggregateWeights: crossSectional.aggregateWeights || [],
+        score: crossScore,
+        components: crossComponents,
+      } : null,
+      weights: research.weights || [],
+      mlBacktest: research.ml_backtest || null,
+    },
+    model: saved || {
+      framework: research.framework,
+      weights: research.weights || [],
+      mlBacktest: research.ml_backtest || null,
+      leakageControl: research.leakage_control,
+    },
+  };
+}
+
 async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
   const key = safeMarket(market);
   const code = cleanCode(symbol, key);
@@ -8540,10 +10568,12 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     fetchRelativeStrengthFactor(symbol, candles, key),
     fetchFlowOptionsFactor(symbol, key, candles),
     fetchRedditSocialFactor(symbol, key, { mode: "local", limit: 10 }),
+    minuteLearningFactorFor(symbol, key),
     historicalBacktestForCandles({ market: key, symbol, candles, strategy, source: marketData.source }),
+    fetchFactorResearchFactor(symbol, strategy, key, candles),
   ]);
   const get = (index, fallback) => results[index].status === "fulfilled" ? results[index].value : fallback(results[index].reason);
-  const historicalBacktest = get(7, (error) => ({ available: false, reason: `Historical walk-forward unavailable: ${error.message || error}` }));
+  const historicalBacktest = get(8, (error) => ({ available: false, reason: `Historical walk-forward unavailable: ${error.message || error}` }));
   const historicalCalibration = historicalBacktestFactor(historicalBacktest);
   const simpleCalibration = calibrationFactor(candles, Number(strategy.horizonDays || 15), Number(strategy.targetUpside || 5), Number(strategy.stopLoss || 4));
   const factors = {
@@ -8554,11 +10584,13 @@ async function fetchFactorLayer(symbol, strategy = {}, market = "ASX") {
     relativeStrength: get(4, (error) => ({ available: false, source: "relative-strength-unavailable", score: 0, thesis: [`Relative strength factor unavailable: ${error.message || error}`] })),
     flowOptions: get(5, (error) => ({ available: false, source: "flow-options-unavailable", score: 0, thesis: [`Flow/options factor unavailable: ${error.message || error}`] })),
     socialMedia: get(6, (error) => ({ available: false, source: "reddit-social-unavailable", score: 0, weight: 0, confidence: 0, sentiment: 0, manipulationRisk: 0, truthScore: 0, items: [], topItems: [], thesis: [`Reddit social factor unavailable: ${error.message || error}`] })),
+    minuteLearning: get(7, (error) => ({ available: false, source: "minute-learning-unavailable", score: 0, confidence: 0, thesis: [`Minute learning factor unavailable: ${error.message || error}`] })),
     marketRegime: marketRegimeFactor(candles),
     liquidity: liquidityFactor(candles),
     calibration: historicalCalibration.available ? historicalCalibration : simpleCalibration,
     historicalCalibration,
     simpleCalibration,
+    factorResearch: get(9, (error) => ({ available: false, source: "factor-research-unavailable", score: 0, confidence: 0, thesis: [`Factor research ML unavailable: ${error.message || error}`], values: { components: [] } })),
   };
   const signal = factorSignal(factors);
   const value = { symbol: normalizeMarketSymbol(symbol, key), market: key, source: "factor-layer", factors, signal };
@@ -8848,6 +10880,76 @@ function applyOptimizedEnsembleWeights(models = [], calibrationSummary = {}) {
     testImprovementPct: optimization.testImprovementPct ?? null,
     validationImprovementPct: optimization.validationImprovementPct ?? null,
     reason: optimization.reason || "OOS-approved learned ensemble weights applied.",
+  };
+}
+
+function isExternalDoubleCheckModel(model = {}) {
+  const name = String(model.name || "");
+  const family = String(model.values?.family || "");
+  return Boolean(model.values?.distilled)
+    || /蒸馏|开源策略复核|Freqtrade|LEAN|Backtrader|Hummingbot|FinRL/i.test(name)
+    || /freqtrade|lean|backtrader|hummingbot|finrl|external|open-source/i.test(family);
+}
+
+function applyExternalDoubleCheckCaps(models = []) {
+  const available = models.filter((model) => model.available && Number(model.weight || 0) > 0);
+  const external = available.filter(isExternalDoubleCheckModel);
+  if (!external.length) {
+    return {
+      applied: false,
+      maxExternalShare: 0.18,
+      maxSingleExternalShare: 0.06,
+      selfModelMinShare: 0.82,
+      reason: "No external double-check models carried live weight.",
+    };
+  }
+  const modelTotal = () => available.reduce((sum, model) => sum + Math.max(0, Number(model.weight || 0)), 0) || 1;
+  const maxSingleShare = 0.06;
+  let singleCapped = 0;
+  for (const model of external) {
+    const totalWithout = Math.max(0, modelTotal() - Math.max(0, Number(model.weight || 0)));
+    const maxWeight = totalWithout > 0
+      ? (maxSingleShare / Math.max(1e-9, 1 - maxSingleShare)) * totalWithout
+      : Number(model.weight || 0);
+    if (Number(model.weight || 0) > maxWeight) {
+      model.weight = Number(maxWeight.toFixed(5));
+      singleCapped += 1;
+    }
+  }
+  const totalAfterSingle = modelTotal();
+  const externalWeight = external.reduce((sum, model) => sum + Math.max(0, Number(model.weight || 0)), 0);
+  const maxExternalShare = 0.18;
+  let groupScale = 1;
+  if (externalWeight / totalAfterSingle > maxExternalShare) {
+    const internalWeight = Math.max(0, totalAfterSingle - externalWeight);
+    const cappedExternalWeight = (maxExternalShare / Math.max(1e-9, 1 - maxExternalShare)) * internalWeight;
+    groupScale = cappedExternalWeight / Math.max(1e-9, externalWeight);
+    for (const model of external) {
+      model.weight = Number((Number(model.weight || 0) * groupScale).toFixed(5));
+    }
+  }
+  for (const model of external) {
+    model.values = {
+      ...(model.values || {}),
+      doubleCheckOnly: true,
+      doubleCheckCap: true,
+      maxExternalShare,
+      maxSingleExternalShare: maxSingleShare,
+    };
+  }
+  const finalTotal = modelTotal();
+  const finalExternalWeight = external.reduce((sum, model) => sum + Math.max(0, Number(model.weight || 0)), 0);
+  return {
+    applied: singleCapped > 0 || groupScale < 0.999,
+    framework: "self-model-primary-double-check-cap",
+    maxExternalShare,
+    maxSingleExternalShare: maxSingleShare,
+    selfModelMinShare: 1 - maxExternalShare,
+    externalModelCount: external.length,
+    externalShare: Number((finalExternalWeight / finalTotal * 100).toFixed(1)),
+    cappedSingleCount: singleCapped,
+    groupScale: Number(groupScale.toFixed(3)),
+    reason: "External/open-source distilled models are capped as double-check evidence; local prediction models keep the dominant live ensemble share.",
   };
 }
 
@@ -9393,6 +11495,124 @@ function localPythonSignalModelViews({ technicals, analog, macroSignal, socialSi
   return views;
 }
 
+function evaluateSerializedLinearModel(model = {}, featureValues = {}) {
+  if (!model?.weights || !model?.centers || !model?.scales) return null;
+  let value = finiteNumber(model.intercept, 0);
+  for (const [name, weight] of Object.entries(model.weights || {})) {
+    const raw = finiteNumber(featureValues[name], finiteNumber(model.centers?.[name], 0));
+    const center = finiteNumber(model.centers?.[name], 0);
+    const scale = Math.max(1e-9, finiteNumber(model.scales?.[name], 1));
+    value += finiteNumber(weight, 0) * ((raw - center) / scale);
+  }
+  return Number(value.toFixed(4));
+}
+
+function modelZooCommitteeView({ technicals, analog, macroSignal, socialSignal, factor, strategy, calibrationSummary, preliminary }) {
+  const zoo = calibrationSummary?.modelZoo || {};
+  const candidates = Array.isArray(zoo.candidates) ? zoo.candidates : [];
+  if (!zoo.active || !candidates.length) {
+    return ensembleModel(
+      "模型委员会-OOS",
+      0,
+      0,
+      0.12,
+      false,
+      zoo.reason || "Model-zoo challenger committee is still collecting or failed OOS activation.",
+      { family: "model-zoo", status: zoo.status || "collecting" },
+    );
+  }
+  const features = buildLocalModelFeatureValues({ technicals, analog, macroSignal, socialSignal, factor, strategy, preliminary });
+  const weights = zoo.deploymentWeights || {};
+  const target = Math.max(1, finiteNumber(strategy?.targetUpside, 5));
+  const stop = Math.max(1, Math.abs(finiteNumber(strategy?.stopLoss, 4)));
+  const predictions = [];
+  for (const candidate of candidates) {
+    const weight = finiteNumber(weights[candidate.name], finiteNumber(candidate.weight, 0));
+    if (weight <= 0.01) continue;
+    let predicted = null;
+    if (candidate.name === "stored_ensemble") {
+      predicted = finiteNumber(preliminary?.projectedFinalReturn ?? analog?.model?.predictedReturn ?? technicals?.projectedUpside, 0);
+    } else if (candidate.kind === "ridge_regression" && candidate.model) {
+      predicted = evaluateSerializedLinearModel(candidate.model, features);
+    } else if (candidate.kind === "target_stop_logistic" && candidate.targetModel && candidate.stopModel) {
+      const targetLogit = evaluateSerializedLinearModel(candidate.targetModel, features);
+      const stopLogit = evaluateSerializedLinearModel(candidate.stopModel, features);
+      if (targetLogit != null && stopLogit != null) {
+        const targetProb = sigmoid(targetLogit);
+        const stopProb = sigmoid(stopLogit);
+        predicted = (targetProb - 0.5) * target * 2.25 - Math.max(0, stopProb - 0.35) * stop * 1.35 + (targetProb - stopProb) * 0.8;
+      }
+    } else if (candidate.name === "sequence_state_proxy") {
+      const trend = (finiteNumber(features.trend, 50) - 50) / 50;
+      const momentum = (finiteNumber(features.momentum, 50) - 50) / 50;
+      const change5 = finiteNumber(features.change5d, 0) / 8;
+      const change20 = finiteNumber(features.change20d, 0) / 18;
+      const volumeAccel = finiteNumber(features.volumeAccel, 0);
+      const pressure = finiteNumber(features.pressureChange, 0) + finiteNumber(features.buyPressure5, 0) * 0.7;
+      const profile = -finiteNumber(features.profileDistance, 0) / 5;
+      const liquidity = -Math.max(0, finiteNumber(features.liquidityShock, 0)) * 0.18;
+      const agreement = (finiteNumber(features.upsideAgreement, 50) - 50) / 50;
+      predicted = trend * 1.1 + momentum * 1.0 + change20 * 1.2 + change5 * 0.7 + volumeAccel * 0.42 + pressure * 0.95 + profile * 0.55 + agreement * 0.65 + liquidity;
+    }
+    if (predicted == null || !Number.isFinite(Number(predicted))) continue;
+    predictions.push({
+      name: candidate.name,
+      label: candidate.label || candidate.name,
+      weight,
+      predicted: clampNumber(Number(predicted), -Math.max(stop, target * 1.8), target * 1.8),
+      directionHitRate: finiteNumber(candidate.test?.directionHitRate, 0),
+    });
+  }
+  if (!predictions.length) {
+    return ensembleModel(
+      "模型委员会-OOS",
+      0,
+      0,
+      0.12,
+      false,
+      "Model-zoo is active, but no serializable candidate can be evaluated for this live symbol yet.",
+      { family: "model-zoo", status: "no_serializable_candidate" },
+    );
+  }
+  const totalWeight = predictions.reduce((sum, row) => sum + Math.max(0, row.weight), 0) || 1;
+  const projected = predictions.reduce((sum, row) => sum + row.predicted * (row.weight / totalWeight), 0);
+  const dispersion = Math.sqrt(predictions.reduce((sum, row) => sum + ((row.predicted - projected) ** 2) * (row.weight / totalWeight), 0));
+  const test = zoo.test || {};
+  const rejectGate = zoo.rejectGate || {};
+  const acceptedLift = finiteNumber(rejectGate.acceptedDirectionHitRate, 0) - finiteNumber(rejectGate.allDirectionHitRate, 0);
+  const residualPenalty = Math.max(0, finiteNumber(zoo.averageResidualCorrelation, 0) - 0.72) * 18;
+  const confidence = clampNumber(
+    45
+      + finiteNumber(test.directionHitRate, 50) * 0.32
+      + Math.max(0, finiteNumber(zoo.testImprovementVsEqualPct, 0)) * 0.42
+      + Math.max(0, acceptedLift) * 0.18
+      - dispersion * 2.1
+      - residualPenalty,
+    0,
+    92,
+  );
+  const activeCount = predictions.filter((row) => row.weight > 0.025).length;
+  return ensembleModel(
+    "模型委员会-OOS",
+    confidence,
+    projected,
+    clampNumber(0.09 + finiteNumber(zoo.deploymentBlend, 0) * 0.18, 0.08, 0.18),
+    activeCount >= 2,
+    `Model-zoo committee ${zoo.status}; test direction ${finiteNumber(test.directionHitRate, 0).toFixed(0)}%, MSE lift vs equal ${finiteNumber(zoo.testImprovementVsEqualPct, 0).toFixed(1)}%, dispersion ${dispersion.toFixed(2)}.`,
+    {
+      family: "model-zoo",
+      status: zoo.status,
+      activeCandidateCount: activeCount,
+      deploymentBlend: finiteNumber(zoo.deploymentBlend, 0),
+      projected,
+      dispersion,
+      rejectGate,
+      residualCorrelation: finiteNumber(zoo.averageResidualCorrelation, 0),
+      candidates: predictions.slice(0, 8),
+    },
+  );
+}
+
 function localNoTradeEvidenceFromEnsemble(ensemble = {}) {
   const models = Array.isArray(ensemble.models) ? ensemble.models : [];
   const stopRisks = models
@@ -9403,10 +11623,27 @@ function localNoTradeEvidenceFromEnsemble(ensemble = {}) {
     .filter((value) => Number.isFinite(value));
   const stopRiskProbability = stopRisks.length ? Math.max(...stopRisks) : null;
   const tradeQualityProbability = tradeQualities.length ? Math.max(...tradeQualities) : null;
+  const zooRows = models.filter((model) => model?.values?.family === "model-zoo" && model.available);
+  const zooRisk = zooRows.map((model) => {
+    const dispersion = Number(model.values?.dispersion);
+    const threshold = Number(model.values?.rejectGate?.threshold);
+    if (!Number.isFinite(dispersion) || !Number.isFinite(threshold) || threshold <= 0) return null;
+    return {
+      dispersion,
+      threshold,
+      blocked: dispersion > threshold,
+    };
+  }).filter(Boolean);
+  const modelZooBlocked = zooRisk.some((row) => row.blocked);
+  const modelZooDispersion = zooRisk.length ? Math.max(...zooRisk.map((row) => row.dispersion)) : null;
+  const modelZooThreshold = zooRisk.length ? Math.max(...zooRisk.map((row) => row.threshold)) : null;
   return {
-    active: stopRiskProbability != null || tradeQualityProbability != null,
+    active: stopRiskProbability != null || tradeQualityProbability != null || zooRisk.length > 0,
     stopRiskProbability,
     tradeQualityProbability,
+    modelZooBlocked,
+    modelZooDispersion,
+    modelZooThreshold,
   };
 }
 
@@ -9463,22 +11700,27 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   const modelDirectionalAccuracy = finiteNumber(analog?.model?.directionalAccuracy, 0);
   const modelPredictedReturn = finiteNumber(analog?.model?.predictedReturn, 0);
   const modelPredictedMaxUpside = finiteNumber(analog?.model?.predictedMaxUpside, 0);
+  const analogCoverageScore = finiteNumber(analog?.coverageScore, analogCount ? 55 : 0);
+  const modelCoverageScore = finiteNumber(analog?.model?.coverageScore, modelSampleCount ? 55 : 0);
+  const analogCoverageMultiplier = clampNumber(analogCoverageScore / 70, 0.32, 1.08);
+  const modelCoverageMultiplier = clampNumber(modelCoverageScore / 70, 0.32, 1.08);
+  const sampleCoverageScore = Math.max(analogCoverageScore, modelCoverageScore);
   const macroChecked = Number(macroSignal?.checkedItems || 0);
   const socialChecked = Number(socialSignal?.checkedItems || 0);
   const factorChecked = Number(factor?.checked || 0);
   const analogReliable = analogCount >= 5;
   const modelReliable = modelSampleCount >= 60;
   const samplePower = Math.max(
-    analogReliable ? Math.min(0.45, analogCount / 18) : 0,
-    modelReliable ? Math.min(0.85, modelSampleCount / 260) : 0,
+    analogReliable ? Math.min(0.45, analogCount / 18) * analogCoverageMultiplier : 0,
+    modelReliable ? Math.min(0.85, modelSampleCount / 260) * modelCoverageMultiplier : 0,
   );
   const reliabilityInputs = [
-    analogReliable ? { value: analogDirectionHitRate, weight: Math.min(0.45, analogCount / 18) } : null,
-    modelReliable ? { value: modelDirectionalAccuracy || modelTargetHitAccuracy, weight: Math.min(0.85, modelSampleCount / 260) } : null,
+    analogReliable ? { value: analogDirectionHitRate, weight: Math.min(0.45, analogCount / 18) * analogCoverageMultiplier } : null,
+    modelReliable ? { value: modelDirectionalAccuracy || modelTargetHitAccuracy, weight: Math.min(0.85, modelSampleCount / 260) * modelCoverageMultiplier } : null,
   ].filter(Boolean);
   const strategyInputs = [
-    analogReliable ? { value: analogStrategyHitProbability, weight: Math.min(0.45, analogCount / 18) } : null,
-    modelReliable ? { value: modelTargetHitAccuracy, weight: Math.min(0.85, modelSampleCount / 260) } : null,
+    analogReliable ? { value: analogStrategyHitProbability, weight: Math.min(0.45, analogCount / 18) * analogCoverageMultiplier } : null,
+    modelReliable ? { value: modelTargetHitAccuracy, weight: Math.min(0.85, modelSampleCount / 260) * modelCoverageMultiplier } : null,
   ].filter(Boolean);
   const reliabilityWeight = reliabilityInputs.reduce((sum, item) => sum + item.weight, 0) || 1;
   const strategyWeight = strategyInputs.reduce((sum, item) => sum + item.weight, 0) || 1;
@@ -9489,14 +11731,14 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     ? strategyInputs.reduce((sum, item) => sum + item.value * item.weight, 0) / strategyWeight
     : 0;
   const historySupportsUpside = (
-    (analogReliable && analogStrategyHitProbability >= 52 && analogRiskAdjustedReturn > 0 && analogStopRate <= 42)
-    || (modelReliable && modelTargetHitAccuracy >= 56 && modelPredictedReturn > targetUpside * 0.2)
-    || (analogReliable && analogMaxUpsideHitRate >= 56 && analogMaxUpside >= targetUpside * 0.45 && analogStopRate <= 45)
-    || (modelReliable && modelMaxUpsideHitAccuracy >= 58 && modelPredictedMaxUpside >= targetUpside * 0.5)
+    (analogReliable && analogCoverageScore >= 45 && analogStrategyHitProbability >= 52 && analogRiskAdjustedReturn > 0 && analogStopRate <= 42)
+    || (modelReliable && modelCoverageScore >= 45 && modelTargetHitAccuracy >= 56 && modelPredictedReturn > targetUpside * 0.2)
+    || (analogReliable && analogCoverageScore >= 45 && analogMaxUpsideHitRate >= 56 && analogMaxUpside >= targetUpside * 0.45 && analogStopRate <= 45)
+    || (modelReliable && modelCoverageScore >= 45 && modelMaxUpsideHitAccuracy >= 58 && modelPredictedMaxUpside >= targetUpside * 0.5)
   );
   const historyWarnsUpside = (
-    (analogReliable && (analogStrategyHitProbability < 38 || analogRiskAdjustedReturn < -0.45 || analogStopRate >= 48))
-    || (modelReliable && modelTargetHitAccuracy < 52 && modelPredictedReturn < targetUpside * 0.2)
+    (analogReliable && (analogCoverageScore < 35 || analogStrategyHitProbability < 38 || analogRiskAdjustedReturn < -0.45 || analogStopRate >= 48))
+    || (modelReliable && (modelCoverageScore < 35 || (modelTargetHitAccuracy < 52 && modelPredictedReturn < targetUpside * 0.2)))
     || (modelReliable && modelMaxUpsideHitAccuracy < 48 && modelPredictedMaxUpside < targetUpside * 0.35)
   );
   const models = [
@@ -9570,9 +11812,23 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
   if (localSignalViews.length) {
     models.push(...localSignalViews);
   }
+  const zooView = modelZooCommitteeView({
+    technicals,
+    analog,
+    macroSignal,
+    socialSignal,
+    factor,
+    strategy,
+    calibrationSummary,
+    preliminary: preliminaryModelConsensus(models),
+  });
+  if (zooView) {
+    models.push(zooView);
+  }
   const performanceWeightAdjusted = applyPerformanceAndRegimeWeights(models, calibrationSummary, marketProfile);
   const agreementWeighting = rebalanceModelAgreementWeights(models);
   const optimizedWeighting = applyOptimizedEnsembleWeights(models, calibrationSummary);
+  const doubleCheckWeighting = applyExternalDoubleCheckCaps(models);
   const available = models.filter((model) => model.available && model.weight > 0);
   const totalWeight = available.reduce((sum, model) => sum + model.weight, 0) || 1;
   for (const model of models) {
@@ -9612,6 +11868,7 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
     evidenceBonus: Number(evidenceBonus.toFixed(2)),
     agreementWeighting,
     optimizedWeighting,
+    doubleCheckWeighting,
     weightingMethod: optimizedWeighting.applied ? "oos-optimized-simplex" : "prior-performance-regime",
     marketRegime: marketProfile,
     performanceWeightAdjusted,
@@ -9632,6 +11889,9 @@ function buildModelEnsemble({ technicals, analog, macroSignal, socialSignal, fac
       blocksUpside: historyWarnsUpside,
       modelPredictedReturn: Number(modelPredictedReturn.toFixed(2)),
       analogRiskAdjustedReturn: Number(analogRiskAdjustedReturn.toFixed(2)),
+      sampleCoverageScore: Number(sampleCoverageScore.toFixed(1)),
+      analogCoverageScore: Number(analogCoverageScore.toFixed(1)),
+      modelCoverageScore: Number(modelCoverageScore.toFixed(1)),
     },
     models,
   };
@@ -9653,6 +11913,7 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   const strategyProbabilityTarget = Math.max(stricterMarket ? 60 : 55, Math.min(stricterMarket ? 76 : 68, baseStrategyProbabilityTarget)) + Number(marketRegime.buyThresholdBonus || 0);
   const historySamplePower = Number(historyGate.samplePower || 0);
   const historyReliability = Number(historyGate.reliability || 0);
+  const historyCoverageScore = Number(historyGate.sampleCoverageScore || Math.max(Number(historyGate.analogCoverageScore || 0), Number(historyGate.modelCoverageScore || 0)) || 0);
   const rawStrategyHitProbability = Number(historyGate.strategyHitProbability || 0);
   const strategyHitProbability = strategyCalibration?.sampleCount >= 5
     ? Number(strategyCalibration.probability || rawStrategyHitProbability)
@@ -9690,6 +11951,10 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     noTradeBlocked = true;
     noTradeReasons.push(`本地交易质量不足 ${Number(noTradeEvidence.tradeQualityProbability).toFixed(0)}% / 要求 ${minTradeQuality.toFixed(0)}%`);
   }
+  if (noTradeEvidence.modelZooBlocked) {
+    noTradeBlocked = true;
+    noTradeReasons.push(`模型委员会分歧过高 ${Number(noTradeEvidence.modelZooDispersion || 0).toFixed(2)} / 阈值 ${Number(noTradeEvidence.modelZooThreshold || 0).toFixed(2)}`);
+  }
 
   let shrink = 0.68;
   if (consensus >= 82 && upsideAgreement >= 70) shrink += 0.14;
@@ -9700,6 +11965,8 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   if (evidenceBonus >= 3) shrink += 0.05;
   if (disagreement > 5) shrink -= Math.min(0.18, (disagreement - 5) * 0.035);
   if (marketValidation?.degraded) shrink -= 0.1;
+  if (marketValidation?.shortHistory) shrink -= 0.18;
+  if (historyCoverageScore > 0 && historyCoverageScore < 45 && Number(projectedUpsideRaw || 0) > 0) shrink -= 0.16;
   if (marketRegime.upsideShrink && Number(projectedUpsideRaw || 0) > 0) shrink *= Number(marketRegime.upsideShrink || 1);
   if (calibration?.sampleCount >= 5 && Number(calibration.confidence || 0) < Number(score || 0)) shrink -= 0.05;
   if (Number(projectedUpsideRaw || 0) > 0 && historySamplePower >= 0.25) {
@@ -9752,6 +12019,10 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     confidenceCap = Math.min(confidenceCap, 75);
     reasons.push("行情仅单源真实数据");
   }
+  if (marketValidation?.shortHistory) {
+    confidenceCap = Math.min(confidenceCap, 55);
+    reasons.push(`新上市/短历史：仅 ${Number(marketValidation.candleCount || 0)} 根K线，完整回测不足`);
+  }
   if (marketRegime.regime === "downtrend") {
     confidenceCap = Math.min(confidenceCap, 72);
     reasons.push("市场环境为下跌趋势");
@@ -9762,6 +12033,10 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
   if (!calibration || Number(calibration.sampleCount || 0) < 5) {
     confidenceCap = Math.min(confidenceCap, 84);
     reasons.push("历史校准样本仍在收集");
+  }
+  if (historyCoverageScore > 0 && historyCoverageScore < 45) {
+    confidenceCap = Math.min(confidenceCap, 60);
+    reasons.push(`历史样本覆盖不足 ${historyCoverageScore.toFixed(0)}/100`);
   }
   if (Number(projectedUpsideRaw || 0) > 0 && historySamplePower < 0.25) {
     reasons.push("样本外策略达标验证不足");
@@ -9811,6 +12086,8 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
     && strategyHitProbability >= strategyProbabilityTarget
     && historyOkForBuy
     && backtestPassed
+    && (historyCoverageScore === 0 || historyCoverageScore >= 45)
+    && !marketValidation?.shortHistory
     && !noTradeBlocked;
 
   return {
@@ -9835,6 +12112,8 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
       blocked: noTradeBlocked,
       stopRiskProbability: noTradeEvidence.stopRiskProbability == null ? null : Number(Number(noTradeEvidence.stopRiskProbability).toFixed(1)),
       tradeQualityProbability: noTradeEvidence.tradeQualityProbability == null ? null : Number(Number(noTradeEvidence.tradeQualityProbability).toFixed(1)),
+      modelZooDispersion: noTradeEvidence.modelZooDispersion == null ? null : Number(Number(noTradeEvidence.modelZooDispersion).toFixed(2)),
+      modelZooThreshold: noTradeEvidence.modelZooThreshold == null ? null : Number(Number(noTradeEvidence.modelZooThreshold).toFixed(2)),
       stopRiskLimit,
       minTradeQuality: Number(minTradeQuality.toFixed(1)),
       reasons: noTradeReasons,
@@ -9845,6 +12124,7 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
       okForBuy: historyOkForBuy,
       strategyHitProbability: Number(strategyHitProbability.toFixed(1)),
       rawStrategyHitProbability: Number(rawStrategyHitProbability.toFixed(1)),
+      sampleCoverageScore: Number(historyCoverageScore.toFixed(1)),
     },
     backtestGate: {
       passed: backtestPassed,
@@ -9857,6 +12137,7 @@ function conservativeForecastCalibration({ ensemble, score, projectedUpsideRaw, 
       avgReturn: Number(walkAvgReturn.toFixed(2)),
       requiredHitRate: Number(Math.max(52, strategyProbabilityTarget - 8).toFixed(1)),
       reason: backtestPassed ? "passed" : "positive forecast blocked until walk-forward/OOS validation improves",
+      shortHistoryBlocked: Boolean(marketValidation?.shortHistory),
     },
   };
 }
@@ -10155,6 +12436,9 @@ function localAnalysis(input) {
       technicals.rsi >= 45 && technicals.rsi <= 68 ? "RSI is in a constructive range." : "RSI suggests either weak momentum or crowding.",
       `Multi-model ensemble: ${ensemble.direction} consensus ${ensemble.consensusAgreement}%, upside agreement ${ensemble.upsideAgreement}%, raw target confidence ${ensemble.confidence}%.`,
       `Model cross-check: evidence bonus ${finiteNumber(ensemble.evidenceBonus, 0).toFixed(1)}%, disagreement penalty ${finiteNumber(ensemble.disagreementPenalty, 0).toFixed(1)}%.`,
+      ensemble.doubleCheckWeighting?.externalModelCount
+        ? `External double-check cap: open-source/distilled models are limited to ${Number(ensemble.doubleCheckWeighting.externalShare || 0).toFixed(1)}% live weight; local models remain the primary forecast driver.`
+        : "External double-check cap: no external/distilled model is carrying live weight.",
       adaptive.reasons.length ? `Adaptive learning: ${adaptive.reasons.join("；")}。旧预测会保留到周期结束并持续校准短/中/长期参数。` : "Adaptive learning: no material penalty from prior forecast outcomes yet.",
       `Conservative calibration: projected upside shrink ${conservative.shrink}x, confidence cap ${conservative.confidenceCap}%, ${conservative.buyEligible ? "high-conviction gate passed" : `high-conviction gate blocked (${conservative.reasons.join("、") || "证据仍不足"})`}.`,
       conservative.noTradeGate?.active
@@ -10170,6 +12454,7 @@ function localAnalysis(input) {
       ensemble.historyGate?.samplePower >= 0.25
         ? `Reliability split: directional reliability ${Number(ensemble.historyGate.reliability || 0).toFixed(0)}%, strategy-hit probability ${Number(ensemble.historyGate.strategyHitProbability || 0).toFixed(0)}%, analog target-hit ${Number(ensemble.historyGate.analogTargetHitRate || 0).toFixed(0)}%, analog max-upside hit ${Number(ensemble.historyGate.analogMaxUpsideHitRate || 0).toFixed(0)}%, self-supervised max-upside hit ${Number(ensemble.historyGate.modelMaxUpsideHitAccuracy || 0).toFixed(0)}%; ${ensemble.historyGate.supportsUpside ? "supports upside" : ensemble.historyGate.blocksUpside ? "blocks upside" : "neutral"}.`
         : "Strategy hit validation: not enough out-of-sample history to lift confidence.",
+      `Sample coverage: ${Number(ensemble.historyGate?.sampleCoverageScore || 0).toFixed(0)}/100 (analog ${Number(ensemble.historyGate?.analogCoverageScore || 0).toFixed(0)}, model ${Number(ensemble.historyGate?.modelCoverageScore || 0).toFixed(0)}); low coverage means the current setup is treated as out-of-distribution and cannot lift buy confidence.`,
       fundamentals ? `Fundamentals checked: PE ${fundamentals.peRatio || "n/a"}, dividend yield ${fundamentals.dividendYield || "n/a"}, beta ${fundamentals.beta || "n/a"}.` : "Fundamental data was not available from the configured provider.",
       news.length ? `Macro/industry/news signal: ${macroSignal.stance}, score ${macroSignal.score}, checked ${macroSignal.checkedItems} multi-source items across direct, peer, upstream, sector, macro, and global channels.` : "No fresh macro or company news was available from the configured provider.",
       ...(macroSignal.influences || []).slice(0, 3).map((item) => `News impact ${item.channel || "mixed"} (${item.source || "source"}, weight ${item.weight}): ${item.title}`),
@@ -11230,6 +13515,30 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/backend-monitor/status" && req.method === "GET") {
+    sendJson(res, 200, await backendMonitorStatus());
+    return;
+  }
+
+  if (url.pathname === "/api/backend-monitor/config") {
+    if (req.method === "GET") {
+      sendJson(res, 200, await readBackendMonitorConfig());
+      return;
+    }
+    if (req.method === "POST") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      const payload = JSON.parse(body || "{}");
+      sendJson(res, 200, await writeBackendMonitorConfig(payload));
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/backend-monitor/run" && req.method === "POST") {
+    sendJson(res, 202, await runBackendMonitorTick("manual-api"));
+    return;
+  }
+
   if (url.pathname === "/api/qlib-readiness" && req.method === "GET") {
     sendJson(res, 200, await runPythonQuantCore("qlib-readiness"));
     return;
@@ -11434,19 +13743,40 @@ async function handleApi(req, res, url) {
     const market = marketFromUrl(url);
     const symbol = normalizeMarketSymbol(url.searchParams.get("symbol") || "", market);
     const horizonDays = Math.max(1, Math.min(60, Number(url.searchParams.get("horizonDays") || 15)));
-    const marketData = await quantLabMarketData(symbol, market, "1y", "1d");
+    const marketData = await quantLabMarketData(symbol, market, process.env.FACTOR_LAB_RANGE || "5y", "1d");
     const result = await runPythonQuantCore("factor-lab", {
       market,
       symbol,
       horizon_days: horizonDays,
       candles: marketData.candles,
     });
+    const savedFactorResearch = await writeFactorResearchModelSnapshot(market, symbol, result).catch(() => null);
+    if (savedFactorResearch) {
+      await appendModelChangeLogFile(market, {
+        event_type: "model-change-log-factor-research",
+        entity_id: `${market}:${symbol}:factor-lab:${savedFactorResearch.savedAt}`,
+        payload: {
+          title: "因子实验室更新动态权重",
+          type: "factor-research-ml",
+          market,
+          symbol,
+          framework: savedFactorResearch.framework,
+          sampleCount: savedFactorResearch.sampleCount,
+          candidateCount: savedFactorResearch.candidateCount,
+          admittedCount: savedFactorResearch.admittedCount,
+          liveScore: savedFactorResearch.liveSignal?.score,
+          holdout: savedFactorResearch.mlBacktest?.test || null,
+          leakageControl: savedFactorResearch.leakageControl,
+        },
+      }).catch(() => null);
+    }
     sendJson(res, 200, {
       ...result,
       source: marketData.source,
       validation: marketData.validation || null,
       warning: marketData.warning || "",
       snapshotSavedAt: marketData.snapshotSavedAt || null,
+      savedFactorResearch,
     });
     return;
   }
@@ -11831,8 +14161,65 @@ async function handleApi(req, res, url) {
       symbols: payload.symbols || [],
       strategy,
       range: payload.range || "5y",
-      limit: payload.limit || 20,
+      limit: payload.limit,
+      largeSample: payload.largeSample !== false,
     }));
+    return;
+  }
+
+  if (url.pathname === "/api/factor-evolution/status" && req.method === "GET") {
+    sendJson(res, 200, await factorEvolutionSchedulerStatus());
+    return;
+  }
+
+  if (url.pathname === "/api/factor-evolution/run" && req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body || "{}");
+    const mode = String(payload.mode || "light").toLowerCase() === "heavy" ? "heavy" : "light";
+    sendJson(res, 202, await runFactorEvolutionCycle(mode, {
+      limit: payload.limit,
+      generations: payload.generations,
+      population: payload.population,
+    }));
+    return;
+  }
+
+  if (url.pathname === "/api/factor-research-batch" && req.method === "POST") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const payload = JSON.parse(body || "{}");
+    const market = safeMarket(payload.market || marketFromUrl(url));
+    const trainingUniverse = await expandTrainingSymbolsForMarket({
+      market,
+      symbols: payload.symbols || [],
+      limit: payload.limit || process.env.FACTOR_RESEARCH_BATCH_SYMBOL_LIMIT || process.env.HISTORICAL_BACKTEST_LARGE_SAMPLE_LIMIT || 80,
+      largeSample: payload.largeSample !== false,
+    });
+    const symbols = trainingUniverse.trainingSymbols;
+    const range = payload.range || process.env.FACTOR_RESEARCH_BATCH_RANGE || "5y";
+    const concurrency = Math.max(1, Math.min(5, Number(process.env.HISTORICAL_BACKTEST_FETCH_CONCURRENCY || 4)));
+    const items = [];
+    let cursor = 0;
+    async function worker() {
+      while (cursor < symbols.length) {
+        const symbol = symbols[cursor];
+        cursor += 1;
+        items.push(await fetchBacktestCandlesForSymbol(symbol, market, range));
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, () => worker()));
+    const horizons = Array.isArray(payload.horizons) && payload.horizons.length
+      ? payload.horizons.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0)
+      : [5, Number(payload.horizonDays || 15), 30];
+    sendJson(res, 200, {
+      ...(await crossSectionalFactorResearchForItems({ market, items, horizons })),
+      range,
+      requestedSymbols: trainingUniverse.requestedSymbols,
+      trainingSymbols: symbols,
+      trainingUniverse,
+      dataSources: items.map((item) => ({ symbol: item.symbol, source: item.source, candles: item.candles?.length || 0, warning: item.warning || item.error || "" })),
+    });
     return;
   }
 
@@ -11930,7 +14317,48 @@ const newsCleanupTimer = setInterval(() => {
 }, NEWS_DISK_CACHE_CLEANUP_MS);
 newsCleanupTimer.unref?.();
 
+function startBackendMonitorScheduler() {
+  const defaults = backendMonitorDefaults();
+  if (!defaults.enabled) {
+    backendMonitorState.enabled = false;
+    return;
+  }
+  backendMonitorState.enabled = true;
+  backendMonitorState.startedAt = new Date().toISOString();
+  const startupDelayMs = Math.max(15_000, Number(process.env.BACKEND_MONITOR_STARTUP_DELAY_MS || 45_000));
+  const startupTimer = setTimeout(() => {
+    runBackendMonitorTick("startup").catch((error) => {
+      backendMonitorState.lastError = error.message || String(error);
+      console.warn(`Backend monitor startup tick skipped: ${backendMonitorState.lastError}`);
+    });
+  }, startupDelayMs);
+  startupTimer.unref?.();
+  backendMonitorTimer = setInterval(() => {
+    runBackendMonitorScheduledTick().catch((error) => {
+      backendMonitorState.lastError = error.message || String(error);
+      console.warn(`Backend monitor interval tick skipped: ${backendMonitorState.lastError}`);
+    });
+  }, defaults.refresh.checkMs);
+  backendMonitorTimer.unref?.();
+}
+
 if (process.env.SERVER_DISABLE_LISTEN !== "true") {
+  const evolutionConfig = factorEvolutionConfig();
+  if (evolutionConfig.enabled) {
+    const startupTimer = setTimeout(() => {
+      tickFactorEvolutionScheduler("startup").catch((error) => {
+        console.warn(`Factor evolution scheduler startup check skipped: ${error.message || error}`);
+      });
+    }, evolutionConfig.startupDelayMs);
+    startupTimer.unref?.();
+    const evolutionTimer = setInterval(() => {
+      tickFactorEvolutionScheduler("interval").catch((error) => {
+        console.warn(`Factor evolution scheduler interval check skipped: ${error.message || error}`);
+      });
+    }, evolutionConfig.checkIntervalMs);
+    evolutionTimer.unref?.();
+  }
+  startBackendMonitorScheduler();
   server.listen(port, host, () => {
     console.log(`Global Quant Watch running at http://${host}:${port}`);
   });
@@ -11953,6 +14381,14 @@ export {
   redditCacheTtlForItem,
   redditProviderStatus,
   fetchRedditSocialFactor,
+  backendMarketSession,
+  backendMonitorBudgetLimits,
+  backendMonitorStatus,
+  computeServerTechnicals,
+  intradaySampleRows,
+  minuteLearningFactorFor,
+  sanitizeBackendMonitorConfig,
+  trainIntradayLinearModel,
   stockAnalysisHistoryRows,
   tradeFootprintRows,
   tushareRows,

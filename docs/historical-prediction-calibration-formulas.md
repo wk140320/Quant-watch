@@ -157,8 +157,11 @@ hitTarget = maxUpside >= targetUpside
 hitStop = maxDrawdown <= -stopLoss
 targetWins = hitTarget and target touch occurs before stop touch when both occur
 stopWins = hitStop and stop touch occurs before target touch when both occur
+ambiguousBarrierOrder = one OHLC bar touched both target and stop, so intrabar order is unknowable
 riskAdjustedReturn = targetUpside if targetWins else -stopLoss if stopWins else forwardReturn
 ```
+
+When `ambiguousBarrierOrder=true`, neither `targetWins` nor `stopWins` is treated as a clean class label. The sample is retained for chronological continuity but receives a lower label-confidence weight. This removes an optimistic bias from daily bars where the high and low crossed both barriers on the same date.
 
 ## Prediction Heads
 
@@ -281,3 +284,354 @@ It combines:
 - The formula catalog above, plus the reason each feature is allowed into the model.
 
 This view is diagnostic only. A high displayed weight means the feature is influential in the current local model evidence; it does not bypass the out-of-sample gate.
+
+## Data Quality And Label Confidence
+
+Historical calibration now uses quality-weighted learning. The goal is to keep chronological continuity while reducing the influence of questionable rows.
+
+```text
+candleQualityWeight = clamp(candleScore / 100, 0.12, 1.0)
+
+candleScore penalties:
+  non_positive_price
+  ohlc_range_inconsistent
+  zero_volume
+  volume_spike
+  extreme_return
+  possible_split_or_provider_jump
+  stale_close_low_volume
+  large_calendar_gap
+```
+
+```text
+labelConfidence =
+  0.34
+  + min(current/future candle weights) * 0.42
+  + average future candle weight * 0.18
+  - near_barrier_boundary penalty
+  - both_target_and_stop_touched penalty
+  - incomplete_future_window penalty
+
+sampleWeight = min(candleQualityWeight, labelConfidence)
+```
+
+The following training and evaluation layers consume `sampleWeight`:
+
+- rolling Ridge return heads
+- rolling Logistic target/stop heads
+- KNN historical analog averages
+- prediction-head ensemble weight fitting
+- calibration buckets and Brier summaries
+
+This means a label can only become highly trusted when the data row itself is clean and the future label window is not ambiguous.
+
+## Model Zoo Committee
+
+The local Python layer now trains a challenger committee on resolved prediction samples. It is separate from the historical OHLCV method weights above: the historical layer asks "which prediction formula worked on old candles?", while the model zoo asks "which live prediction model family worked on our resolved prediction records?"
+
+Candidate families:
+
+```text
+stored_ensemble = original live ensemble prediction saved at forecast time
+technical_ridge = ridge(features: trend, momentum, RSI, volume, risk, gap)
+factor_ridge = ridge(features: factor, news/social/macro/sector/liquidity/calibration)
+orderflow_profile_ridge = ridge(features: buyPressure, pressureChange, volumeAccel, profileDistance)
+wide_regularized_ridge = ridge(all stable technical + factor + agreement features)
+target_stop_meta = logistic(P target-before-stop) and logistic(P stop-first), mapped to expected return
+sequence_state_proxy = lightweight trend/pressure/volume state proxy until LSTM/Transformer has enough data
+tree_boosting_return = optional LightGBM/sklearn gradient boosting challenger when importable
+```
+
+All candidates use the same purged time split:
+
+```text
+train -> validation -> test
+weights are learned on validation only
+test is untouched holdout
+```
+
+Model-zoo ensemble objective:
+
+```text
+zooPrediction = sum(weight_i * candidatePrediction_i)
+objective = minimize mean((zooPrediction - actualForwardReturn)^2)
+constraints = weight_i >= 0, sum(weight_i) = 1
+```
+
+Activation gate:
+
+```text
+active if:
+  test window exists
+  validation direction hit >= 48%
+  and (
+    test MSE improves vs equal weight >= 1%
+    or test MSE improves vs stored ensemble >= 1%
+    or direction lift vs equal/stored >= 3 percentage points
+  )
+  and test direction hit is not materially worse than equal/stored baselines
+```
+
+If the committee fails this gate, its weights and leaderboard are shown as research evidence only. It cannot increase live confidence.
+
+External/open-source challengers are capped:
+
+```text
+self-built/local model share >= 88% inside model-zoo deployment weights
+external/open-source challenger share <= 12%
+single external challenger share <= 8%
+```
+
+This means LightGBM/sklearn, Qlib-style, or other project adapters can confirm or challenge the local forecast, but they do not become the primary predictor.
+
+## Reject-Prediction Gate
+
+The committee also computes per-row prediction dispersion:
+
+```text
+dispersion_t = weighted_std(candidatePrediction_i,t)
+threshold = validation/test dispersion percentile around 72%
+```
+
+When live committee dispersion is above the learned threshold, the quality gate treats the setup as high disagreement:
+
+```text
+high dispersion -> lower confidence or block high-conviction buy
+```
+
+This is intentionally conservative. It improves precision by refusing ambiguous setups rather than forcing a forecast every time.
+
+## Prediction Weight Stability Gate
+
+Historical method weights now need to pass a rolling later-period stability gate before they can raise live confidence.
+
+For each fold:
+
+```text
+fit_rows = prediction cuts before the fold validation segment
+validation_rows = tail of fit history
+test_rows = current later fold
+
+weights = argmin weighted_mse(fit_rows, validation_rows)
+mseImprovementPct = (mse(equalWeight) - mse(weights)) / mse(equalWeight) * 100
+directionLiftPct = directionHit(weights) - directionHit(equalWeight)
+```
+
+Across folds:
+
+```text
+weightDrift = mean(sum(abs(weight_i,fold - avgWeight_i)))
+
+stabilityScore =
+  52
+  + avgMseImprovementPct * 0.9
+  + avgDirectionLiftPct * 1.7
+  + (positiveMseFoldShare - 0.5) * 24
+  + (positiveDirectionFoldShare - 0.5) * 20
+  - weightDrift * 18
+```
+
+Deployment gate:
+
+```text
+stable =
+  stabilityScore >= 52
+  and avgMseImprovementPct >= -1.5
+  and avgDirectionLiftPct >= -1.5
+  and minDirectionHitRate >= 42
+  and weightDrift <= 0.52
+```
+
+If this gate fails, the optimized weights remain visible as research evidence but are not used to increase high-conviction forecasts.
+
+## Short-History Protection
+
+New listings and recently renamed tickers cannot provide a reliable historical learning set. The app uses:
+
+```text
+minimumUsableCandles = 10
+fullHistoryCandles = 35
+```
+
+Rules:
+
+```text
+candles < 10:
+  reject analysis as insufficient real data
+
+10 <= candles < 35:
+  allow limited technical display
+  disable historical analog/self-supervised backtest
+  set marketValidation.shortHistory = true
+  cap confidence <= 55
+  block buyEligible
+```
+
+This is why a new stock such as SPCX can show price/volume/MACD but should not receive a high-confidence buy label until enough point-in-time history exists.
+
+## Sample Coverage / OOD Gate
+
+The historical learner now estimates whether the current feature vector is covered by prior point-in-time samples.
+
+Distances are measured after feature normalization:
+
+```text
+distance(x_t, x_i) = sqrt(mean((standardize(x_t) - standardize(x_i))^2))
+```
+
+For the selected nearest-neighbor set:
+
+```text
+nearestDistance = min(distance)
+avgNeighborDistance = mean(distance_topK)
+p75NeighborDistance = percentile75(distance_topK)
+sampleBonus = min(8, log10(trainSampleCount) * 3.5)
+
+coverageScore =
+  clamp(
+    104
+    - nearestDistance * 24
+    - avgNeighborDistance * 31
+    - p75NeighborDistance * 11
+    + sampleBonus,
+    0,
+    100
+  )
+
+coverageWeight = clamp(0.22 + coverageScore / 100 * 0.78, 0.22, 1.0)
+oodRisk = 1 - coverageScore / 100
+```
+
+Training/calibration use:
+
+```text
+effectiveSampleWeight = dataQualityWeight * labelConfidence * coverageWeight
+```
+
+Live high-conviction use:
+
+```text
+if coverageScore < 45:
+  samplePower is reduced
+  positive buy eligibility is blocked
+  confidence cap is lowered
+```
+
+The goal is precision, not forced coverage. If the current setup is out-of-distribution, the model should say "I do not have enough comparable evidence" instead of inventing certainty.
+
+## Regime-Bucket Calibration
+
+Historical prediction cuts are also grouped by market state visible at the prediction date.
+
+Bucket rules:
+
+```text
+if coverageScore < 40:
+  low_coverage
+elif riskScore < 48 or abs(change5) >= 8 or volumeRatio >= 3.2:
+  volatile
+elif rsi >= 72 or (change5 >= 6 and trendScore >= 60):
+  overextended
+elif trendScore >= 62 and momentumScore >= 56 and change20 >= 2:
+  uptrend
+elif trendScore <= 42 and change20 <= -2:
+  downtrend
+elif volumeRatio >= 1.35 and change5 >= 0 and momentumScore >= 52:
+  volume_breakout
+else:
+  range
+```
+
+For each bucket:
+
+```text
+bucketTargetHitRate = weighted_mean(targetWins)
+bucketStopRate = weighted_mean(stopWins)
+bucketDirectionHitRate = weighted_mean(sign(predictedReturn) == sign(actualFinalReturn))
+bucketAvgReturn = weighted_mean(actualFinalReturn)
+bucketScore = (targetHitRate - 52) / 3.5 + avgReturn * 0.25 - stopRate * 0.04
+```
+
+The live/current bucket is evaluated separately:
+
+```text
+if matched bucket has enough effective samples and:
+  targetHitRate < 50
+  or stopRate > 48
+  or avgReturn < 0:
+    penalize historical backtest factor score
+```
+
+This avoids using a broad average when the current regime historically underperformed.
+
+## Conformal Residual Calibration
+
+For every point-in-time historical prediction:
+
+```text
+finalReturnError_t = abs(predictedFinalReturn_t - actualFinalReturn_t)
+riskAdjustedError_t = abs(predictedReturn_t - actualRiskAdjustedReturn_t)
+maxUpsideError_t = abs(predictedMaxUpside_t - max(0, actualMaxUpside_t))
+targetProbabilityError_t = abs(targetProbability_t - targetWins_t)
+```
+
+Weighted empirical quantiles:
+
+```text
+P80 = weighted_quantile(finalReturnError, sampleWeight, 0.8)
+P90 = weighted_quantile(finalReturnError, sampleWeight, 0.9)
+
+interval80 = [prediction - P80, prediction + P80]
+interval90 = [prediction - P90, prediction + P90]
+```
+
+Uncertainty score:
+
+```text
+uncertaintyScore =
+  clamp(
+    100
+    - finalReturnAbsErrorP80 * 7.5
+    - finalReturnAbsErrorP90 * 3.2
+    - directionMissRate * 22,
+    0,
+    100
+  )
+```
+
+Historical factor penalty:
+
+```text
+conformalPenalty =
+  max(0, finalReturnAbsErrorP80 - 2.4) * 0.22
+  + max(0, finalReturnAbsErrorP90 - 4.2) * 0.12
+```
+
+The model may still predict direction, but wide residual bands prevent a narrow high-confidence magnitude label.
+
+## Path-Noise Label Quality
+
+The label-quality layer measures whether a completed future window is a clean training label or a noisy path:
+
+```text
+pathVolatility = stdev(close-to-close returns inside future window)
+pathChopRatio = sum(abs(dailyReturn)) / max(abs(forwardReturn), 0.35)
+twoSidedExcursionRatio =
+  min(maxUpside / targetUpside, abs(maxDrawdown) / stopLoss)
+directionFlips = sign changes of cumulative return inside the horizon
+```
+
+Penalty flags:
+
+```text
+same_bar_barrier_order_unknown
+final_return_inconclusive
+high_path_chop
+two_sided_excursion
+frequent_direction_flips
+high_path_volatility
+```
+
+These flags lower `labelConfidence` and increase `labelNoiseScore`. Ridge, logistic, KNN analogs, method-weight calibration, residual calibration, and reported historical metrics use the reduced `sampleWeight`.
+
+Leakage rule: path-noise metrics are computed only for historical labels whose full future horizon is complete. They are never computed for the live prediction row.

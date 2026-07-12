@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>后台监控控制台 · Global Quant Watch</title>
+    <link rel="stylesheet" href="/monitor.css?v=20260703">
+  </head>
+  <body>
+    <main class="monitor-shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Global Quant Watch</p>
+          <h1>后台监控控制台</h1>
+          <p id="statusText">正在读取后台状态...</p>
+        </div>
+        <div class="hero-actions">
+          <a href="/" class="ghost-button">返回主控制台</a>
+          <button id="refreshStatus" type="button">刷新状态</button>
+          <button id="toggleBackend" class="danger" type="button" disabled>读取中</button>
+        </div>
+      </section>
+
+      <section class="status-grid">
+        <article class="status-card accent">
+          <span>后台开关</span>
+          <strong id="enabledState">--</strong>
+          <small id="enabledHint">--</small>
+        </article>
+        <article class="status-card">
+          <span>当前任务</span>
+          <strong id="runningState">--</strong>
+          <small id="lastRunAt">--</small>
+        </article>
+        <article class="status-card">
+          <span>待运行任务</span>
+          <strong id="dueJobs">--</strong>
+          <small>持仓 5 分钟 / 监控股 15 分钟</small>
+        </article>
+        <article class="status-card">
+          <span>手机推送</span>
+          <strong id="pushState">--</strong>
+          <small id="pushHint">--</small>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>后台操作</h2>
+            <p>关闭后台后不会抓行情、不会训练、不会发送提醒；开启后在交易时段自动恢复。</p>
+          </div>
+          <button id="runOnce" class="secondary" type="button">立即运行一次</button>
+        </div>
+        <div class="control-grid">
+          <label>
+            持仓股刷新
+            <input id="holdingMinutes" type="number" min="1" max="120" step="1">
+          </label>
+          <label>
+            监控股刷新
+            <input id="watchMinutes" type="number" min="1" max="240" step="1">
+          </label>
+          <label>
+            分钟训练刷新
+            <input id="trainingMinutes" type="number" min="1" max="240" step="1">
+          </label>
+          <label>
+            训练股票数量
+            <input id="trainingSymbols" type="number" min="1" max="5" step="1">
+          </label>
+        </div>
+        <div class="inline-actions">
+          <button id="saveSchedule" type="button">保存频率</button>
+          <span id="saveHint">默认：持仓 5 分钟，监控股 15 分钟，训练 2-3 支。</span>
+        </div>
+      </section>
+
+      <section class="two-column">
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>市场时段</h2>
+          </div>
+          <div id="sessionList" class="list"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>数据预算</h2>
+          </div>
+          <div id="budgetList" class="list"></div>
+        </article>
+      </section>
+
+      <section class="two-column">
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>分钟模型</h2>
+          </div>
+          <div id="modelList" class="list"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>监控池</h2>
+          </div>
+          <div id="poolList" class="list"></div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head compact">
+          <h2>最近后台结果</h2>
+        </div>
+        <div id="resultList" class="result-list"></div>
+      </section>
+    </main>
+    <script src="/monitor-app.js?v=20260703"></script>
+  </body>
+</html>
