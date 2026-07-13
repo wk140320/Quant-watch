@@ -3,116 +3,227 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>后台监控控制台 · Global Quant Watch</title>
-    <link rel="stylesheet" href="/monitor.css?v=20260703">
+    <meta name="theme-color" content="#090a09">
+    <title>模型运行中枢 · Global Quant Watch</title>
+    <link rel="stylesheet" href="/monitor.css?v=20260714-model-ops-4">
   </head>
   <body>
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="返回 Global Quant Watch 主控制台">
+        <span class="brand-mark" aria-hidden="true"><i data-lucide="audio-waveform"></i></span>
+        <span>
+          <strong>Global Quant Watch</strong>
+          <small>Local Model Operations</small>
+        </span>
+      </a>
+      <div class="header-status" aria-live="polite">
+        <span id="headerStatusDot" class="live-dot"></span>
+        <span id="statusText">正在读取本地模型状态</span>
+      </div>
+      <div class="header-actions">
+        <a href="/" class="icon-button" title="返回主控制台" aria-label="返回主控制台"><i data-lucide="layout-dashboard"></i></a>
+        <button id="refreshStatus" class="icon-button" type="button" title="刷新全部状态" aria-label="刷新全部状态"><i data-lucide="refresh-cw"></i></button>
+        <button id="toggleBackend" class="command-button danger" type="button" aria-label="切换后台运行状态" disabled><i data-lucide="power"></i><span>读取中</span></button>
+      </div>
+    </header>
+
     <main class="monitor-shell">
-      <section class="hero">
-        <div>
-          <p class="eyebrow">Global Quant Watch</p>
-          <h1>后台监控控制台</h1>
-          <p id="statusText">正在读取后台状态...</p>
+      <section class="model-hero" aria-labelledby="pageTitle">
+        <div class="hero-copy">
+          <p class="eyebrow">Model operations center</p>
+          <h1 id="pageTitle">模型运行中枢</h1>
+          <p>从数据进入、因子准入、样本外验证，到权重校准与失败后微调，逐步解释每一次模型变化。</p>
+          <div class="hero-meta">
+            <span><i data-lucide="database"></i><strong id="heroSamples">--</strong> 条预测样本</span>
+            <span><i data-lucide="shield-check"></i><strong id="heroGuardrail">--</strong> 护栏覆盖</span>
+            <span><i data-lucide="clock-3"></i><strong id="heroUpdated">--</strong></span>
+          </div>
         </div>
-        <div class="hero-actions">
-          <a href="/" class="ghost-button">返回主控制台</a>
-          <button id="refreshStatus" type="button">刷新状态</button>
-          <button id="toggleBackend" class="danger" type="button" disabled>读取中</button>
-        </div>
+        <div class="hero-art" role="img" aria-label="模型网络、因子曲线与概率分布的量化研究插图"></div>
       </section>
 
-      <section class="status-grid">
-        <article class="status-card accent">
-          <span>后台开关</span>
+      <div class="workspace-bar">
+        <div id="marketTabs" class="segmented-control" aria-label="选择市场">
+          <button class="active" type="button" data-market="ASX">ASX</button>
+          <button type="button" data-market="US">US</button>
+          <button type="button" data-market="CN">A股</button>
+        </div>
+        <nav class="view-tabs" aria-label="后台应用工作区">
+          <button class="active" type="button" data-view="models" aria-label="模型动线" title="模型动线"><i data-lucide="git-branch"></i><span>模型动线</span></button>
+          <button type="button" data-view="control" aria-label="运行控制" title="运行控制"><i data-lucide="sliders-horizontal"></i><span>运行控制</span></button>
+          <button type="button" data-view="audit" aria-label="事件审计" title="事件审计"><i data-lucide="list-tree"></i><span>事件审计</span></button>
+        </nav>
+        <button id="runOnce" class="command-button" type="button"><i data-lucide="play"></i><span>立即运行</span></button>
+      </div>
+
+      <section class="metric-strip" aria-label="运行摘要">
+        <div class="metric-item">
+          <span>后台状态</span>
           <strong id="enabledState">--</strong>
           <small id="enabledHint">--</small>
-        </article>
-        <article class="status-card">
-          <span>当前任务</span>
-          <strong id="runningState">--</strong>
+        </div>
+        <div class="metric-item">
+          <span>模型族</span>
+          <strong id="modelFamilyCount">--</strong>
+          <small id="modelReadyHint">--</small>
+        </div>
+        <div class="metric-item">
+          <span>24 小时变更</span>
+          <strong id="changes24h">--</strong>
           <small id="lastRunAt">--</small>
-        </article>
-        <article class="status-card">
-          <span>待运行任务</span>
-          <strong id="dueJobs">--</strong>
-          <small>持仓 5 分钟 / 监控股 15 分钟</small>
-        </article>
-        <article class="status-card">
-          <span>手机推送</span>
-          <strong id="pushState">--</strong>
-          <small id="pushHint">--</small>
-        </article>
+        </div>
+        <div class="metric-item">
+          <span>已揭晓预测</span>
+          <strong id="resolvedPredictions">--</strong>
+          <small id="calibrationHint">--</small>
+        </div>
       </section>
 
-      <section class="panel">
-        <div class="panel-head">
+      <section id="modelsView" class="view-panel active" data-view-panel="models">
+        <section class="pipeline-section" aria-labelledby="pipelineTitle">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Decision lineage</p>
+              <h2 id="pipelineTitle">预测决策链</h2>
+            </div>
+            <p>节点只在本地证据真实存在时点亮；缺失阶段保持待验证，不用视觉效果冒充可用模型。</p>
+          </div>
+          <div id="pipelineFlow" class="pipeline-flow"></div>
+        </section>
+
+        <section class="model-workspace" aria-label="模型轨迹分析">
+          <aside class="model-rail">
+            <div class="rail-heading">
+              <div>
+                <p class="eyebrow">Model registry</p>
+                <h2>模型族</h2>
+              </div>
+              <span id="modelCountTag" class="status-pill">--</span>
+            </div>
+            <div id="modelList" class="model-list"></div>
+          </aside>
+
+          <section class="trajectory-stage">
+            <div class="trajectory-header">
+              <div>
+                <div class="title-line">
+                  <span id="selectedModelIcon" class="model-icon"><i data-lucide="brain-circuit"></i></span>
+                  <div>
+                    <p id="selectedModelStage" class="eyebrow">模型阶段</p>
+                    <h2 id="selectedModelName">请选择模型</h2>
+                  </div>
+                </div>
+                <p id="selectedModelDescription" class="muted-copy">正在恢复模型轨迹。</p>
+              </div>
+              <div class="trajectory-kpis">
+                <span><small id="primaryMetricLabel">核心指标</small><strong id="primaryMetricValue">--</strong></span>
+                <span><small>证据样本</small><strong id="selectedSampleCount">--</strong></span>
+                <span><small>当前状态</small><strong id="selectedModelStatus">--</strong></span>
+              </div>
+            </div>
+            <div class="chart-shell">
+              <canvas id="trajectoryChart" aria-label="所选模型的历史核心指标轨迹"></canvas>
+              <div id="chartEmpty" class="chart-empty" hidden>
+                <i data-lucide="chart-no-axes-column-increasing"></i>
+                <strong>尚未形成可绘制的样本外轨迹</strong>
+                <span>模型事件仍会保留在下方审计时间线。</span>
+              </div>
+              <div id="chartTooltip" class="chart-tooltip" hidden></div>
+            </div>
+            <div class="chart-legend">
+              <span><i class="legend-line"></i><span id="legendMetric">核心评估指标</span></span>
+              <span><i class="legend-dot improved"></i>改善</span>
+              <span><i class="legend-dot degraded"></i>退化</span>
+              <span><i class="legend-dot neutral"></i>中性/待验证</span>
+            </div>
+            <div class="trajectory-events-head">
+              <div>
+                <h3>关键变更节点</h3>
+                <p>点击节点查看修改原因、证据和防过拟合检查。</p>
+              </div>
+              <div class="event-filter" aria-label="筛选模型变更">
+                <button class="active" type="button" data-event-filter="all">全部</button>
+                <button type="button" data-event-filter="improved">改善</button>
+                <button type="button" data-event-filter="degraded">退化</button>
+              </div>
+            </div>
+            <div id="trajectoryEvents" class="trajectory-events"></div>
+          </section>
+
+          <aside class="evidence-inspector" aria-live="polite">
+            <div class="inspector-heading">
+              <p class="eyebrow">Explainability</p>
+              <h2>变更解释</h2>
+              <span id="eventImpactTag" class="status-pill">等待节点</span>
+            </div>
+            <div id="eventInspector" class="event-inspector-empty">
+              选择一个模型变更节点后，这里会显示修改内容、触发原因、样本证据、公式和护栏结果。
+            </div>
+            <div id="weightEvidence" class="weight-evidence"></div>
+          </aside>
+        </section>
+      </section>
+
+      <section id="controlView" class="view-panel" data-view-panel="control" hidden>
+        <div class="section-heading control-heading">
           <div>
-            <h2>后台操作</h2>
-            <p>关闭后台后不会抓行情、不会训练、不会发送提醒；开启后在交易时段自动恢复。</p>
+            <p class="eyebrow">Daemon controls</p>
+            <h2>后台运行与数据预算</h2>
           </div>
-          <button id="runOnce" class="secondary" type="button">立即运行一次</button>
+          <p>关闭后台后停止抓行情、训练和提醒；Paper Agent 仍不会向券商发送真实订单。</p>
         </div>
-        <div class="control-grid">
-          <label>
-            持仓股刷新
-            <input id="holdingMinutes" type="number" min="1" max="120" step="1">
-          </label>
-          <label>
-            监控股刷新
-            <input id="watchMinutes" type="number" min="1" max="240" step="1">
-          </label>
-          <label>
-            分钟训练刷新
-            <input id="trainingMinutes" type="number" min="1" max="240" step="1">
-          </label>
-          <label>
-            训练股票数量
-            <input id="trainingSymbols" type="number" min="1" max="5" step="1">
-          </label>
-        </div>
-        <div class="inline-actions">
-          <button id="saveSchedule" type="button">保存频率</button>
-          <span id="saveHint">默认：持仓 5 分钟，监控股 15 分钟，训练 2-3 支。</span>
+        <div class="control-layout">
+          <section class="control-surface schedule-surface">
+            <div class="surface-heading">
+              <h3>刷新与训练频率</h3>
+              <span class="status-pill good">真实报价优先</span>
+            </div>
+            <div class="control-grid">
+              <label>持仓完整分析（分钟）<input id="holdingMinutes" type="number" min="1" max="120" step="1"></label>
+              <label>监控股完整分析（分钟）<input id="watchMinutes" type="number" min="1" max="240" step="1"></label>
+              <label>分钟训练刷新<input id="trainingMinutes" type="number" min="1" max="240" step="1"></label>
+              <label>训练股票数量<input id="trainingSymbols" type="number" min="1" max="5" step="1"></label>
+            </div>
+            <div class="inline-actions">
+              <button id="saveSchedule" class="command-button" type="button"><i data-lucide="save"></i><span>保存频率</span></button>
+              <span id="saveHint">报价：持仓 1 分钟、监控股 3 分钟；完整分析按上方频率运行。</span>
+            </div>
+          </section>
+          <section class="control-surface">
+            <div class="surface-heading"><h3>市场时段</h3><i data-lucide="clock-4"></i></div>
+            <div id="sessionList" class="data-list"></div>
+          </section>
+          <section class="control-surface">
+            <div class="surface-heading"><h3>数据预算</h3><i data-lucide="gauge"></i></div>
+            <div id="budgetList" class="data-list"></div>
+          </section>
+          <section class="control-surface">
+            <div class="surface-heading"><h3>监控池</h3><i data-lucide="radar"></i></div>
+            <div id="poolList" class="data-list"></div>
+          </section>
+          <section class="control-surface results-surface">
+            <div class="surface-heading"><h3>最近后台结果</h3><i data-lucide="scan-line"></i></div>
+            <div id="resultList" class="result-list"></div>
+          </section>
         </div>
       </section>
 
-      <section class="two-column">
-        <article class="panel">
-          <div class="panel-head compact">
-            <h2>市场时段</h2>
+      <section id="auditView" class="view-panel" data-view-panel="audit" hidden>
+        <div class="section-heading audit-heading">
+          <div>
+            <p class="eyebrow">Local audit trail</p>
+            <h2>模型事件审计</h2>
           </div>
-          <div id="sessionList" class="list"></div>
-        </article>
-        <article class="panel">
-          <div class="panel-head compact">
-            <h2>数据预算</h2>
+          <div class="audit-controls">
+            <label for="auditFamily">模型族</label>
+            <select id="auditFamily"><option value="all">全部模型</option></select>
           </div>
-          <div id="budgetList" class="list"></div>
-        </article>
-      </section>
-
-      <section class="two-column">
-        <article class="panel">
-          <div class="panel-head compact">
-            <h2>分钟模型</h2>
-          </div>
-          <div id="modelList" class="list"></div>
-        </article>
-        <article class="panel">
-          <div class="panel-head compact">
-            <h2>监控池</h2>
-          </div>
-          <div id="poolList" class="list"></div>
-        </article>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head compact">
-          <h2>最近后台结果</h2>
         </div>
-        <div id="resultList" class="result-list"></div>
+        <div id="auditTimeline" class="audit-timeline"></div>
       </section>
     </main>
-    <script src="/monitor-app.js?v=20260703"></script>
+
+    <script src="/frontend/vendor/lucide/lucide.min.js?v=1.8.0"></script>
+    <script src="/monitor-app.js?v=20260714-model-ops-4"></script>
   </body>
 </html>

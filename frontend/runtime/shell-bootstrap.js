@@ -153,7 +153,14 @@
       const active = button.dataset.pageTarget === next;
       button.classList.toggle("active", active);
       button.setAttribute("aria-current", active ? "page" : "false");
-      if (active) requestAnimationFrame(() => button.scrollIntoView?.({ block: "nearest", inline: "center" }));
+      if (active) requestAnimationFrame(() => {
+        const rail = button.closest("#workspaceRail");
+        if (!rail) return;
+        const itemRect = button.getBoundingClientRect();
+        const railRect = rail.getBoundingClientRect();
+        const clipped = itemRect.left < railRect.left + 8 || itemRect.right > railRect.right - 8;
+        if (clipped) button.scrollIntoView?.({ block: "nearest", inline: "center" });
+      });
     });
     setText("marketTitle", next === "dashboard" ? config.title : `${config.label} · ${PAGE_LABELS[next] || PAGE_LABELS.home}`);
     document.title = next === "home" ? "Global Quant Watch" : `${config.label} · ${PAGE_LABELS[next]} · Global Quant Watch`;
@@ -215,7 +222,7 @@
     appPromise = (async () => {
       await loadScript("quant-chart-math", "/frontend/charts/math.js?v=20260712-chart-split");
       await loadScript("quant-http-runtime", "/frontend/runtime/http.js?v=20260712-runtime-split");
-      await loadScript("quant-full-app", "/app.js?v=20260713-provider-pool-ledger-23");
+      await loadScript("quant-full-app", "/app.js?v=20260714-workspace-performance-1");
       appLoaded = true;
       globalScope.__quantAppLoaded = true;
       document.documentElement.dataset.appState = "ready";
@@ -273,19 +280,49 @@
     });
     const marketMenuButton = document.getElementById("marketMenuButton");
     const marketMenu = document.getElementById("marketMenu");
+    if (marketMenu && marketMenu.parentElement !== document.body) {
+      marketMenu.dataset.portaled = "true";
+      document.body.appendChild(marketMenu);
+    }
+    const positionMarketMenu = () => {
+      if (!marketMenu || !marketMenuButton || marketMenu.hidden) return;
+      const triggerRect = marketMenuButton.getBoundingClientRect();
+      const switcherRect = document.querySelector(".market-switcher")?.getBoundingClientRect() || triggerRect;
+      const menuWidth = marketMenu.offsetWidth || 176;
+      const viewportPadding = 12;
+      const alignRight = globalScope.innerWidth <= 680;
+      const preferredLeft = alignRight ? triggerRect.right - menuWidth : switcherRect.left;
+      const left = Math.min(
+        Math.max(viewportPadding, preferredLeft),
+        Math.max(viewportPadding, globalScope.innerWidth - menuWidth - viewportPadding),
+      );
+      marketMenu.style.top = `${Math.round(triggerRect.bottom + 9)}px`;
+      marketMenu.style.left = `${Math.round(left)}px`;
+      marketMenu.style.right = "auto";
+    };
+    const setMarketMenuOpen = (opening, { focusFirst = false } = {}) => {
+      if (!marketMenu || !marketMenuButton) return;
+      marketMenu.hidden = !opening;
+      marketMenuButton.setAttribute("aria-expanded", opening ? "true" : "false");
+      if (opening) positionMarketMenu();
+      if (opening && focusFirst) marketMenu.querySelector("[data-market-select]")?.focus();
+    };
     marketMenuButton?.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       const opening = marketMenu?.hidden !== false;
-      if (marketMenu) marketMenu.hidden = !opening;
-      marketMenuButton.setAttribute("aria-expanded", opening ? "true" : "false");
+      setMarketMenuOpen(opening);
+    });
+    marketMenuButton?.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowDown") return;
+      event.preventDefault();
+      setMarketMenuOpen(true, { focusFirst: true });
     });
     marketMenu?.querySelectorAll("[data-market-select]").forEach((button) => {
       button.addEventListener("click", (event) => {
         event.preventDefault();
         const next = safeMarket(button.dataset.marketSelect);
-        marketMenu.hidden = true;
-        marketMenuButton?.setAttribute("aria-expanded", "false");
+        setMarketMenuOpen(false);
         if (appLoaded && typeof globalScope.switchMarket === "function") {
           globalScope.switchMarket(next).catch((error) => console.error("Direct market switch failed", error));
           return;
@@ -297,9 +334,15 @@
     document.addEventListener("click", (event) => {
       if (!marketMenu || marketMenu.hidden) return;
       if (event.target.closest(".market-switcher")) return;
-      marketMenu.hidden = true;
-      marketMenuButton?.setAttribute("aria-expanded", "false");
+      setMarketMenuOpen(false);
     });
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !marketMenu || marketMenu.hidden) return;
+      setMarketMenuOpen(false);
+      marketMenuButton?.focus();
+    });
+    globalScope.addEventListener("resize", positionMarketMenu, { passive: true });
+    globalScope.addEventListener("scroll", positionMarketMenu, { passive: true });
   }
 
   function initialPage() {

@@ -8,6 +8,11 @@ import test from "node:test";
 import { createPythonQuantClient } from "../backend/services/python-quant.mjs";
 import { createRuntimeEventHub } from "../backend/services/runtime-events.mjs";
 import { createJobManager } from "../backend/services/job-manager.mjs";
+import {
+  buildModelTrajectoryPayload,
+  dedupeModelEvents,
+  normalizeModelEvent,
+} from "../backend/services/model-trajectories.mjs";
 import { createAlpacaAdapter } from "../backend/providers/us/alpaca.mjs";
 import {
   cleanCode,
@@ -123,4 +128,53 @@ test("Background jobs persist completion without blocking the request", async ()
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("Model trajectory normalizes explainable factor evidence", () => {
+  const event = normalizeModelEvent({
+    market: "ASX",
+    event_type: "model-change-log-factor-research",
+    entity_id: "ASX:BHP:factor",
+    created_at: "2026-07-13T10:00:00Z",
+    payload: {
+      title: "动态因子权重已更新",
+      symbol: "BHP.AX",
+      framework: "purged-factor-research",
+      candidateCount: 24,
+      admittedCount: 6,
+      holdout: { samples: 240, direction_hit_rate_pct: 56.4, ic: 0.08, rank_ic: 0.11 },
+      leakageControl: "features at t, labels after t",
+    },
+  });
+  assert.equal(event.family, "factor");
+  assert.equal(event.metrics.sampleCount, 240);
+  assert.equal(event.metrics.primaryMetric.value, 56.4);
+  assert.equal(event.guardrails[0].label, "未来函数隔离");
+  assert.equal(event.impact, "improved");
+});
+
+test("Model trajectory deduplicates repeated writes and exposes pipeline state", () => {
+  const row = {
+    market: "US",
+    event_type: "model-change-log-minute-learning",
+    entity_id: "US:minute:1",
+    created_at: "2026-07-13T10:00:00Z",
+    payload: {
+      title: "分钟模型已更新",
+      sampleCount: 1200,
+      test: { directionalAccuracy: 53.2, mae: 0.42 },
+      guardrails: ["chronological split"],
+    },
+  };
+  const normalized = [normalizeModelEvent(row), normalizeModelEvent(row)];
+  assert.equal(dedupeModelEvents(normalized).length, 1);
+  const payload = buildModelTrajectoryPayload({
+    market: "US",
+    records: [row, row],
+    intradaySnapshot: { available: true, sampleCount: 1200, updatedAt: row.created_at },
+  });
+  assert.equal(payload.families[0].id, "intraday");
+  assert.equal(payload.families[0].status.code, "ready");
+  assert.equal(payload.summary.eventCount, 1);
+  assert.equal(payload.pipeline.find((stage) => stage.id === "base").state, "ready");
 });

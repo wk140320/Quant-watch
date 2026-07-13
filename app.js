@@ -217,6 +217,8 @@ const state = {
   autoRefreshTimer: null,
   autoRefreshEnabled: safeStorage.getItem("autoRefreshEnabled") === "true",
   nextAutoRefreshAt: null,
+  lastFullRefreshAtByMarket: readJsonStorage("lastFullRefreshAtByMarket:v1", {}),
+  liveQuoteRefreshPromise: null,
   isRefreshing: false,
   refreshToken: 0,
   aiRefreshToken: 0,
@@ -288,6 +290,7 @@ const state = {
   },
   chartRedrawHandles: {},
   statusThrottle: { lastAt: 0, handle: null, message: "" },
+  workspaceTaskToken: 0,
   marketSwitchToken: 0,
   activeMarketAbortController: null,
 };
@@ -424,6 +427,13 @@ function deferUiStep(label, task, delay = 0, options = {}) {
   }, delay);
 }
 
+function deferWorkspaceStep(page, token, label, task, delay = 0, options = {}) {
+  deferUiStep(label, () => {
+    if (state.activePage !== page || state.workspaceTaskToken !== token) return false;
+    return task();
+  }, delay, options);
+}
+
 function setStatusThrottled(message, interval = 450) {
   const now = Date.now();
   if (now - state.statusThrottle.lastAt >= interval) {
@@ -439,6 +449,19 @@ function setStatusThrottled(message, interval = 450) {
     if (state.statusThrottle.message) setStatus(state.statusThrottle.message);
     state.statusThrottle.message = "";
   }, Math.max(0, interval - (now - state.statusThrottle.lastAt)));
+}
+
+function mainRenderPartsForPage(page = state.activePage) {
+  if (page === "dashboard") return ["cards", "detail"];
+  if (page === "simulation") return ["summary"];
+  if (page === "regime") return ["indexes"];
+  if (page === "strategy") return ["agent"];
+  return [];
+}
+
+function queueActiveMainRender(options = {}) {
+  const parts = mainRenderPartsForPage();
+  if (parts.length) queueMainRender(parts, options);
 }
 
 function flushMainRenderQueue(options = {}) {
@@ -459,15 +482,16 @@ function flushMainRenderQueue(options = {}) {
   queue.detail = false;
   queue.indexes = false;
   queue.agent = false;
+  const visibleParts = new Set(mainRenderPartsForPage());
   const tasks = [];
-  if (pending.cards) tasks.push(() => safeUiStep("渲染股票卡片", renderCards));
-  if (pending.summary) tasks.push(() => safeUiStep("渲染持仓概览", renderPortfolioSummary));
-  if (pending.indexes) tasks.push(() => safeUiStep("渲染大盘指数", renderMarketIndexPanel));
-  if (pending.agent) {
+  if (pending.cards && visibleParts.has("cards")) tasks.push(() => safeUiStep("渲染股票卡片", renderCards));
+  if (pending.summary && visibleParts.has("summary")) tasks.push(() => safeUiStep("渲染持仓概览", renderPortfolioSummary));
+  if (pending.indexes && visibleParts.has("indexes")) tasks.push(() => safeUiStep("渲染大盘指数", renderMarketIndexPanel));
+  if (pending.agent && visibleParts.has("agent")) {
     tasks.push(() => safeUiStep("渲染 Agent", renderAgentPanel));
     tasks.push(() => safeUiStep("渲染最优策略", renderOptimalStrategyPanel));
   }
-  if (pending.detail) tasks.push(() => safeUiStep("渲染分析详情", renderDetail));
+  if (pending.detail && visibleParts.has("detail")) tasks.push(() => safeUiStep("渲染分析详情", renderDetail));
   if (options.sync || !window.QuantUI?.runFrameTasks) {
     tasks.forEach((task) => task());
     return;
@@ -492,7 +516,7 @@ function queueMainRender(parts = ["cards", "summary", "detail"], options = {}) {
 }
 
 function renderAnalysisPanelsNow() {
-  queueMainRender(["cards", "summary", "detail"], { immediate: true });
+  queueActiveMainRender({ immediate: true });
 }
 
 function scheduleChartRedraw(key, task) {
@@ -943,8 +967,17 @@ function compactQuoteOverlayForStorage(overlay = {}) {
     delayed: overlay.delayed !== false,
     stale: overlay.stale === true,
     timeVerified: overlay.timeVerified !== false,
+    freshnessAgeMs: Number.isFinite(Number(overlay.freshnessAgeMs)) ? Number(overlay.freshnessAgeMs) : null,
+    crossCheckStatus: overlay.crossCheckStatus || null,
+    crossCheckSources: Array.isArray(overlay.crossCheckSources) ? overlay.crossCheckSources.slice(0, 6) : [],
+    warning: overlay.warning || null,
     latestCandle,
   };
+}
+
+function quoteOverlayTimestamp(overlay = {}) {
+  const verified = overlay.timeVerified !== false && timestampValue(overlay.dataAsOf || overlay.asOf);
+  return verified || timestampValue(overlay.retrievedAt);
 }
 
 function persistQuoteOverlayCache() {
@@ -976,6 +1009,10 @@ function overlayQuoteObject(overlay = {}) {
     source: overlay.source || "market-history-cache",
     delayed: overlay.delayed !== false,
     timeVerified: overlay.timeVerified !== false,
+    freshnessAgeMs: Number.isFinite(Number(overlay.freshnessAgeMs)) ? Number(overlay.freshnessAgeMs) : null,
+    crossCheckStatus: overlay.crossCheckStatus || null,
+    crossCheckSources: Array.isArray(overlay.crossCheckSources) ? overlay.crossCheckSources.slice(0, 6) : [],
+    warning: overlay.warning || null,
   };
 }
 
@@ -997,8 +1034,12 @@ function mergeQuoteOverlayIntoItem(item, overlay, market = state.market) {
   const key = safeMarket(market);
   const symbol = quoteOverlayKey(overlay.symbol, key);
   if (!symbol || symbol !== quoteOverlayKey(item.symbol, key)) return item;
-  const overlayTime = timestampValue(overlay.retrievedAt || overlay.dataAsOf);
-  const currentTime = timestampValue(item.marketRetrievedAt || item.quote?.retrievedAt || item.quote?.asOf || item.signalRefreshedAt || item.updatedAt);
+  const overlayTime = quoteOverlayTimestamp(overlay);
+  const currentTime = quoteOverlayTimestamp(item.marketOverlay || {
+    dataAsOf: item.marketDataAsOf || item.quote?.asOf,
+    retrievedAt: item.marketRetrievedAt || item.quote?.retrievedAt || item.signalRefreshedAt || item.updatedAt,
+    timeVerified: item.quote?.timeVerified,
+  });
   if (currentTime && overlayTime && overlayTime < currentTime) return item;
   const analysisAsOf = item.analysisAsOf || item.signalRefreshedAt || item.updatedAt || item.quote?.asOf || state.snapshotUpdatedAt || null;
   const analysisPrice = asPositiveNumber(item.analysisPrice, asPositiveNumber(item.technicals?.close));
@@ -1041,8 +1082,20 @@ function applyQuoteOverlays(overlays = [], market = state.market, options = {}) 
     if (!symbol || !Number.isFinite(Number(raw?.price)) || Number(raw.price) <= 0) return;
     const overlay = { ...raw, symbol, market: key };
     const existing = state.quoteOverlaysByMarket[key][symbol];
-    if (existing && timestampValue(existing.retrievedAt || existing.dataAsOf) > timestampValue(overlay.retrievedAt || overlay.dataAsOf)) return;
+    if (existing && quoteOverlayTimestamp(existing) > quoteOverlayTimestamp(overlay)) return;
     state.quoteOverlaysByMarket[key][symbol] = overlay;
+    const marketCacheKey = `market:${key}:${symbol}`;
+    const cachedMarket = state.marketCache.get(marketCacheKey);
+    if (cachedMarket?.value) {
+      cachedMarket.value = {
+        ...cachedMarket.value,
+        quote: overlayQuoteObject(overlay),
+        candles: mergeOverlayCandle(cachedMarket.value.candles, overlay.latestCandle),
+        retrievedAt: overlay.retrievedAt || cachedMarket.value.retrievedAt,
+      };
+      cachedMarket.time = Date.now();
+      state.marketCache.set(marketCacheKey, cachedMarket);
+    }
     cacheChanged = true;
     if (key !== state.market) return;
     const item = state.analyses.get(symbol);
@@ -1182,15 +1235,18 @@ function backendMonitorPayload() {
     strategy: getStrategy(),
     capital: getCapital(),
     refresh: {
-      holdingMs: 3 * 60 * 1000,
-      watchMs: 10 * 60 * 1000,
-      trainingMs: 5 * 60 * 1000,
+      quoteHoldingMs: 60 * 1000,
+      quoteWatchMs: 3 * 60 * 1000,
+      holdingMs: 2 * 60 * 1000,
+      watchMs: 5 * 60 * 1000,
+      trainingMs: 2 * 60 * 1000,
+      checkMs: 15 * 1000,
     },
     training: {
       enabled: true,
-      symbolLimit: 2,
+      symbolLimit: 3,
       interval: "5m",
-      range: "5d",
+      range: "1mo",
     },
     notifications: {
       desktop: true,
@@ -1279,11 +1335,15 @@ function loadSavedInputs() {
   if ($("fastInitialRefresh")) $("fastInitialRefresh").checked = runtimeSettings.fastInitialRefresh !== false;
   if ($("allowOffHoursFetch")) $("allowOffHoursFetch").checked = runtimeSettings.allowOffHoursFetch !== false;
   if ($("keepSnapshots")) $("keepSnapshots").checked = runtimeSettings.keepSnapshots !== false;
-  const savedInterval = asNumber(safeStorage.getItem("refreshInterval"), 600000);
+  const cadenceVersion = safeStorage.getItem("refreshCadenceVersion");
+  const savedInterval = cadenceVersion === "live-quotes-v2"
+    ? asNumber(safeStorage.getItem("refreshInterval"), 60000)
+    : 60000;
+  safeStorage.setItem("refreshCadenceVersion", "live-quotes-v2");
   const refreshIntervals = [60000, 300000, 600000, 1800000, 3600000];
   const nearestInterval = refreshIntervals.reduce((best, value) => (
     Math.abs(value - savedInterval) < Math.abs(best - savedInterval) ? value : best
-  ), 600000);
+  ), 60000);
   $("refreshInterval").value = String(nearestInterval);
   $("portfolioCsv").value = safeStorage.getItem(`portfolioCsv:${state.market}`) || holdingsToCsv(activePortfolio()) || activeMarketConfig().samplePortfolio;
   $("holdingEntryDate").value = todayIso();
@@ -2912,6 +2972,7 @@ function syncWorkspaceLocation(page = state.activePage) {
 function setWorkspacePage(page, options = {}) {
   const validPages = new Set(["home", "dashboard", "features", "factors", "regime", "strategy", "simulation", "sources"]);
   const next = validPages.has(page) ? page : "home";
+  const workspaceToken = ++state.workspaceTaskToken;
   state.activePage = next;
   safeStorage.setItem("activeQuantPage", next);
   syncWorkspaceLocation(next);
@@ -2943,27 +3004,29 @@ function setWorkspacePage(page, options = {}) {
     window.QuantHomeMotion?.refresh();
   }
   if (next === "sources") {
-    refreshProviderBudget(false);
-    refreshDataHealth(false);
+    deferWorkspaceStep(next, workspaceToken, "刷新数据源预算", () => refreshProviderBudget(false), 40, { frame: true });
+    deferWorkspaceStep(next, workspaceToken, "刷新数据健康中心", () => refreshDataHealth(false), 120, { idle: true, timeout: 1200 });
   }
   if (next === "regime") {
-    renderMarketMoversPanel();
-    renderAiPickPanel();
+    queueMainRender(["indexes"]);
+    deferWorkspaceStep(next, workspaceToken, "渲染股票池", renderUniversePanel, 20, { frame: true });
+    deferWorkspaceStep(next, workspaceToken, "渲染市场涨跌榜", renderMarketMoversPanel, 40, { frame: true });
+    deferWorkspaceStep(next, workspaceToken, "渲染 AI 选股", renderAiPickPanel, 120, { idle: true, timeout: 900 });
   }
-  if (next === "dashboard") queueMainRender(["cards", "summary", "detail"]);
+  if (next === "dashboard") queueMainRender(["cards", "detail"]);
   if (next === "factors") renderFactorConfigPanel();
   if (next === "strategy") {
     renderAccuracyPanel();
-    renderAgentPanel();
-    renderOptimalStrategyPanel();
-    renderStrategyRevisionPanel();
+    deferWorkspaceStep(next, workspaceToken, "渲染 Agent", renderAgentPanel, 30, { frame: true });
+    deferWorkspaceStep(next, workspaceToken, "渲染最优策略", renderOptimalStrategyPanel, 90, { frame: true });
+    deferWorkspaceStep(next, workspaceToken, "渲染策略版本", renderStrategyRevisionPanel, 180, { idle: true, timeout: 900 });
   }
   if (next === "simulation") {
     renderPortfolioSummary();
-    renderHistory();
-    renderSimulationArchivePanel();
-    runRiskAssessment(false);
-    loadTradingAudit(false);
+    deferWorkspaceStep(next, workspaceToken, "渲染交易历史", renderHistory, 30, { frame: true });
+    deferWorkspaceStep(next, workspaceToken, "渲染模拟归档", renderSimulationArchivePanel, 90, { idle: true, timeout: 700 });
+    deferWorkspaceStep(next, workspaceToken, "加载风险评估", () => runRiskAssessment(false), 220, { idle: true, timeout: 1200 });
+    deferWorkspaceStep(next, workspaceToken, "加载交易审计", () => loadTradingAudit(false), 320, { idle: true, timeout: 1400 });
   }
 }
 
@@ -3983,6 +4046,7 @@ async function runFactorLab() {
 }
 
 function renderFactorConfigPanel(result = state.latestFactorLab) {
+  if (state.activePage !== "factors") return;
   const panel = $("factorConfigPanel");
   if (!panel) return;
   const config = researchConfigForMarket();
@@ -4839,6 +4903,45 @@ async function fetchMarket(symbol, market = state.market, options = {}) {
   state.marketCache.set(key, { time: Date.now(), value });
   if (state.marketCache.size > 80) state.marketCache.delete(state.marketCache.keys().next().value);
   return value;
+}
+
+async function refreshLiveQuotes(symbols = [], options = {}) {
+  if (state.liveQuoteRefreshPromise && options.join !== false) return state.liveQuoteRefreshPromise;
+  const marketKey = safeMarket(options.market || state.market);
+  const switchToken = state.marketSwitchToken;
+  const requested = [...new Set((Array.isArray(symbols) ? symbols : [])
+    .map((symbol) => normalizeSymbolForMarket(symbol, marketKey))
+    .filter(Boolean))];
+  if (!requested.length) return { ok: false, requested: 0, updated: 0, overlays: [], errors: [] };
+  const task = (async () => {
+    const response = await fetch(`/api/quotes/batch?market=${encodeURIComponent(marketKey)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ market: marketKey, symbols: requested, force: true }),
+      cache: "no-store",
+      signal: marketKey === state.market ? state.activeMarketAbortController?.signal : undefined,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || `实时报价刷新失败 (${response.status})`);
+    if (marketKey !== state.market || switchToken !== state.marketSwitchToken) {
+      throw new DOMException("Stale market quote request", "AbortError");
+    }
+    const overlays = Array.isArray(payload.overlays) ? payload.overlays : [];
+    applyQuoteOverlays(overlays, marketKey, { render: false });
+    overlays.forEach((overlay) => patchQuoteOverlayDom(overlay.symbol));
+    if (options.reportStatus !== false) {
+      const singleSource = overlays.filter((overlay) => overlay.crossCheckStatus !== "confirmed").length;
+      const suffix = singleSource ? `，其中 ${singleSource} 只为单一真实源` : "，均通过多源一致性检查";
+      setStatus(`最新报价已同步 ${overlays.length}/${requested.length}${suffix}`);
+    }
+    return { ...payload, overlays };
+  })();
+  state.liveQuoteRefreshPromise = task;
+  try {
+    return await task;
+  } finally {
+    if (state.liveQuoteRefreshPromise === task) state.liveQuoteRefreshPromise = null;
+  }
 }
 
 async function cachedJson(key, url, ttlMs) {
@@ -6574,7 +6677,7 @@ async function restoreServerSnapshot() {
     safeStorage.setItem(snapshotKey(), JSON.stringify(payload));
     safeStorage.setItem(snapshotTimeKey(), state.snapshotUpdatedAt || "");
     evaluateAlerts();
-    queueMainRender(["cards", "summary", "detail"]);
+    queueActiveMainRender();
     updateSydneyClock();
     return true;
   } catch (error) {
@@ -6591,7 +6694,7 @@ function useLocalSnapshotOnly(reason = `${activeMarketConfig().code} 休市中`)
   const restored = currentAnalysesCoverWatchlist() ? true : restoreAnalysisSnapshot();
   if (restored) {
     evaluateAlerts();
-    queueMainRender(["cards", "summary", "detail"]);
+    queueActiveMainRender();
     setStatus(`${reason}，未请求外部 API/AI，已使用 ${formatSnapshotTime(state.snapshotUpdatedAt)} 的本地快照`);
   } else {
     setStatus(`${reason}，未请求外部 API/AI；本地还没有可用快照，请在交易时间内刷新一次`);
@@ -6809,20 +6912,61 @@ function commitAnalysisResults(results, options = {}) {
     if (result?.symbol) state.analyses.set(result.symbol, result);
   });
   applyQuoteOverlays(adjusted.map((result) => result.marketOverlay).filter(Boolean), marketKey, { render: false });
+  applyStoredQuoteOverlays(marketKey);
+  const committed = adjusted.map((result) => state.analyses.get(result.symbol) || result);
   if (options.agentStep === false || state.paperAgentBackendAvailable) {
     renderAgentPanel();
     renderOptimalStrategyPanel();
   }
-  else trainAgentsWithResults(adjusted);
+  else trainAgentsWithResults(committed);
   evaluateAlerts();
   if (marketKey === state.market) persistAnalysisSnapshot("analysis-commit");
-  persistPredictionSamples(adjusted);
-  storeForecastMemory(adjusted);
-  return adjusted;
+  persistPredictionSamples(committed);
+  storeForecastMemory(committed);
+  return committed;
+}
+
+function analysisRequestChunks(preparedItems = [], options = {}) {
+  const maxBytes = Math.max(256_000, Number(options.maxBytes || 1_250_000));
+  const maxItems = Math.max(1, Number(options.maxItems || 10));
+  const encoder = typeof TextEncoder === "function" ? new TextEncoder() : null;
+  const byteSize = (value) => {
+    const text = JSON.stringify(value);
+    return encoder ? encoder.encode(text).byteLength : text.length * 2;
+  };
+  const chunks = [];
+  let current = [];
+  let currentBytes = 64;
+  for (const item of preparedItems) {
+    const itemBytes = byteSize(item?.input || {}) + 2;
+    if (current.length && (current.length >= maxItems || currentBytes + itemBytes > maxBytes)) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 64;
+    }
+    current.push(item);
+    currentBytes += itemBytes;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
 }
 
 async function requestBatchAnalysis(preparedItems, options = {}) {
   const marketKey = safeMarket(options.market || preparedItems?.[0]?.result?.market || preparedItems?.[0]?.input?.market || state.market);
+  if (!options.chunked) {
+    const chunks = analysisRequestChunks(preparedItems);
+    if (chunks.length > 1) {
+      const rows = await Promise.all(chunks.map((chunk) => requestBatchAnalysis(chunk, {
+        ...options,
+        market: marketKey,
+        chunked: true,
+        commit: false,
+      })));
+      const combined = rows.flat();
+      if (options.commit !== false) return commitAnalysisResults(combined, { ...options, market: marketKey });
+      return combined;
+    }
+  }
   const response = await fetch("/api/analyze-batch", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -7020,6 +7164,7 @@ function saveDecision(item) {
 }
 
 function renderHistory() {
+  if (state.activePage !== "simulation") return;
   const target = $("decisionHistory");
   if (!target) return;
   const rows = activeHistory();
@@ -8212,6 +8357,7 @@ function lightgbmModelHtml(lightgbm = null, tripleBarrier = null) {
 }
 
 function renderAccuracyPanel() {
+  if (state.activePage !== "strategy") return;
   const target = $("accuracyPanel");
   if (!target) return;
   const summary = state.accuracySummary;
@@ -8463,25 +8609,57 @@ function renderAccuracyPanel() {
       </div>
     </div>
   `;
+  const preferredPanel = target.dataset.activeLearningPanel || "overview";
   target.innerHTML = `
-    <div class="learning-window-grid">
-      <details class="learning-window" open>
-        <summary><span>曲线总览</span><strong>${pctOrPending(summary.hitRate)} / ${summary.resolved || 0} 已验证</strong></summary>
-        <div class="learning-window-body">${overviewHtml}</div>
-      </details>
-      <details class="learning-window">
-        <summary><span>模型调整</span><strong>${summary.learningEvents?.length || 0} 条记录</strong></summary>
-        <div class="learning-window-body">${adjustmentsHtml}</div>
-      </details>
-      <details class="learning-window">
-        <summary><span>周期与校准</span><strong>${horizonRows.length + patternRows.length + buckets.length + strategyBuckets.length + modelRows.length + errorRows.length} 组</strong></summary>
-        <div class="learning-window-body">${performanceHtml}</div>
-      </details>
+    <div class="learning-workspace" data-learning-workspace>
+      <div class="learning-tablist" role="tablist" aria-label="预测学习视图">
+        <button id="learningTabOverview" class="learning-tab" role="tab" type="button" data-learning-tab="overview" aria-controls="learningPanelOverview">
+          <span>曲线总览</span><strong>${pctOrPending(summary.hitRate)} / ${summary.resolved || 0} 已验证</strong>
+        </button>
+        <button id="learningTabAdjustments" class="learning-tab" role="tab" type="button" data-learning-tab="adjustments" aria-controls="learningPanelAdjustments">
+          <span>模型调整</span><strong>${summary.learningEvents?.length || 0} 条记录</strong>
+        </button>
+        <button id="learningTabCalibration" class="learning-tab" role="tab" type="button" data-learning-tab="calibration" aria-controls="learningPanelCalibration">
+          <span>周期与校准</span><strong>${horizonRows.length + patternRows.length + buckets.length + strategyBuckets.length + modelRows.length + errorRows.length} 组</strong>
+        </button>
+      </div>
+      <section id="learningPanelOverview" class="learning-tab-panel" role="tabpanel" data-learning-panel="overview" aria-labelledby="learningTabOverview">${overviewHtml}</section>
+      <section id="learningPanelAdjustments" class="learning-tab-panel" role="tabpanel" data-learning-panel="adjustments" aria-labelledby="learningTabAdjustments" hidden>${adjustmentsHtml}</section>
+      <section id="learningPanelCalibration" class="learning-tab-panel" role="tabpanel" data-learning-panel="calibration" aria-labelledby="learningTabCalibration" hidden>${performanceHtml}</section>
     </div>
   `;
+  const tabs = [...target.querySelectorAll("[data-learning-tab]")];
+  const panels = [...target.querySelectorAll("[data-learning-panel]")];
+  const activateLearningPanel = (requested) => {
+    const next = panels.some((panel) => panel.dataset.learningPanel === requested) ? requested : "overview";
+    target.dataset.activeLearningPanel = next;
+    tabs.forEach((tab) => {
+      const active = tab.dataset.learningTab === next;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+      tab.tabIndex = active ? 0 : -1;
+    });
+    panels.forEach((panel) => {
+      panel.hidden = panel.dataset.learningPanel !== next;
+      if (!panel.hidden) panel.scrollTop = 0;
+    });
+  };
+  tabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => activateLearningPanel(tab.dataset.learningTab));
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      event.preventDefault();
+      const offset = event.key === "ArrowRight" ? 1 : -1;
+      const nextTab = tabs[(index + offset + tabs.length) % tabs.length];
+      activateLearningPanel(nextTab.dataset.learningTab);
+      nextTab.focus();
+    });
+  });
+  activateLearningPanel(preferredPanel);
 }
 
 function renderMarketIndexPanel() {
+  if (state.activePage !== "regime") return;
   const target = $("marketIndexPanel");
   if (!target) return;
   const rows = state.marketIndexes || [];
@@ -8862,6 +9040,7 @@ function universeForMarket(options = {}) {
 }
 
 function renderUniversePanel() {
+  if (state.activePage !== "regime") return;
   const panel = $("universePanel");
   if (!panel) return;
   const key = universeStorageKey();
@@ -9025,6 +9204,7 @@ function moverColumnHtml(title, rows, emptyText, type) {
 }
 
 function renderMarketMoversPanel() {
+  if (state.activePage !== "regime") return;
   const panel = $("marketMoversPanel");
   if (!panel) return;
   const movers = marketMoversForCurrentMarket();
@@ -9522,6 +9702,7 @@ function rejectedPickHtml(rows = []) {
 }
 
 function renderAiPickPanel() {
+  if (state.activePage !== "regime") return;
   const target = $("aiPickPanel");
   if (!target) return;
   const forecast = state.stockPicker?.forecast || [];
@@ -9748,7 +9929,7 @@ async function loadWorkspaceBootstrap(market = state.market) {
     if (payload.paperAgents) applyPaperAgentBackendState(payload.paperAgents);
     if (Array.isArray(payload.quoteOverlays)) {
       const changed = applyQuoteOverlays(payload.quoteOverlays, key, { render: false });
-      if (changed) queueMainRender(["cards", "summary", "detail"]);
+      if (changed) queueActiveMainRender();
     }
     return payload;
   } catch (error) {
@@ -11315,6 +11496,7 @@ function applyPostModelAdjustments(result) {
 }
 
 function renderAgentPanel() {
+  if (state.activePage !== "strategy") return;
   const target = $("agentPanel");
   if (!target) return;
   const ledger = getAgentLedger();
@@ -11355,6 +11537,7 @@ function renderAgentPanel() {
 }
 
 function renderSimulationArchivePanel() {
+  if (state.activePage !== "simulation") return;
   const target = $("simulationArchivePanel");
   if (!target) return;
   const memory = getAgentMemory();
@@ -11451,6 +11634,7 @@ function renderSimulationArchivePanel() {
 }
 
 function renderOptimalStrategyPanel() {
+  if (state.activePage !== "strategy") return;
   const target = $("optimalStrategyPanel");
   if (!target) return;
   const best = bestStrategyAcrossAgents();
@@ -11493,6 +11677,7 @@ function renderOptimalStrategyPanel() {
 }
 
 function renderPortfolioSummary() {
+  if (state.activePage !== "simulation") return;
   const capital = getCapital();
   syncCapitalFields();
   const holdings = activePortfolio();
@@ -11676,6 +11861,7 @@ function setWatchlistSort(nextKey, nextDirection = null) {
 }
 
 function renderCards() {
+  if (state.activePage !== "dashboard") return;
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
   reconcileWatchlistAddedAt(state.market);
   syncWatchlistSortControls();
@@ -11757,6 +11943,8 @@ function patchQuoteOverlayDom(symbol) {
   const normalized = normalizeSymbolForMarket(symbol, state.market);
   const item = state.analyses.get(normalized);
   if (!normalized || !item) return;
+  if (state.activePage === "simulation") queueMainRender(["summary"]);
+  if (state.activePage !== "dashboard") return;
   const overlay = item.marketOverlay || {};
   const card = [...document.querySelectorAll("[data-card-symbol]")].find((node) => node.dataset.cardSymbol === normalized);
   if (card) {
@@ -11805,6 +11993,8 @@ function patchMonitorAnalysisDom(symbol) {
   const normalized = normalizeSymbolForMarket(symbol, state.market);
   const item = state.analyses.get(normalized);
   if (!normalized || !item) return;
+  if (state.activePage === "simulation") queueMainRender(["summary"]);
+  if (state.activePage !== "dashboard") return;
   const analysis = normalizeAnalysis(item.analysis);
   const card = [...document.querySelectorAll("[data-card-symbol]")].find((node) => node.dataset.cardSymbol === normalized);
   if (card) {
@@ -11829,7 +12019,7 @@ function patchMonitorAnalysisDom(symbol) {
     card.classList.toggle("risk-alert", isRiskAction(analysis.action));
     patchQuoteOverlayDom(normalized);
   }
-  queueMainRender(state.selected === normalized ? ["summary", "detail"] : ["summary"]);
+  if (state.selected === normalized) queueMainRender(["detail"]);
 }
 
 function renderPendingDetail(symbol) {
@@ -11858,7 +12048,7 @@ function renderPendingDetail(symbol) {
       <button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button>
     </div>
   `;
-  $("refreshSelectedStock")?.addEventListener("click", () => refreshAll({ manual: true }));
+  $("refreshSelectedStock")?.addEventListener("click", () => refreshAll({ manual: true, symbols: [state.selected], skipIndexes: true }));
   $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(normalized));
 }
 
@@ -12065,6 +12255,7 @@ function renderDetailUnsafe() {
 }
 
 function renderDetail() {
+  if (state.activePage !== "dashboard") return null;
   try {
     return renderDetailUnsafe();
   } catch (error) {
@@ -12547,15 +12738,15 @@ function chartDashboardHtml({ expanded = false, showExpand = true, title = "K线
         <div class="chart-tools">
           <div id="chartReadout" class="chart-readout muted">${escapeHtml(chartFallbackReadout())}</div>
           <button class="secondary mini-btn" data-chart-reset type="button">重置</button>
+          <div class="chart-overlay-popover">
+            <button class="secondary mini-btn" data-chart-overlay-toggle type="button" aria-expanded="false">指标</button>
+            <div class="chart-overlay-menu" data-chart-overlay-menu hidden>${chartOverlayButtons()}</div>
+          </div>
           ${showExpand ? `<button id="expandChart" class="secondary" type="button">放大</button>` : ""}
         </div>
       </div>
       <div class="chart-legend">
         <span class="legend green">${escapeHtml(title)}</span>
-        <div class="chart-overlay-popover">
-          <button class="secondary mini-btn" data-chart-overlay-toggle type="button" aria-expanded="false">指标</button>
-          <div class="chart-overlay-menu" data-chart-overlay-menu hidden>${chartOverlayButtons()}</div>
-        </div>
       </div>
       <div class="chart-factor-strip"><span>因子叠合</span>${chartFactorButtons()}</div>
       ${expanded ? `<div class="chart-scroll">` : ""}
@@ -13661,16 +13852,35 @@ async function refreshAll(options = {}) {
     state.isRefreshing = true;
     safeUiStep("保存刷新状态", saveState);
     if (refreshButton) refreshButton.disabled = true;
-    symbols = orderedSymbolsForRefresh(marketKey);
-    window.QuantUI?.showSkeletons($("cards"), Math.min(6, symbols.length));
+    symbols = Array.isArray(options.symbols) && options.symbols.length
+      ? [...new Set(options.symbols.map((symbol) => normalizeSymbolForMarket(symbol, marketKey)).filter(Boolean))]
+      : orderedSymbolsForRefresh(marketKey);
+    if (!state.analyses.size) window.QuantUI?.showSkeletons($("cards"), Math.min(6, symbols.length));
     safeUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-start", 250, { market: marketKey, maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
-    const accuracyPromise = safeUiStepAsync("同步预测准确率", () => fetchAccuracySummary(true, marketKey));
-    await optionalWithin(accuracyPromise, runtime.fastInitialRefresh ? 1200 : 2500, null);
-    const indexPromise = refreshMarketIndexes(true, marketKey).catch((error) => {
+    const quotePromise = options.quoteSummary
+      ? Promise.resolve(options.quoteSummary)
+      : options.quotesPrimed
+        ? Promise.resolve({ updated: symbols.length, overlays: symbols.map((symbol) => state.quoteOverlaysByMarket[marketKey]?.[symbol]).filter(Boolean) })
+      : refreshLiveQuotes(symbols, { market: marketKey, reportStatus: true }).catch((error) => {
+        if (error?.name !== "AbortError") {
+          console.warn("Live quote preflight failed", error);
+          setStatus(`最新报价预同步未完成：${compactRuntimeError(error)}；继续使用严格行情接口重试`);
+        }
+        return { updated: 0, overlays: [], errors: [{ error: error.message || String(error) }] };
+      });
+    const accuracyPromise = options.skipIndexes
+      ? Promise.resolve(null)
+      : safeUiStepAsync("同步预测准确率", () => fetchAccuracySummary(true, marketKey));
+    const indexPromise = options.skipIndexes ? Promise.resolve(null) : refreshMarketIndexes(true, marketKey).catch((error) => {
       console.warn("Unable to refresh market indexes", error);
       if (!isStaleRefresh()) safeUiStep("恢复本地大盘快照", () => loadMarketIndexSnapshot(marketKey));
     });
-    if (!runtime.fastInitialRefresh) await optionalWithin(indexPromise, 3500, null);
+    const [quoteSummary] = await Promise.all([
+      optionalWithin(quotePromise, manual ? 9000 : 7000, null),
+      optionalWithin(accuracyPromise, runtime.fastInitialRefresh ? 1200 : 2500, null),
+      runtime.fastInitialRefresh ? Promise.resolve(null) : optionalWithin(indexPromise, 3500, null),
+    ]);
+    const quoteUpdated = new Set((quoteSummary?.overlays || []).map((overlay) => normalizeSymbolForMarket(overlay.symbol, marketKey)).filter(Boolean));
     if (isStaleRefresh()) return;
     setStatus(runtime.fastInitialRefresh
       ? `快速并行读取 ${symbols.length} 只股票真实行情；新闻/AI 后台复核...`
@@ -13679,7 +13889,11 @@ async function refreshAll(options = {}) {
     await runLimited(symbols, concurrency, async (symbol) => {
       if (isStaleRefresh()) return;
       try {
-        const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh, freshMarket: true, market: marketKey });
+        const prepared = await prepareSymbol(symbol, {
+          includeSignals: !runtime.fastInitialRefresh,
+          freshMarket: !quoteUpdated.has(symbol),
+          market: marketKey,
+        });
         if (isStaleRefresh()) return;
         preparedItems.push(prepared);
         if (prepared.result?.marketOverlay) {
@@ -13717,6 +13931,8 @@ async function refreshAll(options = {}) {
     }
     if (isStaleRefresh()) return;
     const seconds = ((Date.now() - startedAt.getTime()) / 1000).toFixed(1);
+    state.lastFullRefreshAtByMarket[marketKey] = Date.now();
+    safeStorage.setItem("lastFullRefreshAtByMarket:v1", JSON.stringify(state.lastFullRefreshAtByMarket));
     setStatus(`刷新完成：${preparedItems.length}/${symbols.length} 只股票，用时 ${seconds}s；后台复核继续更新新闻、因子和 AI`);
     safeUiStep("刷新后排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-complete", 1200, { market: marketKey, maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
     safeUiStep("安排下一次自动刷新", scheduleNextAutoRefresh);
@@ -13745,6 +13961,36 @@ async function refreshAll(options = {}) {
   }
 }
 
+async function runAutoRefreshCycle(options = {}) {
+  if (!state.autoRefreshEnabled) return;
+  const marketKey = state.market;
+  const session = marketState(new Date(), marketKey);
+  const runtime = getRuntimeSettings();
+  if (!session.canRefresh && !runtime.allowOffHoursFetch) {
+    scheduleNextAutoRefresh();
+    return;
+  }
+  if (state.isRefreshing) {
+    scheduleNextAutoRefresh();
+    return;
+  }
+  const symbols = orderedSymbolsForRefresh(marketKey);
+  let quoteSummary = null;
+  try {
+    quoteSummary = await refreshLiveQuotes(symbols, { market: marketKey, reportStatus: true });
+  } catch (error) {
+    if (error?.name !== "AbortError") setStatus(`自动实时报价未完成：${compactRuntimeError(error)}；保留上一笔已验证价格`);
+  }
+  if (marketKey !== state.market || !state.autoRefreshEnabled) return;
+  const fullAnalysisMs = 5 * 60 * 1000;
+  const lastFull = Number(state.lastFullRefreshAtByMarket[marketKey] || 0);
+  if (options.forceFull || Date.now() - lastFull >= fullAnalysisMs) {
+    await refreshAll({ manual: false, quoteSummary, quotesPrimed: Boolean(quoteSummary) });
+    return;
+  }
+  scheduleNextAutoRefresh();
+}
+
 function scheduleNextAutoRefresh() {
   if (!state.autoRefreshEnabled) return;
   if (state.autoRefreshTimer) clearTimeout(state.autoRefreshTimer);
@@ -13754,7 +14000,7 @@ function scheduleNextAutoRefresh() {
     ? asNumber($("refreshInterval").value, 180000)
     : minutesUntilNextRefreshWindow() * 60000;
   state.nextAutoRefreshAt = new Date(Date.now() + interval);
-  state.autoRefreshTimer = setTimeout(() => refreshAll({ manual: false }), Math.min(interval, 2147483647));
+  state.autoRefreshTimer = setTimeout(() => runAutoRefreshCycle(), Math.min(interval, 2147483647));
   setStatus(session.canRefresh || runtime.allowOffHoursFetch
     ? `自动刷新运行中，下一次：${formatClock(state.nextAutoRefreshAt)}`
     : `${activeMarketConfig().code} 休市中，自动刷新暂停；下一次交易窗口：${formatClock(state.nextAutoRefreshAt)}`);
@@ -13769,7 +14015,7 @@ function startAutoRefresh(runNow = false) {
   setStatus(marketState().canRefresh || getRuntimeSettings().allowOffHoursFetch
     ? `自动刷新已启动：每 ${Math.round(interval / 60000)} 分钟`
     : "自动刷新已启动；当前休市，先使用本地快照并等待下一次交易窗口");
-  if (runNow) refreshAll({ manual: true });
+  if (runNow) runAutoRefreshCycle({ forceFull: true });
   else scheduleNextAutoRefresh();
 }
 
@@ -13882,7 +14128,7 @@ async function switchMarket(nextMarket) {
     if (restored) evaluateAlerts();
     return restored;
   });
-  queueMainRender(["cards", "summary", "detail", "indexes", ...(state.activePage === "strategy" ? ["agent"] : [])]);
+  queueActiveMainRender();
   if (state.activePage === "regime") {
     safeUiStep("渲染股票池", renderUniversePanel);
     safeUiStep("渲染涨跌榜", renderMarketMoversPanel);
@@ -13896,7 +14142,7 @@ async function switchMarket(nextMarket) {
   deferMarketStepAsync(token, "加载预测准确率", () => state.activePage === "strategy" ? fetchAccuracySummary(true) : false, 820, { idle: true, timeout: 4500 });
   deferMarketStep(token, "后台渲染市场面板", () => {
     evaluateAlerts();
-    queueMainRender(["cards", "summary", "detail", "indexes", ...(state.activePage === "strategy" ? ["agent"] : [])]);
+    queueActiveMainRender();
     if (state.activePage === "regime") {
       renderUniversePanel();
       renderMarketMoversPanel();
@@ -14037,8 +14283,6 @@ function boot() {
       return restored;
     });
   }
-  safeUiStep("渲染基础股票卡片", renderCards);
-  safeUiStep("渲染基础持仓概览", renderPortfolioSummary);
   safeUiStep("渲染提醒按钮", renderNotificationButton);
   safeUiStep("渲染 API 状态", renderApiStatusBar);
   safeUiStep("启动市场时钟", startSydneyClock);
@@ -14061,18 +14305,10 @@ function boot() {
   deferUiStep("恢复大盘快照", () => {
     if (STARTUP_SAFE_MODE) return false;
     loadMarketIndexSnapshot();
-    renderMarketIndexPanel();
+    queueMainRender(["indexes"]);
   }, 900);
   deferUiStep("加载研究配置", loadResearchConfig, 1700);
   deferUiStep("加载预测准确率", () => state.activePage === "strategy" ? fetchAccuracySummary(true) : false, STARTUP_SAFE_MODE ? 4500 : 2200);
-  deferUiStep("渲染股票池", () => state.activePage === "regime" ? renderUniversePanel() : false, 2600);
-  deferUiStep("渲染涨跌榜", () => state.activePage === "regime" ? renderMarketMoversPanel() : false, 2900);
-  deferUiStep("渲染 AI 选股", () => state.activePage === "regime" ? renderAiPickPanel() : false, 3200);
-  deferUiStep("渲染 Agent", () => state.activePage === "strategy" ? renderAgentPanel() : false, 3500);
-  deferUiStep("渲染最优策略", () => state.activePage === "strategy" ? renderOptimalStrategyPanel() : false, 3800);
-  deferUiStep("渲染历史", () => state.activePage === "simulation" ? renderHistory() : false, 4100);
-  deferUiStep("渲染因子配置", () => state.activePage === "factors" ? renderFactorConfigPanel() : false, 4400);
-  deferUiStep("渲染策略版本", () => state.activePage === "strategy" ? renderStrategyRevisionPanel() : false, 4700);
   deferUiStep("刷新 API 状态", () => refreshApiStatusBar(false), 5200);
   deferUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("startup", 300, { maxSymbols: 60 }), STARTUP_SAFE_MODE ? 6500 : 5600);
   deferUiStep("排队补齐大盘快照", () => {

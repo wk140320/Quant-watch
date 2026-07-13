@@ -119,3 +119,50 @@ test("Visual workspaces keep research layouts and local artwork available", asyn
     stat(new URL("../assets/images/workspace-model-texture-v1.jpg", import.meta.url)),
   ]);
 });
+
+test("Frontend refreshes strict quote overlays before byte-bounded model batches", async () => {
+  const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
+  assert.match(source, /\/api\/quotes\/batch/);
+  assert.match(source, /function quoteOverlayTimestamp/);
+  assert.match(source, /function analysisRequestChunks/);
+  assert.match(source, /maxBytes \|\| 1_250_000/);
+  assert.match(source, /applyStoredQuoteOverlays\(marketKey\)/);
+});
+
+test("Market selection and dense research views avoid cramped horizontal panels", async () => {
+  const [html, shell, source, visualCss] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/runtime/shell-bootstrap.js", import.meta.url), "utf8"),
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/styles/quiet-gold-flow.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(html, /aria-haspopup="menu"/);
+  assert.equal((html.match(/data-market-select=/g) || []).length, 3);
+  assert.match(shell, /setMarketMenuOpen/);
+  assert.match(shell, /document\.body\.appendChild\(marketMenu\)/);
+  assert.match(shell, /positionMarketMenu/);
+  assert.match(source, /class="learning-tablist" role="tablist"/);
+  assert.equal((source.match(/data-learning-panel=/g) || []).length, 3);
+  assert.match(source, /<div class="chart-tools">[\s\S]*chart-overlay-popover[\s\S]*expandChart/);
+  assert.match(visualCss, /\.learning-tab-panel[\s\S]*overflow-x: clip/);
+  assert.match(visualCss, /\.chart-tools \.chart-overlay-popover/);
+  assert.match(visualCss, /\.market-menu\s*\{[\s\S]*position: fixed/);
+});
+
+test("Workspace rendering skips hidden dashboards and defers secondary simulation work", async () => {
+  const [html, source, runtime, performanceCss] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/runtime/ui-runtime.js", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/styles/performance.css", import.meta.url), "utf8"),
+  ]);
+  const bootSource = source.slice(source.indexOf("function boot()"), source.indexOf("boot();"));
+  assert.match(source, /function mainRenderPartsForPage/);
+  assert.match(source, /visibleParts\.has\("cards"\)/);
+  assert.match(source, /deferWorkspaceStep\(next, workspaceToken, "加载风险评估"/);
+  assert.doesNotMatch(bootSource, /safeUiStep\("渲染基础股票卡片", renderCards\)/);
+  assert.doesNotMatch(bootSource, /safeUiStep\("渲染基础持仓概览", renderPortfolioSummary\)/);
+  assert.match(runtime, /const clipped = itemRect\.left/);
+  assert.match(html, /frontend\/styles\/performance\.css/);
+  assert.match(performanceCss, /content-visibility: auto/);
+});

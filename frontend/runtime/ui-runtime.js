@@ -82,10 +82,19 @@
       activeSections.forEach((section) => {
         section.classList.remove("ui-page-enter");
       });
-      requestAnimationFrame(() => activeSections.forEach((section) => section.classList.add("ui-page-enter")));
+      requestAnimationFrame(() => {
+        activeSections.forEach((section) => section.classList.add("ui-page-enter"));
+        setTimeout(() => activeSections.forEach((section) => section.classList.remove("ui-page-enter")), 520);
+      });
       root.dataset.activeWorkspace = String(pageName || "dashboard");
       const activeNav = document.querySelector('[data-page-target].active');
-      activeNav?.scrollIntoView?.({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest", inline: "center" });
+      const navRail = activeNav?.closest?.("#workspaceRail");
+      if (activeNav && navRail) {
+        const itemRect = activeNav.getBoundingClientRect();
+        const railRect = navRail.getBoundingClientRect();
+        const clipped = itemRect.left < railRect.left + 8 || itemRect.right > railRect.right - 8;
+        if (clipped) activeNav.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "nearest", inline: "center" });
+      }
     };
     const complete = () => {
       requestAnimationFrame(() => {

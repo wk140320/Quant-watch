@@ -156,9 +156,11 @@ OPENAI_API_KEY=
 
 ## Background Runtime
 
-The default trading-session cadence is 3 minutes for holdings, 10 minutes for other watchlist symbols, and 5 minutes for minute-model training on at most two priority symbols. The daily request envelope reserves 80% for live monitoring, 15% for minute training, and 5% for manual/failover work; the minute training set keeps an 80/20 persisted-history versus newly completed-bar target when enough history exists.
+The backend now separates lightweight quotes from full analysis. During trading sessions, holdings receive verified quote checks every 1 minute and other watchlist symbols every 3 minutes; full analysis runs every 2/5 minutes respectively. Minute-model training runs every 2 minutes on up to three priority symbols and keeps up to 50,000 deduplicated samples with a 70/30 persisted-history versus newly completed-bar target. The logical request envelope allocates 55% to quotes, 25% to full analysis, 15% to minute training, and 5% to manual/failover work. Manual refresh first updates strict real-price overlays, then recalculates the model in byte-bounded batches.
 
-Open `GlobalQuantMonitor.app` to start, pause, inspect, or manually run the backend monitor. The controller also provides **安装登录自启** and **取消登录自启** actions. Login startup is implemented as a user LaunchAgent and runs `server.mjs` from this project without copying API keys into the plist.
+Open `GlobalQuantMonitor.app` to inspect model trajectories, start or pause the monitor, review the audit trail, and manually run the backend. The signed macOS container uses the same local `/monitor.html` workspace as the browser, so the visual system and model evidence stay in sync; when port `8787` is unavailable it attempts to start `server.mjs` with the bundled Codex Node runtime. The controller also exposes LaunchAgent status without copying API keys into the plist.
+
+The model-operations workspace reads persisted local evidence rather than inventing a visual history. `GET /api/model-trajectories?market=ASX` normalizes calibration, factor research, alpha evolution, intraday learning, adaptive correction, and Paper Agent events into one explainable timeline with formulas, sample counts, reasons, guardrails, and improvement/degradation states.
 
 The local control plane exposes:
 

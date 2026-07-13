@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEST="/Users/wukai/Documents/Codex/Quant-watch-ready"
+DEST="${QUANT_WATCH_READY_DEST:-/Users/wukai/Documents/Codex/Quant-watch-ready}"
 
 if [[ ! -d "$DEST" ]]; then
   echo "Destination does not exist: $DEST" >&2
@@ -16,6 +16,7 @@ rsync -a \
   --exclude .cache \
   --exclude catboost_info \
   --exclude .pnpm-store \
+  --exclude .share \
   --exclude .venv \
   --include .env.example \
   --exclude '.env*' \

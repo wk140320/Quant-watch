@@ -9,7 +9,9 @@
     <link rel="stylesheet" href="/frontend/styles/shell.css?v=20260713-provider-pool-ledger-17">
     <link rel="stylesheet" href="/frontend/styles/visual-workspaces.css?v=20260713-visual-workspaces-2">
     <link rel="stylesheet" href="/frontend/styles/institutional-polish.css?v=20260713-institutional-polish-2">
-    <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260713-provider-pool-ledger-17">
+    <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260713-market-menu-20">
+    <link rel="stylesheet" href="/frontend/styles/simulation-layout.css?v=20260714-simulation-boundary-1">
+    <link rel="stylesheet" href="/frontend/styles/performance.css?v=20260714-workspace-performance-1">
   </head>
   <body>
     <div class="app-shell">
@@ -21,11 +23,11 @@
           </button>
           <div class="market-switcher">
             <button id="marketCycleButton" class="brand-mark market-cycle" type="button" title="点击切换 ASX / US / CN">ASX</button>
-            <button id="marketMenuButton" class="market-menu-trigger" type="button" aria-expanded="false" aria-controls="marketMenu" title="直接选择市场"><i data-lucide="chevron-down"></i></button>
-            <div id="marketMenu" class="market-menu" hidden>
-              <button type="button" data-market-select="ASX"><span>ASX</span><small>澳股</small></button>
-              <button type="button" data-market-select="US"><span>US</span><small>美股</small></button>
-              <button type="button" data-market-select="CN"><span>CN</span><small>A股</small></button>
+            <button id="marketMenuButton" class="market-menu-trigger" type="button" aria-label="直接选择市场" aria-haspopup="menu" aria-expanded="false" aria-controls="marketMenu" title="直接选择市场"><i data-lucide="chevron-down"></i></button>
+            <div id="marketMenu" class="market-menu" role="menu" aria-label="市场列表" hidden>
+              <button type="button" role="menuitem" data-market-select="ASX"><span>ASX</span><small>澳股</small></button>
+              <button type="button" role="menuitem" data-market-select="US"><span>US</span><small>美股</small></button>
+              <button type="button" role="menuitem" data-market-select="CN"><span>CN</span><small>A股</small></button>
             </div>
           </div>
           <div class="market-context">
@@ -313,13 +315,13 @@
               <p class="muted small-text">总资金由你输入；持仓占额由持仓股票计算，可用资金 = 总资金 - 持仓占额。</p>
             </div>
             <div class="section-actions">
-              <button id="saveCapital" class="secondary" type="button">保存资金</button>
-              <button id="loadPortfolio" type="button">导入持仓</button>
+              <button id="saveCapital" class="secondary" type="button"><i data-lucide="save"></i><span>保存资金</span></button>
+              <button id="loadPortfolio" type="button"><i data-lucide="file-up"></i><span>导入持仓</span></button>
             </div>
           </div>
           <div class="capital-holding-grid">
-            <section>
-              <h3>资金</h3>
+            <section class="capital-funds-panel">
+              <h3><i data-lucide="landmark"></i><span>资金</span></h3>
               <div class="strategy-control-grid compact-grid">
                 <label>
                   总资金 <span class="currencyLabel">AUD</span>
@@ -335,8 +337,8 @@
                 </label>
               </div>
             </section>
-            <section>
-              <h3>持仓管理</h3>
+            <section class="holding-entry-panel">
+              <h3><i data-lucide="briefcase-business"></i><span>持仓管理</span></h3>
               <div class="mini-grid">
                 <label>
                   代码
@@ -355,23 +357,29 @@
                   <input id="holdingEntryDate" type="date">
                 </label>
               </div>
-              <button id="addHolding" class="secondary full-btn" type="button">添加/更新持仓</button>
+              <button id="addHolding" class="secondary full-btn" type="button"><i data-lucide="circle-plus"></i><span>添加/更新持仓</span></button>
             </section>
           </div>
           <details class="scroll-fold" open>
             <summary>CSV / 截图导入</summary>
-            <div class="scroll-fold-body">
-              <textarea id="portfolioCsv" rows="6">symbol,qty,avgPrice
+            <div class="scroll-fold-body portfolio-import-grid">
+              <section class="portfolio-import-method csv-import-method">
+                <h3><i data-lucide="table-properties"></i><span>CSV 批量导入</span></h3>
+                <textarea id="portfolioCsv" rows="7">symbol,qty,avgPrice
 BHP,120,43.20
 CBA,20,118.50</textarea>
-              <button id="loadPortfolioCsv" class="secondary full-btn" type="button">保存 CSV 到持仓</button>
-              <label>
-                截图导入
-                <input id="portfolioImage" type="file" accept="image/*">
-              </label>
-              <textarea id="portfolioOcrText" rows="4" placeholder="截图识别文本会显示在这里，也可以粘贴持仓文本后点应用。"></textarea>
-              <button id="applyPortfolioText" class="secondary full-btn" type="button">保存识别文本到持仓</button>
-              <p id="imageImportStatus" class="muted small-text">截图 OCR 依赖 AI/Vision 网络；不可用时可粘贴文本或 CSV。</p>
+                <button id="loadPortfolioCsv" class="secondary full-btn" type="button"><i data-lucide="database-backup"></i><span>保存 CSV 到持仓</span></button>
+              </section>
+              <section class="portfolio-import-method image-import-method">
+                <h3><i data-lucide="scan-text"></i><span>截图与文本导入</span></h3>
+                <label class="portfolio-file-field">
+                  持仓截图
+                  <input id="portfolioImage" type="file" accept="image/*">
+                </label>
+                <textarea id="portfolioOcrText" rows="4" placeholder="截图识别文本会显示在这里，也可以粘贴持仓文本后点应用。"></textarea>
+                <button id="applyPortfolioText" class="secondary full-btn" type="button"><i data-lucide="badge-check"></i><span>保存识别文本到持仓</span></button>
+                <p id="imageImportStatus" class="muted small-text">截图 OCR 依赖 AI/Vision 网络；不可用时可粘贴文本或 CSV。</p>
+              </section>
             </div>
           </details>
         </section>
@@ -491,9 +499,9 @@ CBA,20,118.50</textarea>
             <label>
               间隔
               <select id="refreshInterval">
-                <option value="60000">1 分钟</option>
+                <option value="60000" selected>1 分钟</option>
                 <option value="300000">5 分钟</option>
-                <option value="600000" selected>10 分钟</option>
+                <option value="600000">10 分钟</option>
                 <option value="1800000">30 分钟</option>
                 <option value="3600000">60 分钟</option>
               </select>
@@ -697,9 +705,9 @@ CBA,20,118.50</textarea>
     <script src="/frontend/runtime/icons.js?v=20260713-icons-2"></script>
     <script src="/frontend/domain/market.js?v=20260712-market-isolation-2"></script>
     <script src="/frontend/runtime/storage.js?v=20260713-storage-contract-1"></script>
-    <script src="/frontend/runtime/ui-runtime.js?v=20260713-local-transitions-2"></script>
+    <script src="/frontend/runtime/ui-runtime.js?v=20260714-workspace-performance-1"></script>
     <script src="/frontend/runtime/home-motion.js?v=20260712-home-motion"></script>
     <script src="/frontend/runtime/flow-navigation.js?v=20260713-flow-navigation-2"></script>
-    <script src="/frontend/runtime/shell-bootstrap.js?v=20260713-provider-pool-ledger-23"></script>
+    <script src="/frontend/runtime/shell-bootstrap.js?v=20260714-workspace-performance-1"></script>
   </body>
 </html>

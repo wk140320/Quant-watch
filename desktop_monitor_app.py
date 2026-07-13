@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import http.client
 import json
+import math
 import os
 import subprocess
 import sys
@@ -30,7 +31,7 @@ CONFIG_PATH = BACKEND_MONITOR_DIR / "config.json"
 RUNTIME_PATH = BACKEND_MONITOR_DIR / "runtime.json"
 RUN_REQUEST_PATH = BACKEND_MONITOR_DIR / "manual-run-request.json"
 APP_LOG_PATH = BACKEND_MONITOR_DIR / "desktop-app-runtime.log"
-APP_VERSION = "desktop-local-v1"
+APP_VERSION = "desktop-model-ops-v2"
 NODE_CANDIDATES = [
     Path("/Users/wukai/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node"),
     Path("/opt/homebrew/bin/node"),
@@ -55,20 +56,21 @@ DEFAULT_BUDGET_LIMITS = {
     "trainingMarketReserve": 90,
 }
 COLORS = {
-    "bg": "#090C10",
-    "panel": "#11161C",
-    "panel2": "#182129",
-    "panel3": "#202B34",
-    "border": "#26323B",
-    "border2": "#34505A",
-    "text": "#F3F7F8",
-    "muted": "#89969D",
-    "subtle": "#66747C",
-    "accent": "#5ED2C7",
-    "accent2": "#83B9EE",
-    "gold": "#E7C06F",
-    "danger": "#F18492",
-    "good": "#72D69A",
+    "bg": "#090A09",
+    "surface0": "#0D0F0D",
+    "panel": "#111310",
+    "panel2": "#181A16",
+    "panel3": "#20221D",
+    "border": "#292B26",
+    "border2": "#3A3528",
+    "text": "#F2F0E9",
+    "muted": "#858881",
+    "subtle": "#666A63",
+    "accent": "#C6A35A",
+    "accent2": "#728CA8",
+    "gold": "#E1C77E",
+    "danger": "#C76872",
+    "good": "#5BAA91",
 }
 
 
@@ -217,6 +219,217 @@ def local_intraday_model_status(market: str) -> dict:
     }
 
 
+MODEL_FAMILY_DEFINITIONS = {
+    "calibration": {"name": "预测权重校准", "short": "权重校准", "stage": "OOF 与校准"},
+    "factor": {"name": "因子研究模型", "short": "因子研究", "stage": "特征与因子"},
+    "alpha": {"name": "Alpha 进化模型", "short": "Alpha 进化", "stage": "候选生成"},
+    "intraday": {"name": "分钟学习模型", "short": "分钟学习", "stage": "分钟结构"},
+    "adaptive": {"name": "误差驱动微调", "short": "动态微调", "stage": "预测反馈"},
+    "agent": {"name": "Paper Agent 学习", "short": "Agent 学习", "stage": "纸面执行"},
+}
+MODEL_EVENT_FAMILIES = {
+    "model-change-log-prediction-weight-calibration": "calibration",
+    "model-change-log-cross-sectional-factor-research": "factor",
+    "model-change-log-factor-research": "factor",
+    "model-change-log-alpha-evolution": "alpha",
+    "model-change-log-minute-learning": "intraday",
+    "model-change-log-adaptive-micro-tuning": "adaptive",
+}
+_LOCAL_TRAJECTORY_CACHE: dict[str, tuple[tuple[float, int], dict]] = {}
+
+
+def finite_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def mean_number(values: list[object]) -> float | None:
+    numbers = [number for value in values if (number := finite_number(value)) is not None]
+    return sum(numbers) / len(numbers) if numbers else None
+
+
+def model_event_family(row: dict) -> str:
+    event_type = str(row.get("event_type") or "")
+    if event_type in MODEL_EVENT_FAMILIES:
+        return MODEL_EVENT_FAMILIES[event_type]
+    payload_type = str((row.get("payload") or {}).get("type") or "").lower()
+    if "factor" in payload_type:
+        return "factor"
+    if "alpha" in payload_type:
+        return "alpha"
+    if "minute" in payload_type or "intraday" in payload_type:
+        return "intraday"
+    if "calibrat" in payload_type or "weight" in payload_type:
+        return "calibration"
+    if "tuning" in payload_type or "adjust" in payload_type:
+        return "adaptive"
+    return "agent"
+
+
+def normalized_local_model_event(row: dict) -> dict:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    family = model_event_family(row)
+    holdout = payload.get("holdout") if isinstance(payload.get("holdout"), dict) else {}
+    test = payload.get("test") if isinstance(payload.get("test"), dict) else {}
+    horizons = payload.get("horizonCalibrations") if isinstance(payload.get("horizonCalibrations"), list) else []
+    latest_events = payload.get("latestEvents") if isinstance(payload.get("latestEvents"), list) else []
+    latest = latest_events[0] if latest_events and isinstance(latest_events[0], dict) else {}
+    after_strategies = ((payload.get("after") or {}).get("bestStrategies") or []) if isinstance(payload.get("after"), dict) else []
+    direction = finite_number(test.get("directionalAccuracy") or test.get("directionHitRate") or holdout.get("direction_hit_rate_pct"))
+    if direction is None and horizons:
+        direction = mean_number([(item.get("test") or {}).get("directionHitRate") for item in horizons if isinstance(item, dict)])
+    primary_label = "评估指标"
+    primary_value: float | None = None
+    primary_unit = ""
+    if family == "calibration":
+        primary_label, primary_value, primary_unit = "样本外方向命中", direction, "%"
+    elif family == "factor":
+        primary_label = "Holdout 方向命中" if direction is not None else "因子实时得分"
+        primary_value = direction if direction is not None else finite_number(payload.get("liveScore"))
+        primary_unit = "%" if direction is not None else ""
+    elif family == "alpha":
+        primary_label, primary_value = "候选适应度", finite_number(payload.get("topFitness"))
+    elif family == "intraday":
+        primary_label, primary_value, primary_unit = "测试方向命中", direction, "%"
+    elif family == "adaptive":
+        scale = finite_number(latest.get("adjustmentScale") or payload.get("avgAdjustmentScale"))
+        primary_label, primary_value, primary_unit = "平均调整幅度", (scale * 100 if scale is not None else None), "%"
+    else:
+        primary_label = "策略综合分"
+        primary_value = mean_number([item.get("score") for item in after_strategies if isinstance(item, dict)])
+
+    changes = latest.get("changes") if isinstance(latest.get("changes"), list) else []
+    reasons = latest.get("reasons") if isinstance(latest.get("reasons"), list) else []
+    if not changes and payload.get("summary"):
+        changes = [str(payload.get("summary"))]
+    if not reasons and payload.get("framework"):
+        reasons = [f"框架：{payload.get('framework')}"]
+    guards = []
+    overfit = payload.get("overfitGuard") if isinstance(payload.get("overfitGuard"), dict) else {}
+    for check in overfit.get("checks") or []:
+        if isinstance(check, dict):
+            guards.append({"label": check.get("label") or "防过拟合检查", "pass": check.get("pass") is not False, "note": check.get("note") or ""})
+    for guard in payload.get("guardrails") or []:
+        guards.append({"label": str(guard), "pass": True, "note": ""})
+    if payload.get("leakageControl"):
+        guards.append({"label": "未来函数隔离", "pass": True, "note": str(payload.get("leakageControl"))})
+
+    sample_count = finite_number(payload.get("sampleCount") or payload.get("sampleTotal") or holdout.get("samples") or (payload.get("details") or {}).get("sampleCount"))
+    impact = "neutral"
+    if direction is not None:
+        impact = "improved" if direction >= 50 else "degraded"
+    return {
+        "id": row.get("entity_id") or payload.get("id") or f"{family}:{row.get('created_at')}",
+        "family": family,
+        "stage": MODEL_FAMILY_DEFINITIONS[family]["stage"],
+        "createdAt": row.get("created_at") or payload.get("createdAt") or payload.get("updatedAt"),
+        "title": payload.get("title") or MODEL_FAMILY_DEFINITIONS[family]["name"],
+        "summary": payload.get("summary") or payload.get("reason") or "本次模型事件已写入本地审计日志。",
+        "entity": payload.get("symbol") or row.get("entity_id") or "market",
+        "framework": payload.get("framework") or payload.get("type") or "local-model",
+        "impact": impact,
+        "primaryLabel": primary_label,
+        "primaryValue": primary_value,
+        "primaryUnit": primary_unit,
+        "sampleCount": int(sample_count or 0),
+        "mae": finite_number(test.get("mae") or holdout.get("mae")),
+        "rankIc": finite_number(holdout.get("rank_ic") or test.get("rankIc")),
+        "changes": [str(item) for item in changes[:6]],
+        "reasons": [str(item) for item in reasons[:6]],
+        "guardrails": guards[:8],
+        "formula": payload.get("scaleFormula") or payload.get("formula"),
+    }
+
+
+def local_model_trajectory_payload(market: str) -> dict:
+    key = market.upper()
+    path = PROJECT_ROOT / ".cache" / "records" / f"model-change-log-{key.lower()}.jsonl"
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime, stat.st_size)
+    except OSError:
+        signature = (0.0, 0)
+    cached = _LOCAL_TRAJECTORY_CACHE.get(key)
+    if cached and cached[0] == signature:
+        return copy.deepcopy(cached[1])
+
+    rows = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    events = [normalized_local_model_event(row) for row in rows]
+    events.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+    deduped = []
+    seen = set()
+    for event in events:
+        signature_key = (event.get("family"), event.get("id"), event.get("title"), event.get("entity"), event.get("primaryValue"))
+        if signature_key in seen:
+            continue
+        seen.add(signature_key)
+        deduped.append(event)
+    intraday = local_intraday_model_status(key)
+    families = []
+    for family_id, definition in MODEL_FAMILY_DEFINITIONS.items():
+        family_events = [event for event in deduped if event.get("family") == family_id]
+        if not family_events and family_id != "intraday":
+            continue
+        latest = family_events[0] if family_events else None
+        if family_id == "intraday":
+            status = "已就绪" if intraday.get("available") else "采样中"
+        elif family_id == "adaptive":
+            status = "护栏微调"
+        elif family_id == "agent":
+            status = "Paper"
+        else:
+            status = "研究中"
+        families.append({
+            "id": family_id,
+            **definition,
+            "status": status,
+            "eventCount": len(family_events),
+            "sampleCount": (latest or {}).get("sampleCount") or (intraday.get("sampleCount") if family_id == "intraday" else 0),
+            "primaryLabel": (latest or {}).get("primaryLabel") or "评估指标",
+            "primaryValue": (latest or {}).get("primaryValue"),
+            "primaryUnit": (latest or {}).get("primaryUnit") or "",
+            "events": family_events[:80],
+            "trajectory": list(reversed([
+                {"at": event.get("createdAt"), "value": event.get("primaryValue"), "impact": event.get("impact"), "event": event}
+                for event in family_events if event.get("primaryValue") is not None
+            ][:48])),
+        })
+    now = datetime.now(timezone.utc).timestamp()
+    changes_24h = 0
+    for event in deduped:
+        try:
+            timestamp = datetime.fromisoformat(str(event.get("createdAt")).replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if now - timestamp <= 86400:
+            changes_24h += 1
+    payload = {
+        "market": key,
+        "families": families,
+        "timeline": deduped[:180],
+        "summary": {
+            "modelCount": len(families),
+            "eventCount": len(deduped),
+            "changes24h": changes_24h,
+            "lastChangeAt": deduped[0].get("createdAt") if deduped else intraday.get("updatedAt"),
+            "guardrailCoveragePct": round(sum(1 for event in deduped if event.get("guardrails")) / len(deduped) * 100) if deduped else 0,
+        },
+    }
+    _LOCAL_TRAJECTORY_CACHE[key] = (signature, payload)
+    return copy.deepcopy(payload)
+
+
 def local_status_payload() -> dict:
     config = read_json_file(CONFIG_PATH, {"enabled": False, "markets": {}, "refresh": {}, "training": {}})
     runtime = read_json_file(RUNTIME_PATH, {})
@@ -254,6 +467,7 @@ def local_status_payload() -> dict:
         "budget": budget if isinstance(budget, dict) else {"date": local_budget_date(), "used": {}},
         "budgetLimits": DEFAULT_BUDGET_LIMITS,
         "intradayModels": {market: local_intraday_model_status(market) for market in markets},
+        "modelTrajectories": {market: local_model_trajectory_payload(market) for market in markets},
         "push": {
             "desktopConfigured": True,
             "mobileWebhookConfigured": bool(env.get("MOBILE_PUSH_WEBHOOK_URL")),
@@ -282,9 +496,9 @@ def log_message(message: str, exc: BaseException | None = None) -> None:
 class MonitorDesktopApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Global Quant Watch 后台监控")
-        self.geometry("1160x780")
-        self.minsize(980, 690)
+        self.title("Global Quant Monitor · 模型运行中枢")
+        self.geometry("1320x880")
+        self.minsize(1080, 740)
         self.configure(bg=COLORS["bg"])
         self.status_payload: dict | None = None
         self.server_process: subprocess.Popen | None = None
@@ -307,88 +521,248 @@ class MonitorDesktopApp(tk.Tk):
         style.configure("Muted.TLabel", background=COLORS["bg"], foreground=COLORS["muted"])
         style.configure("Panel.TLabel", background=COLORS["panel"], foreground=COLORS["text"])
         style.configure("MutedPanel.TLabel", background=COLORS["panel"], foreground=COLORS["muted"])
-        style.configure("Title.TLabel", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica", 24, "bold"))
-        style.configure("Metric.TLabel", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica", 20, "bold"))
-        style.configure("TButton", padding=(13, 8), background="#202B34", foreground=COLORS["text"], borderwidth=0, focusthickness=0)
-        style.map("TButton", background=[("active", "#293741"), ("disabled", "#151B21")], foreground=[("disabled", COLORS["subtle"])])
-        style.configure("Accent.TButton", background="#265B55", foreground="#EEFFFC")
-        style.configure("Danger.TButton", background="#45232A", foreground="#FFE8EC")
-        style.configure("Good.TButton", background="#203D2D", foreground="#E9FFF0")
-        style.configure("TEntry", fieldbackground="#0D1217", foreground=COLORS["text"], insertcolor=COLORS["text"], bordercolor=COLORS["border"])
+        style.configure("Title.TLabel", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica Neue", 24, "bold"))
+        style.configure("Metric.TLabel", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica Neue", 20, "bold"))
+        style.configure("TButton", padding=(13, 8), background="#242015", foreground=COLORS["text"], borderwidth=1, bordercolor=COLORS["border2"], focusthickness=0)
+        style.map("TButton", background=[("active", "#2B2518"), ("disabled", "#151613")], foreground=[("disabled", COLORS["subtle"])])
+        style.configure("Accent.TButton", background="#2B2518", foreground=COLORS["gold"], bordercolor="#5A4A2B")
+        style.configure("Danger.TButton", background="#2B181A", foreground="#E5A1A8", bordercolor="#513036")
+        style.configure("Good.TButton", background="#16251F", foreground="#8CC7B4", bordercolor="#2A4A3F")
+        style.configure("TEntry", fieldbackground=COLORS["surface0"], foreground=COLORS["text"], insertcolor=COLORS["text"], bordercolor=COLORS["border"])
+        style.configure("Model.TNotebook", background=COLORS["bg"], borderwidth=0, tabmargins=(0, 8, 0, 0))
+        style.configure("Model.TNotebook.Tab", padding=(18, 9), background=COLORS["panel"], foreground=COLORS["muted"], borderwidth=0)
+        style.map("Model.TNotebook.Tab", background=[("selected", COLORS["panel2"]), ("active", COLORS["panel2"])], foreground=[("selected", COLORS["gold"]), ("active", COLORS["text"])])
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=22)
+        self.current_market = "ASX"
+        self.current_family_id: str | None = None
+        self.current_model_event_index = 0
+        self.chart_hit_targets: list[tuple[float, float, dict]] = []
+        self.hero_image = None
+
+        root = tk.Frame(self, bg=COLORS["bg"], padx=20, pady=16)
         root.pack(fill="both", expand=True)
 
-        header = tk.Frame(root, bg=COLORS["panel"], highlightbackground=COLORS["border2"], highlightthickness=1)
-        header.pack(fill="x", pady=(0, 16))
-        title_block = tk.Frame(header, bg=COLORS["panel"])
-        title_block.pack(side="left", fill="both", expand=True, padx=18, pady=15)
-        tk.Label(title_block, text="LOCAL DESKTOP DAEMON", bg=COLORS["panel"], fg=COLORS["accent"], font=("Helvetica", 10, "bold"), anchor="w").pack(fill="x")
-        tk.Label(title_block, text="Global Quant Watch", bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica", 25, "bold"), anchor="w").pack(fill="x", pady=(2, 0))
-        tk.Label(title_block, text="后端监控、分钟训练、预算和提醒的本地控制台", bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica", 12), anchor="w").pack(fill="x", pady=(2, 0))
-        self.status_label = tk.Label(title_block, text="读取中...", bg="#0D1217", fg=COLORS["muted"], font=("Helvetica", 11), anchor="w", padx=10, pady=5)
-        self.status_label.pack(fill="x", pady=(10, 0))
+        topbar = tk.Frame(root, bg=COLORS["bg"])
+        topbar.pack(fill="x", pady=(0, 10))
+        brand = tk.Frame(topbar, bg=COLORS["bg"])
+        brand.pack(side="left", fill="x", expand=True)
+        tk.Label(brand, text="GQ", bg=COLORS["bg"], fg=COLORS["gold"], font=("Helvetica Neue", 10, "bold"), highlightbackground=COLORS["border2"], highlightthickness=1, padx=8, pady=8).pack(side="left", padx=(0, 9))
+        brand_copy = tk.Frame(brand, bg=COLORS["bg"])
+        brand_copy.pack(side="left")
+        tk.Label(brand_copy, text="Global Quant Watch", bg=COLORS["bg"], fg=COLORS["text"], font=("Helvetica Neue", 14, "bold"), anchor="w").pack(fill="x")
+        tk.Label(brand_copy, text="LOCAL MODEL OPERATIONS", bg=COLORS["bg"], fg=COLORS["muted"], font=("Helvetica Neue", 8), anchor="w").pack(fill="x")
 
-        actions = tk.Frame(header, bg=COLORS["panel"])
-        actions.pack(side="right", padx=14, pady=14)
-        self.start_server_button = ttk.Button(actions, text="启动本地服务", command=self.start_server)
-        self.start_server_button.pack(fill="x", pady=3)
+        actions = tk.Frame(topbar, bg=COLORS["bg"])
+        actions.pack(side="right")
+        self.start_server_button = ttk.Button(actions, text="启动服务", command=self.start_server)
+        self.start_server_button.pack(side="left", padx=3)
         self.refresh_button = ttk.Button(actions, text="刷新", command=self.refresh_status)
-        self.refresh_button.pack(fill="x", pady=3)
+        self.refresh_button.pack(side="left", padx=3)
+        self.run_button = ttk.Button(actions, text="立即运行", command=self.run_once, style="Accent.TButton")
+        self.run_button.pack(side="left", padx=3)
         self.toggle_button = ttk.Button(actions, text="读取中", command=self.toggle_backend)
-        self.toggle_button.pack(fill="x", pady=3)
-        self.run_button = ttk.Button(actions, text="立即运行一次", command=self.run_once, style="Accent.TButton")
-        self.run_button.pack(fill="x", pady=3)
-        self.login_button = ttk.Button(actions, text="安装登录自启", command=self.install_login_agent)
-        self.login_button.pack(fill="x", pady=3)
-        self.remove_login_button = ttk.Button(actions, text="取消登录自启", command=self.remove_login_agent)
-        self.remove_login_button.pack(fill="x", pady=3)
+        self.toggle_button.pack(side="left", padx=3)
 
-        metrics = ttk.Frame(root)
-        metrics.pack(fill="x", pady=(0, 14))
-        self.metric_vars: dict[str, tk.StringVar] = {}
-        metric_defs = [
-            ("enabled", "后台开关"),
-            ("running", "运行状态"),
-            ("due", "待运行任务"),
-            ("push", "手机推送"),
-        ]
-        for key, title in metric_defs:
+        hero = tk.Frame(root, bg=COLORS["surface0"], highlightbackground=COLORS["border"], highlightthickness=1)
+        hero.pack(fill="x", pady=(0, 12))
+        hero_copy = tk.Frame(hero, bg=COLORS["surface0"])
+        hero_copy.pack(side="left", fill="both", expand=True, padx=28, pady=23)
+        tk.Label(hero_copy, text="MODEL OPERATIONS CENTER", bg=COLORS["surface0"], fg=COLORS["accent"], font=("Helvetica Neue", 9, "bold"), anchor="w").pack(fill="x")
+        tk.Label(hero_copy, text="模型运行中枢", bg=COLORS["surface0"], fg=COLORS["text"], font=("Helvetica Neue", 29, "bold"), anchor="w").pack(fill="x", pady=(6, 5))
+        tk.Label(hero_copy, text="把数据、因子、样本外验证、权重校准与失败后微调串成可解释动线。", bg=COLORS["surface0"], fg=COLORS["muted"], font=("Helvetica Neue", 11), anchor="w").pack(fill="x")
+        self.status_label = tk.Label(hero_copy, text="正在恢复本地状态...", bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica Neue", 10), anchor="w", padx=11, pady=7)
+        self.status_label.pack(fill="x", pady=(16, 0))
+        art_path = PROJECT_ROOT / "assets" / "images" / "quant-home-hero-v2.png"
+        if art_path.exists():
+            try:
+                source = tk.PhotoImage(file=str(art_path))
+                self.hero_image = source.subsample(5, 5)
+                art = tk.Label(hero, image=self.hero_image, bg=COLORS["surface0"], borderwidth=0)
+                art.pack(side="right", padx=(0, 1), pady=1)
+            except tk.TclError as exc:
+                log_message("desktop hero image unavailable", exc)
+
+        metrics = tk.Frame(root, bg=COLORS["bg"])
+        metrics.pack(fill="x", pady=(0, 10))
+        self.metric_vars = {}
+        metric_defs = [("enabled", "后台开关"), ("running", "运行状态"), ("due", "待运行任务"), ("push", "手机推送")]
+        for index, (key, title) in enumerate(metric_defs):
             card = tk.Frame(metrics, bg=COLORS["panel"], highlightbackground=COLORS["border"], highlightthickness=1)
-            card.pack(side="left", fill="x", expand=True, padx=5)
-            tk.Frame(card, bg=COLORS["accent"], height=2).pack(fill="x")
-            tk.Label(card, text=title, bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica", 11), anchor="w").pack(fill="x", padx=14, pady=(12, 0))
+            card.pack(side="left", fill="x", expand=True, padx=(0 if index == 0 else 4, 0 if index == len(metric_defs) - 1 else 4))
+            tk.Label(card, text=title, bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica Neue", 9), anchor="w").pack(fill="x", padx=14, pady=(11, 0))
             value = tk.StringVar(value="--")
             self.metric_vars[key] = value
-            tk.Label(card, textvariable=value, bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica", 21, "bold"), anchor="w").pack(fill="x", padx=14, pady=(4, 13))
+            tk.Label(card, textvariable=value, bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica Neue", 18, "bold"), anchor="w").pack(fill="x", padx=14, pady=(4, 11))
 
-        schedule = tk.Frame(root, bg=COLORS["panel"], highlightbackground=COLORS["border"], highlightthickness=1)
-        schedule.pack(fill="x", pady=(0, 14))
+        self.notebook = ttk.Notebook(root, style="Model.TNotebook")
+        self.notebook.pack(fill="both", expand=True)
+        self.model_tab = tk.Frame(self.notebook, bg=COLORS["surface0"])
+        self.control_tab = tk.Frame(self.notebook, bg=COLORS["surface0"])
+        self.system_tab = tk.Frame(self.notebook, bg=COLORS["surface0"])
+        self.notebook.add(self.model_tab, text="模型动线")
+        self.notebook.add(self.control_tab, text="运行控制")
+        self.notebook.add(self.system_tab, text="系统与审计")
+        self._build_model_tab()
+        self._build_control_tab()
+        self._build_system_tab()
+
+    def _build_model_tab(self) -> None:
+        toolbar = tk.Frame(self.model_tab, bg=COLORS["surface0"], padx=16, pady=12)
+        toolbar.pack(fill="x")
+        self.market_buttons: dict[str, tk.Button] = {}
+        for market, label in [("ASX", "ASX"), ("US", "US"), ("CN", "A股")]:
+            button = tk.Button(
+                toolbar,
+                text=label,
+                command=lambda value=market: self.select_model_market(value),
+                bg=COLORS["panel2"] if market == self.current_market else COLORS["panel"],
+                fg=COLORS["gold"] if market == self.current_market else COLORS["muted"],
+                activebackground=COLORS["panel2"],
+                activeforeground=COLORS["gold"],
+                relief="flat",
+                borderwidth=0,
+                padx=16,
+                pady=7,
+                font=("Helvetica Neue", 10, "bold"),
+            )
+            button.pack(side="left", padx=(0, 4))
+            self.market_buttons[market] = button
+        self.model_summary_var = tk.StringVar(value="正在读取模型注册表")
+        tk.Label(toolbar, textvariable=self.model_summary_var, bg=COLORS["surface0"], fg=COLORS["muted"], font=("Helvetica Neue", 10), anchor="e").pack(side="right")
+
+        self.pipeline_canvas = tk.Canvas(self.model_tab, height=96, bg=COLORS["surface0"], highlightthickness=0)
+        self.pipeline_canvas.pack(fill="x", padx=16, pady=(0, 10))
+        self.pipeline_canvas.bind("<Configure>", lambda _event: self.draw_model_pipeline())
+
+        workspace = tk.PanedWindow(
+            self.model_tab,
+            orient="horizontal",
+            bg=COLORS["border"],
+            sashwidth=4,
+            sashrelief="flat",
+            borderwidth=0,
+            showhandle=False,
+        )
+        workspace.pack(fill="both", expand=True)
+
+        rail = tk.Frame(workspace, bg=COLORS["panel"], width=248)
+        workspace.add(rail, minsize=220, width=248)
+        rail_head = tk.Frame(rail, bg=COLORS["panel"])
+        rail_head.pack(fill="x", padx=15, pady=(16, 8))
+        tk.Label(rail_head, text="模型族", bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica Neue", 14, "bold"), anchor="w").pack(side="left")
+        self.model_count_var = tk.StringVar(value="--")
+        tk.Label(rail_head, textvariable=self.model_count_var, bg=COLORS["panel2"], fg=COLORS["muted"], font=("Helvetica Neue", 9), padx=7, pady=3).pack(side="right")
+        self.model_list_frame = tk.Frame(rail, bg=COLORS["panel"])
+        self.model_list_frame.pack(fill="both", expand=True, padx=9, pady=(0, 12))
+
+        center = tk.Frame(workspace, bg=COLORS["surface0"])
+        workspace.add(center, minsize=500, stretch="always")
+        chart_head = tk.Frame(center, bg=COLORS["surface0"])
+        chart_head.pack(fill="x", padx=18, pady=(16, 8))
+        self.model_title_var = tk.StringVar(value="请选择模型")
+        self.model_stage_var = tk.StringVar(value="MODEL TRAJECTORY")
+        title_block = tk.Frame(chart_head, bg=COLORS["surface0"])
+        title_block.pack(side="left", fill="x", expand=True)
+        tk.Label(title_block, textvariable=self.model_stage_var, bg=COLORS["surface0"], fg=COLORS["accent"], font=("Helvetica Neue", 8, "bold"), anchor="w").pack(fill="x")
+        tk.Label(title_block, textvariable=self.model_title_var, bg=COLORS["surface0"], fg=COLORS["text"], font=("Helvetica Neue", 17, "bold"), anchor="w").pack(fill="x", pady=(3, 0))
+        self.model_metric_var = tk.StringVar(value="核心指标 --")
+        tk.Label(chart_head, textvariable=self.model_metric_var, bg=COLORS["panel"], fg=COLORS["gold"], font=("Menlo", 10, "bold"), padx=10, pady=6).pack(side="right")
+
+        self.trajectory_canvas = tk.Canvas(center, height=270, bg="#0B0D0B", highlightbackground=COLORS["border"], highlightthickness=1)
+        self.trajectory_canvas.pack(fill="x", padx=18, pady=(4, 10))
+        self.trajectory_canvas.bind("<Configure>", lambda _event: self.draw_model_trajectory())
+        self.trajectory_canvas.bind("<Button-1>", self.on_trajectory_click)
+
+        events_head = tk.Frame(center, bg=COLORS["surface0"])
+        events_head.pack(fill="x", padx=18, pady=(0, 6))
+        tk.Label(events_head, text="关键变更节点", bg=COLORS["surface0"], fg=COLORS["text"], font=("Helvetica Neue", 12, "bold"), anchor="w").pack(side="left")
+        tk.Label(events_head, text="选择节点查看原因、证据与护栏", bg=COLORS["surface0"], fg=COLORS["muted"], font=("Helvetica Neue", 9), anchor="e").pack(side="right")
+        self.event_listbox = tk.Listbox(
+            center,
+            height=7,
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            selectbackground="#2B2518",
+            selectforeground=COLORS["gold"],
+            relief="flat",
+            highlightbackground=COLORS["border"],
+            highlightthickness=1,
+            activestyle="none",
+            font=("Menlo", 10),
+        )
+        self.event_listbox.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        self.event_listbox.bind("<<ListboxSelect>>", self.on_model_event_select)
+
+        inspector = tk.Frame(workspace, bg=COLORS["panel"], width=342)
+        workspace.add(inspector, minsize=300, width=342)
+        inspector_head = tk.Frame(inspector, bg=COLORS["panel"])
+        inspector_head.pack(fill="x", padx=15, pady=(16, 8))
+        tk.Label(inspector_head, text="变更解释", bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica Neue", 14, "bold"), anchor="w").pack(side="left")
+        self.event_impact_var = tk.StringVar(value="等待节点")
+        tk.Label(inspector_head, textvariable=self.event_impact_var, bg=COLORS["panel2"], fg=COLORS["gold"], font=("Helvetica Neue", 9), padx=7, pady=3).pack(side="right")
+        self.inspector_text = tk.Text(
+            inspector,
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+            wrap="word",
+            font=("Helvetica Neue", 10),
+            padx=15,
+            pady=10,
+            spacing1=2,
+            spacing3=5,
+            selectbackground="#3A3528",
+        )
+        self.inspector_text.pack(fill="both", expand=True)
+        self.inspector_text.tag_configure("title", foreground=COLORS["text"], font=("Helvetica Neue", 14, "bold"), spacing3=8)
+        self.inspector_text.tag_configure("section", foreground=COLORS["gold"], font=("Helvetica Neue", 10, "bold"), spacing1=9, spacing3=4)
+        self.inspector_text.tag_configure("muted", foreground=COLORS["muted"], font=("Helvetica Neue", 9))
+        self.inspector_text.tag_configure("good", foreground=COLORS["good"], font=("Helvetica Neue", 9, "bold"))
+        self.inspector_text.tag_configure("danger", foreground=COLORS["danger"], font=("Helvetica Neue", 9, "bold"))
+        self.inspector_text.configure(state="disabled")
+
+    def _build_control_tab(self) -> None:
+        schedule = tk.Frame(self.control_tab, bg=COLORS["panel"], highlightbackground=COLORS["border"], highlightthickness=1)
+        schedule.pack(fill="x", padx=14, pady=14)
         schedule_header = tk.Frame(schedule, bg=COLORS["panel"])
-        schedule_header.pack(fill="x", padx=14, pady=(12, 6))
-        tk.Label(schedule_header, text="刷新频率", bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica", 15, "bold"), anchor="w").pack(side="left")
-        tk.Label(schedule_header, text="持仓 5 分钟 / 监控 15 分钟 / 分钟训练可独立设置", bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica", 11), anchor="e").pack(side="right")
+        schedule_header.pack(fill="x", padx=16, pady=(14, 7))
+        tk.Label(schedule_header, text="刷新与训练频率", bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica Neue", 15, "bold"), anchor="w").pack(side="left")
+        tk.Label(schedule_header, text="报价 1/3 分钟 · 完整分析与分钟训练独立设置", bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica Neue", 9), anchor="e").pack(side="right")
         fields = tk.Frame(schedule, bg=COLORS["panel"])
-        fields.pack(fill="x", padx=14, pady=(0, 12))
-        self.holding_minutes = self._number_field(fields, "持仓股分钟", 0)
-        self.watch_minutes = self._number_field(fields, "监控股分钟", 1)
+        fields.pack(fill="x", padx=16, pady=(0, 14))
+        self.holding_minutes = self._number_field(fields, "持仓分析分钟", 0)
+        self.watch_minutes = self._number_field(fields, "监控分析分钟", 1)
         self.training_minutes = self._number_field(fields, "训练分钟", 2)
         self.training_symbols = self._number_field(fields, "训练股票数", 3)
-        ttk.Button(fields, text="保存频率", command=self.save_schedule).grid(row=1, column=4, padx=(14, 0), sticky="ew")
+        ttk.Button(fields, text="保存频率", command=self.save_schedule, style="Accent.TButton").grid(row=1, column=4, padx=(14, 0), sticky="ew")
         fields.grid_columnconfigure(4, weight=1)
 
-        middle = ttk.Frame(root)
-        middle.pack(fill="both", expand=True)
-
-        left = ttk.Frame(middle)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 7))
-        right = ttk.Frame(middle)
-        right.pack(side="left", fill="both", expand=True, padx=(7, 0))
-
+        columns = tk.Frame(self.control_tab, bg=COLORS["surface0"])
+        columns.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        left = tk.Frame(columns, bg=COLORS["surface0"])
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = tk.Frame(columns, bg=COLORS["surface0"])
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
         self.sessions_text = self._text_panel(left, "市场时段")
-        self.budget_text = self._text_panel(left, "预算与推送")
-        self.models_text = self._text_panel(right, "分钟模型")
+        self.budget_text = self._text_panel(right, "预算与推送")
+
+    def _build_system_tab(self) -> None:
+        command_bar = tk.Frame(self.system_tab, bg=COLORS["surface0"], padx=14, pady=14)
+        command_bar.pack(fill="x")
+        tk.Label(command_bar, text="系统服务", bg=COLORS["surface0"], fg=COLORS["text"], font=("Helvetica Neue", 14, "bold"), anchor="w").pack(side="left")
+        self.login_button = ttk.Button(command_bar, text="安装登录自启", command=self.install_login_agent)
+        self.login_button.pack(side="right", padx=(6, 0))
+        self.remove_login_button = ttk.Button(command_bar, text="取消登录自启", command=self.remove_login_agent)
+        self.remove_login_button.pack(side="right")
+        columns = tk.Frame(self.system_tab, bg=COLORS["surface0"])
+        columns.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        left = tk.Frame(columns, bg=COLORS["surface0"])
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        right = tk.Frame(columns, bg=COLORS["surface0"])
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self.models_text = self._text_panel(left, "分钟模型与本地注册表")
         self.pool_text = self._text_panel(right, "监控池与最近结果")
 
     def _number_field(self, parent: tk.Frame, title: str, column: int) -> tk.StringVar:
@@ -406,24 +780,259 @@ class MonitorDesktopApp(tk.Tk):
         panel.pack(fill="both", expand=True, pady=(0, 14))
         title_row = tk.Frame(panel, bg=COLORS["panel"])
         title_row.pack(fill="x", padx=14, pady=(12, 5))
-        tk.Label(title_row, text=title, bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica", 15, "bold"), anchor="w").pack(side="left")
-        tk.Label(title_row, text="live/cache aware", bg=COLORS["panel"], fg=COLORS["subtle"], font=("Helvetica", 10), anchor="e").pack(side="right")
+        tk.Label(title_row, text=title, bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica Neue", 14, "bold"), anchor="w").pack(side="left")
+        tk.Label(title_row, text="LOCAL / LIVE", bg=COLORS["panel"], fg=COLORS["subtle"], font=("Helvetica Neue", 8), anchor="e").pack(side="right")
         text = tk.Text(
             panel,
             height=10,
-            bg="#0D1217",
-            fg="#DCE7EA",
+            bg=COLORS["surface0"],
+            fg=COLORS["text"],
             insertbackground=COLORS["text"],
             relief="flat",
             wrap="word",
-            font=("Menlo", 12),
+            font=("Menlo", 10),
             padx=10,
             pady=9,
-            selectbackground="#265B55",
+            selectbackground="#3A3528",
         )
         text.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         text.configure(state="disabled")
         return text
+
+    def select_model_market(self, market: str) -> None:
+        self.current_market = market
+        self.current_family_id = None
+        self.current_model_event_index = 0
+        for key, button in self.market_buttons.items():
+            active = key == market
+            button.configure(
+                bg=COLORS["panel2"] if active else COLORS["panel"],
+                fg=COLORS["gold"] if active else COLORS["muted"],
+            )
+        self.render_model_trajectory()
+
+    def selected_model_payload(self) -> dict:
+        payload = self.status_payload or {}
+        trajectories = payload.get("modelTrajectories") if isinstance(payload.get("modelTrajectories"), dict) else {}
+        return trajectories.get(self.current_market) if isinstance(trajectories.get(self.current_market), dict) else {"families": [], "summary": {}}
+
+    def selected_model_family(self) -> dict | None:
+        families = self.selected_model_payload().get("families") or []
+        if not families:
+            return None
+        for family in families:
+            if family.get("id") == self.current_family_id:
+                return family
+        return families[0]
+
+    def render_model_trajectory(self) -> None:
+        if not hasattr(self, "model_list_frame"):
+            return
+        payload = self.selected_model_payload()
+        families = payload.get("families") or []
+        if not any(family.get("id") == self.current_family_id for family in families):
+            self.current_family_id = families[0].get("id") if families else None
+            self.current_model_event_index = 0
+        summary = payload.get("summary") or {}
+        self.model_summary_var.set(
+            f"{self.current_market} · {summary.get('modelCount', len(families))} 个模型族 · "
+            f"24 小时 {summary.get('changes24h', 0)} 次变更 · 护栏 {summary.get('guardrailCoveragePct', 0)}%"
+        )
+        self.model_count_var.set(f"{len(families)} 个")
+        for child in self.model_list_frame.winfo_children():
+            child.destroy()
+        for family in families:
+            active = family.get("id") == self.current_family_id
+            metric_value = family.get("primaryValue")
+            metric_text = "--" if metric_value is None else f"{float(metric_value):.1f}{family.get('primaryUnit', '')}"
+            button = tk.Button(
+                self.model_list_frame,
+                text=f"{family.get('short', family.get('name', '模型'))}\n{family.get('status', '研究中')}  ·  {metric_text}  ·  {family.get('eventCount', 0)} 次",
+                command=lambda family_id=family.get("id"): self.select_model_family(family_id),
+                justify="left",
+                anchor="w",
+                bg="#242015" if active else COLORS["panel"],
+                fg=COLORS["gold"] if active else COLORS["text"],
+                activebackground="#2B2518",
+                activeforeground=COLORS["gold"],
+                relief="flat",
+                borderwidth=0,
+                padx=12,
+                pady=9,
+                font=("Helvetica Neue", 10, "bold"),
+            )
+            button.pack(fill="x", pady=3)
+        family = self.selected_model_family()
+        if family:
+            self.model_title_var.set(family.get("name") or family.get("short") or "模型")
+            self.model_stage_var.set(str(family.get("stage") or "MODEL TRAJECTORY").upper())
+            value = family.get("primaryValue")
+            value_text = "--" if value is None else f"{float(value):.1f}{family.get('primaryUnit', '')}"
+            self.model_metric_var.set(f"{family.get('primaryLabel', '核心指标')}  {value_text}")
+        else:
+            self.model_title_var.set("暂无模型轨迹")
+            self.model_stage_var.set("WAITING FOR LOCAL EVIDENCE")
+            self.model_metric_var.set("核心指标 --")
+        self.draw_model_pipeline()
+        self.draw_model_trajectory()
+        self.render_model_event_list()
+
+    def select_model_family(self, family_id: str | None) -> None:
+        self.current_family_id = family_id
+        self.current_model_event_index = 0
+        self.render_model_trajectory()
+
+    def draw_model_pipeline(self) -> None:
+        if not hasattr(self, "pipeline_canvas"):
+            return
+        canvas = self.pipeline_canvas
+        canvas.delete("all")
+        width = max(620, canvas.winfo_width())
+        height = max(84, canvas.winfo_height())
+        stages = [
+            ("数据", True),
+            ("因子", any(family.get("id") == "factor" for family in (self.selected_model_payload().get("families") or []))),
+            ("基础模型", any(family.get("id") in {"alpha", "intraday"} for family in (self.selected_model_payload().get("families") or []))),
+            ("OOF", any(family.get("id") == "calibration" for family in (self.selected_model_payload().get("families") or []))),
+            ("集成", any(family.get("id") in {"calibration", "agent"} for family in (self.selected_model_payload().get("families") or []))),
+            ("校准", any(family.get("id") == "adaptive" for family in (self.selected_model_payload().get("families") or []))),
+            ("拒绝交易", bool((self.status_payload or {}).get("config"))),
+        ]
+        left, right, y = 34, width - 34, 42
+        step = (right - left) / max(1, len(stages) - 1)
+        canvas.create_line(left, y, right, y, fill=COLORS["border2"], width=2)
+        for index, (label, available) in enumerate(stages):
+            x = left + index * step
+            fill = COLORS["accent"] if available else COLORS["subtle"]
+            canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill=fill, outline=COLORS["surface0"], width=2)
+            canvas.create_text(x, y + 25, text=label, fill=COLORS["text"] if available else COLORS["muted"], font=("Helvetica Neue", 9), anchor="n")
+
+    def draw_model_trajectory(self) -> None:
+        if not hasattr(self, "trajectory_canvas"):
+            return
+        canvas = self.trajectory_canvas
+        canvas.delete("all")
+        family = self.selected_model_family()
+        points = family.get("trajectory") if family else []
+        points = [point for point in (points or []) if finite_number(point.get("value")) is not None]
+        width = max(420, canvas.winfo_width())
+        height = max(240, canvas.winfo_height())
+        self.chart_hit_targets = []
+        if not points:
+            canvas.create_text(width / 2, height / 2 - 8, text="尚未形成可绘制的样本外轨迹", fill=COLORS["text"], font=("Helvetica Neue", 12, "bold"))
+            canvas.create_text(width / 2, height / 2 + 15, text="事件仍会保留在下方本地审计列表", fill=COLORS["muted"], font=("Helvetica Neue", 9))
+            return
+        values = [float(point.get("value")) for point in points]
+        minimum, maximum = min(values), max(values)
+        spread = max(1.0, maximum - minimum)
+        minimum -= spread * 0.16
+        maximum += spread * 0.16
+        margin_left, margin_right, margin_top, margin_bottom = 48, 20, 24, 36
+        chart_width = width - margin_left - margin_right
+        chart_height = height - margin_top - margin_bottom
+        for index in range(5):
+            y = margin_top + index / 4 * chart_height
+            value = maximum - index / 4 * (maximum - minimum)
+            canvas.create_line(margin_left, y, width - margin_right, y, fill="#242621", width=1)
+            canvas.create_text(8, y, text=f"{value:.1f}", fill=COLORS["muted"], font=("Menlo", 8), anchor="w")
+        coordinates = []
+        for index, point in enumerate(points):
+            x = margin_left + (chart_width / 2 if len(points) == 1 else index / (len(points) - 1) * chart_width)
+            y = margin_top + (maximum - float(point.get("value"))) / (maximum - minimum) * chart_height
+            coordinates.extend([x, y])
+            self.chart_hit_targets.append((x, y, point.get("event") or {}))
+        if len(coordinates) >= 4:
+            canvas.create_line(*coordinates, fill=COLORS["accent"], width=2, smooth=True, splinesteps=18)
+        for x, y, event in self.chart_hit_targets:
+            impact = event.get("impact")
+            fill = COLORS["good"] if impact == "improved" else COLORS["danger"] if impact == "degraded" else COLORS["accent"]
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill=fill, outline="#0B0D0B", width=2)
+        for index in sorted({0, (len(points) - 1) // 2, len(points) - 1}):
+            point = points[index]
+            x = margin_left + (chart_width / 2 if len(points) == 1 else index / (len(points) - 1) * chart_width)
+            canvas.create_text(x, height - 17, text=compact_time(point.get("at"))[5:16], fill=COLORS["muted"], font=("Menlo", 8), anchor="center")
+
+    def render_model_event_list(self) -> None:
+        family = self.selected_model_family()
+        events = family.get("events") if family else []
+        self.event_listbox.delete(0, tk.END)
+        for event in events or []:
+            marker = "+" if event.get("impact") == "improved" else "-" if event.get("impact") == "degraded" else "·"
+            self.event_listbox.insert(tk.END, f" {marker}  {compact_time(event.get('createdAt'))[5:16]}  {event.get('title', '模型事件')}  ·  {event.get('entity', 'market')}")
+        if events:
+            self.current_model_event_index = min(self.current_model_event_index, len(events) - 1)
+            self.event_listbox.selection_set(self.current_model_event_index)
+            self.event_listbox.activate(self.current_model_event_index)
+            self.render_model_event(events[self.current_model_event_index])
+        else:
+            self.render_model_event(None)
+
+    def on_model_event_select(self, _event: tk.Event | None = None) -> None:
+        selection = self.event_listbox.curselection()
+        if not selection:
+            return
+        self.current_model_event_index = int(selection[0])
+        family = self.selected_model_family()
+        events = family.get("events") if family else []
+        if 0 <= self.current_model_event_index < len(events):
+            self.render_model_event(events[self.current_model_event_index])
+
+    def on_trajectory_click(self, event: tk.Event) -> None:
+        if not self.chart_hit_targets:
+            return
+        x, y, selected = min(self.chart_hit_targets, key=lambda point: math.hypot(point[0] - event.x, point[1] - event.y))
+        if math.hypot(x - event.x, y - event.y) > 20:
+            return
+        family = self.selected_model_family()
+        events = family.get("events") if family else []
+        for index, item in enumerate(events):
+            if item.get("id") == selected.get("id") and item.get("createdAt") == selected.get("createdAt"):
+                self.current_model_event_index = index
+                self.event_listbox.selection_clear(0, tk.END)
+                self.event_listbox.selection_set(index)
+                self.event_listbox.see(index)
+                self.render_model_event(item)
+                break
+
+    def render_model_event(self, event: dict | None) -> None:
+        text = self.inspector_text
+        text.configure(state="normal")
+        text.delete("1.0", tk.END)
+        if not event:
+            self.event_impact_var.set("等待节点")
+            text.insert(tk.END, "选择一个模型变更节点后，这里会显示修改内容、触发原因、样本证据、公式和护栏结果。", "muted")
+            text.configure(state="disabled")
+            return
+        impact = event.get("impact")
+        self.event_impact_var.set("样本外改善" if impact == "improved" else "指标退化" if impact == "degraded" else "待验证")
+        text.insert(tk.END, f"{event.get('title', '模型事件')}\n", "title")
+        text.insert(tk.END, f"{event.get('summary', '')}\n", "muted")
+        text.insert(tk.END, "\n证据摘要\n", "section")
+        metric_value = event.get("primaryValue")
+        metric_text = "--" if metric_value is None else f"{float(metric_value):.2f}{event.get('primaryUnit', '')}"
+        text.insert(tk.END, f"核心指标  {event.get('primaryLabel', '评估指标')}  {metric_text}\n")
+        text.insert(tk.END, f"样本数量  {event.get('sampleCount', 0)}\n")
+        text.insert(tk.END, f"模型对象  {event.get('entity', 'market')}\n")
+        text.insert(tk.END, f"发生时间  {compact_time(event.get('createdAt'))}\n")
+        if event.get("changes"):
+            text.insert(tk.END, "\n修改了什么\n", "section")
+            for item in event.get("changes") or []:
+                text.insert(tk.END, f"• {item}\n")
+        if event.get("reasons"):
+            text.insert(tk.END, "\n为什么修改\n", "section")
+            for item in event.get("reasons") or []:
+                text.insert(tk.END, f"• {item}\n")
+        if event.get("formula"):
+            text.insert(tk.END, "\n调整公式\n", "section")
+            text.insert(tk.END, f"{event.get('formula')}\n", "muted")
+        if event.get("guardrails"):
+            text.insert(tk.END, "\n防过拟合与泄漏护栏\n", "section")
+            for guard in event.get("guardrails") or []:
+                tag = "good" if guard.get("pass") is not False else "danger"
+                text.insert(tk.END, f"{'通过' if guard.get('pass') is not False else '未通过'}  {guard.get('label')}\n", tag)
+                if guard.get("note"):
+                    text.insert(tk.END, f"  {guard.get('note')}\n", "muted")
+        text.configure(state="disabled")
 
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -557,15 +1166,16 @@ class MonitorDesktopApp(tk.Tk):
 
         refresh = config.get("refresh", {})
         training = config.get("training", {})
-        self.holding_minutes.set(str(round(int(refresh.get("holdingMs", 300000)) / 60000)))
-        self.watch_minutes.set(str(round(int(refresh.get("watchMs", 900000)) / 60000)))
-        self.training_minutes.set(str(round(int(refresh.get("trainingMs", 300000)) / 60000)))
+        self.holding_minutes.set(str(round(int(refresh.get("holdingMs", 120000)) / 60000)))
+        self.watch_minutes.set(str(round(int(refresh.get("watchMs", 300000)) / 60000)))
+        self.training_minutes.set(str(round(int(refresh.get("trainingMs", 120000)) / 60000)))
         self.training_symbols.set(str(training.get("symbolLimit", 3)))
 
         self._write(self.sessions_text, self.format_sessions(payload))
         self._write(self.budget_text, self.format_budget(payload))
         self._write(self.models_text, self.format_models(payload))
         self._write(self.pool_text, self.format_pools_and_results(payload))
+        self.render_model_trajectory()
         log_message("render complete")
 
     def _write(self, widget: tk.Text, text: str) -> None:
@@ -673,7 +1283,7 @@ class MonitorDesktopApp(tk.Tk):
             "enabled": True,
             "symbolLimit": training_symbols,
             "interval": (config.get("training") or {}).get("interval") or "5m",
-            "range": (config.get("training") or {}).get("range") or "5d",
+            "range": (config.get("training") or {}).get("range") or "1mo",
         }
         self._save_config_local(config, "已保存刷新频率；后台服务下一轮会读取。")
 

@@ -1,0 +1,212 @@
+/* Simulation workspace ownership: keep every import and position control inside its grid track. */
+html[data-active-workspace="simulation"] .main {
+  grid-template-areas:
+    "topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar"
+    "summary summary summary summary summary summary summary summary summary summary summary summary"
+    "capital capital capital capital capital capital capital capital capital capital capital capital"
+    "risk risk risk risk risk risk risk risk risk risk risk risk"
+    "audit audit audit audit audit audit audit audit audit audit audit audit"
+    "positions positions positions positions positions positions positions positions decisions decisions decisions decisions";
+}
+
+html[data-active-workspace="simulation"] .capital-board,
+html[data-active-workspace="simulation"] .capital-board > *,
+html[data-active-workspace="simulation"] .capital-holding-grid,
+html[data-active-workspace="simulation"] .capital-holding-grid > *,
+html[data-active-workspace="simulation"] .portfolio-import-grid,
+html[data-active-workspace="simulation"] .portfolio-import-grid > * {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+}
+
+html[data-active-workspace="simulation"] .capital-board {
+  width: 100%;
+  overflow-x: clip;
+  container-type: inline-size;
+}
+
+html[data-active-workspace="simulation"] .capital-board > .section-head {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+html[data-active-workspace="simulation"] .capital-board > .section-head > div:first-child {
+  flex: 1 1 440px;
+}
+
+html[data-active-workspace="simulation"] .capital-board > .section-head .section-actions {
+  flex: 0 1 auto;
+  margin-left: auto;
+}
+
+html[data-active-workspace="simulation"] .capital-board button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+html[data-active-workspace="simulation"] .capital-board button svg,
+html[data-active-workspace="simulation"] .capital-board h3 svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+}
+
+html[data-active-workspace="simulation"] .capital-holding-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.88fr) minmax(0, 1.12fr);
+  align-items: stretch;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+html[data-active-workspace="simulation"] .capital-holding-grid > section {
+  min-height: 176px;
+  padding: 18px;
+  border: 1px solid var(--qw-line-soft);
+  border-radius: 8px;
+  background: linear-gradient(145deg, rgba(121, 169, 219, 0.045), rgba(12, 15, 17, 0.84));
+}
+
+html[data-active-workspace="simulation"] .capital-holding-grid h3,
+html[data-active-workspace="simulation"] .portfolio-import-method h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  color: var(--qw-text);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+html[data-active-workspace="simulation"] .capital-holding-grid h3 svg,
+html[data-active-workspace="simulation"] .portfolio-import-method h3 svg {
+  color: var(--qw-amber);
+}
+
+html[data-active-workspace="simulation"] .capital-funds-panel .strategy-control-grid.compact-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 0;
+}
+
+html[data-active-workspace="simulation"] .holding-entry-panel .mini-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+html[data-active-workspace="simulation"] .capital-holding-grid label,
+html[data-active-workspace="simulation"] .portfolio-import-method label {
+  min-width: 0;
+}
+
+html[data-active-workspace="simulation"] .capital-board input,
+html[data-active-workspace="simulation"] .capital-board textarea,
+html[data-active-workspace="simulation"] .capital-board select,
+html[data-active-workspace="simulation"] .capital-board input[type="file"] {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+html[data-active-workspace="simulation"] .holding-entry-panel .full-btn {
+  width: 100%;
+  margin-top: 14px;
+}
+
+html[data-active-workspace="simulation"] .capital-board .scroll-fold {
+  width: 100%;
+  margin-top: 14px;
+}
+
+html[data-active-workspace="simulation"] .capital-board .scroll-fold-body {
+  max-height: 470px;
+  padding: 0;
+  overflow-x: hidden;
+}
+
+html[data-active-workspace="simulation"] .portfolio-import-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0;
+}
+
+html[data-active-workspace="simulation"] .portfolio-import-method {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 18px;
+}
+
+html[data-active-workspace="simulation"] .portfolio-import-method + .portfolio-import-method {
+  border-left: 1px solid var(--qw-line-soft);
+}
+
+html[data-active-workspace="simulation"] .portfolio-import-method h3 {
+  margin-bottom: 2px;
+}
+
+html[data-active-workspace="simulation"] .portfolio-import-method textarea {
+  resize: vertical;
+}
+
+html[data-active-workspace="simulation"] .portfolio-file-field {
+  display: grid;
+  gap: 7px;
+}
+
+html[data-active-workspace="simulation"] .portfolio-file-field input[type="file"] {
+  padding: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+html[data-active-workspace="simulation"] .portfolio-import-method .small-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@container (max-width: 980px) {
+  html[data-active-workspace="simulation"] .capital-holding-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  html[data-active-workspace="simulation"] .capital-funds-panel .strategy-control-grid.compact-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  html[data-active-workspace="simulation"] .portfolio-import-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  html[data-active-workspace="simulation"] .portfolio-import-method + .portfolio-import-method {
+    border-top: 1px solid var(--qw-line-soft);
+    border-left: 0;
+  }
+}
+
+@media (max-width: 680px) {
+  html[data-active-workspace="simulation"] .capital-board > .section-head .section-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  html[data-active-workspace="simulation"] .capital-board > .section-head .section-actions button {
+    min-width: 0;
+    flex: 1 1 0;
+  }
+
+  html[data-active-workspace="simulation"] .capital-funds-panel .strategy-control-grid.compact-grid,
+  html[data-active-workspace="simulation"] .holding-entry-panel .mini-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  html[data-active-workspace="simulation"] .capital-holding-grid > section,
+  html[data-active-workspace="simulation"] .portfolio-import-method {
+    padding: 15px;
+  }
+}

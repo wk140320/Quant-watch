@@ -24,7 +24,9 @@ const {
   sanitizeUniverseRows,
   scoreRedditSocialPosts,
   fetchRedditSocialFactor,
+  historicalBacktestFactor,
   backendMarketSession,
+  backendDueQuoteJobs,
   backendMonitorBudgetLimits,
   computeServerTechnicals,
   marketAnalysisEventFromMonitorResult,
@@ -33,6 +35,8 @@ const {
   predictionCandlesWithQuote,
   projectedMaxDownsideConfidenceMetrics,
   normalizeQuote,
+  realtimeQuoteQuality,
+  selectBestRealtimeQuote,
   sanitizeQuoteChangeAgainstCandles,
   validMarketQuoteDate,
   verifiedProviderTimestamp,
@@ -445,7 +449,7 @@ test("Reddit disabled status and factor fallback do not throw", async () => {
   }
 });
 
-test("Backend monitor config persists holdings at 3m and watchlist at 10m cadence", () => {
+test("Backend monitor config separates high-frequency quotes from full analysis", () => {
   const config = sanitizeBackendMonitorConfig({
     strategy: { horizonDays: 15, confidence: 80, targetUpside: 5, stopLoss: 4, maxPosition: 20 },
     capital: { baseCapital: 5000 },
@@ -460,13 +464,31 @@ test("Backend monitor config persists holdings at 3m and watchlist at 10m cadenc
       },
     },
   });
-  assert.equal(config.refresh.holdingMs, 3 * 60 * 1000);
-  assert.equal(config.refresh.watchMs, 10 * 60 * 1000);
+  assert.equal(config.refresh.quoteHoldingMs, 60 * 1000);
+  assert.equal(config.refresh.quoteWatchMs, 3 * 60 * 1000);
+  assert.equal(config.refresh.holdingMs, 2 * 60 * 1000);
+  assert.equal(config.refresh.watchMs, 5 * 60 * 1000);
   assert.ok(config.markets.ASX.watchlist.includes("CPU.AX"));
   assert.ok(config.markets.ASX.watchlist.includes("BHP.AX"));
   assert.ok(!config.markets.ASX.watchlist.includes("AAPL"));
   assert.equal(config.markets.US.portfolio[0].symbol, "AAPL");
-  assert.equal(config.training.symbolLimit, 2);
+  assert.equal(config.training.symbolLimit, 3);
+});
+
+test("Quote scheduler prioritizes holdings without waiting for full analysis cadence", () => {
+  const config = sanitizeBackendMonitorConfig({
+    markets: {
+      ASX: {
+        watchlist: ["BHP", "CPU"],
+        portfolio: [{ symbol: "CPU", qty: 10, avgPrice: 20 }],
+      },
+    },
+  });
+  const now = Date.parse("2026-07-13T04:00:00.000Z");
+  const jobs = backendDueQuoteJobs(config, { lastQuoteChecks: {} }, now);
+  assert.equal(jobs[0].symbol, "CPU.AX");
+  assert.equal(jobs[0].tier, "holding");
+  assert.ok(jobs.some((job) => job.symbol === "BHP.AX" && job.tier === "watch"));
 });
 
 test("Backend market session recognises regular market hours", () => {
@@ -606,6 +628,43 @@ test("Provider timestamp parser accepts explicit ISO or epoch values only", () =
   assert.equal(verifiedProviderTimestamp([1783918200]), "2026-07-13T04:50:00.000Z");
 });
 
+test("Strict quote selection chooses the freshest cross-checked price and rejects stale outliers", () => {
+  const now = new Date("2026-07-13T05:00:00.000Z");
+  const selected = selectBestRealtimeQuote([
+    {
+      source: "old-source",
+      quote: { symbol: "CAR", price: 26.37, asOf: "2026-07-13T02:30:00.000Z", timeVerified: true, source: "old-source" },
+    },
+    {
+      source: "source-a",
+      quote: { symbol: "CAR", price: 25.9, asOf: "2026-07-13T04:58:00.000Z", timeVerified: true, source: "source-a" },
+    },
+    {
+      source: "source-b",
+      quote: { symbol: "CAR", price: 25.91, asOf: "2026-07-13T04:59:00.000Z", timeVerified: true, source: "source-b" },
+    },
+    {
+      source: "bad-outlier",
+      quote: { symbol: "CAR", price: 31.2, asOf: "2026-07-13T04:59:30.000Z", timeVerified: true, source: "bad-outlier" },
+    },
+  ], "ASX", 26.37, { strict: true, symbol: "CAR", now });
+  assert.equal(selected.quote.price, 25.91);
+  assert.equal(selected.quote.crossCheckStatus, "confirmed");
+  assert.deepEqual(selected.quote.crossCheckSources.sort(), ["source-a", "source-b"]);
+  assert.match(selected.warning, /old|conflict/i);
+});
+
+test("Open-market strict freshness rejects retrieval-time-only quotes", () => {
+  const quality = realtimeQuoteQuality({
+    symbol: "CAR",
+    price: 25.9,
+    retrievedAt: "2026-07-13T05:00:00.000Z",
+    timeVerified: false,
+  }, "ASX", new Date("2026-07-13T05:00:00.000Z"), { strict: true, symbol: "CAR" });
+  assert.equal(quality.usable, false);
+  assert.match(quality.reason, /verified provider timestamp/i);
+});
+
 test("Backend technicals and intraday model train from completed minute bars", () => {
   const candles = Array.from({ length: 90 }, (_, index) => {
     const close = 100 + Math.sin(index / 5) * 1.5 + index * 0.03;
@@ -632,11 +691,26 @@ test("Backend technicals and intraday model train from completed minute bars", (
 
 test("Backend monitor budget defaults reserve quota for minute training", () => {
   const limits = backendMonitorBudgetLimits();
+  assert.ok(limits.quoteCalls > limits.manualQuoteReserve);
   assert.ok(limits.marketCalls > limits.trainingMarketReserve);
   assert.ok(limits.marketCalls > limits.trainingMarketReserve + limits.manualMarketReserve);
   assert.ok(limits.trainingCalls > 0);
   assert.equal(Object.values(limits.requestAllocation).reduce((sum, value) => sum + value, 0), 100);
   assert.equal(Object.values(limits.trainingDataMix).reduce((sum, value) => sum + value, 0), 100);
+});
+
+test("Historical backtest factor exposes finite conformal errors", () => {
+  const factor = historicalBacktestFactor({
+    available: true,
+    dataDepth: { predictionCuts: 120 },
+    metrics: { samples: 120, targetHitRate: 58, stopRate: 31, avgForwardReturn: 1.4 },
+    conformalCalibration: {
+      framework: "walk-forward-conformal",
+      overall: { finalReturnAbsErrorP80: 2.6, finalReturnAbsErrorP90: 4.8 },
+    },
+  });
+  assert.equal(factor.values.finalReturnP80Error, 2.6);
+  assert.equal(factor.values.finalReturnP90Error, 4.8);
 });
 
 test("Provider key pools preserve primary-first failover order and remove duplicates", () => {
