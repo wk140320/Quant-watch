@@ -152,7 +152,8 @@ def label_confidence_for_window(
     target_upside: float,
     stop_loss: float,
 ) -> dict[str, Any]:
-    future = quality_rows[index + 1:min(len(quality_rows), index + horizon + 1)]
+    entry_index = int(number(outcome.get("entryIndex"), index + 1))
+    future = quality_rows[entry_index:min(len(quality_rows), entry_index + horizon)]
     current = quality_rows[index] if 0 <= index < len(quality_rows) else {"sampleWeight": 0.5, "flags": []}
     quality_weight = min([number(row.get("sampleWeight"), 0.5) for row in [current, *future]] or [0.5])
     avg_future = mean([number(row.get("sampleWeight"), 0.5) for row in future]) if future else 0.5
@@ -165,8 +166,8 @@ def label_confidence_for_window(
     both_touched = bool(outcome.get("hitTarget")) and bool(outcome.get("hitStop"))
     same_bar_order_unknown = bool(outcome.get("ambiguousBarrierOrder"))
 
-    entry = number(rows[index].get("close")) if 0 <= index < len(rows) else 0.0
-    path = rows[index + 1:min(len(rows), index + horizon + 1)]
+    entry = number(outcome.get("entryPrice"), number(rows[entry_index].get("open")) if 0 <= entry_index < len(rows) else 0.0)
+    path = rows[entry_index:min(len(rows), entry_index + horizon)]
     daily_returns: list[float] = []
     cumulative_returns: list[float] = []
     previous_close = entry

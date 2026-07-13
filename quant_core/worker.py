@@ -10,6 +10,12 @@ from alpha_mining import analyze_alpha_evolution
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features
 from historical_backtest import batch_historical_backtest, run_historical_backtest
 from local_model import train_local_model_suite
+from paper_agents import configure as configure_paper_agents
+from paper_agents import list_agent_events, load_state as load_paper_agent_state
+from paper_agents import migrate as migrate_paper_agents
+from paper_agents import reset as reset_paper_agents
+from paper_agents import step as step_paper_agents
+from production_training import train_market_multitask
 from provider_budget import provider_plan
 from risk import assess_portfolio, build_paper_order_intent
 from store import append_event, control_plane_summary, list_events, list_market_rows, list_order_intents, market_data_summary, record_market_rows, record_order_intent
@@ -197,10 +203,12 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "local-market-data-store",
                 "local-market-data-replay",
                 "historical-walk-forward-backtest",
+                "market-level-multitask-oof-training",
                 "ibkr-readiness",
                 "qlib-readiness",
                 "alpha-evolution",
                 "local-model-suite",
+                "persistent-paper-agents",
             ],
             "order_execution_enabled": False,
         }
@@ -288,9 +296,16 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             retrain_interval=int(payload.get("retrain_interval", payload.get("retrainInterval", 60)) or 60),
             max_train_window=int(payload.get("max_train_window", payload.get("maxTrainWindow", 240)) or 240),
             knn_window=int(payload.get("knn_window", payload.get("knnWindow", 260)) or 260),
+            adaptive_labels=payload.get("adaptive_labels", payload.get("adaptiveLabels", True)) is not False,
+            transaction_cost_bps=float(payload.get("transaction_cost_bps", payload.get("transactionCostBps", 0)) or 0),
         )
     if operation == "historical-backtest-batch":
-        return batch_historical_backtest(payload)
+        result = batch_historical_backtest(payload)
+        if payload.get("production_training", payload.get("productionTraining", False)) is True:
+            result["productionTraining"] = train_market_multitask(payload)
+        return result
+    if operation == "production-model-train":
+        return train_market_multitask(payload)
     if operation == "trade-analysis":
         return analyze_trades(
             payload.get("trades") or [],
@@ -329,6 +344,18 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return market_data_summary(payload)
     if operation == "market-data-list":
         return list_market_rows(payload)
+    if operation == "paper-agent-summary":
+        return load_paper_agent_state(str(payload.get("market") or "ASX"), payload.get("db_path"))
+    if operation == "paper-agent-config":
+        return configure_paper_agents(payload)
+    if operation == "paper-agent-reset":
+        return reset_paper_agents(payload)
+    if operation == "paper-agent-migrate":
+        return migrate_paper_agents(payload)
+    if operation == "paper-agent-step":
+        return step_paper_agents(payload)
+    if operation == "paper-agent-events":
+        return list_agent_events(payload)
     raise ValueError(f"Unknown Python quant core operation: {operation}")
 
 

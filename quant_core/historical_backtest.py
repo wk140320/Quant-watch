@@ -25,7 +25,11 @@ def mean(values: list[float]) -> float:
 
 
 def sample_weight(row: dict[str, Any]) -> float:
-    return clamp(number(row.get("sampleWeight"), 1.0), 0.05, 1.5)
+    return clamp(number(row.get("evaluationWeight", row.get("sampleWeight")), 1.0), 0.05, 1.5)
+
+
+def training_weight(row: dict[str, Any]) -> float:
+    return clamp(number(row.get("trainingWeight", row.get("sampleWeight")), 1.0), 0.05, 1.5)
 
 
 def weighted_sample_mean(rows: list[dict[str, Any]], key: str) -> float:
@@ -55,6 +59,67 @@ def weighted_quantile(values: list[float], weights: list[float], q: float) -> fl
         if cumulative >= threshold:
             return value
     return pairs[-1][0]
+
+
+def weighted_effective_n(weights: list[float]) -> float:
+    clean = [max(0.0, number(weight, 0.0)) for weight in weights if math.isfinite(number(weight, math.nan))]
+    total = sum(clean)
+    squared = sum(weight ** 2 for weight in clean)
+    if total <= 1e-12 or squared <= 1e-12:
+        return 0.0
+    return total ** 2 / squared
+
+
+def weighted_binary_wilson_interval(
+    rows: list[dict[str, Any]],
+    positives: list[float | bool],
+    *,
+    label: str,
+    confidence: float = 0.90,
+) -> dict[str, Any]:
+    weights = [sample_weight(row) for row in rows]
+    usable = [
+        (weights[index], 1.0 if positives[index] else 0.0)
+        for index in range(min(len(rows), len(positives)))
+        if weights[index] > 0
+    ]
+    if not usable:
+        return {
+            "label": label,
+            "available": False,
+            "samples": 0,
+            "effectiveSamples": 0.0,
+            "observedRate": None,
+            "lowerBound": None,
+            "upperBound": None,
+            "margin": None,
+            "confidencePct": round(confidence * 100, 2),
+        }
+    clean_weights = [row[0] for row in usable]
+    total = sum(clean_weights)
+    n_eff = weighted_effective_n(clean_weights)
+    p_hat = sum(weight * value for weight, value in usable) / total if total > 1e-12 else 0.0
+    # z≈1.645 is the two-sided 90% normal quantile. Keep explicit to avoid scipy dependency.
+    z = 1.6448536269514722 if confidence >= 0.895 else 1.2815515655446004
+    if n_eff <= 1e-9:
+        lower = upper = p_hat
+    else:
+        denominator = 1.0 + (z ** 2) / n_eff
+        center = (p_hat + (z ** 2) / (2.0 * n_eff)) / denominator
+        margin = z * math.sqrt(max(0.0, (p_hat * (1.0 - p_hat) + (z ** 2) / (4.0 * n_eff)) / n_eff)) / denominator
+        lower = clamp(center - margin, 0.0, 1.0)
+        upper = clamp(center + margin, 0.0, 1.0)
+    return {
+        "label": label,
+        "available": True,
+        "samples": len(usable),
+        "effectiveSamples": round(n_eff, 5),
+        "observedRate": round(p_hat * 100.0, 5),
+        "lowerBound": round(lower * 100.0, 5),
+        "upperBound": round(upper * 100.0, 5),
+        "margin": round((upper - lower) * 50.0, 5),
+        "confidencePct": round(confidence * 100, 2),
+    }
 
 
 def pct_change(current: float, previous: float) -> float:
@@ -184,6 +249,43 @@ def rolling_vwap(rows: list[dict[str, Any]], end: int, window: int = 20) -> floa
         prices.append(explicit if math.isfinite(explicit) and explicit > 0 else typical)
         weights.append(volume)
     return weighted_mean(prices, weights)
+
+
+def atr_pct_at(rows: list[dict[str, Any]], end: int, period: int = 14) -> float:
+    if end <= 0 or not rows:
+        return 0.0
+    start = max(1, end - max(2, period) + 1)
+    values: list[float] = []
+    for index in range(start, end + 1):
+        high = number(rows[index].get("high"), number(rows[index].get("close")))
+        low = number(rows[index].get("low"), number(rows[index].get("close")))
+        previous_close = number(rows[index - 1].get("close"))
+        true_range = max(high - low, abs(high - previous_close), abs(low - previous_close))
+        if previous_close > 0:
+            values.append(true_range / previous_close * 100.0)
+    return mean(values)
+
+
+def adaptive_barriers(
+    rows: list[dict[str, Any]],
+    index: int,
+    horizon: int,
+    target_upside: float,
+    stop_loss: float,
+) -> dict[str, float]:
+    atr_pct = max(0.15, atr_pct_at(rows, index, 14))
+    horizon_scale = math.sqrt(max(1.0, horizon) / 15.0)
+    target = clamp(
+        max(target_upside * 0.55, atr_pct * 2.35 * horizon_scale),
+        max(0.6, target_upside * 0.55),
+        max(target_upside * 1.8, 1.5),
+    )
+    stop = clamp(
+        max(stop_loss * 0.55, atr_pct * 1.65 * horizon_scale),
+        max(0.5, stop_loss * 0.55),
+        max(stop_loss * 1.6, 1.0),
+    )
+    return {"atrPct": atr_pct, "targetPct": target, "stopPct": stop}
 
 
 def price_level_metrics(row: dict[str, Any], close: float) -> dict[str, float]:
@@ -419,20 +521,24 @@ FORMULA_BOOK = {
         "reversalPressure": "clamp(reversalPressure,-1.5,1.5)",
     },
     "labels": {
-        "forwardReturn": "(close[t+horizon] - close[t]) / close[t] * 100",
-        "maxUpside": "(max(high[t+1:t+horizon]) - close[t]) / close[t] * 100",
-        "maxDrawdown": "(min(low[t+1:t+horizon]) - close[t]) / close[t] * 100",
+        "entryPrice": "next session VWAP when supplied, otherwise next session open; signal-day close is never treated as an executable fill",
+        "adaptiveTarget": "clamp(max(0.55*strategyTarget, ATR14_pct*2.35*sqrt(horizon/15)), 0.55*strategyTarget, 1.8*strategyTarget)",
+        "adaptiveStop": "clamp(max(0.55*strategyStop, ATR14_pct*1.65*sqrt(horizon/15)), 0.55*strategyStop, 1.6*strategyStop)",
+        "forwardReturn": "(close[entry+horizon-1] - nextSessionEntry) / nextSessionEntry * 100 - roundTripCosts",
+        "maxUpside": "(max(high[entry:entry+horizon]) - nextSessionEntry) / nextSessionEntry * 100",
+        "maxDrawdown": "(min(low[entry:entry+horizon]) - nextSessionEntry) / nextSessionEntry * 100",
         "targetWins": "maxUpside>=targetUpside and target touch occurs before stop touch when both occur",
         "stopWins": "maxDrawdown<=-stopLoss and stop touch occurs before target touch when both occur",
         "ambiguousBarrierOrder": "true when a single OHLC bar touches both target and stop, because daily bars cannot reveal the intrabar order",
         "riskAdjustedReturn": "targetUpside if targetWins else -stopLoss if stopWins else forwardReturn",
         "labelConfidence": "combines current/future candle quality, barrier-margin ambiguity, both-barrier touch risk, intrabar-order uncertainty, path chop, two-sided excursions, and future-window completeness",
         "labelNoiseScore": "0-100 path-label noise score; high values mean the future path was too choppy or order-ambiguous to trust as a strong training label",
-        "sampleWeight": "min(dataQualityWeight,labelConfidence) used by Ridge/Logistic/KNN/ensemble calibration to avoid learning too strongly from suspicious rows",
+        "trainingWeight": "min(dataQualityWeight,labelConfidence) may soften noisy completed labels during fitting only",
+        "evaluationWeight": "dataQualityWeight only; future-path label confidence cannot hide difficult holdout samples",
     },
     "data_quality": {
         "candleScore": "100 minus penalties for bad OHLC ranges, zero volume, stale low-volume closes, large calendar gaps, extreme returns, and possible split/provider jumps",
-        "qualityWeightedLearning": "training loss and calibration metrics are weighted by sampleWeight instead of treating all historical cuts equally",
+        "qualityWeightedLearning": "training loss may use trainingWeight; reported holdout metrics use evaluationWeight and preserve the natural outcome distribution",
         "labelReliability": "target/stop labels close to barrier boundaries or touching both barriers are down-weighted because the label is less stable",
         "sampleCoverage": "KNN nearest/average/p75 feature distance from prior fully-known samples; low coverage lowers sampleWeight and blocks buy signals",
     },
@@ -464,16 +570,30 @@ def vector_from_feature(feature: dict[str, float]) -> list[float]:
     return [number(feature.get(name)) for name in FEATURE_NAMES]
 
 
-def outcome_window(rows: list[dict[str, float | str]], index: int, horizon: int, target_upside: float, stop_loss: float) -> dict[str, Any]:
-    entry = number(rows[index]["close"])
-    end = min(len(rows) - 1, index + horizon)
-    if entry <= 0 or end <= index:
+def outcome_window(
+    rows: list[dict[str, float | str]],
+    index: int,
+    horizon: int,
+    target_upside: float,
+    stop_loss: float,
+    *,
+    transaction_cost_bps: float = 0.0,
+) -> dict[str, Any]:
+    entry_index = index + 1
+    if entry_index >= len(rows):
+        return {"targetWins": False, "stopWins": False, "forwardReturn": 0.0, "maxUpside": 0.0, "maxDrawdown": 0.0}
+    entry_row = rows[entry_index]
+    explicit_vwap = number(entry_row.get("vwap"), math.nan)
+    entry_open = number(entry_row.get("open"), number(entry_row.get("close")))
+    entry = explicit_vwap if math.isfinite(explicit_vwap) and explicit_vwap > 0 else entry_open
+    end = min(len(rows) - 1, entry_index + max(1, horizon) - 1)
+    if entry <= 0 or end < entry_index:
         return {"targetWins": False, "stopWins": False, "forwardReturn": 0.0, "maxUpside": 0.0, "maxDrawdown": 0.0}
     max_high = entry
     min_low = entry
     first_event = None
     first_event_day = None
-    for offset in range(index + 1, end + 1):
+    for offset in range(entry_index, end + 1):
         high_return = pct_change(number(rows[offset]["high"]), entry)
         low_return = pct_change(number(rows[offset]["low"]), entry)
         max_high = max(max_high, number(rows[offset]["high"]))
@@ -482,18 +602,20 @@ def outcome_window(rows: list[dict[str, float | str]], index: int, horizon: int,
         stop_hit_on_bar = low_return <= -stop_loss
         if first_event is None and target_hit_on_bar and stop_hit_on_bar:
             first_event = "ambiguous"
-            first_event_day = offset - index
+            first_event_day = offset - entry_index + 1
         elif first_event is None and target_hit_on_bar:
             first_event = "target"
-            first_event_day = offset - index
+            first_event_day = offset - entry_index + 1
         elif first_event is None and stop_hit_on_bar:
             first_event = "stop"
-            first_event_day = offset - index
+            first_event_day = offset - entry_index + 1
     max_upside = pct_change(max_high, entry)
     max_drawdown = pct_change(min_low, entry)
     hit_target = max_upside >= target_upside
     hit_stop = max_drawdown <= -stop_loss
-    forward_return = pct_change(number(rows[end]["close"]), entry)
+    gross_forward_return = pct_change(number(rows[end]["close"]), entry)
+    round_trip_cost_pct = max(0.0, number(transaction_cost_bps)) / 100.0
+    forward_return = gross_forward_return - round_trip_cost_pct
     target_wins = hit_target and (not hit_stop or first_event == "target")
     stop_wins = hit_stop and (not hit_target or first_event == "stop")
     ambiguous_barrier_order = first_event == "ambiguous"
@@ -505,6 +627,17 @@ def outcome_window(rows: list[dict[str, float | str]], index: int, horizon: int,
         "firstBarrierEvent": first_event,
         "firstBarrierDay": first_event_day,
         "ambiguousBarrierOrder": ambiguous_barrier_order,
+        "signalIndex": index,
+        "signalDate": rows[index].get("date"),
+        "signalPrice": number(rows[index].get("close")),
+        "entryIndex": entry_index,
+        "entryDate": entry_row.get("date"),
+        "entryPrice": entry,
+        "entrySource": "next_session_vwap" if math.isfinite(explicit_vwap) and explicit_vwap > 0 else "next_session_open",
+        "targetBarrierPct": target_upside,
+        "stopBarrierPct": stop_loss,
+        "transactionCostBps": round_trip_cost_pct * 100.0,
+        "grossForwardReturn": gross_forward_return,
         "forwardReturn": forward_return,
         "maxUpside": max_upside,
         "maxDrawdown": max_drawdown,
@@ -518,6 +651,8 @@ def build_labeled_rows(
     target_upside: float,
     stop_loss: float,
     quality_profile: dict[str, Any] | None = None,
+    adaptive_labels: bool = True,
+    transaction_cost_bps: float = 0.0,
 ) -> list[dict[str, Any]]:
     labeled = []
     start = 55
@@ -532,21 +667,45 @@ def build_labeled_rows(
         ]
     for end in range(start, len(rows) - horizon):
         feature = feature_dict(rows, end)
-        outcome = outcome_window(rows, end, horizon, target_upside, stop_loss)
+        barriers = adaptive_barriers(rows, end, horizon, target_upside, stop_loss) if adaptive_labels else {
+            "atrPct": atr_pct_at(rows, end, 14),
+            "targetPct": target_upside,
+            "stopPct": stop_loss,
+        }
+        outcome = outcome_window(
+            rows,
+            end,
+            horizon,
+            barriers["targetPct"],
+            barriers["stopPct"],
+            transaction_cost_bps=transaction_cost_bps,
+        )
         row_quality = quality_rows[end] if end < len(quality_rows) else {"score": 100.0, "sampleWeight": 1.0, "flags": []}
-        label_quality = label_confidence_for_window(rows, quality_rows, end, horizon, outcome, target_upside, stop_loss)
-        weight = clamp(
+        label_quality = label_confidence_for_window(
+            rows,
+            quality_rows,
+            end,
+            horizon,
+            outcome,
+            barriers["targetPct"],
+            barriers["stopPct"],
+        )
+        training_row_weight = clamp(
             min(number(row_quality.get("sampleWeight"), 1.0), number(label_quality.get("labelConfidence"), 1.0)),
             0.05,
             1.0,
         )
+        evaluation_row_weight = clamp(number(row_quality.get("sampleWeight"), 1.0), 0.05, 1.0)
         labeled.append({
             "index": end,
             "date": rows[end]["date"],
             "x": vector_from_feature(feature),
             "feature": feature,
             "outcome": outcome,
-            "sampleWeight": weight,
+            "sampleWeight": evaluation_row_weight,
+            "trainingWeight": training_row_weight,
+            "evaluationWeight": evaluation_row_weight,
+            "softLabelWeight": number(label_quality.get("labelConfidence"), 1.0),
             "dataQualityScore": number(row_quality.get("score"), 100.0),
             "dataQualityFlags": list(row_quality.get("flags") or []),
             "labelConfidence": number(label_quality.get("labelConfidence"), 1.0),
@@ -558,6 +717,12 @@ def build_labeled_rows(
                 "directionFlips": int(number(label_quality.get("directionFlips"), 0.0)),
             },
             "labelQualityFlags": list(label_quality.get("flags") or []),
+            "atrPct": number(barriers.get("atrPct")),
+            "targetBarrierPct": number(barriers.get("targetPct")),
+            "stopBarrierPct": number(barriers.get("stopPct")),
+            "entryPrice": number(outcome.get("entryPrice")),
+            "entryDate": outcome.get("entryDate"),
+            "entrySource": outcome.get("entrySource"),
             "y_return": clamp(number(outcome["riskAdjustedReturn"]), -24, 24),
             "y_final": clamp(number(outcome["forwardReturn"]), -24, 24),
             "y_max": clamp(max(0.0, number(outcome["maxUpside"])), 0, 32),
@@ -571,7 +736,7 @@ def fit_standardizer(samples: list[dict[str, Any]]) -> tuple[list[float], list[f
     width = len(samples[0]["x"]) if samples else 0
     centers: list[float] = []
     scales: list[float] = []
-    weights = [sample_weight(row) for row in samples]
+    weights = [training_weight(row) for row in samples]
     total_weight = sum(weights) or 1.0
     for index in range(width):
         values = [number(row["x"][index]) for row in samples]
@@ -593,7 +758,7 @@ def dot(weights: list[float], x: list[float]) -> float:
 def fit_ridge(samples: list[dict[str, Any]], target_key: str, penalty: float = 0.08, epochs: int = 40) -> dict[str, Any]:
     centers, scales = fit_standardizer(samples)
     targets = [number(row[target_key]) for row in samples]
-    weights_for_rows = [sample_weight(row) for row in samples]
+    weights_for_rows = [training_weight(row) for row in samples]
     total_weight = sum(weights_for_rows) or 1.0
     weights = [0.0 for _ in centers]
     intercept = sum(targets[index] * weights_for_rows[index] for index in range(len(targets))) / total_weight if targets else 0.0
@@ -616,7 +781,7 @@ def fit_ridge(samples: list[dict[str, Any]], target_key: str, penalty: float = 0
 def fit_logistic(samples: list[dict[str, Any]], target_key: str, penalty: float = 0.08, epochs: int = 40) -> dict[str, Any]:
     centers, scales = fit_standardizer(samples)
     targets = [1.0 if number(row[target_key]) >= 0.5 else 0.0 for row in samples]
-    weights_for_rows = [sample_weight(row) for row in samples]
+    weights_for_rows = [training_weight(row) for row in samples]
     total_weight = sum(weights_for_rows) or 1.0
     base = clamp(sum(targets[index] * weights_for_rows[index] for index in range(len(targets))) / total_weight if targets else 0.5, 0.02, 0.98)
     intercept = math.log(base / (1 - base))
@@ -696,9 +861,9 @@ def knn_prediction(train_rows: list[dict[str, Any]], x: list[float], k: int = 18
     selected = sorted(ranked, key=lambda item: item[0])[:max(4, min(k, len(ranked)))]
     best = [row for _, row in selected]
     coverage = coverage_from_distances([distance for distance, _ in selected], len(train_rows))
-    total_weight = sum(sample_weight(row) for row in best) or 1.0
+    total_weight = sum(training_weight(row) for row in best) or 1.0
     def neighbor_mean(key: str) -> float:
-        return sum(number(row.get(key)) * sample_weight(row) for row in best) / total_weight
+        return sum(number(row.get(key)) * training_weight(row) for row in best) / total_weight
     return {
         "targetProb": neighbor_mean("y_target"),
         "stopProb": neighbor_mean("y_stop"),
@@ -934,6 +1099,74 @@ def summarize_conformal_calibration(predictions: list[dict[str, Any]], current_r
         "currentRegimeSummary": conformal_error_summary(current_rows, current_regime.get("label") or current_bucket or "当前状态", current_bucket or "current"),
         "highCoverage": conformal_error_summary(high_coverage_rows, "高覆盖样本", "high_coverage"),
         "policy": "Use empirical residual quantiles to keep final-return/max-upside labels honest; high-confidence labels require narrow historical residual bands.",
+    }
+
+
+def summarize_statistical_reliability(predictions: list[dict[str, Any]], target_upside: float) -> dict[str, Any]:
+    if not predictions:
+        return {
+            "available": False,
+            "framework": "weighted-wilson-backtest-reliability",
+            "reason": "No historical prediction cuts were available.",
+        }
+    buy_rows = [row for row in predictions if row.get("buySignal")]
+    trade_rows = buy_rows or predictions
+    scope = "accepted_buy_signals" if buy_rows else "all_prediction_cuts_no_buy_signals"
+    direction = weighted_binary_wilson_interval(
+        predictions,
+        [
+            (number(row.get("predictedReturn")) >= 0 and number(row.get("actualFinalReturn")) >= 0)
+            or (number(row.get("predictedReturn")) < 0 and number(row.get("actualFinalReturn")) < 0)
+            for row in predictions
+        ],
+        label="direction_hit",
+    )
+    target = weighted_binary_wilson_interval(
+        trade_rows,
+        [bool(row.get("targetWins")) for row in trade_rows],
+        label="target_before_stop",
+    )
+    stop = weighted_binary_wilson_interval(
+        trade_rows,
+        [bool(row.get("stopWins")) for row in trade_rows],
+        label="stop_before_target",
+    )
+    effective = number(target.get("effectiveSamples"), 0.0)
+    target_lower = number(target.get("lowerBound"), 0.0)
+    direction_lower = number(direction.get("lowerBound"), 0.0)
+    stop_upper = number(stop.get("upperBound"), 100.0)
+    margin = number(target.get("margin"), 100.0)
+    score = clamp(
+        100.0
+        - max(0.0, 55.0 - target_lower) * 1.25
+        - max(0.0, 52.0 - direction_lower) * 0.8
+        - max(0.0, stop_upper - 52.0) * 0.9
+        - max(0.0, 14.0 - effective) * 2.15
+        - max(0.0, margin - 16.0) * 0.75,
+        0.0,
+        100.0,
+    )
+    if effective < 10:
+        status = "collecting"
+    elif target_lower >= 58 and direction_lower >= 53 and stop_upper <= 48:
+        status = "strong"
+    elif target_lower < 50 or stop_upper > 58:
+        status = "weak_lower_bound"
+    elif margin >= 20:
+        status = "wide_interval"
+    else:
+        status = "usable"
+    return {
+        "available": True,
+        "framework": "weighted-wilson-backtest-reliability",
+        "scope": scope,
+        "targetUpside": target_upside,
+        "status": status,
+        "score": round(score, 5),
+        "target": target,
+        "stop": stop,
+        "direction": direction,
+        "policy": "Use sample-weighted Wilson intervals and effective sample size so high-confidence labels require statistically defensible lower bounds, not only point estimates.",
     }
 
 
@@ -1187,7 +1420,7 @@ def fit_prediction_weights(rows: list[dict[str, Any]], names: list[str], penalty
         return []
     weights = [1.0 / len(names) for _ in names]
     prior = list(weights)
-    row_weights = [sample_weight(row) for row in rows]
+    row_weights = [training_weight(row) for row in rows]
     total_weight = sum(row_weights) or 1.0
     lr = 0.0012 / max(1, len(names))
     for _ in range(420):
@@ -1666,6 +1899,53 @@ def aggregate_conformal_calibrations(results: list[dict[str, Any]]) -> dict[str,
     }
 
 
+def aggregate_statistical_reliability(results: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [row.get("statisticalReliability") or {} for row in results if row.get("available") and row.get("statisticalReliability")]
+    rows = [row for row in rows if row.get("available")]
+    if not rows:
+        return {
+            "available": False,
+            "framework": "aggregate-weighted-wilson-backtest-reliability",
+            "reason": "No symbol-level statistical reliability interval was available.",
+        }
+
+    def aggregate_section(name: str) -> dict[str, Any]:
+        sections = [row.get(name) or {} for row in rows if (row.get(name) or {}).get("available")]
+        total = sum(max(1e-9, number(section.get("effectiveSamples"), section.get("samples", 0))) for section in sections)
+        if not sections or total <= 1e-12:
+            return {"available": False, "samples": 0, "effectiveSamples": 0.0}
+        weighted = lambda field: sum(number(section.get(field)) * max(1e-9, number(section.get("effectiveSamples"), section.get("samples", 0))) for section in sections) / total
+        return {
+            "available": True,
+            "samples": sum(int(number(section.get("samples"))) for section in sections),
+            "effectiveSamples": round(total, 4),
+            "observedRate": round(weighted("observedRate"), 5),
+            "lowerBound": round(weighted("lowerBound"), 5),
+            "upperBound": round(weighted("upperBound"), 5),
+            "margin": round(weighted("margin"), 5),
+            "confidencePct": round(weighted("confidencePct"), 4),
+        }
+
+    total_weight = sum(max(1e-9, number((row.get("target") or {}).get("effectiveSamples"), 0.0)) for row in rows)
+    weighted_score = (
+        sum(number(row.get("score")) * max(1e-9, number((row.get("target") or {}).get("effectiveSamples"), 0.0)) for row in rows)
+        / max(1e-9, total_weight)
+    )
+    status_rank = {"strong": 4, "usable": 3, "wide_interval": 2, "weak_lower_bound": 1, "collecting": 0}
+    weakest_status = min((row.get("status") or "collecting" for row in rows), key=lambda name: status_rank.get(str(name), 0))
+    return {
+        "available": True,
+        "framework": "aggregate-weighted-wilson-backtest-reliability",
+        "symbolCount": len(rows),
+        "status": weakest_status,
+        "score": round(weighted_score, 5),
+        "target": aggregate_section("target"),
+        "stop": aggregate_section("stop"),
+        "direction": aggregate_section("direction"),
+        "policy": "Aggregates symbol-level weighted Wilson reliability intervals by effective sample size; single-symbol intervals remain the stricter evidence for trade labels.",
+    }
+
+
 def compact_horizon_result(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "available": bool(result.get("available")),
@@ -1679,6 +1959,7 @@ def compact_horizon_result(result: dict[str, Any]) -> dict[str, Any]:
         "predictionCalibration": result.get("predictionCalibration"),
         "regimeCalibration": result.get("regimeCalibration"),
         "conformalCalibration": result.get("conformalCalibration"),
+        "statisticalReliability": result.get("statisticalReliability"),
         "values": result.get("values"),
         "reason": result.get("reason"),
     }
@@ -1763,6 +2044,8 @@ def run_historical_backtest(
     retrain_interval: int = 60,
     max_train_window: int = 240,
     knn_window: int = 260,
+    adaptive_labels: bool = True,
+    transaction_cost_bps: float = 0.0,
 ) -> dict[str, Any]:
     rows = sanitize_candles(candles)
     data_quality = assess_candle_quality(rows)
@@ -1784,7 +2067,15 @@ def run_historical_backtest(
             "reason": "Not enough historical candles for point-in-time walk-forward backtest.",
         }
 
-    labeled = build_labeled_rows(rows, horizon, target_upside, stop_loss, data_quality)
+    labeled = build_labeled_rows(
+        rows,
+        horizon,
+        target_upside,
+        stop_loss,
+        data_quality,
+        adaptive_labels=adaptive_labels,
+        transaction_cost_bps=transaction_cost_bps,
+    )
     by_index = {row["index"]: row for row in labeled}
     predictions: list[dict[str, Any]] = []
     model_cache: dict[int, dict[str, Any]] = {}
@@ -1887,6 +2178,7 @@ def run_historical_backtest(
         })
 
     summary = summarize_predictions(predictions, target_upside)
+    statistical_reliability = summarize_statistical_reliability(predictions, target_upside)
     latest_feature = feature_dict(rows, len(rows) - 1)
     current_regime = regime_bucket_from_feature(
         latest_feature,
@@ -1929,11 +2221,14 @@ def run_historical_backtest(
         "dataQuality": {
             **{key: value for key, value in data_quality.items() if key != "rows"},
             "recentRows": data_quality.get("rows", [])[-12:],
-            "learningPolicy": "Rows are retained for chronology but Ridge/Logistic/KNN/weight calibration are down-weighted by sampleWeight=min(candleQuality,labelConfidence); labels with same-bar target/stop ambiguity, high path chop, or two-sided excursions receive lower weight.",
+            "learningPolicy": "Training may soften completed noisy labels with trainingWeight=min(candleQuality,labelConfidence), while holdout metrics use evaluationWeight=candleQuality only so difficult future paths cannot be hidden.",
         },
         "horizonDays": horizon,
         "targetUpside": target_upside,
         "stopLoss": stop_loss,
+        "adaptiveLabels": adaptive_labels,
+        "entryPolicy": "next_session_vwap_else_open",
+        "transactionCostBps": transaction_cost_bps,
         "embargoSamples": embargo,
         "minTrainSamples": min_train,
         "step": step,
@@ -1966,7 +2261,8 @@ def run_historical_backtest(
                 "minimumTrainCutoffGap": horizon + embargo,
                 "features": "All features use candles <= prediction index t.",
                 "labels": "Outcome labels are used only for completed historical rows and never for the prediction cut model training.",
-                "qualityWeights": "Data-quality and label-confidence weights use only candle rows up to t and completed historical outcome windows for already-known labels.",
+                "entry": "Signals formed from close[t] enter at next-session VWAP/open; no same-close fill is assumed.",
+                "qualityWeights": "Training-only label confidence may use completed historical outcomes; untouched evaluation metrics never use future-path label confidence.",
             },
         },
         "metrics": {key: (round(value, 5) if isinstance(value, float) and math.isfinite(value) else value) for key, value in summary.items()},
@@ -1978,6 +2274,7 @@ def run_historical_backtest(
         "predictionCalibration": prediction_calibration,
         "regimeCalibration": regime_calibration,
         "conformalCalibration": conformal_calibration,
+        "statisticalReliability": statistical_reliability,
         "recentPredictions": predictions[-30:],
         "values": {
             "samples": summary.get("buySignals") or summary.get("samples") or 0,
@@ -2002,6 +2299,11 @@ def run_historical_backtest(
             "finalReturnP80Error": conformal_calibration.get("overall", {}).get("finalReturnAbsErrorP80"),
             "finalReturnP90Error": conformal_calibration.get("overall", {}).get("finalReturnAbsErrorP90"),
             "currentRegimeP80Error": conformal_calibration.get("currentRegimeSummary", {}).get("finalReturnAbsErrorP80"),
+            "statisticalReliabilityScore": statistical_reliability.get("score"),
+            "targetHitLowerBound": statistical_reliability.get("target", {}).get("lowerBound"),
+            "stopRateUpperBound": statistical_reliability.get("stop", {}).get("upperBound"),
+            "directionHitLowerBound": statistical_reliability.get("direction", {}).get("lowerBound"),
+            "effectiveIndependentSamples": statistical_reliability.get("target", {}).get("effectiveSamples"),
         },
         "thesis": [
             f"Historical walk-forward used {len(predictions)} point-in-time cuts from {len(rows)} real OHLCV candles.",
@@ -2011,6 +2313,7 @@ def run_historical_backtest(
             f"Sample coverage gate average {summary.get('avgCoverageScore'):.1f}/100; low-coverage share {summary.get('lowCoverageSamplePct'):.1f}%, so out-of-distribution cuts cannot dominate confidence.",
             f"Current regime bucket {regime_calibration.get('current', {}).get('label')}; matched historical cuts {regime_calibration.get('matchedBucket', {}).get('count', 0)} with target-hit {number(regime_calibration.get('matchedBucket', {}).get('targetHitRate'), 0):.1f}% and stop-first {number(regime_calibration.get('matchedBucket', {}).get('stopRate'), 0):.1f}%.",
             f"Conformal residuals: final-return P80 error {number(conformal_calibration.get('overall', {}).get('finalReturnAbsErrorP80'), 0):.2f}%, P90 {number(conformal_calibration.get('overall', {}).get('finalReturnAbsErrorP90'), 0):.2f}%; labels are widened when historical residuals are wide.",
+            f"Statistical reliability: target-hit 90% lower bound {number(statistical_reliability.get('target', {}).get('lowerBound'), 0):.1f}%, stop-rate upper bound {number(statistical_reliability.get('stop', {}).get('upperBound'), 0):.1f}%, effective independent samples {number(statistical_reliability.get('target', {}).get('effectiveSamples'), 0):.1f}.",
             f"Accepted buy-signal target hit {summary.get('acceptedTargetRate') if summary.get('acceptedTargetRate') is not None else summary.get('targetHitRate'):.1f}%, stop-first {summary.get('stopRate'):.1f}%, average forward return {summary.get('avgForwardReturn'):.2f}%.",
             f"Prediction-weight calibration ({horizon_label(horizon)}): {prediction_calibration.get('status', 'collecting')} with {prediction_calibration.get('sampleCount', 0)} historical cuts.",
         ],
@@ -2055,6 +2358,8 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
                 retrain_interval=int(payload.get("retrain_interval", payload.get("retrainInterval")) or 60),
                 max_train_window=int(payload.get("max_train_window", payload.get("maxTrainWindow")) or 240),
                 knn_window=int(payload.get("knn_window", payload.get("knnWindow")) or 260),
+                adaptive_labels=bool(payload.get("adaptive_labels", payload.get("adaptiveLabels", True))),
+                transaction_cost_bps=number(payload.get("transaction_cost_bps", payload.get("transactionCostBps")), 0.0),
             )
             all_horizon_results[horizon].append(result)
             horizon_results.append(result)
@@ -2092,6 +2397,7 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
     )
     regime_calibration = aggregate_regime_calibrations(available)
     conformal_calibration = aggregate_conformal_calibrations(available)
+    statistical_reliability = aggregate_statistical_reliability(available)
     return {
         "framework": "historical-walk-forward-backtest-batch",
         "market": str(payload.get("market") or "ASX"),
@@ -2120,6 +2426,11 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
             "lowQualitySamplePct": round(weighted("lowQualitySamplePct"), 4) if available else None,
             "avgCoverageScore": round(weighted("avgCoverageScore"), 4) if available else None,
             "lowCoverageSamplePct": round(weighted("lowCoverageSamplePct"), 4) if available else None,
+            "statisticalReliabilityScore": round(number(statistical_reliability.get("score")), 5) if available else None,
+            "targetHitLowerBound": statistical_reliability.get("target", {}).get("lowerBound") if available else None,
+            "stopRateUpperBound": statistical_reliability.get("stop", {}).get("upperBound") if available else None,
+            "directionHitLowerBound": statistical_reliability.get("direction", {}).get("lowerBound") if available else None,
+            "effectiveIndependentSamples": statistical_reliability.get("target", {}).get("effectiveSamples") if available else None,
         },
         "dataQuality": {
             "framework": "batch-point-in-time-candle-quality-gate",
@@ -2135,6 +2446,7 @@ def batch_historical_backtest(payload: dict[str, Any]) -> dict[str, Any]:
         "horizonCalibrations": horizon_calibrations,
         "regimeCalibration": regime_calibration,
         "conformalCalibration": conformal_calibration,
+        "statisticalReliability": statistical_reliability,
         "modelStorage": {
             "persistRecommended": True,
             "sampleRetention": "append-only local market cache; historical candles and learned weights are reusable because past OHLCV rows are point-in-time stable after adjustment policy is fixed",

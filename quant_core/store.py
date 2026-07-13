@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,8 @@ def default_db_path() -> Path:
     return (Path(__file__).resolve().parents[1] / ".cache" / "quant-control-plane.sqlite3").resolve()
 
 
-def _connect(path: str | Path | None = None) -> sqlite3.Connection:
+@contextmanager
+def _connect(path: str | Path | None = None):
     db_path = Path(path).expanduser().resolve() if path else default_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path, timeout=5)
@@ -91,9 +93,56 @@ def _connect(path: str | Path | None = None) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_market_l2_symbol_time
           ON market_l2_depth(market, symbol, ts DESC);
+        CREATE TABLE IF NOT EXISTS paper_agent_state (
+          market TEXT PRIMARY KEY,
+          updated_at TEXT NOT NULL,
+          revision INTEGER NOT NULL DEFAULT 0,
+          migration_id TEXT,
+          config_json TEXT NOT NULL,
+          ledger_json TEXT NOT NULL,
+          memory_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS paper_agent_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at TEXT NOT NULL,
+          market TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          bar_ts TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          price REAL,
+          quantity REAL,
+          pnl_pct REAL,
+          source TEXT,
+          payload_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_agent_events_market_time
+          ON paper_agent_events(market, id DESC);
+        CREATE TABLE IF NOT EXISTS background_jobs (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          job_type TEXT NOT NULL,
+          market TEXT,
+          status TEXT NOT NULL,
+          progress REAL NOT NULL DEFAULT 0,
+          payload_json TEXT NOT NULL,
+          result_json TEXT,
+          error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_background_jobs_status_time
+          ON background_jobs(status, updated_at DESC);
         """
     )
-    return connection
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _json(value: Any) -> str:

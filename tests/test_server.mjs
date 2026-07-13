@@ -12,7 +12,11 @@ const {
   factorSignal,
   isLimitedProvider,
   localBatchAnalysis,
+  localModelScopeForStrategy,
+  providerApiKeys,
   providerConfigured,
+  providerKeyPoolStatus,
+  withProviderApiKey,
   redditCacheTtlForItem,
   redditProviderStatus,
   runPythonQuantCore,
@@ -23,6 +27,15 @@ const {
   backendMarketSession,
   backendMonitorBudgetLimits,
   computeServerTechnicals,
+  marketAnalysisEventFromMonitorResult,
+  marketOverlayFromHistoryPayload,
+  mergeQuoteIntoCandles,
+  predictionCandlesWithQuote,
+  projectedMaxDownsideConfidenceMetrics,
+  normalizeQuote,
+  sanitizeQuoteChangeAgainstCandles,
+  validMarketQuoteDate,
+  verifiedProviderTimestamp,
   intradaySampleRows,
   sanitizeBackendMonitorConfig,
   trainIntradayLinearModel,
@@ -31,6 +44,21 @@ const {
   tushareRows,
   universePayload,
 } = await import("../server.mjs");
+
+const {
+  cacheControlFor,
+  resolvedStaticPath,
+} = await import("../backend/http/static-files.mjs");
+
+test("Versioned static assets are immutable while HTML remains fresh", () => {
+  assert.equal(cacheControlFor(new URL("http://local/frontend/styles/shell.css?v=1"), "/app/frontend/styles/shell.css"), "public, max-age=31536000, immutable");
+  assert.equal(cacheControlFor(new URL("http://local/"), "/app/index.html"), "no-store");
+});
+
+test("Static file resolution stays inside the application root", () => {
+  assert.equal(resolvedStaticPath("/tmp/quant-watch", "/frontend/styles/shell.css"), "/tmp/quant-watch/frontend/styles/shell.css");
+  assert.throws(() => resolvedStaticPath("/tmp/quant-watch", "/../../etc/passwd"), /outside the application root/);
+});
 
 test("Alpaca bars preserve real trade count without changing source capability", () => {
   const rows = alpacaRows({
@@ -235,6 +263,27 @@ test("Local batch analysis handles pools beyond the old forty symbol cap", () =>
   assert.ok(result.results.every((row) => row.symbol && row.analysis?.action));
 });
 
+test("Horizon-isolated local models override market-wide fallback only with enough samples", () => {
+  const summary = {
+    localModelDeployment: {
+      sampleCount: 210,
+      horizonSuites: {
+        short: { sampleCount: 27, status: "collecting", reason: "short collecting" },
+        mid: { sampleCount: 88, signalModels: { featureScoreHead: { active: true } } },
+        long: { sampleCount: 65, modelZoo: { active: true } },
+      },
+    },
+  };
+  const mid = localModelScopeForStrategy(summary, { horizonDays: 15 });
+  assert.equal(mid.horizonBucket, "mid");
+  assert.equal(mid.source, "horizon_isolated");
+  assert.equal(mid.sampleCount, 88);
+  const short = localModelScopeForStrategy(summary, { horizonDays: 5 });
+  assert.equal(short.horizonBucket, "short");
+  assert.equal(short.source, "market_fallback");
+  assert.equal(short.sampleCount, 210);
+});
+
 test("Node service can call the Python quant core", async () => {
   const health = await runPythonQuantCore("health");
   assert.equal(health.ok, true);
@@ -280,6 +329,28 @@ test("Saved factor configuration changes the decision factor signal", () => {
   assert.ok(momentum.score > reversal.score);
   assert.ok(momentum.enabledFactors.includes("momentum_5"));
   assert.ok(!momentum.enabledFactors.includes("reversal_5"));
+});
+
+test("Maximum downside confidence uses historical adverse paths without inventing a positive return label", () => {
+  const result = projectedMaxDownsideConfidenceMetrics({
+    projectedFinalReturn: 1.2,
+    ensemble: { consensusAgreement: 72, upsideAgreement: 64 },
+    analog: {
+      examples: [
+        { maxDrawdown: -1.4 },
+        { maxDrawdown: -2.1 },
+        { maxDrawdown: -3.2 },
+        { maxDrawdown: -2.6 },
+      ],
+    },
+    confidence: 63,
+    strategy: { stopLoss: 4 },
+    conservative: { shrink: 0.82, noTradeGate: { stopRiskProbability: 28 } },
+  });
+  assert.ok(result.projectedMaxDownside > 0);
+  assert.ok(result.projectedMaxDownside <= 4.88);
+  assert.ok(result.probability >= 0 && result.probability <= 92);
+  assert.match(result.basis, /analog-drawdown/);
 });
 
 test("Reddit social scoring rewards relevant fact-backed engagement", () => {
@@ -359,8 +430,10 @@ test("Reddit disabled status and factor fallback do not throw", async () => {
   const previous = process.env.REDDIT_ENABLED;
   process.env.REDDIT_ENABLED = "false";
   try {
-    const status = await redditProviderStatus("US");
+    const status = await redditProviderStatus("US", { compact: true });
     assert.equal(status.enabled, false);
+    assert.equal(Array.isArray(status.cache?.rows), false);
+    assert.ok(status.cache?.summary);
     assert.equal(status.configured, false);
     const factor = await fetchRedditSocialFactor("ZZZUNIT", "US", { mode: "refresh", limit: 10 });
     assert.equal(factor.available, false);
@@ -372,7 +445,7 @@ test("Reddit disabled status and factor fallback do not throw", async () => {
   }
 });
 
-test("Backend monitor config persists holdings at 5m and watchlist at 15m cadence", () => {
+test("Backend monitor config persists holdings at 3m and watchlist at 10m cadence", () => {
   const config = sanitizeBackendMonitorConfig({
     strategy: { horizonDays: 15, confidence: 80, targetUpside: 5, stopLoss: 4, maxPosition: 20 },
     capital: { baseCapital: 5000 },
@@ -387,13 +460,13 @@ test("Backend monitor config persists holdings at 5m and watchlist at 15m cadenc
       },
     },
   });
-  assert.equal(config.refresh.holdingMs, 5 * 60 * 1000);
-  assert.equal(config.refresh.watchMs, 15 * 60 * 1000);
+  assert.equal(config.refresh.holdingMs, 3 * 60 * 1000);
+  assert.equal(config.refresh.watchMs, 10 * 60 * 1000);
   assert.ok(config.markets.ASX.watchlist.includes("CPU.AX"));
   assert.ok(config.markets.ASX.watchlist.includes("BHP.AX"));
   assert.ok(!config.markets.ASX.watchlist.includes("AAPL"));
   assert.equal(config.markets.US.portfolio[0].symbol, "AAPL");
-  assert.equal(config.training.symbolLimit, 3);
+  assert.equal(config.training.symbolLimit, 2);
 });
 
 test("Backend market session recognises regular market hours", () => {
@@ -401,6 +474,136 @@ test("Backend market session recognises regular market hours", () => {
   const asxClosed = backendMarketSession("ASX", new Date("2026-07-03T08:00:00Z"));
   assert.equal(asxOpen.open, true);
   assert.equal(asxClosed.open, false);
+});
+
+test("Latest market history overlay wins over an older analysis snapshot price", () => {
+  const overlay = marketOverlayFromHistoryPayload({
+    market: "ASX",
+    symbol: "CAR",
+    source: "stockanalysis-asx-daily-single-source",
+    savedAt: "2026-07-13T04:41:32.571Z",
+    candles: [
+      { date: "2026-07-10", open: 26.12, high: 26.56, low: 26.01, close: 26.37, volume: 557286 },
+      { date: "2026-07-13", open: 26.37, high: 26.37, low: 25.79, close: 25.79, volume: 244029 },
+    ],
+  }, "ASX", "CAR", new Date("2026-07-13T04:45:00.000Z"));
+  assert.equal(overlay.symbol, "CAR.AX");
+  assert.equal(overlay.price, 25.79);
+  assert.equal(overlay.previousClose, 26.37);
+  assert.equal(overlay.dataAsOf, "2026-07-13");
+  assert.equal(overlay.retrievedAt, "2026-07-13T04:41:32.571Z");
+});
+
+test("Stock quote keeps the latest real price but rejects a mismatched provider previous close", () => {
+  const check = sanitizeQuoteChangeAgainstCandles("CAR", "ASX", [
+    { date: "2026-07-10", open: 26.12, high: 26.56, low: 26.01, close: 26.37, volume: 557286 },
+    { date: "2026-07-13", open: 26.22, high: 26.33, low: 25.76, close: 25.96, volume: 727701 },
+  ], {
+    symbol: "CAR.AX",
+    price: 25.96,
+    previousClose: 34.58,
+    change: -8.62,
+    changePercent: -24.9277,
+    asOf: "2026-07-13T06:00:00.000Z",
+    date: "2026-07-13",
+    retrievedAt: "2026-07-13T07:16:00.000Z",
+    timeVerified: true,
+    source: "yahoo-finance-asx-quote",
+  }, new Date("2026-07-13T07:19:00.000Z"));
+  assert.equal(check.quote.price, 25.96);
+  assert.equal(check.quote.previousClose, 26.37);
+  assert.equal(check.quote.change, -0.41);
+  assert.equal(check.quote.changePercent, -1.5548);
+  assert.equal(check.quote.changeSource, "adjacent-real-candles");
+  assert.match(check.warning, /price remains the latest real quote/i);
+});
+
+test("Unverified ASX company quote remains displayable but cannot create a candle", () => {
+  const quote = normalizeQuote({
+    symbol: "CAR",
+    price: 25.9,
+    previousClose: 26.37,
+    retrievedAt: "2026-07-13T04:50:00.000Z",
+    timeVerified: false,
+    source: "asx-official-company-header",
+  }, "ASX");
+  assert.equal(quote.price, 25.9);
+  assert.equal(quote.asOf, null);
+  assert.equal(quote.date, null);
+  assert.equal(quote.timeVerified, false);
+  const candles = mergeQuoteIntoCandles([
+    { date: "2026-07-10", open: 26.12, high: 26.56, low: 26.01, close: 26.37, volume: 557286 },
+  ], quote, "ASX", new Date("2026-07-13T04:50:00.000Z"));
+  assert.equal(candles.length, 1);
+  assert.equal(candles[0].close, 26.37);
+});
+
+test("Unverified real quote updates the point-in-time model view without polluting stored candles", () => {
+  const base = [
+    { date: "2026-07-10", open: 26.12, high: 26.56, low: 26.01, close: 26.37, volume: 557286 },
+  ];
+  const quote = normalizeQuote({
+    symbol: "CAR",
+    price: 25.9,
+    previousClose: 26.37,
+    retrievedAt: "2026-07-13T04:50:00.000Z",
+    timeVerified: false,
+    source: "asx-official-company-header",
+  }, "ASX", 26.37);
+  const modelRows = predictionCandlesWithQuote(base, quote, "ASX", new Date("2026-07-13T04:50:00.000Z"));
+  assert.equal(base[0].close, 26.37);
+  assert.equal(modelRows.length, 1);
+  assert.equal(modelRows[0].close, 25.9);
+  assert.equal(modelRows[0].predictionOnly, true);
+});
+
+test("Backend live analysis event carries the current model price while retaining verified history", () => {
+  const event = marketAnalysisEventFromMonitorResult({
+    market: "ASX",
+    symbol: "CAR.AX",
+    tier: "watch",
+    source: "backend-monitor-local",
+    marketSource: "stockanalysis-asx-daily",
+    quote: {
+      symbol: "CAR.AX",
+      market: "ASX",
+      price: 25.9,
+      previousClose: 26.37,
+      retrievedAt: "2026-07-13T04:50:00.000Z",
+      timeVerified: false,
+      source: "asx-official-company-header",
+      delayed: true,
+    },
+    candles: [{ date: "2026-07-10", open: 26.12, high: 26.56, low: 26.01, close: 26.37, volume: 557286 }],
+    technicals: { close: 25.9, rsi: 48, volumeRatio: 1.1, mainForceProxy: 51 },
+    analysis: { action: "HOLD", confidence: 57 },
+    updatedAt: "2026-07-13T04:50:02.000Z",
+  });
+  assert.equal(event.analysisPrice, 25.9);
+  assert.equal(event.analysisAsOf, "2026-07-13T04:50:02.000Z");
+  assert.equal(event.candles.at(-1).close, 26.37);
+  assert.equal(event.analysisNeedsRefresh, false);
+});
+
+test("Quote-to-candle merge rejects weekends and future dates", () => {
+  const base = [{ date: "2026-07-10", open: 26.12, high: 26.56, low: 26.01, close: 26.37, volume: 557286 }];
+  const now = new Date("2026-07-13T04:50:00.000Z");
+  assert.equal(validMarketQuoteDate("2026-07-12", "ASX", now), false);
+  assert.equal(validMarketQuoteDate("2026-07-14", "ASX", now), false);
+  assert.equal(validMarketQuoteDate("2026-07-13", "ASX", now), true);
+  const weekend = mergeQuoteIntoCandles(base, { price: 26.1, date: "2026-07-12", timeVerified: true }, "ASX", now);
+  const future = mergeQuoteIntoCandles(base, { price: 26.1, date: "2026-07-14", timeVerified: true }, "ASX", now);
+  const valid = mergeQuoteIntoCandles(base, { price: 25.79, date: "2026-07-13", timeVerified: true, source: "unit" }, "ASX", now);
+  assert.equal(weekend.length, 1);
+  assert.equal(future.length, 1);
+  assert.equal(valid.length, 2);
+  assert.equal(valid.at(-1).close, 25.79);
+});
+
+test("Provider timestamp parser accepts explicit ISO or epoch values only", () => {
+  assert.equal(verifiedProviderTimestamp(["13/07/2026 14:50"]), null);
+  assert.equal(verifiedProviderTimestamp(["2026-07-13T04:50:00Z"]), "2026-07-13T04:50:00.000Z");
+  assert.equal(verifiedProviderTimestamp([1783918200]), "2026-07-13T04:50:00.000Z");
 });
 
 test("Backend technicals and intraday model train from completed minute bars", () => {
@@ -430,5 +633,39 @@ test("Backend technicals and intraday model train from completed minute bars", (
 test("Backend monitor budget defaults reserve quota for minute training", () => {
   const limits = backendMonitorBudgetLimits();
   assert.ok(limits.marketCalls > limits.trainingMarketReserve);
+  assert.ok(limits.marketCalls > limits.trainingMarketReserve + limits.manualMarketReserve);
   assert.ok(limits.trainingCalls > 0);
+  assert.equal(Object.values(limits.requestAllocation).reduce((sum, value) => sum + value, 0), 100);
+  assert.equal(Object.values(limits.trainingDataMix).reduce((sum, value) => sum + value, 0), 100);
+});
+
+test("Provider key pools preserve primary-first failover order and remove duplicates", () => {
+  const env = {
+    TIINGO_API_KEY: "primary-key",
+    TIINGO_API_KEYS: "backup-one, backup-two backup-one",
+    TIINGO_API_KEY_BACKUP_1: "backup-three",
+  };
+  assert.deepEqual(providerApiKeys("tiingo", env), ["primary-key", "backup-one", "backup-two", "backup-three"]);
+  assert.deepEqual(providerApiKeys("unknown", env), []);
+  const status = providerKeyPoolStatus("tiingo");
+  assert.equal(typeof status.keyCount, "number");
+  assert.equal(status.failoverOnly, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(status, "keys"), false);
+});
+
+test("Provider key pool advances in order only after quota-style failures", async () => {
+  const attempts = [];
+  const result = await withProviderApiKey("tiingo", {
+    env: { TIINGO_API_KEY: "primary", TIINGO_API_KEYS: "backup-one,backup-two" },
+    runtimeKey: "tiingo-unit-order",
+    backoffKey: "tiingo-unit-order",
+    keyBackoffMs: 1000,
+    backoffMs: 1000,
+  }, async (key) => {
+    attempts.push(key);
+    if (key !== "backup-two") throw new Error("HTTP 429: rate limit");
+    return "ok";
+  });
+  assert.equal(result, "ok");
+  assert.deepEqual(attempts, ["primary", "backup-one", "backup-two"]);
 });

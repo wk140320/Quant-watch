@@ -11,9 +11,11 @@ sys.path.insert(0, str(ROOT / "quant_core"))
 from alpha_mining import analyze_alpha_evolution  # noqa: E402
 from data_quality import assess_candle_quality  # noqa: E402
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features  # noqa: E402
-from historical_backtest import outcome_window, run_historical_backtest  # noqa: E402
+from historical_backtest import adaptive_barriers, outcome_window, run_historical_backtest  # noqa: E402
 from local_model import train_local_model_suite  # noqa: E402
+from paper_agents import configure as configure_paper_agents, list_agent_events, load_state as load_paper_agent_state, migrate as migrate_paper_agents, step as step_paper_agents  # noqa: E402
 from provider_budget import provider_plan  # noqa: E402
+from production_training import build_market_dataset, fit_constrained_stack, point_in_time_features, purged_walk_forward_folds  # noqa: E402
 from risk import assess_portfolio, build_paper_order_intent  # noqa: E402
 from store import append_event, control_plane_summary, list_events, list_market_rows, market_data_summary, record_market_rows, record_order_intent  # noqa: E402
 from trades import analyze_trades  # noqa: E402
@@ -296,6 +298,8 @@ class QuantCoreTests(unittest.TestCase):
         self.assertGreater(result["signalModels"]["tripleBarrier"]["targetRate"], 0)
         feature_head = result["signalModels"]["featureScoreHead"]
         self.assertEqual(feature_head["model"]["featureCount"], 19)
+        self.assertFalse(feature_head["productionEligible"])
+        self.assertFalse(feature_head["active"])
         self.assertIn("buyPressure5", feature_head["featureNames"])
         self.assertIn("profileDistance", feature_head["featureNames"])
         self.assertIn("volumeAccel", feature_head["featureNames"])
@@ -313,9 +317,20 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(result["modelZoo"]["framework"], "python-local-model-zoo-committee")
         self.assertGreaterEqual(result["modelZoo"]["candidateCount"], 4)
         self.assertIn("rejectGate", result["modelZoo"])
+        self.assertIn("stability", result["modelZoo"])
         self.assertIn("deploymentWeights", result["modelZoo"])
+        self.assertFalse(result["modelZoo"]["productionEligible"])
+        self.assertFalse(result["modelZoo"]["active"])
+        self.assertIn("productionGate", result["modelZoo"])
+        self.assertGreaterEqual(result["modelZoo"]["productionGate"]["required"]["testRows"], 150)
         self.assertIn("doubleCheckPolicy", result["modelZoo"])
         self.assertGreaterEqual(result["modelZoo"]["doubleCheckPolicy"]["selfModelMinShare"], 0.8)
+        self.assertIn("horizonSuites", result)
+        self.assertEqual(result["horizonSuites"]["mid"]["horizonScope"], "mid")
+        self.assertEqual(result["horizonSuites"]["mid"]["sampleCount"], len(prediction_samples()))
+        self.assertEqual(result["horizonPolicy"]["framework"], "horizon-isolated-local-model-deployment")
+        self.assertEqual(result["deploymentStatus"], "research_or_shadow_only")
+        self.assertFalse(result["productionEligible"])
 
     def test_historical_backtest_uses_point_in_time_slices(self):
         result = run_historical_backtest(
@@ -353,6 +368,10 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("avgLabelNoiseScore", result["metrics"])
         self.assertIn("labelNoiseScore", result["recentPredictions"][-1])
         self.assertIn("ambiguousBarrierPct", result["values"])
+        self.assertIn("statisticalReliability", result)
+        self.assertEqual(result["statisticalReliability"]["framework"], "weighted-wilson-backtest-reliability")
+        self.assertIn("lowerBound", result["statisticalReliability"]["target"])
+        self.assertIn("targetHitLowerBound", result["values"])
 
     def test_data_quality_gate_downweights_suspicious_candles_and_labels(self):
         rows = candles(260)
@@ -391,6 +410,96 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(outcome["firstBarrierEvent"], "ambiguous")
         self.assertFalse(outcome["targetWins"])
         self.assertFalse(outcome["stopWins"])
+
+    def test_historical_label_enters_on_next_session_not_signal_close(self):
+        rows = [
+            {"date": "2026-01-01", "open": 99, "high": 101, "low": 98, "close": 100, "volume": 1000},
+            {"date": "2026-01-02", "open": 110, "high": 112, "low": 108, "close": 111, "volume": 1200},
+            {"date": "2026-01-03", "open": 111, "high": 114, "low": 109, "close": 113, "volume": 1100},
+        ]
+        outcome = outcome_window(rows, 0, 2, target_upside=5, stop_loss=4)
+        self.assertEqual(outcome["entryPrice"], 110)
+        self.assertEqual(outcome["entryDate"], "2026-01-02")
+        self.assertEqual(outcome["entrySource"], "next_session_open")
+        self.assertAlmostEqual(outcome["grossForwardReturn"], (113 / 110 - 1) * 100, places=6)
+
+    def test_adaptive_barriers_scale_with_realized_volatility(self):
+        quiet = panel_candles(120, drift=0.01, phase=0)
+        volatile = panel_candles(120, drift=0.01, phase=0)
+        for index, row in enumerate(volatile):
+            row["high"] = row["close"] + 2.5 + (index % 3)
+            row["low"] = row["close"] - 2.5 - (index % 2)
+        quiet_barriers = adaptive_barriers(quiet, 90, 15, 5, 4)
+        volatile_barriers = adaptive_barriers(volatile, 90, 15, 5, 4)
+        self.assertGreater(volatile_barriers["targetPct"], quiet_barriers["targetPct"])
+        self.assertGreater(volatile_barriers["stopPct"], quiet_barriers["stopPct"])
+
+    def test_point_in_time_join_excludes_future_rows_without_counting_a_leak(self):
+        item = {
+            "pointInTimeFeatures": [
+                {"available_at": "2025-02-01T08:00:00Z", "values": {"eventSentiment": 0.7}},
+                {"available_at": "2025-05-01T08:00:00Z", "values": {"eventSentiment": -0.9}},
+            ]
+        }
+        joined = point_in_time_features(item, "2025-03-01", "US")
+        self.assertEqual(joined["sourceRows"], 1)
+        self.assertEqual(joined["futureRowsExcluded"], 1)
+        self.assertEqual(joined["joinViolationCount"], 0)
+        self.assertGreater(joined["values"]["eventSentiment"], 0)
+
+    def test_market_dataset_and_purged_folds_keep_training_before_test(self):
+        dataset = build_market_dataset(panel_items(230), market="US", horizons=[5], target_upside=3, stop_loss=3)
+        self.assertGreater(dataset["summary"]["rawRows"], 500)
+        self.assertEqual(dataset["summary"]["pointInTimeJoinViolationCount"], 0)
+        folds = purged_walk_forward_folds(dataset["rows"], horizon=5, fold_count=3, embargo_days=7, min_train_dates=70, test_dates=25)
+        self.assertGreaterEqual(len(folds), 2)
+        dates = sorted({row["date"] for row in dataset["rows"]})
+        for fold in folds:
+            train_index = dates.index(fold["trainEnd"])
+            test_index = dates.index(fold["testStart"])
+            self.assertGreaterEqual(test_index - train_index - 1, 12)
+
+    def test_constrained_stack_is_non_negative_normalized_and_capped(self):
+        rows = []
+        for index in range(120):
+            actual = 1.0 if index % 4 in {0, 1} else 0.0
+            rows.append({
+                "actualTarget": actual,
+                "evaluationWeight": 1.0,
+                "a": 0.78 if actual else 0.22,
+                "b": 0.68 if actual else 0.32,
+                "c": 0.58 if actual else 0.42,
+            })
+        weights = fit_constrained_stack(rows, ["a", "b", "c"], cap=0.4)
+        self.assertAlmostEqual(sum(weights), 1.0, places=7)
+        self.assertTrue(all(0 <= value <= 0.400001 for value in weights))
+
+    def test_worker_trains_market_multitask_candidate_and_persists_oof(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = dispatch({
+                "operation": "production-model-train",
+                "market": "US",
+                "items": panel_items(240),
+                "horizons": [5],
+                "target_upside": 3,
+                "stop_loss": 3,
+                "production_fold_count": 3,
+                "production_min_train_dates": 75,
+                "production_test_dates": 30,
+                "production_embargo_days": 7,
+                "enable_tree_models": False,
+                "artifact_dir": temp_dir,
+            })
+            self.assertTrue(result["available"])
+            self.assertEqual(result["framework"], "market-level-multitask-oof-calibrated-stack")
+            model = result["horizonModels"][0]
+            self.assertTrue(model["available"])
+            self.assertIn("elasticPrediction", model["models"] + [row.get("model") for row in model["prunedModels"]])
+            self.assertEqual(model["leakageControl"]["entry"], "next-session VWAP/open")
+            self.assertFalse(result["productionEligibility"]["eligible"])
+            artifact = model["oofArtifact"]
+            self.assertIsNotNone(artifact)
+            self.assertTrue((Path(temp_dir) / artifact["filename"]).exists())
 
     def test_worker_dispatch_exposes_local_model_train(self):
         result = dispatch({"operation": "local-model-train", "market": "US", "samples": prediction_samples()})
@@ -508,6 +617,9 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("finalReturnAbsErrorP80", result["conformalCalibration"]["overall"])
         self.assertIn("avgLabelNoiseScore", result["metrics"])
         self.assertIn("highNoiseSamplePct", result["metrics"])
+        self.assertIn("statisticalReliability", result)
+        self.assertEqual(result["statisticalReliability"]["framework"], "aggregate-weighted-wilson-backtest-reliability")
+        self.assertIn("targetHitLowerBound", result["metrics"])
         self.assertIn("stability", result["predictionCalibration"])
         self.assertEqual(result["predictionCalibration"]["stability"]["framework"], "aggregate-purged-walk-forward-weight-stability")
         for row in result["horizonCalibrations"]:
@@ -711,6 +823,125 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(payload["market"], "US")
         self.assertEqual(payload["positions"][0]["currentPrice"], 200)
         self.assertEqual(payload["policy"]["maxPositionPct"], 30)
+
+    def test_paper_agents_persist_and_dedupe_real_bar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            item = {
+                "market": "US",
+                "symbol": "AAPL",
+                "price": 200.0,
+                "barTs": "2026-07-13T14:35:00Z",
+                "source": "alpaca-us-real-bars",
+                "fresh": True,
+                "analysis": {
+                    "action": "WATCH_BUY",
+                    "confidence": 91,
+                    "projectedFinalReturn": 8,
+                    "projectedMaxUpside": 11,
+                    "strategyHitProbability": 84,
+                    "finalReturnProbability": 76,
+                    "maxUpsideProbability": 88,
+                    "downsideConfidence": 18,
+                },
+                "technicals": {"close": 200, "trendScore": 82, "riskScore": 78, "rsi": 61, "volumeRatio": 1.8, "change5d": 4.1},
+                "factors": {"quality": {"available": True, "score": 28}},
+                "news": [{"title": "verified product launch"}],
+            }
+            first = step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": [item]})
+            self.assertTrue(first["events"])
+            self.assertTrue(all(event["order_execution_enabled"] is False for event in first["events"]))
+            second = step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": [item]})
+            self.assertEqual(second["events"], [])
+            saved = load_paper_agent_state("US", db_path)
+            self.assertGreater(sum(len(agent["positions"]) for agent in saved["ledger"]["agents"]), 0)
+            events = list_agent_events({"db_path": db_path, "market": "US"})
+            self.assertEqual(events["count"], len(first["events"]))
+
+    def test_paper_agents_reject_closed_stale_and_simulated_prices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            base = {"market": "ASX", "symbol": "BHP", "price": 45, "barTs": "2026-07-13T01:00:00Z", "analysis": {"confidence": 99}}
+            closed = step_paper_agents({"db_path": db_path, "market": "ASX", "marketOpen": False, "items": [{**base, "source": "eodhd-asx-real", "fresh": True}]})
+            simulated = step_paper_agents({"db_path": db_path, "market": "ASX", "marketOpen": True, "items": [{**base, "source": "simulated-fixture", "fresh": True}]})
+            stale = step_paper_agents({"db_path": db_path, "market": "ASX", "marketOpen": True, "items": [{**base, "source": "eodhd-asx-real", "fresh": False}]})
+            self.assertFalse(closed["events"])
+            self.assertFalse(simulated["events"])
+            self.assertFalse(stale["events"])
+
+    def test_paper_agent_browser_migration_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            payload = {
+                "db_path": db_path,
+                "market": "US",
+                "migrationId": "browser-agent-v1-test",
+                "agentConfigByMarket": {"US": {"initialCapital": 25000}},
+                "agentMemoryByMarket": {"US": {"strategyBook": {"trend": {"trades": 42}}, "archives": [{"reason": "cycle"}], "totalReplayTrades": 42}},
+            }
+            first = migrate_paper_agents(payload)
+            second = migrate_paper_agents(payload)
+            self.assertTrue(first["migrated"])
+            self.assertTrue(second["duplicate"])
+            self.assertEqual(second["config"]["initialCapital"], 25000)
+            self.assertEqual(second["memory"]["strategyBook"]["trend"]["trades"], 42)
+            self.assertEqual(len(second["memory"]["archives"]), 1)
+
+    def test_paper_agent_empty_browser_migration_cannot_erase_backend_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            item = {
+                "market": "US", "symbol": "AAPL", "price": 200.0,
+                "barTs": "2026-07-13T14:35:00Z", "source": "alpaca-us-real-bars", "fresh": True,
+                "analysis": {"action": "WATCH_BUY", "confidence": 94, "projectedFinalReturn": 9, "projectedMaxUpside": 12, "strategyHitProbability": 88, "finalReturnProbability": 81, "maxUpsideProbability": 90, "downsideConfidence": 15},
+                "technicals": {"close": 200, "trendScore": 84, "riskScore": 80, "rsi": 62, "volumeRatio": 1.9, "change5d": 4.6},
+                "factors": {"quality": {"available": True, "score": 30}}, "news": [{"title": "verified launch"}],
+            }
+            step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": [item]})
+            before = load_paper_agent_state("US", db_path)
+            migrated = migrate_paper_agents({
+                "db_path": db_path, "market": "US", "migrationId": "empty-browser-v2",
+                "agentLedgerByMarket": {"US": {"market": "US", "agents": []}},
+                "agentMemoryByMarket": {"US": {}},
+            })
+            self.assertEqual(sum(len(agent["trades"]) for agent in migrated["ledger"]["agents"]), sum(len(agent["trades"]) for agent in before["ledger"]["agents"]))
+            self.assertEqual(sum(len(agent["positions"]) for agent in migrated["ledger"]["agents"]), sum(len(agent["positions"]) for agent in before["ledger"]["agents"]))
+
+    def test_paper_agent_same_marker_accepts_a_strictly_richer_browser_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            marker = "browser-v3-recovery"
+            first = migrate_paper_agents({"db_path": db_path, "market": "ASX", "migrationId": marker})
+            richer_agent = first["ledger"]["agents"][0]
+            richer_agent["trades"] = [{"id": "restored-trade", "symbol": "CPU.AX", "side": "BUY"}]
+            richer_agent["positions"] = {"CPU.AX": {"qty": 10, "avgPrice": 25}}
+            recovered = migrate_paper_agents({
+                "db_path": db_path,
+                "market": "ASX",
+                "migrationId": marker,
+                "agentLedgerByMarket": {"ASX": first["ledger"]},
+            })
+            self.assertTrue(recovered["migrated"])
+            self.assertFalse(recovered["duplicate"])
+            self.assertEqual(sum(len(agent["trades"]) for agent in recovered["ledger"]["agents"]), 1)
+            self.assertEqual(sum(len(agent["positions"]) for agent in recovered["ledger"]["agents"]), 1)
+
+    def test_paper_agent_capital_update_preserves_trades_and_positions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            item = {
+                "market": "US", "symbol": "AAPL", "price": 200.0,
+                "barTs": "2026-07-13T14:35:00Z", "source": "alpaca-us-real-bars", "fresh": True,
+                "analysis": {"action": "WATCH_BUY", "confidence": 94, "projectedFinalReturn": 9, "projectedMaxUpside": 12, "strategyHitProbability": 88, "finalReturnProbability": 81, "maxUpsideProbability": 90, "downsideConfidence": 15},
+                "technicals": {"close": 200, "trendScore": 84, "riskScore": 80, "rsi": 62, "volumeRatio": 1.9, "change5d": 4.6},
+                "factors": {"quality": {"available": True, "score": 30}}, "news": [{"title": "verified launch"}],
+            }
+            step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": [item]})
+            before = load_paper_agent_state("US", db_path)
+            updated = configure_paper_agents({"db_path": db_path, "market": "US", "config": {"initialCapital": 25000}})
+            self.assertEqual(updated["config"]["initialCapital"], 25000)
+            self.assertEqual(sum(len(agent["trades"]) for agent in updated["ledger"]["agents"]), sum(len(agent["trades"]) for agent in before["ledger"]["agents"]))
+            self.assertEqual(sum(len(agent["positions"]) for agent in updated["ledger"]["agents"]), sum(len(agent["positions"]) for agent in before["ledger"]["agents"]))
 
     def test_python_client_request_encodes_json_and_query(self):
         captured = {}

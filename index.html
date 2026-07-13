@@ -5,27 +5,44 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Global Quant Watch</title>
     <link rel="stylesheet" href="/styles.css?v=20260624-detail-safe">
+    <link rel="stylesheet" href="/frontend/styles/tokens.css?v=20260712-graphite-system">
+    <link rel="stylesheet" href="/frontend/styles/shell.css?v=20260713-provider-pool-ledger-17">
+    <link rel="stylesheet" href="/frontend/styles/visual-workspaces.css?v=20260713-visual-workspaces-2">
+    <link rel="stylesheet" href="/frontend/styles/institutional-polish.css?v=20260713-institutional-polish-2">
+    <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260713-provider-pool-ledger-17">
   </head>
   <body>
     <div class="app-shell">
       <header class="sidebar terminal-header">
         <div class="brand">
-          <button id="marketCycleButton" class="brand-mark market-cycle" type="button" title="点击切换 AUX / US / CN">AUX</button>
-          <div>
+          <button id="homeBrandButton" class="product-home" type="button" title="返回主页">
+            <span class="product-mark" aria-hidden="true"><i data-lucide="audio-waveform"></i></span>
+            <span>Global Quant Watch</span>
+          </button>
+          <div class="market-switcher">
+            <button id="marketCycleButton" class="brand-mark market-cycle" type="button" title="点击切换 ASX / US / CN">ASX</button>
+            <button id="marketMenuButton" class="market-menu-trigger" type="button" aria-expanded="false" aria-controls="marketMenu" title="直接选择市场"><i data-lucide="chevron-down"></i></button>
+            <div id="marketMenu" class="market-menu" hidden>
+              <button type="button" data-market-select="ASX"><span>ASX</span><small>澳股</small></button>
+              <button type="button" data-market-select="US"><span>US</span><small>美股</small></button>
+              <button type="button" data-market-select="CN"><span>CN</span><small>A股</small></button>
+            </div>
+          </div>
+          <div class="market-context">
             <h1 id="brandMarketTitle">澳股 ASX</h1>
-            <p id="brandSubtitle">Global Quant Watch · 多市场只读分析与提醒</p>
+            <p id="brandSubtitle">真实数据工作区</p>
           </div>
         </div>
 
-        <nav class="workspace-nav side-workspace-nav" aria-label="量化工作区">
-          <button class="active" data-page-target="dashboard" type="button">监控台</button>
-          <button data-page-target="features" type="button">特征分析</button>
-          <button data-page-target="factors" type="button">因子实验室</button>
-          <button data-page-target="regime" type="button">市场状态</button>
-          <button data-page-target="strategy" type="button">策略/Agent</button>
-          <button data-page-target="simulation" type="button">模拟持仓</button>
-          <button data-page-target="sources" type="button">数据源</button>
-          <a class="monitor-entry" href="/monitor.html">后台开关</a>
+        <nav id="workspaceRail" class="workspace-nav side-workspace-nav" aria-label="量化工作区" tabindex="0">
+          <button class="active" data-page-target="home" type="button"><i data-lucide="house"></i><span>主页</span></button>
+          <button data-page-target="dashboard" type="button"><i data-lucide="chart-candlestick"></i><span>监控台</span></button>
+          <button data-page-target="features" type="button"><i data-lucide="scan-search"></i><span>特征分析</span></button>
+          <button data-page-target="factors" type="button"><i data-lucide="flask-conical"></i><span>因子实验室</span></button>
+          <button data-page-target="regime" type="button"><i data-lucide="activity"></i><span>市场状态</span></button>
+          <button data-page-target="strategy" type="button"><i data-lucide="brain-circuit"></i><span>策略/Agent</span></button>
+          <button data-page-target="simulation" type="button"><i data-lucide="wallet-cards"></i><span>模拟持仓</span></button>
+          <button data-page-target="sources" type="button"><i data-lucide="database-zap"></i><span>数据中心</span></button>
         </nav>
       </header>
 
@@ -46,6 +63,92 @@
             <button type="submit">加入监控</button>
           </form>
         </header>
+
+        <section class="quant-page-section home-page" data-quant-page="home" hidden>
+          <section class="home-hero" aria-labelledby="homeProductTitle">
+            <div class="home-hero-media" aria-hidden="true"></div>
+            <div class="home-hero-copy">
+              <p class="home-kicker"><span></span>AUX · US · CN / REAL-DATA RESEARCH</p>
+              <h1 id="homeProductTitle">Global Quant Watch</h1>
+              <p class="home-lede">把真实行情、新闻与社媒事件、因子研究和风险约束，收束到一个可追溯的跨市场决策工作台。</p>
+              <div class="home-actions">
+                <button id="homeOpenDashboard" type="button">进入监控</button>
+                <button id="homeOpenStrategy" class="secondary" type="button">查看策略与模型</button>
+              </div>
+            </div>
+            <div class="home-live-rail" aria-label="当前系统状态">
+              <div>
+                <span id="homeMarketCode">ASX</span>
+                <strong id="homeSessionState">读取市场状态</strong>
+                <small id="homeMarketClock">--:--:--</small>
+              </div>
+              <div>
+                <span>监控覆盖</span>
+                <strong><b id="homeReadyCount">0</b> / <b id="homeWatchCount">0</b></strong>
+                <small>已完成真实行情分析</small>
+              </div>
+              <div>
+                <span>策略信号</span>
+                <strong><b id="homeBuyCount">0</b> 关注 · <b id="homeRiskCount">0</b> 风险</strong>
+                <small>基于当前策略门槛</small>
+              </div>
+              <div>
+                <span>证据状态</span>
+                <strong id="homeEvidenceState">本地快照优先</strong>
+                <small id="homeSnapshotState">等待快照</small>
+              </div>
+            </div>
+          </section>
+
+          <section class="home-intelligence-band reveal-on-scroll" aria-labelledby="homeResearchTitle">
+            <div class="home-band-heading">
+              <p>RESEARCH SURFACES</p>
+              <h2 id="homeResearchTitle">从今天最重要的证据开始</h2>
+            </div>
+            <div class="home-entry-grid">
+              <button class="home-entry" data-home-target="dashboard" type="button">
+                <span>01</span>
+                <strong>监控与决策</strong>
+                <small>持仓优先、买卖门槛、风险提醒</small>
+                <i aria-hidden="true">↗</i>
+              </button>
+              <button class="home-entry" data-home-target="regime" type="button">
+                <span>02</span>
+                <strong>市场状态</strong>
+                <small>指数、宏观、行业宽度和风险阶段</small>
+                <i aria-hidden="true">↗</i>
+              </button>
+              <button class="home-entry" data-home-target="factors" type="button">
+                <span>03</span>
+                <strong>因子实验室</strong>
+                <small>样本外验证、进化候选和模型稳定性</small>
+                <i aria-hidden="true">↗</i>
+              </button>
+            </div>
+          </section>
+
+          <section class="home-visual-gallery reveal-on-scroll" aria-labelledby="homeVisualTitle">
+            <div class="home-gallery-heading">
+              <p>LIVE RESEARCH MAP</p>
+              <h2 id="homeVisualTitle">在同一条证据链上观察市场与模型</h2>
+              <span>当前市场、风险阶段、因子稳定性与预测校准保持相互可追溯。</span>
+            </div>
+            <div class="home-visual-grid">
+              <button class="home-visual-entry home-market-entry" data-home-target="regime" type="button">
+                <span class="home-visual-index">MARKET / 01</span>
+                <strong>市场脉冲</strong>
+                <small>现金指数 · 行业宽度 · 风险阶段</small>
+                <i aria-hidden="true">进入市场状态 ↗</i>
+              </button>
+              <button class="home-visual-entry home-model-entry" data-home-target="strategy" type="button">
+                <span class="home-visual-index">MODEL / 02</span>
+                <strong>预测与因子拓扑</strong>
+                <small>样本外校准 · 权重漂移 · Agent 决策</small>
+                <i aria-hidden="true">进入策略与模型 ↗</i>
+              </button>
+            </div>
+          </section>
+        </section>
 
         <section class="quant-page-section quant-lab-page" data-quant-page="features" hidden>
           <div class="section-head">
@@ -116,6 +219,7 @@
               <button id="refreshProviderBudget" class="secondary" type="button">检查数据源</button>
               <button id="refreshDataHealth" class="secondary" type="button">检查健康</button>
               <button id="refreshNewsNow" type="button">刷新新闻</button>
+              <a class="button-link secondary" href="/monitor.html"><i data-lucide="power"></i><span>后台控制</span></a>
             </div>
           </div>
           <div id="providerBudgetPanel" class="quant-lab-panel compact-panel">
@@ -165,7 +269,7 @@
           </div>
         </section>
 
-        <section class="portfolio-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board strategy-constraints-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <div>
               <h2>策略约束</h2>
@@ -202,7 +306,7 @@
           <textarea id="strategyText" rows="4">单只股票交易周期在15日以内，上涨置信区间80%，预估上涨幅度5%，优先选择流动性充足、成交量放大、MACD转强且新闻面没有重大利空的澳大利亚股票。</textarea>
         </section>
 
-        <section class="portfolio-board quant-page-section" data-quant-page="simulation" hidden>
+        <section class="portfolio-board capital-board quant-page-section" data-quant-page="simulation" hidden>
           <div class="section-head">
             <div>
               <h2>资金与持仓导入</h2>
@@ -272,7 +376,7 @@ CBA,20,118.50</textarea>
           </details>
         </section>
 
-        <section class="quant-page-section quant-lab-page" data-quant-page="simulation" hidden>
+        <section class="quant-page-section quant-lab-page risk-board" data-quant-page="simulation" hidden>
           <div class="section-head">
             <div>
               <h2>模拟组合风险引擎</h2>
@@ -299,7 +403,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="quant-page-section quant-lab-page" data-quant-page="simulation" hidden>
+        <section class="quant-page-section quant-lab-page audit-board" data-quant-page="simulation" hidden>
           <div class="section-head">
             <div>
               <h2>模拟订单意图审计</h2>
@@ -375,7 +479,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="market-board quant-page-section" data-quant-page="regime" hidden>
+        <section class="market-board refresh-board quant-page-section" data-quant-page="regime" hidden>
           <div class="section-head">
             <div>
               <h2>自动刷新与快照策略</h2>
@@ -389,8 +493,8 @@ CBA,20,118.50</textarea>
               <select id="refreshInterval">
                 <option value="60000">1 分钟</option>
                 <option value="300000">5 分钟</option>
-                <option value="600000">10 分钟</option>
-                <option value="1800000" selected>30 分钟</option>
+                <option value="600000" selected>10 分钟</option>
+                <option value="1800000">30 分钟</option>
                 <option value="3600000">60 分钟</option>
               </select>
             </label>
@@ -410,7 +514,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="market-board quant-page-section" data-quant-page="regime" hidden>
+        <section class="market-board market-overview-board quant-page-section" data-quant-page="regime" hidden>
           <div class="section-head">
             <h2>市场大盘</h2>
             <button id="refreshIndexes" class="secondary" type="button">更新大盘</button>
@@ -423,7 +527,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="market-board stock-picker-board quant-page-section" data-quant-page="regime" hidden>
+        <section class="market-board stock-picker-board universe-board quant-page-section" data-quant-page="regime" hidden>
           <div class="section-head">
             <div>
               <h2>市场股票池覆盖</h2>
@@ -439,7 +543,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="market-board stock-picker-board quant-page-section" data-quant-page="regime" hidden>
+        <section class="market-board stock-picker-board movers-board quant-page-section" data-quant-page="regime" hidden>
           <div class="section-head">
             <div>
               <h2>大盘涨跌榜 / 龙虎榜</h2>
@@ -452,7 +556,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="market-board stock-picker-board quant-page-section" data-quant-page="dashboard">
+        <section class="market-board stock-picker-board ai-picker-board quant-page-section" data-quant-page="regime" hidden>
           <div class="section-head">
             <h2>AI选股</h2>
             <button id="aiPickStocks" class="secondary" type="button">严格筛选Top15</button>
@@ -462,9 +566,9 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="metrics-row quant-page-section" data-quant-page="dashboard" id="portfolioSummary"></section>
+        <section class="metrics-row simulation-capital-summary quant-page-section" data-quant-page="simulation" id="portfolioSummary" hidden></section>
 
-        <section class="portfolio-board quant-page-section" data-quant-page="simulation" hidden>
+        <section class="portfolio-board portfolio-positions-board quant-page-section" data-quant-page="simulation" hidden>
           <div class="section-head">
             <h2>模拟持仓与仓位建议</h2>
             <button id="rebalanceAdvice" class="secondary" type="button">重新计算</button>
@@ -474,7 +578,7 @@ CBA,20,118.50</textarea>
           <div id="allocationAdvice" class="allocation-list"></div>
         </section>
 
-        <section class="portfolio-board quant-page-section" data-quant-page="simulation" hidden>
+        <section class="portfolio-board decision-history-board quant-page-section" data-quant-page="simulation" hidden>
           <div class="panel history-panel">
             <div class="panel-head">
               <h2>决策记录</h2>
@@ -488,7 +592,7 @@ CBA,20,118.50</textarea>
           <div class="section-head">
             <h2>预测学习与准确率</h2>
             <div class="inline-actions">
-              <button id="runHistoricalBacktest" class="secondary" type="button">5年历史预测校准</button>
+              <button id="runHistoricalBacktest" class="secondary" type="button">市场级多任务训练</button>
               <button id="refreshAccuracy" class="secondary" type="button">更新</button>
             </div>
           </div>
@@ -539,7 +643,7 @@ CBA,20,118.50</textarea>
           <textarea id="aiChatInput" rows="3" placeholder="例如：我昨天买入WOW今天跌了2%，请结合当前持仓和策略告诉我是否要止损、减仓还是继续持有。"></textarea>
         </section>
 
-        <section class="portfolio-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board strategy-history-board quant-page-section" data-quant-page="strategy" hidden>
           <div class="section-head">
             <div>
               <h2>策略版本记录</h2>
@@ -553,11 +657,22 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="workspace quant-page-section" data-quant-page="dashboard">
+        <section class="workspace quant-page-section" data-quant-page="dashboard" hidden>
           <div class="watchlist">
             <div class="section-head">
               <h2>选票与提醒</h2>
-              <button id="refreshAll" type="button">刷新</button>
+              <div class="watchlist-tools" aria-label="监控股排序与刷新">
+                <label class="sr-only" for="watchlistSortKey">排序字段</label>
+                <select id="watchlistSortKey" class="watchlist-sort-select" aria-label="监控股排序字段">
+                  <option value="addedAt">添加时间</option>
+                  <option value="symbol">首字母</option>
+                  <option value="price">股价</option>
+                  <option value="change">涨跌幅</option>
+                  <option value="confidence">置信度</option>
+                </select>
+                <button id="watchlistSortDirection" class="watchlist-sort-direction" type="button" aria-label="当前降序，点击切换为升序" title="切换排序方向"><i data-lucide="arrow-down"></i><span>降序</span></button>
+                <button id="refreshAll" type="button" title="刷新当前市场"><i data-lucide="refresh-cw"></i><span>刷新</span></button>
+              </div>
             </div>
             <div id="cards" class="cards"></div>
           </div>
@@ -579,6 +694,12 @@ CBA,20,118.50</textarea>
       </footer>
     </div>
 
-    <script src="/app.js?v=20260628-self-primary-double-check"></script>
+    <script src="/frontend/runtime/icons.js?v=20260713-icons-2"></script>
+    <script src="/frontend/domain/market.js?v=20260712-market-isolation-2"></script>
+    <script src="/frontend/runtime/storage.js?v=20260713-storage-contract-1"></script>
+    <script src="/frontend/runtime/ui-runtime.js?v=20260713-local-transitions-2"></script>
+    <script src="/frontend/runtime/home-motion.js?v=20260712-home-motion"></script>
+    <script src="/frontend/runtime/flow-navigation.js?v=20260713-flow-navigation-2"></script>
+    <script src="/frontend/runtime/shell-bootstrap.js?v=20260713-provider-pool-ledger-23"></script>
   </body>
 </html>

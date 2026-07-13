@@ -3,9 +3,19 @@ from __future__ import annotations
 import math
 from typing import Any
 
-MAX_ENSEMBLE_ROWS = 600
-MAX_SUPERVISED_ROWS = 720
+# Keep enough resolved history for meaningful market/horizon diagnostics. These are
+# memory guards, not training targets; the production trainer persists its full OOF
+# table separately and applies stricter market-level gates.
+MAX_ENSEMBLE_ROWS = 20_000
+MAX_SUPERVISED_ROWS = 50_000
 MODEL_ZOO_MIN_ROWS = 48
+HORIZON_SCOPE_MIN_ROWS = 32
+PRODUCTION_MIN_ROWS = 500
+PRODUCTION_MIN_TEST_ROWS = 150
+PRODUCTION_MIN_TARGET_EVENTS = 50
+PRODUCTION_MIN_STOP_EVENTS = 50
+PRODUCTION_MIN_FOLDS = 5
+PRODUCTION_MIN_POSITIVE_FOLDS = 4
 TRIPLE_BARRIER_CLASSES = {"stop": 0, "timeout": 1, "target": 2}
 DEFAULT_EMBARGO_FRACTION = 0.025
 FEATURE_CATALOG = {
@@ -76,6 +86,31 @@ def tail_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     if limit <= 0 or len(rows) <= limit:
         return rows
     return rows[-limit:]
+
+
+def horizon_bucket_for_days(value: Any) -> str:
+    """Keep short-, mid-, and long-horizon labels from contaminating each other."""
+    days = max(1, int(number(value, 15)))
+    if days <= 7:
+        return "short"
+    if days <= 25:
+        return "mid"
+    return "long"
+
+
+def horizon_bucket_for_sample(sample: dict[str, Any]) -> str:
+    return horizon_bucket_for_days(
+        sample.get("horizonDays", sample.get("horizon_days", (sample.get("strategy") or {}).get("horizonDays", 15)))
+    )
+
+
+def horizon_samples_by_bucket(samples: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    buckets = {"short": [], "mid": [], "long": []}
+    for sample in samples or []:
+        if not isinstance(sample, dict):
+            continue
+        buckets[horizon_bucket_for_sample(sample)].append(sample)
+    return buckets
 
 
 def sample_model_weight(model: dict[str, Any]) -> float:
@@ -419,6 +454,65 @@ def split_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def legacy_production_gate(
+    rows: list[dict[str, Any]],
+    research_active: bool,
+    stability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prevent small local research fits from silently becoming live models.
+
+    The market-level production trainer owns the real Champion/Challenger path. This
+    gate keeps the older per-record model suite useful for diagnostics while making
+    its deployment contract explicit and conservative.
+    """
+    audit = split_audit(rows)
+    stability = stability or {}
+    candidates = stability.get("candidates") or []
+    positive_folds = max(
+        [int(number(candidate.get("positiveJointFoldCount"), 0)) for candidate in candidates]
+        or [0]
+    )
+    target_events = sum(1 for row in rows if number(row.get("target_label"), 0) >= 0.5)
+    stop_events = sum(1 for row in rows if number(row.get("stop_label"), 0) >= 0.5)
+    checks = {
+        "researchEvidencePassed": bool(research_active),
+        "trainingRows": len(rows) >= PRODUCTION_MIN_ROWS,
+        "independentTestRows": int(audit.get("testSamples") or 0) >= PRODUCTION_MIN_TEST_ROWS,
+        "targetEvents": target_events >= PRODUCTION_MIN_TARGET_EVENTS,
+        "stopEvents": stop_events >= PRODUCTION_MIN_STOP_EVENTS,
+        "rollingFolds": int(stability.get("foldCount") or 0) >= PRODUCTION_MIN_FOLDS,
+        "positiveRollingFolds": positive_folds >= PRODUCTION_MIN_POSITIVE_FOLDS,
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    return {
+        "eligible": not failed,
+        "status": "production_eligible" if not failed else "research_or_shadow_only",
+        "checks": checks,
+        "failedChecks": failed,
+        "observed": {
+            "rows": len(rows),
+            "testRows": int(audit.get("testSamples") or 0),
+            "targetEvents": target_events,
+            "stopEvents": stop_events,
+            "rollingFolds": int(stability.get("foldCount") or 0),
+            "positiveRollingFolds": positive_folds,
+        },
+        "required": {
+            "rows": PRODUCTION_MIN_ROWS,
+            "testRows": PRODUCTION_MIN_TEST_ROWS,
+            "targetEvents": PRODUCTION_MIN_TARGET_EVENTS,
+            "stopEvents": PRODUCTION_MIN_STOP_EVENTS,
+            "rollingFolds": PRODUCTION_MIN_FOLDS,
+            "positiveRollingFolds": PRODUCTION_MIN_POSITIVE_FOLDS,
+        },
+        "reason": (
+            "Legacy local candidate passed the conservative production evidence gate."
+            if not failed
+            else "Local candidate remains research/Shadow evidence and cannot change live probability or weights."
+        ),
+    }
+
+
 def feature_matrix(rows: list[dict[str, Any]], feature_names: list[str]) -> list[list[float]]:
     return [[number(row["features"].get(name)) for name in feature_names] for row in rows]
 
@@ -570,10 +664,10 @@ def serialize_linear_model(model: dict[str, Any], feature_names: list[str], limi
 
 def train_regression_head(rows: list[dict[str, Any]], name: str, feature_names: list[str], baseline_key: str = "stored_prediction") -> dict[str, Any]:
     if len(rows) < 32:
-        return {"name": name, "status": "collecting", "active": False, "sampleCount": len(rows), "minSamples": 32}
+        return {"name": name, "status": "collecting", "active": False, "researchActive": False, "productionEligible": False, "sampleCount": len(rows), "minSamples": 32}
     train, validation, test = split_supervised_rows(rows)
     if len(validation) < 5 or len(test) < 5:
-        return {"name": name, "status": "collecting", "active": False, "sampleCount": len(rows), "minSamples": 40}
+        return {"name": name, "status": "collecting", "active": False, "researchActive": False, "productionEligible": False, "sampleCount": len(rows), "minSamples": 40}
     penalties = [0.24, 0.1, 0.04]
     candidates = []
     for penalty in penalties:
@@ -587,28 +681,39 @@ def train_regression_head(rows: list[dict[str, Any]], name: str, feature_names: 
     selected = candidates[0]
     deployment_model = fit_ridge_regression([*train, *validation], feature_names, "actual_return", selected["penalty"])
     test_metrics = evaluate_regression_head(test, predict_regression(deployment_model, test, feature_names), baseline_key)
-    active = number(selected["validation"].get("improvementPct"), -999) >= 1 and number(test_metrics.get("improvementPct"), -999) >= 0.5
+    research_active = number(selected["validation"].get("improvementPct"), -999) >= 1 and number(test_metrics.get("improvementPct"), -999) >= 0.5
+    production_gate = legacy_production_gate(rows, research_active)
+    production_eligible = bool(production_gate["eligible"])
     return {
         "name": name,
         "kind": "ridge_regression",
-        "status": "active" if active else "rejected_oos",
-        "active": active,
+        "status": "production_eligible" if production_eligible else "research_active" if research_active else "rejected_oos",
+        "active": production_eligible,
+        "researchActive": research_active,
+        "productionEligible": production_eligible,
+        "productionGate": production_gate,
         "sampleCount": len(rows),
         "featureNames": feature_names,
         "selectedLambda": selected["penalty"],
         "validation": round_metrics(selected["validation"]),
         "test": round_metrics(test_metrics),
         "model": serialize_linear_model(deployment_model, feature_names),
-        "reason": "OOS regression head improved over baseline." if active else "Regression head did not beat the existing baseline on validation/test.",
+        "reason": (
+            "OOS regression head passed the production evidence gate."
+            if production_eligible
+            else "OOS regression head is retained for research but cannot affect live forecasts until the market-level production gate passes."
+            if research_active
+            else "Regression head did not beat the existing baseline on validation/test."
+        ),
     }
 
 
 def train_logistic_head(rows: list[dict[str, Any]], name: str, feature_names: list[str], target_key: str, baseline_key: str = "stored_target_probability") -> dict[str, Any]:
     if len(rows) < 32:
-        return {"name": name, "status": "collecting", "active": False, "sampleCount": len(rows), "minSamples": 32}
+        return {"name": name, "status": "collecting", "active": False, "researchActive": False, "productionEligible": False, "sampleCount": len(rows), "minSamples": 32}
     train, validation, test = split_supervised_rows(rows)
     if len(validation) < 5 or len(test) < 5:
-        return {"name": name, "status": "collecting", "active": False, "sampleCount": len(rows), "minSamples": 40}
+        return {"name": name, "status": "collecting", "active": False, "researchActive": False, "productionEligible": False, "sampleCount": len(rows), "minSamples": 40}
     penalties = [0.24, 0.1, 0.04]
     candidates = []
     for penalty in penalties:
@@ -622,20 +727,31 @@ def train_logistic_head(rows: list[dict[str, Any]], name: str, feature_names: li
     selected = candidates[0]
     deployment_model = fit_logistic([*train, *validation], feature_names, target_key, selected["penalty"])
     test_metrics = evaluate_logistic_head(test, predict_logistic(deployment_model, test, feature_names), target_key, baseline_key)
-    active = number(selected["validation"].get("improvementPct"), -999) >= 1 and number(test_metrics.get("improvementPct"), -999) >= 0.5
+    research_active = number(selected["validation"].get("improvementPct"), -999) >= 1 and number(test_metrics.get("improvementPct"), -999) >= 0.5
+    production_gate = legacy_production_gate(rows, research_active)
+    production_eligible = bool(production_gate["eligible"])
     return {
         "name": name,
         "kind": "logistic_meta_label",
         "target": target_key,
-        "status": "active" if active else "rejected_oos",
-        "active": active,
+        "status": "production_eligible" if production_eligible else "research_active" if research_active else "rejected_oos",
+        "active": production_eligible,
+        "researchActive": research_active,
+        "productionEligible": production_eligible,
+        "productionGate": production_gate,
         "sampleCount": len(rows),
         "featureNames": feature_names,
         "selectedLambda": selected["penalty"],
         "validation": round_metrics(selected["validation"]),
         "test": round_metrics(test_metrics),
         "model": serialize_linear_model(deployment_model, feature_names),
-        "reason": "OOS logistic head improved over baseline." if active else "Logistic head did not beat the existing probability baseline on validation/test.",
+        "reason": (
+            "OOS logistic head passed the production evidence gate."
+            if production_eligible
+            else "OOS logistic head is retained for research but cannot affect live forecasts until the market-level production gate passes."
+            if research_active
+            else "Logistic head did not beat the existing probability baseline on validation/test."
+        ),
     }
 
 
@@ -1441,6 +1557,156 @@ def lightgbm_return_candidate(
     }
 
 
+def model_zoo_fold_predictions(
+    train: list[dict[str, Any]],
+    evaluation: list[dict[str, Any]],
+    groups: dict[str, list[str]],
+) -> dict[str, list[float]]:
+    """Fit only on the earlier fold and score the immediately following fold."""
+    predictions: dict[str, list[float]] = {
+        "stored_ensemble": [number(row.get("stored_prediction")) for row in evaluation],
+    }
+    for name in ["technical_ridge", "factor_ridge", "orderflow_profile_ridge", "wide_regularized_ridge"]:
+        feature_names = groups[name]
+        penalty = 0.12 if name != "wide_regularized_ridge" else 0.2
+        model = fit_ridge_regression(train, feature_names, "actual_return", penalty)
+        predictions[name] = predict_regression(model, evaluation, feature_names)
+    meta_features = groups["target_stop_meta"]
+    target_model = fit_logistic(train, meta_features, "target_label", 0.12)
+    stop_model = fit_logistic(train, meta_features, "stop_label", 0.12)
+    predictions["target_stop_meta"] = target_stop_meta_predictions(target_model, stop_model, evaluation, meta_features)
+    predictions["sequence_state_proxy"] = sequence_state_proxy_predictions(evaluation)
+    return predictions
+
+
+def model_zoo_walk_forward_stability(rows: list[dict[str, Any]], groups: dict[str, list[str]]) -> dict[str, Any]:
+    """Require more than one later-period regime before a committee may deploy.
+
+    This intentionally checks simple serializable candidates only. Optional tree/deep
+    candidates remain challengers in the final holdout, but cannot create a false
+    sense of stability from a single favourable split.
+    """
+    if len(rows) < 72:
+        return {
+            "available": False,
+            "framework": "expanding-walk-forward-model-zoo-stability",
+            "sampleCount": len(rows),
+            "minSamples": 72,
+            "reason": "Need at least 72 resolved samples before judging model-zoo stability across later periods.",
+        }
+    min_train = max(24, int(len(rows) * 0.42))
+    fold_size = max(6, min(24, int(len(rows) * 0.12)))
+    candidate_starts = [
+        max(min_train, int(len(rows) * fraction))
+        for fraction in (0.48, 0.58, 0.68, 0.78, 0.88)
+    ]
+    folds: list[dict[str, Any]] = []
+    stats: dict[str, dict[str, Any]] = {}
+    seen_starts: set[int] = set()
+    for start in candidate_starts:
+        if start in seen_starts:
+            continue
+        seen_starts.add(start)
+        end = min(len(rows), start + fold_size)
+        train = rows[:start]
+        evaluation = rows[start:end]
+        if len(train) < min_train or len(evaluation) < 6:
+            continue
+        predictions = model_zoo_fold_predictions(train, evaluation, groups)
+        baseline = predictions["stored_ensemble"]
+        fold_candidates: list[dict[str, Any]] = []
+        for name, values in predictions.items():
+            metric = evaluate_zoo_candidate(evaluation, values, baseline)
+            direction_lift = number(metric.get("directionHitRate")) - number(
+                evaluate_zoo_candidate(evaluation, baseline).get("directionHitRate")
+            )
+            row = {
+                "name": name,
+                "mseImprovementPct": round(number(metric.get("improvementPct")), 5) if name != "stored_ensemble" else 0.0,
+                "directionLiftPct": round(direction_lift, 5) if name != "stored_ensemble" else 0.0,
+                "directionHitRate": round(number(metric.get("directionHitRate")), 5),
+                "mse": round(number(metric.get("mse")), 5),
+            }
+            fold_candidates.append(row)
+            if name == "stored_ensemble":
+                continue
+            item = stats.setdefault(name, {
+                "name": name,
+                "folds": 0,
+                "mseImprovement": [],
+                "directionLift": [],
+                "directionHit": [],
+                "positiveJointFolds": 0,
+            })
+            item["folds"] += 1
+            item["mseImprovement"].append(number(metric.get("improvementPct")))
+            item["directionLift"].append(direction_lift)
+            item["directionHit"].append(number(metric.get("directionHitRate")))
+            if number(metric.get("improvementPct")) >= 0 and direction_lift >= 0:
+                item["positiveJointFolds"] += 1
+        folds.append({
+            "trainSamples": len(train),
+            "evaluationSamples": len(evaluation),
+            "startDate": str(evaluation[0].get("date") or ""),
+            "endDate": str(evaluation[-1].get("date") or ""),
+            "candidates": fold_candidates,
+        })
+    candidate_rows: list[dict[str, Any]] = []
+    for name, item in stats.items():
+        mse_values = item["mseImprovement"]
+        direction_values = item["directionLift"]
+        positive_mse_pct = mean([1.0 if value >= 0 else 0.0 for value in mse_values]) * 100
+        positive_direction_pct = mean([1.0 if value >= 0 else 0.0 for value in direction_values]) * 100
+        avg_mse = mean(mse_values)
+        avg_direction = mean(direction_values)
+        stable = (
+            item["folds"] >= 2
+            and positive_mse_pct >= 50
+            and positive_direction_pct >= 50
+            and (avg_mse >= 0 or avg_direction >= 1.0)
+        )
+        candidate_rows.append({
+            "name": name,
+            "foldCount": item["folds"],
+            "avgMseImprovementPct": round(avg_mse, 5),
+            "avgDirectionLiftPct": round(avg_direction, 5),
+            "positiveMseFoldPct": round(positive_mse_pct, 5),
+            "positiveDirectionFoldPct": round(positive_direction_pct, 5),
+            "positiveJointFoldCount": int(item["positiveJointFolds"]),
+            "avgDirectionHitRate": round(mean(item["directionHit"]), 5),
+            "stable": stable,
+        })
+    candidate_rows.sort(key=lambda row: (row["stable"], row["avgMseImprovementPct"], row["avgDirectionLiftPct"]), reverse=True)
+    stable_rows = [row for row in candidate_rows if row["stable"]]
+    avg_mse = mean([row["avgMseImprovementPct"] for row in stable_rows]) if stable_rows else 0.0
+    avg_direction = mean([row["avgDirectionLiftPct"] for row in stable_rows]) if stable_rows else 0.0
+    stability_score = clamp(
+        42
+        + min(22, len(stable_rows) * 7)
+        + clamp(avg_mse, -10, 14) * 1.1
+        + clamp(avg_direction, -6, 10) * 1.7
+        + min(10, len(folds) * 2.5),
+        0,
+        100,
+    )
+    passed = len(folds) >= 2 and len(stable_rows) >= 2 and stability_score >= 56
+    return {
+        "available": bool(folds),
+        "framework": "expanding-walk-forward-model-zoo-stability",
+        "sampleCount": len(rows),
+        "foldCount": len(folds),
+        "foldSize": fold_size,
+        "stableCandidateCount": len(stable_rows),
+        "stableCandidateNames": [row["name"] for row in stable_rows],
+        "stabilityScore": round(stability_score, 5),
+        "pass": passed,
+        "candidates": candidate_rows,
+        "folds": folds,
+        "leakageControl": "Each expanding fold fits its candidates only on rows before the fold and evaluates on the next unseen period.",
+        "reason": "Multiple later-period folds support the candidate set." if passed else "Candidate performance is not stable enough across later periods; keep the committee research-only.",
+    }
+
+
 def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str, Any]:
     if len(rows) < MODEL_ZOO_MIN_ROWS:
         return {
@@ -1448,6 +1714,8 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
             "market": market,
             "status": "collecting",
             "active": False,
+            "researchActive": False,
+            "productionEligible": False,
             "sampleCount": len(rows),
             "minSamples": MODEL_ZOO_MIN_ROWS,
             "reason": "Need more resolved point-in-time prediction samples before running model-zoo challenger validation.",
@@ -1464,6 +1732,8 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
             "market": market,
             "status": "collecting",
             "active": False,
+            "researchActive": False,
+            "productionEligible": False,
             "sampleCount": len(rows),
             "minSamples": MODEL_ZOO_MIN_ROWS,
             "splitAudit": split_audit(rows),
@@ -1471,6 +1741,7 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
         }
 
     groups = model_zoo_feature_groups()
+    stability = model_zoo_walk_forward_stability(rows, groups)
     baseline_validation = [number(row.get("stored_prediction")) for row in validation]
     baseline_test = [number(row.get("stored_prediction")) for row in test]
     candidates: list[dict[str, Any]] = [{
@@ -1611,7 +1882,7 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
     direction_lift_vs_stored = number(selected_test.get("directionHitRate")) - number(stored_test.get("directionHitRate"))
     residual_corr = average_residual_correlation(test, test_map, names)
     reject_gate = build_reject_gate(test, test_map, names, selected_weights)
-    active = (
+    research_active = (
         len(test) >= 6
         and number(selected_validation.get("directionHitRate"), 0) >= 48
         and (
@@ -1621,9 +1892,13 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
             or direction_lift_vs_stored >= 3.0
         )
         and number(selected_test.get("directionHitRate"), 0) >= max(48, min(number(equal_test.get("directionHitRate"), 50), number(stored_test.get("directionHitRate"), 50)) - 1.5)
+        and bool(stability.get("pass"))
     )
+    production_gate = legacy_production_gate(rows, research_active, stability)
+    production_eligible = bool(production_gate["eligible"])
     sample_power = clamp((len(rows) - MODEL_ZOO_MIN_ROWS) / 180, 0.0, 1.0)
-    deployment_blend = round(0.18 + sample_power * 0.34, 3) if active else 0.0
+    stability_multiplier = clamp(number(stability.get("stabilityScore"), 56.0) / 100.0, 0.5, 1.0) if stability.get("available") else 0.5
+    deployment_blend = round((0.18 + sample_power * 0.34) * stability_multiplier, 3) if production_eligible else 0.0
     deployment_weights = {name: round(number(selected_weights[index]), 5) for index, name in enumerate(names)}
     candidate_rows = []
     for candidate in usable:
@@ -1637,8 +1912,10 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
             "label": candidate.get("label") or name,
             "family": candidate.get("family") or "model",
             "kind": candidate.get("kind") or "candidate",
-            "status": "active" if active and candidate_active else "research_only",
-            "active": bool(active and candidate_active),
+            "status": "production_eligible" if production_eligible and candidate_active else "research_active" if research_active and candidate_active else "research_only",
+            "active": bool(production_eligible and candidate_active),
+            "researchActive": bool(research_active and candidate_active),
+            "productionEligible": bool(production_eligible and candidate_active),
             "weight": weight,
             "featureNames": candidate.get("featureNames") or [],
             "validation": validation_metric,
@@ -1661,8 +1938,11 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
     return {
         "framework": "python-local-model-zoo-committee",
         "market": market,
-        "status": "active" if active else "research_only",
-        "active": active,
+        "status": "production_eligible" if production_eligible else "research_active" if research_active else "research_only",
+        "active": production_eligible,
+        "researchActive": research_active,
+        "productionEligible": production_eligible,
+        "productionGate": production_gate,
         "sampleCount": len(rows),
         "candidateCount": len(usable),
         "activeCandidateCount": sum(1 for row in candidate_rows if row.get("active")),
@@ -1682,6 +1962,7 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
         "directionLiftVsEqualPct": round(direction_lift_vs_equal, 4),
         "directionLiftVsStoredPct": round(direction_lift_vs_stored, 4),
         "averageResidualCorrelation": round(residual_corr, 4),
+        "stability": stability,
         "rejectGate": reject_gate,
         "standardOutput": [
             "P(target-before-stop)",
@@ -1700,14 +1981,15 @@ def train_model_zoo(rows: list[dict[str, Any]], market: str = "ASX") -> dict[str
         ],
         "guardrails": [
             "Weights are learned only on the validation window and judged on untouched later test rows.",
+            "The model-zoo must also show stable candidate evidence across expanding later-period folds before it may deploy.",
             "Candidates that fail test evidence remain research-only and cannot lift live confidence.",
             "High committee dispersion activates abstention/no-trade pressure instead of forcing a directional call.",
             "Average residual correlation is monitored so redundant models do not create fake confidence.",
         ],
         "reason": (
-            f"Model-zoo committee passed OOS validation: test direction {number(selected_test.get('directionHitRate')):.1f}%, MSE lift vs equal {equal_improvement:.1f}%, vs stored {stored_improvement:.1f}%."
-            if active
-            else f"Model-zoo committee is research-only: test direction {number(selected_test.get('directionHitRate')):.1f}%, MSE lift vs equal {equal_improvement:.1f}%, vs stored {stored_improvement:.1f}%."
+            f"Model-zoo committee passed OOS and stability validation: test direction {number(selected_test.get('directionHitRate')):.1f}%, MSE lift vs equal {equal_improvement:.1f}%, vs stored {stored_improvement:.1f}%, stability {number(stability.get('stabilityScore')):.0f}."
+            if production_eligible
+            else f"Model-zoo committee is research/Shadow-only: test direction {number(selected_test.get('directionHitRate')):.1f}%, MSE lift vs equal {equal_improvement:.1f}%, vs stored {stored_improvement:.1f}%; production gate: {', '.join(production_gate['failedChecks']) or 'pending'}"
         ),
     }
 
@@ -1817,11 +2099,13 @@ def deep_learning_readiness(sample_count: int) -> dict[str, Any]:
         "framework": "pytorch_optional_local_heads",
         "torchReady": torch_ready,
         "active": False,
-        "status": "ready_waiting_samples" if torch_ready and sample_count >= 180 else "collecting_or_missing_torch",
-        "minSamples": 180,
+        "productionEligible": False,
+        "status": "challenger_research_ready" if torch_ready and sample_count >= 10_000 else "collecting_or_missing_torch",
+        "researchMinSamples": 10_000,
+        "minSamples": 250_000,
         "sampleCount": sample_count,
         "reason": (
-            "PyTorch is importable; deep heads should train only after enough point-in-time samples and should beat ridge/logistic heads OOS."
+            "PyTorch is importable; TCN/LSTM/Transformer stay Challenger-only until at least 250,000 point-in-time sequences and repeated OOS wins over tree models."
             if torch_ready
             else "PyTorch is not importable in this worker environment; local ridge/logistic heads are used."
         ),
@@ -1836,6 +2120,8 @@ def train_local_ensemble_weights(samples: list[dict[str, Any]], market: str = "A
             "market": market,
             "status": "collecting",
             "active": False,
+            "researchActive": False,
+            "productionEligible": False,
             "sampleCount": len(rows),
             "minSamples": 24,
             "reason": "Need at least 24 resolved ensemble samples before replacing engineering prior weights.",
@@ -1847,6 +2133,8 @@ def train_local_ensemble_weights(samples: list[dict[str, Any]], market: str = "A
             "market": market,
             "status": "collecting",
             "active": False,
+            "researchActive": False,
+            "productionEligible": False,
             "sampleCount": len(rows),
             "minSamples": 24,
             "reason": "Not enough recurrent ensemble models to optimize a stable simplex weight vector.",
@@ -1862,6 +2150,8 @@ def train_local_ensemble_weights(samples: list[dict[str, Any]], market: str = "A
             "market": market,
             "status": "collecting",
             "active": False,
+            "researchActive": False,
+            "productionEligible": False,
             "sampleCount": len(rows),
             "minSamples": 32,
             "modelNames": names,
@@ -1894,21 +2184,26 @@ def train_local_ensemble_weights(samples: list[dict[str, Any]], market: str = "A
         or test_metrics.get("targetHitRate") is None
         or number(test_metrics.get("targetHitRate")) >= number(stored_test.get("targetHitRate")) - 4
     )
-    active = (
+    research_active = (
         number(validation_improvement, -999) >= 1
         and number(test_improvement, -999) >= 0.5
         and direction_floor_ok
         and target_floor_ok
     )
+    production_gate = legacy_production_gate(supervised_rows(samples), research_active)
+    production_eligible = bool(production_gate["eligible"])
     sample_power = clamp((len(rows) - 24) / 120, 0, 1)
-    deployment_blend = round(0.35 + sample_power * 0.45, 2) if active else 0
+    deployment_blend = round(0.35 + sample_power * 0.45, 2) if production_eligible else 0
     weights = {name: round(deployment_weights[index], 5) for index, name in enumerate(names)}
     prior_weights = {name: round(deployment_prior[index], 5) for index, name in enumerate(names)}
     return {
         "framework": "python-local-simplex-ridge-ensemble",
         "market": market,
-        "status": "active" if active else "rejected_oos",
-        "active": active,
+        "status": "production_eligible" if production_eligible else "research_active" if research_active else "rejected_oos",
+        "active": production_eligible,
+        "researchActive": research_active,
+        "productionEligible": production_eligible,
+        "productionGate": production_gate,
         "sampleCount": len(rows),
         "modelCount": len(names),
         "modelNames": names,
@@ -1928,20 +2223,38 @@ def train_local_ensemble_weights(samples: list[dict[str, Any]], market: str = "A
         "testImprovementPct": round(test_improvement, 2) if test_improvement is not None else None,
         "reason": (
             f"Python local model optimized simplex weights improved untouched test MSE by {number(test_improvement):.1f}% versus stored ensemble."
-            if active
+            if production_eligible
+            else "Python local weight optimizer is research/Shadow-only and cannot replace live weights until the market-level OOF production gate passes."
+            if research_active
             else "Python local model did not beat the stored ensemble on validation/test without weakening direction or target-hit reliability."
         ),
     }
 
 
-def train_local_model_suite(samples: list[dict[str, Any]], market: str = "ASX") -> dict[str, Any]:
+def train_local_model_suite_for_scope(samples: list[dict[str, Any]], market: str = "ASX", scope: str = "market_all") -> dict[str, Any]:
     supervised = supervised_rows(samples)
+    ensemble_optimization = train_local_ensemble_weights(samples, market)
+    model_zoo = train_model_zoo(supervised, market)
+    signal_models = train_local_signal_heads(samples, market)
+    production_eligible = bool(model_zoo.get("productionEligible"))
     return {
         "framework": "python-local-quant-model-suite",
         "market": market,
-        "ensembleWeightOptimization": train_local_ensemble_weights(samples, market),
-        "modelZoo": train_model_zoo(supervised, market),
-        "signalModels": train_local_signal_heads(samples, market),
+        "horizonScope": scope,
+        "sampleCount": len(supervised),
+        "deploymentStatus": "production_eligible" if production_eligible else "research_or_shadow_only",
+        "productionEligible": production_eligible,
+        "productionPolicy": {
+            "owner": "market-level-multitask-oof-calibrated-stack",
+            "legacyLocalModelsMayVote": production_eligible,
+            "explicitEligibilityRequired": True,
+            "researchRowsRetained": len(supervised),
+            "maxResearchRows": MAX_SUPERVISED_ROWS,
+            "reason": "Low-sample local heads remain visible for research but cannot alter live probability, confidence, or ensemble weights.",
+        },
+        "ensembleWeightOptimization": ensemble_optimization,
+        "modelZoo": model_zoo,
+        "signalModels": signal_models,
         "lightgbm": train_lightgbm_suite(supervised, market),
         "tripleBarrier": triple_barrier_summary(supervised),
         "splitAudit": split_audit(supervised),
@@ -1953,3 +2266,47 @@ def train_local_model_suite(samples: list[dict[str, Any]], market: str = "ASX") 
         "deepLearning": deep_learning_readiness(len(supervised)),
         "featureCatalog": FEATURE_CATALOG,
     }
+
+
+def collecting_horizon_scope(bucket: str, samples: list[dict[str, Any]]) -> dict[str, Any]:
+    resolved = supervised_rows(samples)
+    return {
+        "framework": "python-local-quant-model-suite",
+        "horizonScope": bucket,
+        "sampleCount": len(resolved),
+        "status": "collecting",
+        "available": False,
+        "minSamples": HORIZON_SCOPE_MIN_ROWS,
+        "reason": "Need at least 32 resolved samples in this horizon bucket; market-wide models remain a fallback only.",
+    }
+
+
+def train_local_model_suite(samples: list[dict[str, Any]], market: str = "ASX") -> dict[str, Any]:
+    """Train an auditable market fallback plus horizon-specific deployment candidates.
+
+    A 3-day signal and a 30-day signal are distinct targets. The market-wide suite is
+    preserved for diagnostics and low-data fallback, while the Node layer selects a
+    matching horizon suite only after it has enough resolved examples.
+    """
+    suite = train_local_model_suite_for_scope(samples, market, "market_all")
+    scopes: dict[str, dict[str, Any]] = {}
+    for bucket, scoped_samples in horizon_samples_by_bucket(samples).items():
+        resolved_count = len(supervised_rows(scoped_samples))
+        scopes[bucket] = (
+            train_local_model_suite_for_scope(scoped_samples, market, bucket)
+            if resolved_count >= HORIZON_SCOPE_MIN_ROWS
+            else collecting_horizon_scope(bucket, scoped_samples)
+        )
+    suite["horizonSuites"] = scopes
+    suite["horizonPolicy"] = {
+        "framework": "horizon-isolated-local-model-deployment",
+        "buckets": {
+            "short": "1-7 trading days",
+            "mid": "8-25 trading days",
+            "long": "26+ trading days",
+        },
+        "minResolvedSamples": HORIZON_SCOPE_MIN_ROWS,
+        "fallback": "Use market-wide evidence only while the matching horizon bucket is still collecting; fallback predictions cannot raise high-conviction buy confidence.",
+        "note": "Horizon scopes are separated before fitting weights, coefficients, calibration, and no-trade diagnostics.",
+    }
+    return suite

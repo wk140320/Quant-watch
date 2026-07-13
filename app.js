@@ -41,40 +41,21 @@ if (!Promise.allSettled) {
   };
 }
 
-const safeStorage = {
-  getItem(key) {
-    try {
-      return window.localStorage.getItem(key);
-    } catch (error) {
-      console.warn(`Unable to read safeStorage.${key}`, error);
-      return null;
-    }
-  },
-  setItem(key, value) {
-    try {
-      window.localStorage.setItem(key, value);
-      return true;
-    } catch (error) {
-      console.warn(`Unable to write safeStorage.${key}`, error);
-      return false;
-    }
-  },
-  removeItem(key) {
-    try {
-      window.localStorage.removeItem(key);
-      return true;
-    } catch (error) {
-      console.warn(`Unable to remove safeStorage.${key}`, error);
-      return false;
-    }
-  },
-};
+const safeStorage = window.QuantStorage;
+
+if (!safeStorage?.getItem || !safeStorage?.readJson) {
+  throw new Error("Storage runtime module failed to load.");
+}
 
 const BOOT_PENDING_KEY = "quantWatchBootPending";
 let startupRecoveredFromPreviousCrash = false;
 try {
-  startupRecoveredFromPreviousCrash = safeStorage.getItem(BOOT_PENDING_KEY) === "true";
-  safeStorage.setItem(BOOT_PENDING_KEY, "true");
+  const previousBootStartedAt = Date.parse(safeStorage.getItem(BOOT_PENDING_KEY) || "");
+  const previousBootAge = Date.now() - previousBootStartedAt;
+  startupRecoveredFromPreviousCrash = Number.isFinite(previousBootStartedAt)
+    && previousBootAge >= 20_000
+    && previousBootAge <= 24 * 60 * 60_000;
+  safeStorage.setItem(BOOT_PENDING_KEY, new Date().toISOString());
 } catch (error) {
   startupRecoveredFromPreviousCrash = false;
 }
@@ -91,240 +72,51 @@ const STARTUP_STORAGE_CHAR_LIMIT = 240000;
 const STARTUP_SAFE_MODE = startupRecoveredFromPreviousCrash || hasStartupSafeQuery();
 
 function readJsonStorage(key, fallback, options = {}) {
-  try {
-    const raw = safeStorage.getItem(key);
-    if (!raw) return fallback;
-    const maxChars = Number(options.maxChars || STARTUP_STORAGE_CHAR_LIMIT);
-    if (raw.length > maxChars) {
-      console.warn(`Skipping oversized safeStorage.${key}`, { length: raw.length, maxChars });
-      return fallback;
-    }
-    const value = JSON.parse(raw);
-    return value == null ? fallback : value;
-  } catch (error) {
-    console.warn(`Ignoring invalid safeStorage.${key}`, error);
-    safeStorage.removeItem(key);
-    return fallback;
-  }
+  return safeStorage.readJson(key, fallback, {
+    maxChars: Number(options.maxChars || STARTUP_STORAGE_CHAR_LIMIT),
+    removeInvalid: true,
+  });
 }
 
-const MARKET_CONFIG = {
-  ASX: {
-    code: "ASX",
-    label: "澳股",
-    title: "澳股监控台",
-    clockLabel: "悉尼时间",
-    timezone: "Australia/Sydney",
-    currency: "AUD",
-    locale: "en-AU",
-    defaultSymbols: ["BHP", "CBA", "WDS", "RIO"],
-    symbolPlaceholder: "输入 ASX 代码，如 BHP, CBA, WDS",
-    holdingPlaceholder: "BHP",
-    samplePortfolio: "symbol,qty,avgPrice\nBHP,120,43.20\nCBA,20,118.50",
-    indexes: [
-      { symbol: "^AXJO", label: "S&P/ASX 200", note: "现金指数点位", unit: "points" },
-      { symbol: "^AORD", label: "All Ordinaries", note: "现金指数点位", unit: "points" },
-      { symbol: "^AXKO", label: "S&P/ASX 300", note: "现金指数点位", unit: "points" },
-    ],
-    open: 10 * 60,
-    close: 16 * 60,
-    refreshClose: 16 * 60 + 15,
-  },
-  US: {
-    code: "US",
-    label: "美股",
-    title: "美股监控台",
-    clockLabel: "纽约时间",
-    timezone: "America/New_York",
-    currency: "USD",
-    locale: "en-US",
-    defaultSymbols: ["AAPL", "NVDA", "MSFT", "TSLA"],
-    symbolPlaceholder: "输入美股代码，如 AAPL, NVDA, MSFT",
-    holdingPlaceholder: "NVDA",
-    samplePortfolio: "symbol,qty,avgPrice\nAAPL,10,190.00\nNVDA,5,120.00",
-    indexes: [
-      { symbol: "^GSPC", label: "S&P 500", note: "现金指数点位", unit: "points" },
-      { symbol: "^IXIC", label: "Nasdaq Composite", note: "现金指数点位", unit: "points" },
-      { symbol: "^DJI", label: "Dow Jones", note: "现金指数点位", unit: "points" },
-    ],
-    open: 9 * 60 + 30,
-    close: 16 * 60,
-    refreshClose: 16 * 60 + 15,
-  },
-  CN: {
-    code: "CN",
-    label: "A股",
-    title: "A股监控台",
-    clockLabel: "北京时间",
-    timezone: "Asia/Shanghai",
-    currency: "CNY",
-    locale: "zh-CN",
-    defaultSymbols: ["600519", "300750", "000001", "601318"],
-    symbolPlaceholder: "输入 A股代码，如 600519, 300750, 000001",
-    holdingPlaceholder: "600519",
-    samplePortfolio: "symbol,qty,avgPrice\n600519,10,1500.00\n300750,20,180.00",
-    indexes: [
-      { symbol: "SH000001", label: "上证指数", note: "官方指数" },
-      { symbol: "SZ399001", label: "深证成指", note: "官方指数" },
-      { symbol: "SZ399006", label: "创业板指", note: "官方指数" },
-    ],
-    open: 9 * 60 + 30,
-    close: 15 * 60,
-    refreshClose: 15 * 60 + 15,
-  },
-};
+const {
+  LEGACY_WRONG_MARKET_HOLDINGS,
+  MARKET_CONFIG,
+  MARKET_UNIVERSES,
+  allowWatchSymbolForMarket,
+  isLikelyForeignMarketSymbol,
+  isMarketNativeAutoSymbol,
+  marketDefaultSet,
+  marketUniverseSet,
+  normalizeSymbolForMarket,
+  normalizeWatchlistItemsForMarket,
+  safeMarket,
+} = window.QuantMarket || {};
 
-const OBVIOUS_US_SYMBOLS = new Set([
-  "AAPL", "MSFT", "NVDA", "TSLA", "GOOG", "GOOGL", "META", "AMZN", "AMD", "AVGO",
-  "INTC", "NFLX", "ORCL", "CRM", "ADBE", "JPM", "BAC", "WFC", "GS", "MS", "XOM",
-  "CVX", "COP", "SPY", "QQQ", "DIA", "IWM",
-]);
+if (!MARKET_CONFIG || !normalizeSymbolForMarket) {
+  throw new Error("Market domain module failed to load.");
+}
 
-const OBVIOUS_ASX_ONLY_SYMBOLS = new Set([
-  "CBA", "NAB", "ANZ", "WBC", "WDS", "FMG", "WES", "WOW", "TLS", "COL", "MQG",
-  "QBE", "REA", "COH", "SHL", "CPU", "ORG", "APA", "SCG", "NST", "S32", "MIN",
-  "PLS", "LYC", "SEK", "PME", "STW", "VAS", "IOZ", "TCL",
-]);
+const {
+  bollingerChartSeries,
+  chartBounds,
+  clamp,
+  ema,
+  fibonacciChartLevels,
+  pctChange,
+  rangeCount,
+  rsi,
+  sma,
+  xFor,
+  yFor,
+} = window.QuantChartMath || {};
 
-const MARKET_UNIVERSES = {
-  ASX: [
-    "BHP", "CBA", "RIO", "CSL", "NAB", "WBC", "ANZ", "MQG", "WES", "WOW",
-    "TLS", "FMG", "WDS", "GMG", "TCL", "QBE", "REA", "COH", "SHL", "CPU",
-    "ORG", "APA", "SCG", "NST", "S32", "MIN", "PLS", "LYC", "COL", "PME",
-    "ALL", "XRO", "JHX", "AMC", "CAR", "SOL", "IAG", "SUN", "SGP", "EDV",
-    "TWE", "AGL", "DXS", "BSL", "QAN", "HVN", "JBH", "ALD", "VCX", "WHC",
-    "STO", "RHC", "SEK", "DMP", "A2M", "IEL", "ALU", "MGR", "BXB", "NEM",
-  ],
-  US: [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "AMD", "JPM",
-    "BAC", "WFC", "GS", "XOM", "CVX", "COP", "LLY", "UNH", "V", "MA",
-    "COST", "WMT", "NFLX", "CRM", "ORCL", "ADBE", "INTC", "QCOM", "KO", "PEP",
-    "PLTR", "IBM", "GE", "CAT", "BA", "RTX", "NKE", "DIS", "MCD", "HD",
-    "TMO", "ABBV", "MRK", "PFE", "NOW", "SHOP", "UBER", "PANW", "CRWD", "MU",
-    "SMCI", "ARM", "TSM", "BABA", "SBUX", "LMT", "LIN", "ISRG", "BKNG", "TXN",
-  ],
-  CN: [
-    "600519", "300750", "002594", "000858", "601318", "600036", "601398", "000001",
-    "600900", "601899", "600276", "300760", "002475", "600030", "601012", "600309",
-    "000333", "000651", "300059", "002415", "600887", "601888", "600089", "002230",
-    "601888", "603259", "688981", "600031", "600050", "600406", "601668", "601857",
-    "601988", "601288", "601985", "600028", "600048", "600919", "002352", "002415",
-    "002714", "300124", "300274", "300308", "300347", "300498", "600438", "600660",
-  ],
-};
+if (!chartBounds || !ema || !sma) {
+  throw new Error("Chart math module failed to load.");
+}
 
-const MANUAL_WATCH_SOURCES = new Set(["manual", "holding", "csv", "text", "screenshot", "app-buy"]);
 const AI_PICK_COUNT = 15;
 const AI_PICK_UNIVERSE_LIMIT = 180;
 const PREDICTION_TRAINING_UNIVERSE_LIMIT = 80;
-const LEGACY_WRONG_MARKET_HOLDINGS = {
-  US: new Set(["TCL"]),
-};
-
-function safeMarket(value) {
-  return MARKET_CONFIG[value] ? value : "ASX";
-}
-
-function cleanSymbolText(symbol) {
-  return String(symbol || "").trim().toUpperCase();
-}
-
-function normalizeSymbolForMarket(symbol, market) {
-  const key = safeMarket(market);
-  const clean = cleanSymbolText(symbol);
-  if (key === "CN") {
-    const noSuffix = clean.replace(/\.(SS|SH|SHH|SZ|SHE|SHZ)$/, "");
-    if (/^(SH000|SZ399)\d{3}$/.test(noSuffix)) return noSuffix;
-    const noPrefix = noSuffix.replace(/^(SH|SZ)(?=\d{6}$)/, "");
-    return /^\d{6}$/.test(noPrefix) ? noPrefix : "";
-  }
-  if (key === "US") {
-    const value = clean.replace(/\s+/g, "");
-    if (/\.A[UX]$/.test(value) || OBVIOUS_ASX_ONLY_SYMBOLS.has(value)) return "";
-    if (/^\^[A-Z0-9.]{2,12}$/.test(value)) return value;
-    return /^[A-Z][A-Z0-9.-]{0,9}$/.test(value) ? value : "";
-  }
-  const value = clean.replace(/\.A[UX]$/, "");
-  if (/^\^[A-Z0-9.]{2,12}$/.test(value)) return value;
-  if (OBVIOUS_US_SYMBOLS.has(value)) return "";
-  return /^[A-Z0-9]{2,6}$/.test(value) ? value : "";
-}
-
-function symbolFromWatchEntry(entry) {
-  if (entry && typeof entry === "object") return entry.symbol || entry.code || entry.ticker || "";
-  return entry;
-}
-
-function sourceFromWatchEntry(entry, fallback = "saved") {
-  if (entry && typeof entry === "object") return entry.source || fallback;
-  return fallback;
-}
-
-function isManualWatchSource(source) {
-  return String(source || "")
-    .toLowerCase()
-    .split("+")
-    .some((part) => MANUAL_WATCH_SOURCES.has(part));
-}
-
-function marketUniverseSet(market) {
-  return new Set((MARKET_UNIVERSES[safeMarket(market)] || []).map((item) => normalizeSymbolForMarket(item, market)).filter(Boolean));
-}
-
-function marketDefaultSet(market) {
-  return new Set((MARKET_CONFIG[safeMarket(market)]?.defaultSymbols || []).map((item) => normalizeSymbolForMarket(item, market)).filter(Boolean));
-}
-
-function isMarketNativeAutoSymbol(symbol, market) {
-  const key = safeMarket(market);
-  const normalized = normalizeSymbolForMarket(symbol, key);
-  if (!normalized) return false;
-  if (normalized.startsWith("^") || /^(SH000|SZ399)\d{3}$/.test(normalized)) return true;
-  if (key === "CN") return /^\d{6}$/.test(normalized);
-  if (marketUniverseSet(key).has(normalized) || marketDefaultSet(key).has(normalized)) return true;
-  if (key === "US") {
-    const asxAuto = marketUniverseSet("ASX").has(normalized) || marketDefaultSet("ASX").has(normalized) || OBVIOUS_ASX_ONLY_SYMBOLS.has(normalized);
-    return !asxAuto;
-  }
-  if (key === "ASX") {
-    const usAuto = marketUniverseSet("US").has(normalized) || marketDefaultSet("US").has(normalized) || OBVIOUS_US_SYMBOLS.has(normalized);
-    return !usAuto;
-  }
-  return true;
-}
-
-function isLikelyForeignMarketSymbol(symbol, market) {
-  const key = safeMarket(market);
-  const normalized = normalizeSymbolForMarket(symbol, key);
-  if (!normalized || normalized.startsWith("^") || /^(SH000|SZ399)\d{3}$/.test(normalized)) return false;
-  const asxKnown = marketUniverseSet("ASX").has(normalized) || marketDefaultSet("ASX").has(normalized) || OBVIOUS_ASX_ONLY_SYMBOLS.has(normalized);
-  const usKnown = marketUniverseSet("US").has(normalized) || marketDefaultSet("US").has(normalized) || OBVIOUS_US_SYMBOLS.has(normalized);
-  if (key === "US") return asxKnown && !usKnown;
-  if (key === "ASX") return usKnown && !asxKnown;
-  if (key === "CN") return !/^\d{6}$/.test(normalized);
-  return false;
-}
-
-function allowWatchSymbolForMarket(symbol, market, source = "saved") {
-  const key = safeMarket(market);
-  const normalized = normalizeSymbolForMarket(symbol, key);
-  if (!normalized) return "";
-  if (isLikelyForeignMarketSymbol(normalized, key)) return "";
-  if (isManualWatchSource(source)) return normalized;
-  return isMarketNativeAutoSymbol(normalized, key) ? normalized : "";
-}
-
-function normalizeWatchlistItemsForMarket(symbols, market, origins = {}, fallbackSource = "saved") {
-  const key = safeMarket(market);
-  const originMap = origins?.[key] || {};
-  const rows = Array.isArray(symbols) ? symbols : [];
-  return [...new Set(rows.map((entry) => {
-    const raw = symbolFromWatchEntry(entry);
-    const normalized = normalizeSymbolForMarket(raw, key);
-    const source = sourceFromWatchEntry(entry, originMap[normalized] || fallbackSource);
-    return allowWatchSymbolForMarket(normalized || raw, key, source);
-  }).filter(Boolean))];
-}
 
 function initialWatchlistForMarket(market) {
   const key = safeMarket(market);
@@ -357,9 +149,13 @@ function normalizeHoldingForStorage(holding, fallbackMarket = "ASX") {
 }
 
 const initialMarket = safeMarket(safeStorage.getItem("selectedMarket") || "ASX");
+const storedActivePage = safeStorage.getItem("activeQuantPage") || "home";
+const initialActivePage = storedActivePage === "research" ? "features" : storedActivePage;
 const savedPortfolio = readJsonStorage("portfolioJson", []);
 const savedPortfolioByMarket = readJsonStorage("portfolioByMarket", null);
 const savedWatchlistOrigins = readJsonStorage("watchlistOriginsByMarket", {});
+const savedWatchlistAddedAt = readJsonStorage("watchlistAddedAtByMarket", {});
+const savedWatchlistSort = readJsonStorage("watchlistSortByMarket", {});
 
 function portfolioRowsFromStorage(byMarket, fallbackRows) {
   if (!byMarket || typeof byMarket !== "object") return Array.isArray(fallbackRows) ? fallbackRows : [];
@@ -374,12 +170,14 @@ const state = {
   market: initialMarket,
   watchlistsByMarket: readJsonStorage("watchlistsByMarket", {}),
   watchlistOriginsByMarket: savedWatchlistOrigins,
+  watchlistAddedAtByMarket: savedWatchlistAddedAt,
+  watchlistSortByMarket: savedWatchlistSort,
   watchlist: initialWatchlistForMarket(initialMarket),
   portfolio: portfolioRowsFromStorage(savedPortfolioByMarket, savedPortfolio).map((item) => normalizeHoldingForStorage(item, item.market || "ASX")).filter((item) => item.symbol && item.qty > 0),
   analyses: new Map(),
   analysesByMarket: new Map(),
   selected: null,
-  activePage: safeStorage.getItem("activeQuantPage") || "dashboard",
+  activePage: initialActivePage,
   chartRange: safeStorage.getItem("chartRange") || "6M",
   chartInterval: safeStorage.getItem("chartInterval") || "1d",
   chartHoverIndex: null,
@@ -424,6 +222,15 @@ const state = {
   aiRefreshToken: 0,
   clockTimer: null,
   snapshotUpdatedAt: safeStorage.getItem(`analysisSnapshotTime:${initialMarket}`) || (initialMarket === "ASX" ? safeStorage.getItem("analysisSnapshotTime") : null),
+  quoteOverlaysByMarket: (() => {
+    const saved = readJsonStorage("quoteOverlaysByMarket:v1", {});
+    return Object.fromEntries(Object.keys(MARKET_CONFIG).map((market) => [
+      market,
+      saved?.[market] && typeof saved[market] === "object" ? saved[market] : {},
+    ]));
+  })(),
+  detailEvidence: { symbol: null, open: false, tab: "decision" },
+  detailConfidence: { symbol: null, open: false },
   history: Array.isArray(readJsonStorage("decisionHistory", [])) ? readJsonStorage("decisionHistory", []) : [],
   notifiedAlerts: readJsonStorage("notifiedAlerts", {}),
   notificationsEnabled: safeStorage.getItem("notificationsEnabled") === "true",
@@ -456,6 +263,12 @@ const state = {
   agentConfigByMarket: readJsonStorage("agentConfigByMarket", {}),
   agentLedgerByMarket: readJsonStorage("agentLedgerByMarket", {}),
   agentMemoryByMarket: readJsonStorage("agentMemoryByMarket", {}),
+  paperAgentBackendAvailable: false,
+  paperAgentBackendStatus: "connecting",
+  paperAgentEventSource: null,
+  paperAgentPollTimer: null,
+  paperAgentReloadTimer: null,
+  backendSchedulesAvailable: false,
   researchConfigByMarket: readJsonStorage("researchConfigByMarket", {}),
   modelChangeLogByMarket: readJsonStorage("modelChangeLogByMarket", {}),
   latestFactorLab: null,
@@ -476,6 +289,7 @@ const state = {
   chartRedrawHandles: {},
   statusThrottle: { lastAt: 0, handle: null, message: "" },
   marketSwitchToken: 0,
+  activeMarketAbortController: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -494,6 +308,8 @@ const cancelUiIdle = window.cancelIdleCallback
 const WHEEL_ZOOM_IN = 1.012;
 const WHEEL_ZOOM_OUT = 0.988;
 const WHEEL_PAN_DIVISOR = 520;
+const CHART_MAX_VISIBLE_BARS = 180;
+const CHART_MIN_ZOOM = 1 / 36;
 const MODEL_CHANGE_LOG_LIMIT = 250;
 const SNAPSHOT_KEY = "analysisSnapshotV2";
 const DEFAULT_TECHNICALS = {
@@ -536,6 +352,9 @@ const DEFAULT_ANALYSIS = {
   projectedMaxUpside: 0,
   maxUpsideConfidence: 0,
   maxUpsideHitProbability: 0,
+  projectedMaxDownside: 0,
+  maxDownsideConfidence: 0,
+  maxDownsideHitProbability: 0,
   horizonDays: 15,
   suggestedTradeValue: 0,
   calibration: null,
@@ -622,7 +441,7 @@ function setStatusThrottled(message, interval = 450) {
   }, Math.max(0, interval - (now - state.statusThrottle.lastAt)));
 }
 
-function flushMainRenderQueue() {
+function flushMainRenderQueue(options = {}) {
   const queue = state.renderQueue;
   if (queue.handle) {
     cancelUiFrame(queue.handle);
@@ -640,16 +459,20 @@ function flushMainRenderQueue() {
   queue.detail = false;
   queue.indexes = false;
   queue.agent = false;
-  safeUiStep("批量渲染", () => {
-    if (pending.cards) renderCards();
-    if (pending.summary) renderPortfolioSummary();
-    if (pending.indexes) renderMarketIndexPanel();
-    if (pending.agent) {
-      renderAgentPanel();
-      renderOptimalStrategyPanel();
-    }
-    if (pending.detail) renderDetail();
-  });
+  const tasks = [];
+  if (pending.cards) tasks.push(() => safeUiStep("渲染股票卡片", renderCards));
+  if (pending.summary) tasks.push(() => safeUiStep("渲染持仓概览", renderPortfolioSummary));
+  if (pending.indexes) tasks.push(() => safeUiStep("渲染大盘指数", renderMarketIndexPanel));
+  if (pending.agent) {
+    tasks.push(() => safeUiStep("渲染 Agent", renderAgentPanel));
+    tasks.push(() => safeUiStep("渲染最优策略", renderOptimalStrategyPanel));
+  }
+  if (pending.detail) tasks.push(() => safeUiStep("渲染分析详情", renderDetail));
+  if (options.sync || !window.QuantUI?.runFrameTasks) {
+    tasks.forEach((task) => task());
+    return;
+  }
+  window.QuantUI.runFrameTasks(tasks, { budgetMs: 7 });
 }
 
 function queueMainRender(parts = ["cards", "summary", "detail"], options = {}) {
@@ -658,7 +481,7 @@ function queueMainRender(parts = ["cards", "summary", "detail"], options = {}) {
     if (part && Object.prototype.hasOwnProperty.call(queue, part)) queue[part] = true;
   });
   if (options.immediate) {
-    flushMainRenderQueue();
+    flushMainRenderQueue({ sync: true });
     return;
   }
   if (queue.handle) return;
@@ -722,6 +545,7 @@ function indexSnapshotKey(market = state.market) {
 function setStatus(message) {
   const status = $("status");
   if (status) status.textContent = message;
+  window.QuantUI?.setStatusTone(message);
 }
 
 function formatClock(date) {
@@ -783,13 +607,15 @@ function minutesUntilNextRefreshWindow(date = new Date(), market = state.market)
 function formatSnapshotTime(iso) {
   if (!iso) return "暂无";
   const config = activeMarketConfig();
+  const numeric = Number(iso);
+  const value = Number.isFinite(numeric) && numeric > 0 && numeric < 1e12 ? numeric * 1000 : iso;
   return new Intl.DateTimeFormat("zh-CN", {
     timeZone: config.timezone,
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(iso));
+  }).format(new Date(value));
 }
 
 function updateSydneyClock() {
@@ -812,6 +638,7 @@ function updateSydneyClock() {
     session.className = stateNow.canRefresh ? "market-open" : "market-closed";
   }
   if (snapshot) snapshot.textContent = snapshotsEnabled() ? `本地快照：${formatSnapshotTime(state.snapshotUpdatedAt)}` : "本地快照：已关闭";
+  if (state.activePage === "home") renderHomePage();
 }
 
 function startSydneyClock() {
@@ -845,12 +672,36 @@ function removeWatchlistOrigin(symbol, market = state.market) {
   if (normalized && state.watchlistOriginsByMarket?.[key]) delete state.watchlistOriginsByMarket[key][normalized];
 }
 
+function watchlistAddedAtFor(symbol, market = state.market) {
+  const key = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, key);
+  return normalized ? state.watchlistAddedAtByMarket?.[key]?.[normalized] || null : null;
+}
+
+function setWatchlistAddedAt(symbol, value = new Date().toISOString(), market = state.market) {
+  const key = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, key);
+  if (!normalized) return "";
+  state.watchlistAddedAtByMarket[key] = state.watchlistAddedAtByMarket[key] || {};
+  if (!state.watchlistAddedAtByMarket[key][normalized]) {
+    state.watchlistAddedAtByMarket[key][normalized] = value;
+  }
+  return normalized;
+}
+
+function removeWatchlistAddedAt(symbol, market = state.market) {
+  const key = safeMarket(market);
+  const normalized = normalizeSymbolForMarket(symbol, key);
+  if (normalized && state.watchlistAddedAtByMarket?.[key]) delete state.watchlistAddedAtByMarket[key][normalized];
+}
+
 function addWatchSymbol(symbol, source = "manual", market = state.market, analysis = null) {
   const key = safeMarket(market);
   const normalized = allowWatchSymbolForMarket(symbol, key, source);
   if (!normalized) return "";
   if (key === state.market && !state.watchlist.includes(normalized)) state.watchlist.unshift(normalized);
   setWatchlistOrigin(normalized, source, key);
+  setWatchlistAddedAt(normalized, new Date().toISOString(), key);
   if (analysis && key === state.market) state.analyses.set(normalized, { ...analysis, symbol: normalized, market: key });
   return normalized;
 }
@@ -875,9 +726,26 @@ function reconcileWatchlistOrigins(market = state.market) {
   });
 }
 
+function reconcileWatchlistAddedAt(market = state.market) {
+  const key = safeMarket(market);
+  const active = new Set(state.watchlist.map((symbol) => normalizeSymbolForMarket(symbol, key)).filter(Boolean));
+  const saved = state.watchlistAddedAtByMarket[key] || {};
+  state.watchlistAddedAtByMarket[key] = Object.fromEntries(
+    Object.entries(saved).filter(([symbol]) => active.has(normalizeSymbolForMarket(symbol, key)))
+  );
+  const base = Date.now();
+  state.watchlist.forEach((symbol, index) => {
+    const normalized = normalizeSymbolForMarket(symbol, key);
+    if (normalized && !state.watchlistAddedAtByMarket[key][normalized]) {
+      state.watchlistAddedAtByMarket[key][normalized] = new Date(base - index * 1000).toISOString();
+    }
+  });
+}
+
 function sanitizeActiveMarketState() {
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
   reconcileWatchlistOrigins(state.market);
+  reconcileWatchlistAddedAt(state.market);
   state.analyses = new Map([...state.analyses.entries()]
     .map(([symbol, item]) => {
       const normalized = normalizeSymbolForMarket(item?.symbol || symbol, state.market);
@@ -927,6 +795,15 @@ function normalizeAnalysis(value = {}) {
     analysis.maxUpsideConfidence || analysis.qualityGate?.maxUpsideHitProbability || analysis.magnitudeHitProbability
   );
   analysis.maxUpsideConfidence = asNumber(analysis.maxUpsideConfidence, analysis.maxUpsideHitProbability);
+  analysis.projectedMaxDownside = Math.max(0, asNumber(
+    analysis.projectedMaxDownside,
+    analysis.qualityGate?.projectedMaxDownside || 0
+  ));
+  analysis.maxDownsideHitProbability = asNumber(
+    analysis.maxDownsideHitProbability,
+    analysis.maxDownsideConfidence || analysis.qualityGate?.maxDownsideHitProbability || 0
+  );
+  analysis.maxDownsideConfidence = asNumber(analysis.maxDownsideConfidence, analysis.maxDownsideHitProbability);
   analysis.strategyHitProbability = asNumber(analysis.strategyHitProbability, analysis.strategyConfidence || analysis.qualityGate?.strategyHitProbability || analysis.qualityGate?.historyGate?.strategyHitProbability || 0);
   analysis.strategyConfidence = asNumber(analysis.strategyConfidence, analysis.strategyHitProbability);
   analysis.upsideConfidence = asNumber(analysis.upsideConfidence, analysis.projectedFinalReturn > 0 ? analysis.confidence : 0);
@@ -971,6 +848,8 @@ function normalizeCandles(candles) {
             : [],
       orderflowSource: row?.orderflowSource || row?.tradeSource || null,
       closeOnly: Boolean(row?.closeOnly),
+      realtime: Boolean(row?.realtime),
+      quoteSource: row?.quoteSource || null,
     };
   }).filter(Boolean);
 }
@@ -987,13 +866,15 @@ function normalizeAnalysisItem(item, payloadMarket = state.market) {
   if (!allowWatchSymbolForMarket(symbol, market, source)) return null;
   const sourceTechnicals = item?.technicals || item?.technical || {};
   const sourceAnalysis = item?.analysis || {};
-  const candles = normalizeCandles(item?.candles);
+  const candles = sanitizeSnapshotCandlesForMarket(item?.candles);
   if (!symbol || !sourceAnalysis.action || !candles.length || !hasRequiredSnapshotTechnicals(sourceTechnicals)) return null;
   return {
     ...item,
     symbol,
     market,
     candles,
+    analysisAsOf: item?.analysisAsOf || item?.signalRefreshedAt || item?.updatedAt || item?.quote?.asOf || null,
+    analysisPrice: asPositiveNumber(item?.analysisPrice, asPositiveNumber(sourceTechnicals.close)),
     technicals: normalizeTechnicals(sourceTechnicals),
     analysis: normalizeAnalysis(sourceAnalysis),
     news: Array.isArray(item?.news) ? item.news : [],
@@ -1023,6 +904,163 @@ function normalizeSnapshotPayload(payload) {
     watchlist: [...new Set([...watchlist, ...symbols])],
     selected: symbols.has(selected) ? selected : analyses[0].symbol,
   };
+}
+
+function timestampValue(value) {
+  const parsed = Date.parse(value || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isDailyTradingDate(date) {
+  const value = String(date || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return true;
+  const day = new Date(`${value}T12:00:00.000Z`).getUTCDay();
+  return day !== 0 && day !== 6;
+}
+
+function sanitizeSnapshotCandlesForMarket(candles = []) {
+  return normalizeCandles(candles)
+    .filter((row) => isDailyTradingDate(row.date))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+}
+
+function quoteOverlayKey(symbol, market = state.market) {
+  return normalizeSymbolForMarket(symbol, market);
+}
+
+function compactQuoteOverlayForStorage(overlay = {}) {
+  const latestCandle = normalizeCandles(overlay.latestCandle ? [overlay.latestCandle] : [])[0] || null;
+  return {
+    symbol: overlay.symbol,
+    market: overlay.market,
+    price: asPositiveNumber(overlay.price, null),
+    previousClose: asPositiveNumber(overlay.previousClose, null),
+    change: Number.isFinite(Number(overlay.change)) ? Number(overlay.change) : null,
+    changePercent: Number.isFinite(Number(overlay.changePercent)) ? Number(overlay.changePercent) : null,
+    dataAsOf: overlay.dataAsOf || null,
+    retrievedAt: overlay.retrievedAt || null,
+    source: overlay.source || "market-history-cache",
+    delayed: overlay.delayed !== false,
+    stale: overlay.stale === true,
+    timeVerified: overlay.timeVerified !== false,
+    latestCandle,
+  };
+}
+
+function persistQuoteOverlayCache() {
+  try {
+    const compact = Object.fromEntries(Object.keys(MARKET_CONFIG).map((market) => [
+      market,
+      Object.fromEntries(Object.entries(state.quoteOverlaysByMarket[market] || {}).map(([symbol, overlay]) => [
+        symbol,
+        compactQuoteOverlayForStorage(overlay),
+      ])),
+    ]));
+    safeStorage.setItem("quoteOverlaysByMarket:v1", JSON.stringify(compact));
+  } catch (error) {
+    console.warn("Unable to persist quote overlays", error);
+  }
+}
+
+function overlayQuoteObject(overlay = {}) {
+  return {
+    symbol: overlay.symbol,
+    market: overlay.market,
+    price: asPositiveNumber(overlay.price),
+    previousClose: asPositiveNumber(overlay.previousClose, null),
+    change: Number.isFinite(Number(overlay.change)) ? Number(overlay.change) : null,
+    changePercent: Number.isFinite(Number(overlay.changePercent)) ? Number(overlay.changePercent) : null,
+    asOf: overlay.dataAsOf || null,
+    date: /^\d{4}-\d{2}-\d{2}$/.test(String(overlay.dataAsOf || "").slice(0, 10)) ? String(overlay.dataAsOf).slice(0, 10) : null,
+    retrievedAt: overlay.retrievedAt || null,
+    source: overlay.source || "market-history-cache",
+    delayed: overlay.delayed !== false,
+    timeVerified: overlay.timeVerified !== false,
+  };
+}
+
+function mergeOverlayCandle(candles = [], latestCandle = null) {
+  const rows = sanitizeSnapshotCandlesForMarket(candles);
+  const incoming = normalizeCandles(latestCandle ? [latestCandle] : [])[0];
+  if (!incoming || !isDailyTradingDate(incoming.date)) return rows;
+  const incomingDate = String(incoming.date).slice(0, 10);
+  const latestDate = String(rows.at(-1)?.date || "").slice(0, 10);
+  if (latestDate && incomingDate < latestDate) return rows;
+  const index = rows.findIndex((row) => String(row.date).slice(0, 10) === incomingDate);
+  if (index >= 0) rows[index] = { ...rows[index], ...incoming };
+  else rows.push(incoming);
+  return rows;
+}
+
+function mergeQuoteOverlayIntoItem(item, overlay, market = state.market) {
+  if (!item || !overlay) return item;
+  const key = safeMarket(market);
+  const symbol = quoteOverlayKey(overlay.symbol, key);
+  if (!symbol || symbol !== quoteOverlayKey(item.symbol, key)) return item;
+  const overlayTime = timestampValue(overlay.retrievedAt || overlay.dataAsOf);
+  const currentTime = timestampValue(item.marketRetrievedAt || item.quote?.retrievedAt || item.quote?.asOf || item.signalRefreshedAt || item.updatedAt);
+  if (currentTime && overlayTime && overlayTime < currentTime) return item;
+  const analysisAsOf = item.analysisAsOf || item.signalRefreshedAt || item.updatedAt || item.quote?.asOf || state.snapshotUpdatedAt || null;
+  const analysisPrice = asPositiveNumber(item.analysisPrice, asPositiveNumber(item.technicals?.close));
+  const quote = overlayQuoteObject({ ...overlay, symbol, market: key });
+  const candles = mergeOverlayCandle(item.candles, overlay.latestCandle);
+  const latestClose = asPositiveNumber(quote.price, asPositiveNumber(candles.at(-1)?.close, item.technicals?.close));
+  const analysisTime = timestampValue(analysisAsOf);
+  const priceChangedSinceAnalysis = Number.isFinite(analysisPrice)
+    && Number.isFinite(latestClose)
+    && Math.abs(latestClose - analysisPrice) > Math.max(0.0001, analysisPrice * 0.00001);
+  const analysisNeedsRefresh = Boolean(priceChangedSinceAnalysis && overlayTime && analysisTime && overlayTime > analysisTime + 1000);
+  return {
+    ...item,
+    symbol,
+    market: key,
+    analysisAsOf,
+    analysisPrice,
+    analysisNeedsRefresh,
+    marketDataAsOf: overlay.dataAsOf || null,
+    marketRetrievedAt: overlay.retrievedAt || null,
+    marketOverlay: { ...overlay, symbol },
+    quote,
+    candles,
+    technicals: {
+      ...item.technicals,
+      close: latestClose,
+      livePriceOverlay: true,
+    },
+  };
+}
+
+function applyQuoteOverlays(overlays = [], market = state.market, options = {}) {
+  const key = safeMarket(market);
+  state.quoteOverlaysByMarket[key] = state.quoteOverlaysByMarket[key] || {};
+  let changed = false;
+  let cacheChanged = false;
+  (Array.isArray(overlays) ? overlays : []).forEach((raw) => {
+    if (safeMarket(raw?.market || key) !== key) return;
+    const symbol = quoteOverlayKey(raw?.symbol, key);
+    if (!symbol || !Number.isFinite(Number(raw?.price)) || Number(raw.price) <= 0) return;
+    const overlay = { ...raw, symbol, market: key };
+    const existing = state.quoteOverlaysByMarket[key][symbol];
+    if (existing && timestampValue(existing.retrievedAt || existing.dataAsOf) > timestampValue(overlay.retrievedAt || overlay.dataAsOf)) return;
+    state.quoteOverlaysByMarket[key][symbol] = overlay;
+    cacheChanged = true;
+    if (key !== state.market) return;
+    const item = state.analyses.get(symbol);
+    if (!item) return;
+    const merged = mergeQuoteOverlayIntoItem(item, overlay, key);
+    if (merged !== item) {
+      state.analyses.set(symbol, merged);
+      changed = true;
+    }
+  });
+  if (cacheChanged && options.persist !== false) persistQuoteOverlayCache();
+  if (changed && options.render !== false) queueMainRender(["cards", "summary", "detail"]);
+  return changed;
+}
+
+function applyStoredQuoteOverlays(market = state.market) {
+  const key = safeMarket(market);
+  return applyQuoteOverlays(Object.values(state.quoteOverlaysByMarket[key] || {}), key, { render: false });
 }
 
 function getStrategy() {
@@ -1144,13 +1182,13 @@ function backendMonitorPayload() {
     strategy: getStrategy(),
     capital: getCapital(),
     refresh: {
-      holdingMs: 5 * 60 * 1000,
-      watchMs: 15 * 60 * 1000,
+      holdingMs: 3 * 60 * 1000,
+      watchMs: 10 * 60 * 1000,
       trainingMs: 5 * 60 * 1000,
     },
     training: {
       enabled: true,
-      symbolLimit: 3,
+      symbolLimit: 2,
       interval: "5m",
       range: "5d",
     },
@@ -1192,10 +1230,13 @@ function saveState() {
   sanitizeActiveMarketState();
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
   reconcileWatchlistOrigins(state.market);
+  reconcileWatchlistAddedAt(state.market);
   state.watchlistsByMarket[state.market] = state.watchlist;
   safeStorage.setItem("selectedMarket", state.market);
   safeStorage.setItem("watchlistsByMarket", JSON.stringify(state.watchlistsByMarket));
   safeStorage.setItem("watchlistOriginsByMarket", JSON.stringify(state.watchlistOriginsByMarket));
+  safeStorage.setItem("watchlistAddedAtByMarket", JSON.stringify(state.watchlistAddedAtByMarket));
+  safeStorage.setItem("watchlistSortByMarket", JSON.stringify(state.watchlistSortByMarket));
   safeStorage.setItem("watchlist", JSON.stringify(state.watchlist));
   safeStorage.setItem("strategy", JSON.stringify(getStrategy()));
   safeStorage.setItem("capital", JSON.stringify({ ...getCapital(), baseCapital: asNumber($("totalCapital").value, 0) }));
@@ -1238,11 +1279,11 @@ function loadSavedInputs() {
   if ($("fastInitialRefresh")) $("fastInitialRefresh").checked = runtimeSettings.fastInitialRefresh !== false;
   if ($("allowOffHoursFetch")) $("allowOffHoursFetch").checked = runtimeSettings.allowOffHoursFetch !== false;
   if ($("keepSnapshots")) $("keepSnapshots").checked = runtimeSettings.keepSnapshots !== false;
-  const savedInterval = asNumber(safeStorage.getItem("refreshInterval"), 1800000);
+  const savedInterval = asNumber(safeStorage.getItem("refreshInterval"), 600000);
   const refreshIntervals = [60000, 300000, 600000, 1800000, 3600000];
   const nearestInterval = refreshIntervals.reduce((best, value) => (
     Math.abs(value - savedInterval) < Math.abs(best - savedInterval) ? value : best
-  ), 1800000);
+  ), 600000);
   $("refreshInterval").value = String(nearestInterval);
   $("portfolioCsv").value = safeStorage.getItem(`portfolioCsv:${state.market}`) || holdingsToCsv(activePortfolio()) || activeMarketConfig().samplePortfolio;
   $("holdingEntryDate").value = todayIso();
@@ -1383,48 +1424,6 @@ function upsertHolding(holding) {
   return true;
 }
 
-function ema(values, period) {
-  const alpha = 2 / (period + 1);
-  const output = [];
-  let previous = values[0];
-  values.forEach((value, index) => {
-    previous = index === 0 ? value : value * alpha + previous * (1 - alpha);
-    output.push(previous);
-  });
-  return output;
-}
-
-function sma(values, period) {
-  return values.map((_, index) => {
-    const start = Math.max(0, index - period + 1);
-    const slice = values.slice(start, index + 1);
-    return slice.reduce((sum, value) => sum + value, 0) / slice.length;
-  });
-}
-
-function rsi(values, period = 14) {
-  if (values.length <= period) return 50;
-  let gains = 0;
-  let losses = 0;
-  for (let index = values.length - period; index < values.length; index += 1) {
-    const change = values[index] - values[index - 1];
-    if (change >= 0) gains += change;
-    else losses -= change;
-  }
-  if (losses === 0) return 100;
-  const relativeStrength = gains / losses;
-  return 100 - 100 / (1 + relativeStrength);
-}
-
-function pctChange(current, previous) {
-  if (!previous) return 0;
-  return ((current - previous) / previous) * 100;
-}
-
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
-}
-
 function computeTechnicals(candles) {
   const rows = normalizeCandles(candles);
   if (!rows.length) return { ...DEFAULT_TECHNICALS };
@@ -1483,6 +1482,25 @@ function computeTechnicals(candles) {
     projectedUpside,
     mainForceProxy,
   };
+}
+
+function predictionCandlesWithLiveQuote(candles, quote = null) {
+  const rows = normalizeCandles(candles);
+  const price = asPositiveNumber(quote?.price, NaN);
+  if (!rows.length || !Number.isFinite(price)) return rows;
+  const index = rows.length - 1;
+  const latest = rows[index];
+  rows[index] = {
+    ...latest,
+    high: Math.max(latest.high, price),
+    low: Math.min(latest.low, price),
+    close: price,
+    adjClose: price,
+    predictionOnly: true,
+    predictionQuoteSource: quote?.source || null,
+    predictionQuoteRetrievedAt: quote?.retrievedAt || quote?.asOf || null,
+  };
+  return rows;
 }
 
 function computeMacdSeries(candles) {
@@ -1881,32 +1899,13 @@ function formatCompactNumber(value, maximumFractionDigits = 2) {
   });
 }
 
-function localBackendOfflineMessage(url = "") {
-  return `本地后端未连接：${url || "API"}。请确认 8787 服务正在运行，然后刷新页面。`;
-}
+const {
+  normalizeApiErrorMessage,
+  requestJson,
+} = window.QuantHttp || {};
 
-function normalizeApiErrorMessage(message, url = "", options = {}) {
-  const text = String(message || "读取失败");
-  if (options.network) return localBackendOfflineMessage(url);
-  if (/quota has been exceeded|quota exceeded|The quota has been exceeded/i.test(text)) {
-    return "外部数据源额度已用尽；已优先保留本地真实快照/缓存，稍后或更换数据源后再刷新。";
-  }
-  if (/Load failed|Failed to fetch|NetworkError|ERR_CONNECTION_REFUSED|ECONNREFUSED/i.test(text)) {
-    return `真实数据源请求失败：${text}`;
-  }
-  return text;
-}
-
-async function requestJson(url, options = {}) {
-  let response;
-  try {
-    response = await fetch(url, options);
-  } catch (error) {
-    throw new Error(normalizeApiErrorMessage(error.message || error, url, { network: true }));
-  }
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(normalizeApiErrorMessage(payload.error || `请求失败：${response.status}`, url));
-  return payload;
+if (!normalizeApiErrorMessage || !requestJson) {
+  throw new Error("HTTP runtime module failed to load.");
 }
 
 function normalizeResearchConfig(config = {}, market = state.market) {
@@ -2823,41 +2822,146 @@ function volumeProfileMiniChart(buckets, profile = {}) {
   `;
 }
 
+function renderHomePage() {
+  const config = activeMarketConfig();
+  const session = marketState();
+  const rows = [...state.analyses.values()].filter((item) => (
+    (!item?.market || safeMarket(item.market) === state.market)
+    && item?.analysis?.action
+    && item.analysis.action !== "ERROR"
+  ));
+  const buyCount = rows.filter((item) => isBuyAction(item.analysis?.action)).length;
+  const riskCount = rows.filter((item) => isRiskAction(item.analysis?.action)).length;
+  const dualSourceCount = rows.filter((item) => item.marketValidation?.ok && !item.marketValidation?.degraded).length;
+  const degradedCount = rows.filter((item) => item.marketValidation?.degraded).length;
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value;
+  };
+
+  setText("homeMarketCode", `${config.code} / ${config.currency}`);
+  setText("homeMarketClock", `${session.hour}:${session.minute}:${session.second} · ${config.clockLabel}`);
+  setText("homeSessionState", session.isTrading ? "交易进行中" : session.canRefresh ? "收盘刷新窗口" : "当前休市");
+  setText("homeReadyCount", rows.length);
+  setText("homeWatchCount", state.watchlist.length);
+  setText("homeBuyCount", buyCount);
+  setText("homeRiskCount", riskCount);
+  setText("homeEvidenceState", dualSourceCount
+    ? `双源 ${dualSourceCount} · 单源 ${degradedCount}`
+    : degradedCount
+      ? `真实单源 ${degradedCount}`
+      : "本地快照优先");
+  setText("homeSnapshotState", snapshotsEnabled()
+    ? `快照 ${formatSnapshotTime(state.snapshotUpdatedAt)}`
+    : "本地快照已关闭");
+
+  const sessionNode = $("homeSessionState");
+  if (sessionNode) sessionNode.dataset.tone = session.isTrading ? "open" : session.canRefresh ? "window" : "closed";
+  const evidenceState = dualSourceCount
+    ? `双源 ${dualSourceCount} · 单源 ${degradedCount}`
+    : degradedCount
+      ? `真实单源 ${degradedCount}`
+      : "本地快照优先";
+  const homeSummary = JSON.stringify({
+    market: state.market,
+    readyCount: rows.length,
+    watchCount: state.watchlist.length,
+    buyCount,
+    riskCount,
+    evidenceState,
+    snapshotUpdatedAt: state.snapshotUpdatedAt || null,
+  });
+  const summaryCacheKey = `${state.market}:${homeSummary}`;
+  if (renderHomePage.lastSummary !== summaryCacheKey) {
+    renderHomePage.lastSummary = summaryCacheKey;
+    safeStorage.setItem(`homeSummary:${state.market}`, homeSummary);
+  }
+}
+
+const WORKSPACE_PAGE_LABELS = Object.freeze({
+  home: "主页",
+  dashboard: "监控台",
+  features: "特征分析",
+  factors: "因子实验室",
+  regime: "市场状态",
+  strategy: "策略 / Agent",
+  simulation: "模拟持仓",
+  sources: "数据中心",
+});
+
+function workspaceTitle(page = state.activePage, market = state.market) {
+  const key = safeMarket(market);
+  const label = WORKSPACE_PAGE_LABELS[page] || WORKSPACE_PAGE_LABELS.home;
+  return page === "dashboard" ? MARKET_CONFIG[key].title : `${MARKET_CONFIG[key].label} · ${label}`;
+}
+
+function syncWorkspaceLocation(page = state.activePage) {
+  const next = WORKSPACE_PAGE_LABELS[page] ? page : "home";
+  document.title = next === "home"
+    ? "Global Quant Watch"
+    : `${activeMarketConfig().label} · ${WORKSPACE_PAGE_LABELS[next]} · Global Quant Watch`;
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set("page", next);
+    window.history.replaceState({ ...(window.history.state || {}), page: next }, "", url);
+  } catch (error) {
+    console.warn("Unable to persist workspace URL", error);
+  }
+}
+
 function setWorkspacePage(page, options = {}) {
-  const validPages = new Set(["dashboard", "features", "factors", "regime", "strategy", "simulation", "sources"]);
-  const next = validPages.has(page) ? page : "dashboard";
+  const validPages = new Set(["home", "dashboard", "features", "factors", "regime", "strategy", "simulation", "sources"]);
+  const next = validPages.has(page) ? page : "home";
   state.activePage = next;
   safeStorage.setItem("activeQuantPage", next);
-  document.querySelectorAll("[data-quant-page]").forEach((section) => {
-    section.hidden = section.dataset.quantPage !== next;
-  });
-  document.querySelectorAll("[data-page-target]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.pageTarget === next);
-  });
-  document.querySelectorAll("[data-control-page]").forEach((panel) => {
-    const pages = String(panel.dataset.controlPage || "")
-      .split(/\s+/)
-      .filter(Boolean);
-    panel.hidden = pages.length > 0 && !pages.includes(next);
-  });
+  syncWorkspaceLocation(next);
+  document.documentElement.dataset.activeWorkspace = next;
+  const applyPage = () => {
+    document.querySelectorAll("[data-quant-page]").forEach((section) => {
+      section.hidden = section.dataset.quantPage !== next;
+    });
+    document.querySelectorAll("[data-page-target]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.pageTarget === next);
+      button.setAttribute("aria-current", button.dataset.pageTarget === next ? "page" : "false");
+    });
+    document.querySelectorAll("[data-control-page]").forEach((panel) => {
+      const pages = String(panel.dataset.controlPage || "")
+        .split(/\s+/)
+        .filter(Boolean);
+      panel.hidden = pages.length > 0 && !pages.includes(next);
+    });
+    const marketTitle = $("marketTitle");
+    if (marketTitle) marketTitle.textContent = workspaceTitle(next);
+  };
+  if (window.QuantUI?.transitionPage && !options.silent) window.QuantUI.transitionPage(applyPage, next);
+  else applyPage();
   if (!options.silent) {
-    const labels = {
-      dashboard: "监控台",
-      features: "特征分析",
-      factors: "因子实验室",
-      regime: "市场状态",
-      strategy: "策略/Agent",
-      simulation: "模拟持仓",
-      sources: "数据源",
-    };
-    setStatus(`已打开 ${activeMarketConfig().label} · ${labels[next]}`);
+    setStatus(`已打开 ${activeMarketConfig().label} · ${WORKSPACE_PAGE_LABELS[next]}`);
+  }
+  if (next === "home") {
+    renderHomePage();
+    window.QuantHomeMotion?.refresh();
   }
   if (next === "sources") {
     refreshProviderBudget(false);
     refreshDataHealth(false);
   }
-  if (next === "regime") renderMarketMoversPanel();
+  if (next === "regime") {
+    renderMarketMoversPanel();
+    renderAiPickPanel();
+  }
+  if (next === "dashboard") queueMainRender(["cards", "summary", "detail"]);
+  if (next === "factors") renderFactorConfigPanel();
+  if (next === "strategy") {
+    renderAccuracyPanel();
+    renderAgentPanel();
+    renderOptimalStrategyPanel();
+    renderStrategyRevisionPanel();
+  }
   if (next === "simulation") {
+    renderPortfolioSummary();
+    renderHistory();
+    renderSimulationArchivePanel();
     runRiskAssessment(false);
     loadTradingAudit(false);
   }
@@ -4091,7 +4195,10 @@ function renderDataHealth(payload) {
   }, { dual: 0, single: 0, error: 0, unknown: 0 });
   const providerPill = (provider) => {
     const health = providerHealth(provider);
-    const text = !provider.configured ? "未接入" : health === "warn" ? "额度/权限" : "可用";
+    const poolCount = Math.max(0, asNumber(provider.keyPool?.keyCount, 0));
+    const activePosition = Math.max(0, asNumber(provider.keyPool?.activeKeyPosition, 0));
+    const poolText = poolCount > 1 ? ` · ${activePosition || 1}/${poolCount} 故障转移` : "";
+    const text = !provider.configured ? "未接入" : health === "warn" ? `额度/权限${poolText}` : `可用${poolText}`;
     return `<span class="api-pill ${health}"><i></i><b>${escapeHtml(provider.name || provider.source || "provider")}</b><em>${escapeHtml(text)}</em></span>`;
   };
   panel.innerHTML = `
@@ -4711,14 +4818,18 @@ function factorRows(factors, market = state.market) {
   ].filter(([, factor]) => factor);
 }
 
-async function fetchMarket(symbol, market = state.market) {
+async function fetchMarket(symbol, market = state.market, options = {}) {
   const marketKey = safeMarket(market);
   const normalized = normalizeSymbolForMarket(symbol, marketKey);
   if (!normalized) throw new Error(`${symbol || ""} 不是 ${activeMarketConfig(marketKey).label} 有效代码`);
   const key = `market:${marketKey}:${normalized}`;
   const cached = state.marketCache.get(key);
-  if (cached && Date.now() - cached.time < 60 * 1000) return cached.value;
-  const response = await fetch(`/api/market/${encodeURIComponent(normalized)}?market=${encodeURIComponent(marketKey)}&range=9mo&interval=1d`);
+  if (!options.fresh && cached && Date.now() - cached.time < 60 * 1000) return cached.value;
+  const fresh = options.fresh ? "&fresh=1" : "";
+  const response = await fetch(`/api/market/${encodeURIComponent(normalized)}?market=${encodeURIComponent(marketKey)}&range=1y&interval=1d${fresh}`, {
+    cache: options.fresh ? "no-store" : "default",
+    signal: marketKey === state.market ? state.activeMarketAbortController?.signal : undefined,
+  });
   if (!response.ok) throw new Error((await response.json()).error || `无法读取 ${symbol}`);
   const value = await response.json();
   if (safeMarket(value.market || marketKey) !== marketKey) throw new Error(`${symbol} 返回了错误市场 ${value.market}`);
@@ -4741,7 +4852,7 @@ async function cachedJson(key, url, ttlMs) {
 }
 
 function chartFetchRange(interval) {
-  return interval === "1wk" ? "2y" : interval === "1mo" ? "5y" : interval === "1d" ? "9mo" : "5d";
+  return interval === "1wk" ? "2y" : interval === "1mo" ? "5y" : interval === "1d" ? "2y" : "5d";
 }
 
 function chartDataKey(symbol, interval, market = state.market) {
@@ -4749,7 +4860,10 @@ function chartDataKey(symbol, interval, market = state.market) {
 }
 
 async function fetchMarketChartPayload(symbol, range, interval) {
-  const response = await fetch(`/api/market/${encodeURIComponent(symbol)}?market=${encodeURIComponent(state.market)}&range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`);
+  const market = state.market;
+  const response = await fetch(`/api/market/${encodeURIComponent(symbol)}?market=${encodeURIComponent(market)}&range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`, {
+    signal: state.activeMarketAbortController?.signal,
+  });
   if (!response.ok) {
     let payload = {};
     try {
@@ -4759,7 +4873,9 @@ async function fetchMarketChartPayload(symbol, range, interval) {
     }
     throw new Error(payload.error || `无法读取 ${symbol} ${interval}`);
   }
-  return response.json();
+  const payload = await response.json();
+  if (market !== state.market || safeMarket(payload.market || market) !== market) throw new DOMException("Stale market chart request", "AbortError");
+  return payload;
 }
 
 function chartFallbackReadout(cachedChart = null) {
@@ -4770,11 +4886,12 @@ function chartFallbackReadout(cachedChart = null) {
 }
 
 async function fetchChartMarket(symbol, interval) {
-  if (interval === "1d") return normalizeCandles(state.analyses.get(symbol)?.candles || []);
   const range = chartFetchRange(interval);
   const key = chartDataKey(symbol, interval);
   const cached = state.chartDataCache.get(key);
   if (cached && Date.now() - cached.time < 60000) return normalizeCandles(cached.candles);
+  const analysisCandles = normalizeCandles(state.analyses.get(symbol)?.candles || []);
+  if (interval === "1d" && analysisCandles.length >= CHART_MAX_VISIBLE_BARS) return analysisCandles;
   try {
     const payload = await fetchMarketChartPayload(symbol, range, interval);
     const candles = normalizeCandles(payload.candles);
@@ -4787,7 +4904,7 @@ async function fetchChartMarket(symbol, interval) {
     let candles = normalizeCandles(state.analyses.get(symbol)?.candles || []);
     try {
       if (!candles.length) {
-        fallbackPayload = await fetchMarketChartPayload(symbol, "9mo", "1d");
+        fallbackPayload = await fetchMarketChartPayload(symbol, "1y", "1d");
         candles = normalizeCandles(fallbackPayload.candles);
       }
     } catch (fallbackError) {
@@ -4985,11 +5102,13 @@ function saveIndexChartView() {
 function visibleIndexCandles(sourceCandles) {
   const source = normalizeCandles(sourceCandles);
   const baseCount = Math.min(source.length, indexChartRangeCount());
-  const baseStart = Math.max(0, source.length - baseCount);
+  const availableCount = Math.min(source.length, CHART_MAX_VISIBLE_BARS);
+  const baseStart = Math.max(0, source.length - availableCount);
+  const minZoom = Math.min(1, baseCount / Math.max(1, availableCount));
   const maxZoom = Math.max(1, baseCount / 18);
-  state.indexChartZoom = clamp(Number(state.indexChartZoom || 1), 1, maxZoom);
-  const visibleCount = Math.max(8, Math.min(baseCount, Math.round(baseCount / state.indexChartZoom)));
-  const maxOffset = Math.max(0, baseCount - visibleCount);
+  state.indexChartZoom = clamp(Number(state.indexChartZoom || 1), minZoom, maxZoom);
+  const visibleCount = Math.min(availableCount, Math.max(Math.min(8, availableCount), Math.round(baseCount / state.indexChartZoom)));
+  const maxOffset = Math.max(0, availableCount - visibleCount);
   state.indexChartOffset = clamp(Math.round(Number(state.indexChartOffset || 0)), 0, maxOffset);
   const end = source.length - state.indexChartOffset;
   const start = Math.max(baseStart, end - visibleCount);
@@ -5316,7 +5435,7 @@ function bindIndexChartEvents(row, candles) {
         state.indexChartOffset = Math.max(0, Number(state.indexChartOffset || 0) + Math.round(event.deltaX / WHEEL_PAN_DIVISOR));
       } else {
         const factor = event.deltaY < 0 ? WHEEL_ZOOM_IN : WHEEL_ZOOM_OUT;
-        state.indexChartZoom = clamp(Number(state.indexChartZoom || 1) * factor, 1, 40);
+        state.indexChartZoom = clamp(Number(state.indexChartZoom || 1) * factor, CHART_MIN_ZOOM, 40);
       }
       saveIndexChartView();
       scheduleChartRedraw("index", () => drawIndexChart(row));
@@ -5597,6 +5716,7 @@ function newsRefreshSymbolsForMarket(limit = 40) {
 }
 
 async function refreshDueNewsOnOpen() {
+  if (state.backendSchedulesAvailable) return { skipped: true, reason: "backend scheduler owns news refresh windows" };
   const symbol = state.selected || state.watchlist[0] || activeMarketConfig().defaultSymbols[0] || "";
   let health = null;
   try {
@@ -5645,6 +5765,9 @@ function redditWarmupSymbolsForMarket(limit = 60, market = state.market) {
 }
 
 async function queueRedditSocialWarmup(reason = "auto", options = {}) {
+  if (state.backendSchedulesAvailable && reason !== "manual") {
+    return { skipped: true, reason: "backend scheduler owns Reddit cache warmup" };
+  }
   const marketKey = safeMarket(options.market || state.market);
   const symbols = redditWarmupSymbolsForMarket(options.maxSymbols || 60, marketKey);
   if (!symbols.length) return null;
@@ -5825,33 +5948,28 @@ async function runHistoricalBacktest() {
   }
   try {
     if (button) button.disabled = true;
-    setStatus(`正在运行 ${activeMarketConfig().label} 5年大样本历史预测校准（训练池 ${symbols.length} 只，关注/持仓 ${activeSymbols.length} 只，短/中/长期）...`);
+    setStatus(`正在排队 ${activeMarketConfig().label} 市场级多任务训练（训练池 ${symbols.length} 只，关注/持仓 ${activeSymbols.length} 只，5/15/30日）...`);
     const strategy = getStrategy();
-    const result = await requestJson(`/api/historical-backtest-batch?market=${encodeURIComponent(state.market)}`, {
+    const result = await requestJson(`/api/jobs/backtest`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         market: state.market,
         symbols,
-        range: "5y",
+        range: "",
         limit: PREDICTION_TRAINING_UNIVERSE_LIMIT,
         largeSample: true,
+        productionTraining: true,
         horizonDays: strategy.horizonDays,
         targetUpside: strategy.targetUpside,
         stopLoss: strategy.stopLoss,
       }),
     });
-    state.historicalBacktestSummary = result;
-    if (result.savedModel && state.accuracySummary) {
-      state.accuracySummary.historicalPredictionModel = result.savedModel;
-    }
-    renderAccuracyPanel();
-    const trainingCount = result.trainingSymbols?.length || result.symbolCount || symbols.length;
-    setStatus(`历史预测校准完成：训练池 ${trainingCount} 只，${result.sampleTotal || 0} 个历史切片，${(result.horizonCalibrations || []).length || 1} 套周期权重`);
+    setStatus(`市场级训练已进入后台作业 ${result.id}；页面可继续操作，完成后会自动载入 OOF 与生产门控证据`);
     return result;
   } catch (error) {
     console.warn("Historical backtest failed", error);
-    setStatus(`历史预测校准失败：${compactDisplayError(error.message)}`);
+    setStatus(`市场级训练排队失败：${compactDisplayError(error.message)}`);
     return null;
   } finally {
     if (button) button.disabled = false;
@@ -5863,8 +5981,9 @@ function analysisSampleId(item, createdAt = new Date().toISOString()) {
   const technicals = normalizeTechnicals(item.technicals);
   const strategy = getStrategy();
   const latest = (item.candles || []).at(-1) || {};
+  const modelDate = item.analysisAsOf ? marketState(new Date(item.analysisAsOf), item.market || state.market).dateKey : String(latest.date || "").slice(0, 10);
   const stamp = String(createdAt || new Date().toISOString()).replace(/[-:.TZ]/g, "").slice(0, 14);
-  return `${state.market}:${item.symbol}:${String(latest.date || "").slice(0, 10)}:${analysis.horizonDays || strategy.horizonDays}:${strategy.targetUpside}:${stamp}`;
+  return `${state.market}:${item.symbol}:${modelDate}:${analysis.horizonDays || strategy.horizonDays}:${strategy.targetUpside}:${stamp}`;
 }
 
 function predictionSampleFromResult(item) {
@@ -5911,7 +6030,9 @@ function predictionSampleFromResult(item) {
     const found = factorList.find(([label]) => matcher(String(label)));
     return Number(found?.[1]?.score || 0);
   };
-  const asOfDate = String(latest.date || "").slice(0, 10);
+  const asOfDate = item.analysisAsOf
+    ? marketState(new Date(item.analysisAsOf), item.market || state.market).dateKey
+    : String(latest.date || "").slice(0, 10);
   if (!asOfDate || !technicals.close) return null;
   const createdAt = new Date().toISOString();
   return {
@@ -5925,7 +6046,11 @@ function predictionSampleFromResult(item) {
     stopLoss: Number(strategy.stopLoss || 4),
     close: technicals.close,
     currentPrice: technicals.close,
-    currentDate: latest.date || new Date().toISOString(),
+    currentDate: item.analysisAsOf || item.marketRetrievedAt || latest.date || new Date().toISOString(),
+    priceSource: technicals.priceSource || item.quote?.source || item.marketSource || "verified-candle",
+    priceAsOf: technicals.priceAsOf || item.marketRetrievedAt || item.analysisAsOf || latest.date || null,
+    priceTimeVerified: technicals.priceTimeVerified !== false,
+    priceDelayed: technicals.priceDelayed !== false,
     confidence: Number(analysis.confidence || 0),
     predictionConfidence: Number(analysis.predictionConfidence ?? analysis.confidence ?? 0),
     magnitudeConfidence: Number(analysis.magnitudeConfidence ?? analysis.magnitudeHitProbability ?? analysis.moveHitProbability ?? 0),
@@ -6120,6 +6245,7 @@ async function deleteWatchSymbol(rawSymbol) {
   const wasHolding = Boolean(findHolding(symbol));
   state.watchlist = state.watchlist.filter((item) => normalizeSymbolForMarket(item, state.market) !== symbol);
   removeWatchlistOrigin(symbol, state.market);
+  removeWatchlistAddedAt(symbol, state.market);
   state.analyses.delete(symbol);
   state.analysesByMarket.set(state.market, new Map(state.analyses));
   state.selected = state.watchlist.find((item) => state.analyses.has(item)) || state.watchlist[0] || null;
@@ -6194,13 +6320,119 @@ function preparedHasSignals(item) {
   return Boolean(result.news?.length && (factorEvidence || result.fundamentals || result.xPosts?.length || result.youtubeItems?.length));
 }
 
-function compactAnalysisForSnapshot(item) {
+function compactSnapshotCandle(row = {}) {
+  const close = asPositiveNumber(row.close, NaN);
+  if (!row.date || !Number.isFinite(close)) return null;
+  const open = asPositiveNumber(row.open, close);
   return {
-    ...item,
-    candles: (item.candles || []).slice(-220),
-    news: (item.news || []).slice(0, 10),
-    xPosts: (item.xPosts || []).slice(0, 10),
-    youtubeItems: (item.youtubeItems || []).slice(0, 10),
+    date: String(row.date),
+    open,
+    high: Math.max(asPositiveNumber(row.high, close), open, close),
+    low: Math.min(asPositiveNumber(row.low, close), open, close),
+    close,
+    adjClose: asPositiveNumber(row.adjClose, close),
+    volume: Math.max(0, asNumber(row.volume, 0)),
+    ...(row.realtime ? { realtime: true } : {}),
+    ...(row.quoteSource ? { quoteSource: row.quoteSource } : {}),
+  };
+}
+
+function compactSnapshotFactors(factors = null) {
+  if (!factors || typeof factors !== "object") return null;
+  const compactItem = (item = {}) => ({
+    id: item.id || item.name || item.url || null,
+    title: String(item.title || item.name || item.text || "").slice(0, 240),
+    text: String(item.text || item.summary || item.description || "").slice(0, 360),
+    url: item.url || item.permalink || null,
+    source: item.source || item.provider || item.subreddit || null,
+    publishedAt: item.publishedAt || item.createdAt || item.date || null,
+    score: Number.isFinite(Number(item.score)) ? Number(item.score) : null,
+    relevance: Number.isFinite(Number(item.relevance)) ? Number(item.relevance) : null,
+    impact: Number.isFinite(Number(item.impact)) ? Number(item.impact) : null,
+    sentiment: Number.isFinite(Number(item.sentiment)) ? Number(item.sentiment) : item.sentiment || null,
+    truthScore: Number.isFinite(Number(item.truthScore)) ? Number(item.truthScore) : null,
+  });
+  return Object.fromEntries(Object.entries(factors).map(([key, factor]) => {
+    if (!factor || typeof factor !== "object") return [key, factor];
+    const { items, topItems, model, ...summary } = factor;
+    return [key, {
+      ...summary,
+      items: (Array.isArray(items) ? items : []).slice(0, 2).map(compactItem),
+      topItems: (Array.isArray(topItems) ? topItems : []).slice(0, 2).map(compactItem),
+      ...(model && typeof model === "object" ? { model: {
+        available: model.available !== false,
+        source: model.source || null,
+        status: model.status || null,
+        sampleCount: Number(model.sampleCount || model.samples || 0),
+        confidence: Number(model.confidence || 0),
+        updatedAt: model.updatedAt || null,
+        reason: String(model.reason || "").slice(0, 320),
+      } } : {}),
+    }];
+  }));
+}
+
+function compactSnapshotAnalysis(analysis = null) {
+  if (!analysis || typeof analysis !== "object") return analysis;
+  const { ensemble, thesis, risks, factorSignal: rawFactorSignal, ...summary } = analysis;
+  const factorSignal = rawFactorSignal && typeof rawFactorSignal === "object"
+    ? {
+      ...rawFactorSignal,
+      thesis: (Array.isArray(rawFactorSignal.thesis) ? rawFactorSignal.thesis : []).slice(0, 4).map((text) => String(text).slice(0, 420)),
+      items: (Array.isArray(rawFactorSignal.items) ? rawFactorSignal.items : []).slice(0, 2),
+    }
+    : rawFactorSignal;
+  return {
+    ...summary,
+    thesis: (Array.isArray(thesis) ? thesis : []).slice(0, 8).map((text) => String(text).slice(0, 520)),
+    risks: (Array.isArray(risks) ? risks : []).slice(0, 8).map((text) => String(text).slice(0, 420)),
+    factorSignal,
+    ensemble: ensemble && typeof ensemble === "object" ? {
+      direction: ensemble.direction || null,
+      upsideAgreement: Number(ensemble.upsideAgreement || 0),
+      consensusAgreement: Number(ensemble.consensusAgreement || 0),
+      marketRegime: ensemble.marketRegime || null,
+      configuredFactorScore: Number(ensemble.configuredFactorScore || 0),
+      models: (Array.isArray(ensemble.models) ? ensemble.models : []).slice(0, 12).map((model) => ({
+        name: model.name || model.id || "model",
+        available: model.available !== false,
+        confidence: Number(model.confidence || 0),
+        projectedUpside: Number(model.projectedUpside || model.projectedFinalReturn || 0),
+        normalizedWeight: Number(model.normalizedWeight || model.weight || 0),
+        reason: String(model.reason || model.thesis || "").slice(0, 320),
+      })),
+    } : ensemble,
+  };
+}
+
+function compactAnalysisForSnapshot(item) {
+  const candles = (item.candles || []).slice(-180).map(compactSnapshotCandle).filter(Boolean);
+  return {
+    symbol: item.symbol,
+    market: item.market || state.market,
+    source: item.source || "unknown",
+    marketSource: item.marketSource || null,
+    marketWarning: item.marketWarning || "",
+    quoteWarning: item.quoteWarning || "",
+    analysisAsOf: item.analysisAsOf || item.signalRefreshedAt || item.updatedAt || item.quote?.asOf || state.snapshotUpdatedAt || null,
+    analysisPrice: asPositiveNumber(item.analysisPrice, asPositiveNumber(item.technicals?.close)),
+    signalRefreshedAt: item.signalRefreshedAt || item.analysisAsOf || item.updatedAt || null,
+    updatedAt: item.updatedAt || item.analysisAsOf || null,
+    marketDataAsOf: item.marketDataAsOf || item.marketOverlay?.dataAsOf || item.quote?.asOf || null,
+    marketRetrievedAt: item.marketRetrievedAt || item.marketOverlay?.retrievedAt || item.quote?.retrievedAt || null,
+    analysisNeedsRefresh: Boolean(item.analysisNeedsRefresh),
+    candles,
+    technicals: item.technicals,
+    analysis: compactSnapshotAnalysis(item.analysis),
+    quote: item.quote || null,
+    marketOverlay: item.marketOverlay ? compactQuoteOverlayForStorage(item.marketOverlay) : null,
+    analog: item.analog || null,
+    fundamentals: item.fundamentals || null,
+    factors: compactSnapshotFactors(item.factors),
+    news: (item.news || []).slice(0, 6),
+    xPosts: (item.xPosts || []).slice(0, 4),
+    youtubeItems: (item.youtubeItems || []).slice(0, 4),
+    marketValidation: item.marketValidation || null,
   };
 }
 
@@ -6230,7 +6462,7 @@ function currentAnalysesCoverWatchlist() {
   return snapshotCoversCurrentWatchlist({ analyses: [...state.analyses.values()] });
 }
 
-function persistAnalysisSnapshot(reason = "refresh") {
+function persistAnalysisSnapshot(reason = "refresh", options = {}) {
   if (!snapshotsEnabled()) return false;
   const updatedAt = new Date().toISOString();
   const payload = {
@@ -6258,11 +6490,18 @@ function persistAnalysisSnapshot(reason = "refresh") {
     if (state.market === "ASX") safeStorage.setItem("analysisSnapshotTime", updatedAt);
     state.snapshotUpdatedAt = updatedAt;
     updateSydneyClock();
-    fetch(`/api/snapshot?market=${encodeURIComponent(state.market)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    }).catch((error) => console.warn("Unable to persist server snapshot", error));
+    if (options.server !== false) {
+      fetch(`/api/snapshot?market=${encodeURIComponent(state.market)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      }).then(async (response) => {
+        if (!response.ok) {
+          const errorPayload = await response.json().catch(() => ({}));
+          throw new Error(errorPayload.error || `Snapshot save failed (${response.status})`);
+        }
+      }).catch((error) => console.warn("Unable to persist server snapshot", error));
+    }
     return true;
   } catch (error) {
     console.warn("Unable to persist analysis snapshot", error);
@@ -6282,14 +6521,26 @@ function applySnapshotPayload(payload) {
     });
     return false;
   }
-  state.analyses = new Map(snapshot.analyses.map((item) => [item.symbol, item]));
+  const mergedAnalyses = new Map(state.analyses);
+  snapshot.analyses.forEach((item) => {
+    const existing = mergedAnalyses.get(item.symbol);
+    const incomingTime = timestampValue(item.analysisAsOf || item.signalRefreshedAt || item.updatedAt || snapshot.updatedAt || snapshot.savedAt);
+    const existingTime = timestampValue(existing?.analysisAsOf || existing?.signalRefreshedAt || existing?.updatedAt);
+    if (!existing || !existingTime || incomingTime >= existingTime) mergedAnalyses.set(item.symbol, item);
+  });
+  state.analyses = mergedAnalyses;
+  if (Array.isArray(payload?.quoteOverlays)) applyQuoteOverlays(payload.quoteOverlays, state.market, { render: false });
+  applyStoredQuoteOverlays(state.market);
   if (snapshot.selected) state.selected = snapshot.selected;
   if (Array.isArray(snapshot.watchlist) && snapshot.watchlist.length) {
     snapshot.watchlist.forEach((symbol) => {
       addWatchSymbol(symbol, watchlistOriginFor(symbol, state.market, "snapshot"), state.market);
     });
   }
-  state.snapshotUpdatedAt = snapshot.updatedAt || snapshot.savedAt || safeStorage.getItem(snapshotTimeKey());
+  const incomingSnapshotTime = snapshot.updatedAt || snapshot.savedAt || null;
+  state.snapshotUpdatedAt = timestampValue(incomingSnapshotTime) >= timestampValue(state.snapshotUpdatedAt)
+    ? incomingSnapshotTime
+    : state.snapshotUpdatedAt || safeStorage.getItem(snapshotTimeKey());
   return true;
 }
 
@@ -6401,7 +6652,7 @@ async function prepareSymbol(symbol, options = {}) {
   const marketKey = safeMarket(options.market || state.market);
   const normalized = normalizeSymbolForMarket(symbol, marketKey);
   if (!normalized) throw new Error(`${symbol || ""} 不是 ${activeMarketConfig(marketKey).label} 有效代码`);
-  const market = await fetchMarket(normalized, marketKey);
+  const market = await fetchMarket(normalized, marketKey, { fresh: options.freshMarket === true });
   const candles = normalizeCandles(market.candles);
   const minimumUsableCandles = 10;
   const fullHistoryCandles = 35;
@@ -6409,7 +6660,16 @@ async function prepareSymbol(symbol, options = {}) {
   if (candles.length < minimumUsableCandles) {
     throw new Error(`${normalized} 历史数据不足：仅 ${candles.length} 根真实K线，至少需要 ${minimumUsableCandles} 根才能进入新上市观察模式`);
   }
-  const technicals = computeTechnicals(candles);
+  const predictionCandles = predictionCandlesWithLiveQuote(candles, market.quote);
+  const quotePrice = asPositiveNumber(market.quote?.price, NaN);
+  const technicals = {
+    ...computeTechnicals(predictionCandles),
+    livePriceOverlay: Number.isFinite(quotePrice),
+    priceSource: market.quote?.source || market.source || "verified-candle",
+    priceAsOf: market.quote?.asOf || market.quote?.retrievedAt || market.retrievedAt || candles.at(-1)?.date || null,
+    priceTimeVerified: market.quote ? market.quote.timeVerified !== false : true,
+    priceDelayed: market.quote ? market.quote.delayed !== false : true,
+  };
   const analog = shortHistory
     ? {
       count: 0,
@@ -6443,7 +6703,7 @@ async function prepareSymbol(symbol, options = {}) {
       shortHistory: true,
       reason: `新上市/短历史模式：仅 ${candles.length} 根真实K线，未启用历史相似样本和自监督回测。`,
     }
-    : computeHistoricalAnalog(candles, getStrategy().horizonDays, getStrategy().horizonDays);
+    : computeHistoricalAnalog(predictionCandles, getStrategy().horizonDays, getStrategy().horizonDays);
   const factorKey = `factors:${marketKey}:${normalized}:${getStrategy().horizonDays}:${getStrategy().targetUpside}`;
   const timeouts = signalTimeouts(options);
   const [news, fundamentals, xPosts, youtubeItems, fetchedFactors] = includeSignals
@@ -6480,6 +6740,23 @@ async function prepareSymbol(symbol, options = {}) {
     ? `新上市/短历史模式：仅 ${candles.length}/${fullHistoryCandles} 根真实K线，完整历史回测不足，预测置信度会被压低。`
     : "";
   const input = buildAnalysisInput(normalized, technicals, analog, fundamentals, xPosts, youtubeItems, news, factors, marketForInput, marketKey);
+  const modelInputAsOf = market.quote?.retrievedAt || market.quote?.asOf || market.retrievedAt || new Date().toISOString();
+  const latestCandle = candles.at(-1) || null;
+  const marketOverlay = Number.isFinite(quotePrice) ? {
+    symbol: normalized,
+    market: marketKey,
+    price: quotePrice,
+    previousClose: asPositiveNumber(market.quote?.previousClose, null),
+    change: Number.isFinite(Number(market.quote?.change)) ? Number(market.quote.change) : null,
+    changePercent: Number.isFinite(Number(market.quote?.changePercent)) ? Number(market.quote.changePercent) : null,
+    dataAsOf: market.quote?.asOf || (market.quote?.timeVerified !== false ? market.quote?.date : null) || null,
+    retrievedAt: modelInputAsOf,
+    source: market.quote?.source || market.source || "real-market",
+    delayed: market.quote?.delayed !== false,
+    stale: false,
+    timeVerified: market.quote?.timeVerified !== false,
+    latestCandle,
+  } : null;
   return {
     symbol: normalized,
     input,
@@ -6489,6 +6766,7 @@ async function prepareSymbol(symbol, options = {}) {
       candles,
       technicals,
       quote: market.quote || null,
+      marketOverlay,
       analog,
       fundamentals,
       xPosts,
@@ -6499,6 +6777,10 @@ async function prepareSymbol(symbol, options = {}) {
       marketWarning: [market.warning, shortHistoryWarning].filter(Boolean).join(" "),
       quoteWarning: market.quoteWarning,
       marketValidation,
+      modelInputAsOf,
+      analysisPrice: technicals.close,
+      marketDataAsOf: marketOverlay?.dataAsOf || null,
+      marketRetrievedAt: modelInputAsOf,
     },
   };
 }
@@ -6506,17 +6788,28 @@ async function prepareSymbol(symbol, options = {}) {
 function commitAnalysisResults(results, options = {}) {
   const marketKey = safeMarket(options.market || results?.[0]?.market || state.market);
   if (options.requireActive !== false && marketKey !== state.market) return [];
+  const committedAt = new Date().toISOString();
   const adjusted = results
     .map((result) => {
       const symbol = allowWatchSymbolForMarket(result?.symbol, marketKey, watchlistOriginFor(result?.symbol, marketKey, "analysis"));
       if (!symbol || (result?.market && safeMarket(result.market) !== marketKey)) return null;
-      return applyPostModelAdjustments({ ...result, symbol, market: marketKey });
+      return applyPostModelAdjustments({
+        ...result,
+        symbol,
+        market: marketKey,
+        analysisAsOf: committedAt,
+        signalRefreshedAt: committedAt,
+        updatedAt: committedAt,
+        analysisPrice: asPositiveNumber(result?.technicals?.close, result?.analysisPrice),
+        analysisNeedsRefresh: false,
+      });
     })
     .filter(Boolean);
   adjusted.forEach((result) => {
     if (result?.symbol) state.analyses.set(result.symbol, result);
   });
-  if (options.agentStep === false) {
+  applyQuoteOverlays(adjusted.map((result) => result.marketOverlay).filter(Boolean), marketKey, { render: false });
+  if (options.agentStep === false || state.paperAgentBackendAvailable) {
     renderAgentPanel();
     renderOptimalStrategyPanel();
   }
@@ -6624,7 +6917,7 @@ async function requestParallelSingleAnalysis(preparedItems, options = {}) {
 
 async function analyzeSymbol(symbol) {
   await fetchAccuracySummary(false);
-  const prepared = await prepareSymbol(symbol, { includeSignals: true });
+  const prepared = await prepareSymbol(symbol, { includeSignals: true, freshMarket: true });
   const [result] = await requestBatchAnalysis([prepared]);
   return result;
 }
@@ -6636,7 +6929,9 @@ function orderedSymbolsForRefresh(market = state.market) {
     : sanitizeSymbolsForMarket(state.watchlistsByMarket[marketKey] || MARKET_CONFIG[marketKey].defaultSymbols, marketKey);
   if (marketKey === state.market) state.watchlist = watchlist;
   const portfolioSymbols = activePortfolio(marketKey).map((holding) => normalizeSymbolForMarket(holding.symbol, marketKey)).filter(Boolean);
-  return [...new Set([...portfolioSymbols, ...watchlist])].filter((symbol) => allowWatchSymbolForMarket(symbol, marketKey, watchlistOriginFor(symbol, marketKey, "refresh")));
+  const selected = marketKey === state.market ? normalizeSymbolForMarket(state.selected, marketKey) : null;
+  return [...new Set([selected, ...portfolioSymbols, ...watchlist].filter(Boolean))]
+    .filter((symbol) => allowWatchSymbolForMarket(symbol, marketKey, watchlistOriginFor(symbol, marketKey, "refresh")));
 }
 
 function mergePreparedSignalsIntoAnalysis(prepared, market = state.market) {
@@ -7225,8 +7520,43 @@ function improvementHtml(improvement = {}) {
   `;
 }
 
+function productionTrainingSummaryHtml(training = null) {
+  if (!training) return "";
+  const dataset = training.dataset || {};
+  const target = dataset.firstStageTarget || {};
+  const eligibility = training.productionEligibility || {};
+  const failedChecks = Object.entries(eligibility.checks || {}).filter(([, passed]) => !passed).map(([name]) => name);
+  const horizonRows = Array.isArray(training.horizonModels) ? training.horizonModels : [];
+  return `
+    <div class="boost-plan production-training-evidence">
+      <div class="boost-row">
+        <strong>市场级多任务 OOF 候选 · ${escapeHtml(training.manifest?.deployment_status || "research")}</strong>
+        <span>${escapeHtml(training.framework || "market-level-multitask-oof-calibrated-stack")} · 版本 ${escapeHtml(training.manifest?.model_version || "待生成")}</span>
+        <p>样本 ${formatCompactNumber(dataset.rawRows || 0, 0)} 行 · 有效 ${formatCompactNumber(dataset.effectiveWeightedRows || 0, 1)} · 股票 ${dataset.symbolCount || 0}/${target.symbols || "-"} · PIT 事件覆盖 ${numberOrPending(dataset.pointInTimeCoveragePct, 1)}% · 泄漏违规 ${dataset.pointInTimeJoinViolationCount || 0}</p>
+        <p class="muted small-text">${eligibility.eligible ? "已具备生产证据，但仍需 Paper Champion 与显式晋升。" : `当前仅允许 Research/Shadow；未通过：${failedChecks.map(escapeHtml).join("、") || "周期样本/OOF 证据不足"}。`}</p>
+      </div>
+      ${horizonRows.map((row) => {
+        const metrics = row.metrics || {};
+        const ranking = row.rankingMetrics || {};
+        const quantile = row.conformalQuantiles || {};
+        const weights = Object.entries(row.weights || {}).sort(([, left], [, right]) => Number(right) - Number(left));
+        const failed = Object.entries(row.productionChecks || {}).filter(([, passed]) => !passed).map(([name]) => name);
+        return `
+          <div class="boost-row">
+            <strong>${row.horizon || "-"}日 · ${escapeHtml(row.deploymentStatus || "research")} · OOF ${formatCompactNumber(row.oofRows || 0, 0)}</strong>
+            <span>BSS ${numberOrPending(metrics.brierSkillScore, 3)} · ECE ${numberOrPending(metrics.ecePct, 2)}% · 校准斜率 ${numberOrPending(metrics.calibrationSlope, 2)} · Rank IC ${numberOrPending(ranking.rankIc, 3)} · Top-K lift ${ranking.topDecileLift == null ? "n/a" : formatPct(ranking.topDecileLift)}</span>
+            <p>目标/止损/超时 ${row.eventCounts?.target || 0}/${row.eventCounts?.stop || 0}/${row.eventCounts?.timeout || 0} · CQR覆盖 ${quantile.observedCoveragePct == null ? "n/a" : `${Number(quantile.observedCoveragePct).toFixed(1)}%`} · EV ${row.expectedValue?.expectedValuePct == null ? "n/a" : formatPct(row.expectedValue.expectedValuePct)}</p>
+            ${weights.length ? `<p class="muted small-text">受约束权重：${weights.map(([name, value]) => `${escapeHtml(name)} ${Math.round(Number(value) * 100)}%`).join(" · ")}</p>` : ""}
+            ${failed.length ? `<p class="muted small-text">生产门控未通过：${failed.map(escapeHtml).join("、")}</p>` : ""}
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function predictionCalibrationSummaryHtml(source = null) {
-  if (!source) return `<p class="muted">预测权重校准尚未生成。运行历史预测校准后会在这里显示短/中/长期模型权重。</p>`;
+  if (!source) return `<p class="muted">市场级 OOF 证据尚未生成。启动后台训练后会在这里显示 5/15/30 日模型、概率校准和生产门控。</p>`;
   const calibration = source.predictionCalibration || null;
   const horizons = Array.isArray(source.horizonCalibrations) ? source.horizonCalibrations : [];
   const rows = horizons.length ? horizons : calibration ? [calibration] : [];
@@ -7260,6 +7590,7 @@ function predictionCalibrationSummaryHtml(source = null) {
         <span>${escapeHtml(source.framework || "prediction-weight-calibration")} · 保存 ${source.savedAt ? new Date(source.savedAt).toLocaleString() : source.generatedAt ? new Date(source.generatedAt).toLocaleString() : "本次运行"} · 训练股票 ${source.availableCount || source.symbolCount || 0}/${trainingSymbolCount || source.symbolCount || 0} · 用户输入 ${requestedSymbolCount || 0} · 样本 ${formatCompactNumber(source.sampleTotal || 0, 0)}</span>
         <p>目标是校准“预测方法本身”的准确率，不等同于买入策略回测；短期、中期、长期分别学习权重，避免把长期逻辑硬套到隔日/短线预测。</p>
       </div>
+      ${productionTrainingSummaryHtml(source.productionTraining)}
       ${cards || `<div class="boost-row"><strong>样本不足</strong><span>等待更多历史切片</span><p>需要更多真实K线切片才能分周期学习权重。</p></div>`}
     </div>
   `;
@@ -7270,8 +7601,8 @@ function historicalBacktestHtml(summary = null) {
   if (!summary) {
     return `
       <div class="learning-section">
-        <h4>历史预测校准</h4>
-        ${savedModel ? predictionCalibrationSummaryHtml(savedModel) : `<p class="muted">点击“5年历史预测校准”后，会用过去每个可用交易日模拟当时预测，只用该日以前的数据训练，再按短/中/长期验证预测头权重是否优于等权和动量基线。</p>`}
+        <h4>市场级预测校准</h4>
+        ${savedModel ? predictionCalibrationSummaryHtml(savedModel) : `<p class="muted">启动市场级训练后，后台会按市场与 5/15/30 日周期生成严格样本外预测、概率校准和生产拒绝证据；页面无需等待作业完成。</p>`}
         ${savedModel?.crossSectionalFactorResearch ? crossSectionalFactorResearchHtml(savedModel.crossSectionalFactorResearch) : ""}
       </div>
     `;
@@ -7284,6 +7615,10 @@ function historicalBacktestHtml(summary = null) {
   const conformalCalibration = summary.conformalCalibration || summary.savedModel?.conformalCalibration || {};
   const conformalOverall = conformalCalibration.overall || {};
   const conformalCurrent = conformalCalibration.currentRegimeSummary || conformalOverall;
+  const statisticalReliability = summary.statisticalReliability || summary.savedModel?.statisticalReliability || {};
+  const reliabilityTarget = statisticalReliability.target || {};
+  const reliabilityStop = statisticalReliability.stop || {};
+  const reliabilityDirection = statisticalReliability.direction || {};
   const results = Array.isArray(summary.results) ? summary.results : [];
   const availableRows = results.filter((row) => row.available);
   const unavailableRows = results.filter((row) => !row.available);
@@ -7295,7 +7630,7 @@ function historicalBacktestHtml(summary = null) {
     : Number(summary.trainingUniverse?.requestedSymbols?.length || 0);
   return `
     <div class="learning-section">
-      <h4>历史预测校准</h4>
+      <h4>市场级预测校准</h4>
       ${predictionCalibrationSummaryHtml(summary.savedModel || summary)}
       <div class="accuracy-grid">
         <div class="accuracy-metric"><span>股票 / 可用</span><strong>${summary.symbolCount || 0} / ${summary.availableCount || 0}</strong></div>
@@ -7318,7 +7653,10 @@ function historicalBacktestHtml(summary = null) {
         <div class="accuracy-metric"><span>退化K线</span><strong>${pctOrPending(dataQuality.degradedRowPct)}</strong></div>
         <div class="accuracy-metric"><span>方向命中</span><strong>${pctOrPending(metrics.directionHitRate)}</strong></div>
         <div class="accuracy-metric"><span>达标命中</span><strong>${pctOrPending(metrics.targetHitRate)}</strong></div>
+        <div class="accuracy-metric"><span>达标下界</span><strong>${pctOrPending(metrics.targetHitLowerBound ?? reliabilityTarget.lowerBound)}</strong></div>
         <div class="accuracy-metric"><span>先止损率</span><strong>${pctOrPending(metrics.stopRate)}</strong></div>
+        <div class="accuracy-metric"><span>止损上界</span><strong>${pctOrPending(metrics.stopRateUpperBound ?? reliabilityStop.upperBound)}</strong></div>
+        <div class="accuracy-metric"><span>统计把握</span><strong>${numberOrPending(metrics.statisticalReliabilityScore ?? statisticalReliability.score, 0)}</strong></div>
         <div class="accuracy-metric"><span>平均收益</span><strong>${metrics.avgForwardReturn == null ? "n/a" : formatPct(metrics.avgForwardReturn)}</strong></div>
         <div class="accuracy-metric"><span>目标Brier</span><strong>${numberOrPending(metrics.brierTarget, 3)}</strong></div>
       </div>
@@ -7334,6 +7672,13 @@ function historicalBacktestHtml(summary = null) {
           <strong>共形误差区间校准</strong>
           <span>${escapeHtml(conformalCalibration.framework)} · 样本 ${formatCompactNumber(conformalCurrent.samples || conformalOverall.samples || 0, 0)} · P80 ${conformalCurrent.finalReturnAbsErrorP80 == null ? "n/a" : `±${Number(conformalCurrent.finalReturnAbsErrorP80).toFixed(2)}%`} · P90 ${conformalCurrent.finalReturnAbsErrorP90 == null ? "n/a" : `±${Number(conformalCurrent.finalReturnAbsErrorP90).toFixed(2)}%`} · 不确定性 ${numberOrPending(conformalCurrent.uncertaintyScore ?? conformalOverall.uncertaintyScore, 0)}</span>
           <p>${escapeHtml(conformalCalibration.policy || "按历史预测残差估计未来标签误差带；误差带过宽时降低高置信幅度预测。")}</p>
+        </div>
+      ` : ""}
+      ${statisticalReliability.framework ? `
+        <div class="boost-row">
+          <strong>统计置信区间门控</strong>
+          <span>${escapeHtml(statisticalReliability.framework)} · ${escapeHtml(statisticalReliability.status || "collecting")} · 达标下界 ${pctOrPending(reliabilityTarget.lowerBound)} · 止损上界 ${pctOrPending(reliabilityStop.upperBound)} · 方向下界 ${pctOrPending(reliabilityDirection.lowerBound)} · 有效独立样本 ${numberOrPending(reliabilityTarget.effectiveSamples, 1)}</span>
+          <p>${escapeHtml(statisticalReliability.policy || "使用样本权重 Wilson 区间，要求高置信标签不只命中率点估计高，还要统计下界有支撑。")}</p>
         </div>
       ` : ""}
       <div class="bucket-list">
@@ -7457,16 +7802,18 @@ function accuracyBoostPlanHtml(rows = []) {
 
 function optimizedWeightLearningHtml(optimization = null) {
   if (!optimization) return `<p class="muted">学习型权重尚未生成。</p>`;
+  const productionReady = optimization.productionEligible === true && optimization.active === true;
+  const gate = optimization.productionGate || {};
   const weights = Object.entries(optimization.weights || {})
     .sort(([, a], [, b]) => Number(b || 0) - Number(a || 0))
     .slice(0, 10);
-  const statusText = optimization.active
+  const statusText = productionReady
     ? `已启用 · 样本 ${optimization.sampleCount || 0} · 测试集MSE改善 ${optimization.testImprovementPct == null ? "n/a" : `${Number(optimization.testImprovementPct).toFixed(1)}%`} · 混合 ${Math.round(Number(optimization.deploymentBlend || 0) * 100)}%`
-    : `${optimization.status || "collecting"} · 样本 ${optimization.sampleCount || 0}/${optimization.minSamples || 24}`;
+    : `${optimization.status || "collecting"} · 样本 ${optimization.sampleCount || 0}/${gate.required?.rows || optimization.minSamples || 500} · 仅 Research/Shadow`;
   return `
     <div class="boost-plan">
       <div class="boost-row">
-        <strong>${optimization.active ? "样本外最优权重已启用" : "学习型权重未替换线上权重"}</strong>
+        <strong>${productionReady ? "样本外最优权重已启用" : "学习型权重未替换线上权重"}</strong>
         <span>${escapeHtml(statusText)}</span>
         <p>${escapeHtml(optimization.reason || "需要更多到期样本或样本外表现还没有超过旧权重。")}</p>
       </div>
@@ -7487,22 +7834,35 @@ function modelZooCommitteeHtml(modelZoo = null) {
   const test = modelZoo.test || {};
   const baselines = modelZoo.baselines || {};
   const reject = modelZoo.rejectGate || {};
+  const stability = modelZoo.stability || {};
   const candidates = Array.isArray(modelZoo.candidates) ? modelZoo.candidates : [];
   const adapters = Array.isArray(modelZoo.externalAdapters) ? modelZoo.externalAdapters : [];
-  const statusText = modelZoo.active
+  const productionReady = modelZoo.productionEligible === true && modelZoo.active === true;
+  const productionGate = modelZoo.productionGate || {};
+  const statusText = productionReady
     ? `已接入实时 ensemble · 样本 ${modelZoo.sampleCount || 0} · 候选 ${modelZoo.activeCandidateCount || 0}/${modelZoo.candidateCount || 0}`
-    : `${modelZoo.status || "collecting"} · 样本 ${modelZoo.sampleCount || 0}/${modelZoo.minSamples || 48}`;
+    : `${modelZoo.status || "collecting"} · 样本 ${modelZoo.sampleCount || 0}/${productionGate.required?.rows || modelZoo.minSamples || 500} · 仅 Research/Shadow`;
   return `
     <div class="boost-plan">
       <div class="boost-row">
-        <strong>多模型预测委员会 · ${modelZoo.active ? "样本外通过" : "研究观察"}</strong>
+        <strong>多模型预测委员会 · ${productionReady ? "生产门槛通过" : "研究观察"}</strong>
         <span>${escapeHtml(statusText)} · 测试方向 ${pctOrPending(test.directionHitRate)} · MSE ${numberOrPending(test.mse, 3)}</span>
         <p>${escapeHtml(modelZoo.reason || "候选模型必须先在验证集学习权重，再到后面的测试集打赢基准；没有通过时不会提高实时置信率。")}</p>
+      </div>
+      <div class="boost-row">
+        <strong>生产资格闸门</strong>
+        <span>${productionReady ? "全部通过" : `未通过 ${escapeHtml((productionGate.failedChecks || []).join(" / ") || "仍在收集")}`}</span>
+        <p>生产要求：训练样本 ${productionGate.required?.rows || 500}+、独立测试 ${productionGate.required?.testRows || 150}+、止盈/止损事件各 ${productionGate.required?.targetEvents || 50}/${productionGate.required?.stopEvents || 50}+、滚动窗口 ${productionGate.required?.rollingFolds || 5} 个且至少 ${productionGate.required?.positiveRollingFolds || 4} 个为正。</p>
       </div>
       <div class="boost-row">
         <strong>拒绝预测闸门</strong>
         <span>阈值 ${numberOrPending(reject.threshold, 2)} · 接受 ${reject.acceptedSamples || 0} · 拒绝 ${reject.rejectedSamples || 0} · 接受后方向 ${pctOrPending(reject.acceptedDirectionHitRate)}</span>
         <p>${escapeHtml(reject.reason || "当候选模型分歧过大，系统会降低置信度或拒绝高置信买入，而不是硬给方向。")}</p>
+      </div>
+      <div class="boost-row">
+        <strong>跨阶段稳定性</strong>
+        <span>${stability.available ? `${stability.pass ? "通过" : "未通过"} · ${stability.foldCount || 0} 折 · 稳定候选 ${stability.stableCandidateCount || 0} · 分数 ${numberOrPending(stability.stabilityScore, 0)}` : `收集样本 ${modelZoo.sampleCount || 0}/${stability.minSamples || 72}`}</span>
+        <p>${escapeHtml(stability.reason || "候选需要在多个后续时间段重复表现稳定，单一测试集表现不能直接抬高实时置信度。")}</p>
       </div>
       <div class="boost-row">
         <strong>基准对照</strong>
@@ -7514,7 +7874,7 @@ function modelZooCommitteeHtml(modelZoo = null) {
       ${candidates.length ? candidates.map((candidate) => `
         <div class="bucket-row model-zoo-row">
           <strong>${escapeHtml(candidate.label || candidate.name || "-")}</strong>
-          <span>${escapeHtml(candidate.family || candidate.kind || "model")} · ${candidate.active ? "active" : candidate.status || "research"}</span>
+          <span>${escapeHtml(candidate.family || candidate.kind || "model")} · ${candidate.productionEligible ? "production" : candidate.status || "research"}</span>
           <span>权重 ${Math.round(Number(candidate.weight || 0) * 100)}%</span>
           <span>测试方向 ${pctOrPending(candidate.test?.directionHitRate)}</span>
           <span>MSE ${numberOrPending(candidate.test?.mse, 3)}</span>
@@ -7530,6 +7890,42 @@ function modelZooCommitteeHtml(modelZoo = null) {
           <span>${escapeHtml(row.role || "")}</span>
         </div>
       `).join("") : ""}
+    </div>
+  `;
+}
+
+function horizonModelScopesHtml(deployment = null) {
+  const scopes = deployment?.horizonSuites || {};
+  const rows = [
+    ["short", "短期 1-7日"],
+    ["mid", "中期 8-25日"],
+    ["long", "长期 26日+"],
+  ].map(([key, label]) => ({ key, label, scope: scopes[key] || {} }));
+  if (!Object.keys(scopes).length) return `<p class="muted">周期隔离模型尚未生成；当前仅显示市场级校准。</p>`;
+  return `
+    <div class="boost-plan">
+      <div class="boost-row">
+        <strong>周期隔离部署</strong>
+        <span>短/中/长期各自训练与验证</span>
+        <p>${escapeHtml(deployment?.horizonPolicy?.note || "不同预测周期不共用学习权重；对应桶样本不足时，市场级模型只作为保守回退，不能提高高置信买入信号。")}</p>
+      </div>
+    </div>
+    <div class="bucket-list">
+      ${rows.map(({ key, label, scope }) => {
+        const zoo = scope.modelZoo || {};
+        const signal = scope.signalModels || {};
+        const activeHeads = Object.values(signal)
+          .filter((item) => item && typeof item === "object" && item.active === true).length;
+        return `
+          <div class="bucket-row">
+            <strong>${escapeHtml(label)}</strong>
+            <span>${escapeHtml(scope.status || (scope.available === false ? "collecting" : "ready"))}</span>
+            <span>样本 ${scope.sampleCount || 0}/${scope.minSamples || 32}</span>
+            <span>本地头 ${activeHeads}</span>
+            <span>委员会 ${zoo.active ? "OOS+稳定通过" : zoo.status || "collecting"}</span>
+          </div>
+        `;
+      }).join("")}
     </div>
   `;
 }
@@ -7685,7 +8081,7 @@ function modelExplainabilityHtml(summary = {}) {
             <span>历史校准权重 ${Math.round(row.weight * 100)}%</span>
             <span>${escapeHtml(MODEL_FORMULA_CATALOG[row.name] || "该预测头由后端历史回测公式生成，权重由样本外误差决定。")}</span>
           </div>
-        `).join("") : `<p class="muted">运行历史预测校准后，会显示短/中/长期预测头权重。</p>`}
+        `).join("") : `<p class="muted">运行市场级多任务训练后，会显示 5/15/30 日 OOF 权重与生产门控。</p>`}
       </div>
     </div>
   `;
@@ -7978,6 +8374,10 @@ function renderAccuracyPanel() {
     <div class="learning-section">
       <h4>学习型最优权重</h4>
       ${optimizedWeightLearningHtml(summary.ensembleWeightOptimization)}
+    </div>
+    <div class="learning-section">
+      <h4>短中长期模型</h4>
+      ${horizonModelScopesHtml(summary.localModelDeployment)}
     </div>
     <div class="learning-section">
       <h4>模型委员会与拒绝预测</h4>
@@ -8781,6 +9181,56 @@ function maxUpsideProbability(analysis) {
   return clamp(magnitudeProbability(analysis) - Math.min(14, Math.max(0, maxMove - Math.abs(projectedFinalReturn(analysis))) * 2.6), 0, 90);
 }
 
+function projectedMaxDownside(analysis) {
+  const explicit = Number(analysis.projectedMaxDownside ?? analysis.qualityGate?.projectedMaxDownside);
+  return Number.isFinite(explicit) && explicit > 0 ? explicit : null;
+}
+
+function maxDownsideProbability(analysis) {
+  const explicit = Number(analysis.maxDownsideHitProbability ?? analysis.maxDownsideConfidence ?? analysis.qualityGate?.maxDownsideHitProbability);
+  return Number.isFinite(explicit) && explicit > 0 ? explicit : null;
+}
+
+function confidenceBreakdownHtml(analysis) {
+  const finalReturn = projectedFinalReturn(analysis);
+  const finalProbability = finalReturnProbability(analysis);
+  const maxUp = projectedMaxUpside(analysis);
+  const maxUpProbability = maxUpsideProbability(analysis);
+  const maxDown = projectedMaxDownside(analysis);
+  const maxDownProbability = maxDownsideProbability(analysis);
+  const horizon = Math.max(1, Math.round(Number(analysis.horizonDays || getStrategy().horizonDays || 15)));
+  const direction = directionLabel(analysis);
+  const upside = clamp(Number(analysis.upsideConfidence || 0), 0, 100);
+  const downside = clamp(Number(analysis.downsideConfidence || 0), 0, 100);
+  const finalTone = finalReturn > 0 ? "good-text" : finalReturn < 0 ? "danger-text" : "muted";
+  const finalDirection = finalReturn > 0 ? "上涨" : finalReturn < 0 ? "下跌" : "横盘";
+  return `
+    <div class="confidence-breakdown-head">
+      <div><span>CONFIDENCE DECOMPOSITION</span><strong>综合置信不是单一答案</strong></div>
+      <p>方向、周期内极值与周期结束收益分别校准，避免把三种概率混成一个数字。</p>
+    </div>
+    <div class="confidence-breakdown-grid">
+      <section>
+        <span>01 · 方向判断</span>
+        <strong>${direction} · ${Math.round(directionReliability(analysis))}%</strong>
+        <div class="confidence-pair"><em>看涨 ${Math.round(upside)}%</em><em>看跌 ${Math.round(downside)}%</em></div>
+        <small>判断未来主要方向，不代表一定触及目标幅度。</small>
+      </section>
+      <section>
+        <span>02 · 周期内最大波动</span>
+        <strong class="good-text">最高上涨 +${formatPct(maxUp)} · ${Math.round(maxUpProbability)}%</strong>
+        <strong class="danger-text">最大下跌 ${maxDown == null ? "待新预测" : `-${formatPct(maxDown)} · ${Math.round(maxDownProbability || 0)}%`}</strong>
+        <small>分别表示周期内高点和低点触达估计，不等同于收盘收益。</small>
+      </section>
+      <section>
+        <span>03 · 周期结束</span>
+        <strong class="${finalTone}">${horizon} 日后${finalDirection} ${finalReturn > 0 ? "+" : ""}${formatPct(finalReturn)} · ${Math.round(finalProbability)}%</strong>
+        <div class="confidence-pair"><em>幅度置信 ${Math.round(magnitudeProbability(analysis))}%</em><em>策略达标 ${Math.round(strategyProbability(analysis))}%</em></div>
+        <small>描述周期结束时的方向和幅度，与中途最高/最低触达分开计算。</small>
+      </section>
+    </div>`;
+}
+
 function selectionUpside(analysis) {
   return Math.max(0, projectedFinalReturn(analysis), projectedMaxUpside(analysis) * 0.72);
 }
@@ -9213,6 +9663,212 @@ async function runAiStockPicker() {
   } finally {
     if (button) button.disabled = false;
   }
+}
+
+function applyPaperAgentBackendState(payload = {}) {
+  const market = safeMarket(payload.market || state.market);
+  if (!payload.ledger?.agents?.length) return false;
+  state.agentConfigByMarket[market] = payload.config || state.agentConfigByMarket[market] || {};
+  state.agentLedgerByMarket[market] = payload.ledger;
+  state.agentMemoryByMarket[market] = payload.memory || state.agentMemoryByMarket[market] || emptyAgentMemory(market);
+  state.paperAgentBackendAvailable = true;
+  state.paperAgentBackendStatus = "connected";
+  state.backendSchedulesAvailable = true;
+  safeStorage.setItem("paperAgentBackendConnected", "true");
+  saveAgentState();
+  if (market === state.market) {
+    renderAgentPanel();
+    renderOptimalStrategyPanel();
+  }
+  return true;
+}
+
+async function loadPaperAgentBackend(market = state.market, options = {}) {
+  const key = safeMarket(market);
+  try {
+    const response = await fetch(`/api/paper-agents?market=${encodeURIComponent(key)}`, { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Paper Agent backend unavailable");
+    applyPaperAgentBackendState(payload);
+    return payload;
+  } catch (error) {
+    state.paperAgentBackendStatus = "offline-local-view";
+    if (options.silent !== true) setStatus(`Paper Agent 后端暂不可用：${compactDisplayError(error.message)}；当前只显示本地只读备份`);
+    return null;
+  }
+}
+
+async function migratePaperAgentsToBackend() {
+  const marker = "paper-agent-browser-v3-nondestructive";
+  const backupKey = "paperAgentBrowserBackup:v1";
+  if (!safeStorage.getItem(backupKey)) {
+    safeStorage.setItem(backupKey, JSON.stringify({
+      savedAt: new Date().toISOString(),
+      agentConfigByMarket: state.agentConfigByMarket,
+      agentLedgerByMarket: state.agentLedgerByMarket,
+      agentMemoryByMarket: state.agentMemoryByMarket,
+    }));
+  }
+  const backup = readJsonStorage(backupKey, null);
+  const migrationConfig = backup?.agentConfigByMarket || state.agentConfigByMarket;
+  const migrationLedgers = backup?.agentLedgerByMarket || state.agentLedgerByMarket;
+  const migrationMemory = backup?.agentMemoryByMarket || state.agentMemoryByMarket;
+  for (const market of Object.keys(MARKET_CONFIG)) {
+    try {
+      const response = await fetch(`/api/paper-agents/migrate?market=${encodeURIComponent(market)}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          market,
+          migrationId: marker,
+          agentConfigByMarket: migrationConfig,
+          agentLedgerByMarket: migrationLedgers,
+          agentMemoryByMarket: migrationMemory,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Paper Agent migration failed");
+      applyPaperAgentBackendState(payload);
+    } catch (error) {
+      console.warn(`Paper Agent migration skipped for ${market}`, error);
+    }
+  }
+  safeStorage.setItem("paperAgentMigrationId", marker);
+}
+
+async function loadWorkspaceBootstrap(market = state.market) {
+  const key = safeMarket(market);
+  const token = state.marketSwitchToken;
+  try {
+    const response = await fetch(`/api/workspace/bootstrap?market=${encodeURIComponent(key)}`, { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Workspace bootstrap failed");
+    if (key !== state.market || token !== state.marketSwitchToken) return null;
+    state.backendSchedulesAvailable = true;
+    if (payload.paperAgents) applyPaperAgentBackendState(payload.paperAgents);
+    if (Array.isArray(payload.quoteOverlays)) {
+      const changed = applyQuoteOverlays(payload.quoteOverlays, key, { render: false });
+      if (changed) queueMainRender(["cards", "summary", "detail"]);
+    }
+    return payload;
+  } catch (error) {
+    console.warn("Workspace bootstrap unavailable", error);
+    return null;
+  }
+}
+
+function schedulePaperAgentReload(delay = 180) {
+  clearTimeout(state.paperAgentReloadTimer);
+  state.paperAgentReloadTimer = setTimeout(() => loadPaperAgentBackend(state.market, { silent: true }), delay);
+}
+
+function connectRuntimeEventStream() {
+  if (state.paperAgentEventSource || typeof EventSource !== "function") return;
+  const streamMarket = state.market;
+  const stream = new EventSource(`/api/runtime/stream?market=${encodeURIComponent(streamMarket)}`);
+  state.paperAgentEventSource = stream;
+  const reload = () => schedulePaperAgentReload();
+  ["paper-agent.trade", "paper-agent.config", "paper-agent.reset", "paper-agent.migrated"].forEach((type) => stream.addEventListener(type, reload));
+  stream.addEventListener("monitor.complete", () => {
+    if (streamMarket !== state.market) return;
+    state.backendSchedulesAvailable = true;
+    renderHomePage();
+  });
+  stream.addEventListener("market.quote", (event) => {
+    if (streamMarket !== state.market) return;
+    try {
+      const envelope = JSON.parse(event.data || "{}");
+      const overlay = envelope.payload || envelope;
+      if (safeMarket(overlay.market) !== state.market) return;
+      const changed = applyQuoteOverlays([overlay], state.market, { render: false });
+      if (changed) patchQuoteOverlayDom(overlay.symbol);
+    } catch (error) {
+      console.warn("Unable to apply live quote event", error);
+    }
+  });
+  stream.addEventListener("market.analysis", (event) => {
+    if (streamMarket !== state.market) return;
+    try {
+      const envelope = JSON.parse(event.data || "{}");
+      const payload = envelope.payload || envelope;
+      if (safeMarket(payload.market) !== state.market) return;
+      const item = normalizeAnalysisItem(payload, state.market);
+      if (!item) return;
+      state.analyses.set(item.symbol, item);
+      applyStoredQuoteOverlays(state.market);
+      state.analysesByMarket.set(state.market, new Map(state.analyses));
+      persistAnalysisSnapshot("backend-live-analysis", { server: false });
+      patchMonitorAnalysisDom(item.symbol);
+    } catch (error) {
+      console.warn("Unable to apply live analysis event", error);
+    }
+  });
+  stream.addEventListener("job.complete", async (event) => {
+    try {
+      const envelope = JSON.parse(event.data || "{}");
+      const payload = envelope.payload || envelope;
+      if (payload.type !== "backtest" || (payload.market && safeMarket(payload.market) !== state.market)) return;
+      const job = await requestJson(`/api/jobs/${encodeURIComponent(payload.id)}`);
+      if (!job?.result || safeMarket(job.result.market || state.market) !== state.market) return;
+      state.historicalBacktestSummary = job.result;
+      if (job.result.savedModel) {
+        state.accuracySummary ||= {};
+        state.accuracySummary.historicalPredictionModel = job.result.savedModel;
+      }
+      renderAccuracyPanel();
+      const trainingCount = job.result.trainingSymbols?.length || job.result.symbolCount || 0;
+      const production = job.result.productionTraining;
+      setStatus(`市场级训练完成：${trainingCount} 只股票，${formatCompactNumber(production?.dataset?.rawRows || job.result.sampleTotal || 0, 0)} 行，候选状态 ${production?.manifest?.deployment_status || "research"}`);
+    } catch (error) {
+      console.warn("Unable to load completed backtest job", error);
+    }
+  });
+  stream.addEventListener("job.failed", (event) => {
+    try {
+      const envelope = JSON.parse(event.data || "{}");
+      const payload = envelope.payload || envelope;
+      if (payload.type === "backtest" && (!payload.market || safeMarket(payload.market) === state.market)) {
+        setStatus(`市场级训练失败：${compactDisplayError(payload.error || "后台作业失败")}`);
+      }
+    } catch {
+      // Keep the live workspace usable if a malformed status event arrives.
+    }
+  });
+  stream.onopen = () => {
+    state.paperAgentBackendStatus = "streaming";
+    clearInterval(state.paperAgentPollTimer);
+    state.paperAgentPollTimer = null;
+  };
+  stream.onerror = () => {
+    state.paperAgentBackendStatus = "polling";
+    if (!state.paperAgentPollTimer) {
+      state.paperAgentPollTimer = setInterval(() => loadPaperAgentBackend(state.market, { silent: true }), 60_000);
+    }
+  };
+}
+
+async function savePaperAgentConfig(config = {}) {
+  const response = await fetch(`/api/paper-agents/config?market=${encodeURIComponent(state.market)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ market: state.market, config }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Paper Agent config save failed");
+  applyPaperAgentBackendState(payload);
+  return payload;
+}
+
+async function resetPaperAgentBackend(preserveMemory = true) {
+  const response = await fetch(`/api/paper-agents/reset?market=${encodeURIComponent(state.market)}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ market: state.market, preserveMemory }),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Paper Agent reset failed");
+  applyPaperAgentBackendState(payload);
+  return payload;
 }
 
 function agentConfigForMarket(market = state.market) {
@@ -10666,9 +11322,9 @@ function renderAgentPanel() {
   ledger.agents.forEach(markAgentToMarket);
   const memorySummary = `
     <div class="agent-memory-note">
-      <strong>长期策略记忆</strong>
+      <div class="agent-memory-heading"><strong>长期策略记忆</strong><span class="tag ${state.paperAgentBackendAvailable ? "good" : "warn"}">${state.paperAgentBackendAvailable ? `后台 Paper · ${escapeHtml(state.paperAgentBackendStatus)}` : "本地只读备份"}</span></div>
       <span>策略 ${Object.keys(memory.strategyBook || {}).length} 个 · 归档 ${memory.archives?.length || 0} 个周期 · 回放交易 ${Math.round(memory.totalReplayTrades || 0)} · 纸面成交 ${Math.round(memory.totalPaperTrades || 0)}</span>
-      <p>重置训练只会把当前周期归档；下一轮 agent 会继续继承长期胜率、策略评分和个股偏置。</p>
+      <p>${state.paperAgentBackendAvailable ? "浏览器关闭后仍由后端读取真实行情、执行 Paper 买卖并持久化；不会发送真实订单。" : "后端暂未连接；当前页面不会在浏览器内自动生成新成交。"}</p>
       ${(memory.lossLessons || []).length ? `<p>最近亏损经验：${memory.lossLessons.slice(0, 3).map((row) => `${escapeHtml(row.symbol)} ${formatPct(row.pnlPct)}：${escapeHtml(row.lesson)}`).join(" / ")}</p>` : ""}
     </div>
   `;
@@ -10855,10 +11511,12 @@ function renderPortfolioSummary() {
     <div class="metric"><span>可用 / 新买入</span><strong>${formatMoney(capital.availableCash)} / ${formatMoney(capital.availableForNewTrades)}</strong></div>
     <div class="metric"><span>买入/轻仓关注</span><strong>${alerts}</strong></div>
   `;
-  renderAlerts();
-  renderPortfolioTable();
-  renderAllocationAdvice();
-  renderAccuracyPanel();
+  if (state.activePage === "simulation") {
+    renderAlerts();
+    renderPortfolioTable();
+    renderAllocationAdvice();
+  }
+  if (state.activePage === "strategy") renderAccuracyPanel();
 }
 
 function universeMetaForSymbol(symbol, market = state.market) {
@@ -10869,13 +11527,158 @@ function universeMetaForSymbol(symbol, market = state.market) {
 function selectWatchSymbol(symbol) {
   const normalized = normalizeSymbolForMarket(symbol, state.market);
   if (!normalized) return;
+  if (state.selected !== normalized) {
+    state.detailEvidence = { symbol: normalized, open: false, tab: "decision" };
+    state.detailConfidence = { symbol: normalized, open: false };
+  }
   state.selected = normalized;
   renderCards();
   renderDetail();
 }
 
+let watchSparklineFrame = 0;
+
+function drawWatchlistSparklines(root = document) {
+  const scrollRoot = $("cards");
+  const scrollRect = scrollRoot?.getBoundingClientRect();
+  root.querySelectorAll("[data-watch-sparkline]").forEach((slot) => {
+    const canvasRect = slot.getBoundingClientRect();
+    if (scrollRect && (
+      canvasRect.bottom < scrollRect.top - 24
+      || canvasRect.top > scrollRect.bottom + 24
+      || canvasRect.right < scrollRect.left - 24
+      || canvasRect.left > scrollRect.right + 24
+    )) return;
+    let canvas = slot;
+    if (!(slot instanceof HTMLCanvasElement)) {
+      canvas = document.createElement("canvas");
+      canvas.dataset.watchSparkline = slot.dataset.watchSparkline;
+      canvas.setAttribute("aria-label", slot.getAttribute("aria-label") || `${slot.dataset.watchSparkline} 最近真实走势`);
+      slot.replaceWith(canvas);
+    }
+    const symbol = normalizeSymbolForMarket(canvas.dataset.watchSparkline, state.market);
+    const item = state.analyses.get(symbol);
+    const values = (item?.candles || []).slice(-30).map((row) => Number(row.close)).filter((value) => Number.isFinite(value) && value > 0);
+    if (values.length < 3) return;
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(72, Math.round(rect.width || 94));
+    const height = Math.max(24, Math.round(rect.height || 30));
+    const ratio = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = Math.max(0.0001, max - min);
+    const positive = values.at(-1) >= values[0];
+    const stroke = positive ? "#7dd3a5" : "#ef8e9b";
+    const fill = positive ? "rgba(125, 211, 165, 0.08)" : "rgba(239, 142, 155, 0.08)";
+    const points = values.map((value, index) => ({
+      x: 2 + index / Math.max(1, values.length - 1) * (width - 4),
+      y: 3 + (1 - (value - min) / range) * (height - 7),
+    }));
+    ctx.beginPath();
+    points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+    ctx.lineTo(points.at(-1).x, height - 2);
+    ctx.lineTo(points[0].x, height - 2);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.beginPath();
+    points.forEach((point, index) => index ? ctx.lineTo(point.x, point.y) : ctx.moveTo(point.x, point.y));
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke();
+  });
+}
+
+function scheduleWatchlistSparklines(root = document) {
+  if (watchSparklineFrame) cancelAnimationFrame(watchSparklineFrame);
+  watchSparklineFrame = requestAnimationFrame(() => {
+    watchSparklineFrame = 0;
+    drawWatchlistSparklines(root);
+  });
+}
+
+const WATCHLIST_SORT_KEYS = new Set(["addedAt", "symbol", "price", "change", "confidence"]);
+
+function watchlistSortConfig(market = state.market) {
+  const key = safeMarket(market);
+  const saved = state.watchlistSortByMarket?.[key] || {};
+  const config = {
+    key: WATCHLIST_SORT_KEYS.has(saved.key) ? saved.key : "addedAt",
+    direction: saved.direction === "asc" ? "asc" : "desc",
+  };
+  state.watchlistSortByMarket[key] = config;
+  return config;
+}
+
+function watchlistSortValue(symbol, key, index) {
+  const item = state.analyses.get(symbol);
+  if (key === "symbol") return symbol;
+  if (key === "addedAt") {
+    const timestamp = Date.parse(watchlistAddedAtFor(symbol, state.market) || "");
+    return Number.isFinite(timestamp) ? timestamp : -index;
+  }
+  if (key === "price") return Number(item?.marketOverlay?.price ?? item?.technicals?.close);
+  if (key === "change") return Number(item?.marketOverlay?.changePercent ?? item?.quote?.changePercent);
+  if (key === "confidence") return Number(item?.analysis?.confidence);
+  return index;
+}
+
+function sortedWatchlistSymbols() {
+  const config = watchlistSortConfig();
+  return state.watchlist
+    .map((symbol, index) => ({ symbol, index, value: watchlistSortValue(symbol, config.key, index) }))
+    .sort((left, right) => {
+      const leftMissing = config.key !== "symbol" && !Number.isFinite(left.value);
+      const rightMissing = config.key !== "symbol" && !Number.isFinite(right.value);
+      if (leftMissing || rightMissing) {
+        if (leftMissing && rightMissing) return left.index - right.index;
+        return leftMissing ? 1 : -1;
+      }
+      const comparison = config.key === "symbol"
+        ? String(left.value).localeCompare(String(right.value), activeMarketConfig().locale, { numeric: true, sensitivity: "base" })
+        : Number(left.value) - Number(right.value);
+      if (comparison === 0) return left.index - right.index;
+      return config.direction === "asc" ? comparison : -comparison;
+    })
+    .map((row) => row.symbol);
+}
+
+function syncWatchlistSortControls() {
+  const config = watchlistSortConfig();
+  const select = $("watchlistSortKey");
+  const direction = $("watchlistSortDirection");
+  if (select && select.value !== config.key) select.value = config.key;
+  if (direction) {
+    const ascending = config.direction === "asc";
+    direction.innerHTML = `<i data-lucide="arrow-${ascending ? "up" : "down"}"></i><span>${ascending ? "升序" : "降序"}</span>`;
+    direction.setAttribute("aria-label", `当前${ascending ? "升序" : "降序"}，点击切换为${ascending ? "降序" : "升序"}`);
+    direction.title = `切换为${ascending ? "降序" : "升序"}`;
+  }
+}
+
+function setWatchlistSort(nextKey, nextDirection = null) {
+  const current = watchlistSortConfig();
+  state.watchlistSortByMarket[state.market] = {
+    key: WATCHLIST_SORT_KEYS.has(nextKey) ? nextKey : current.key,
+    direction: nextDirection === "asc" || nextDirection === "desc" ? nextDirection : current.direction,
+  };
+  safeStorage.setItem("watchlistSortByMarket", JSON.stringify(state.watchlistSortByMarket));
+  syncWatchlistSortControls();
+  renderCards();
+}
+
 function renderCards() {
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
+  reconcileWatchlistAddedAt(state.market);
+  syncWatchlistSortControls();
   const cardsEl = $("cards");
   if (!cardsEl) return;
   const universeMeta = new Map();
@@ -10883,7 +11686,7 @@ function renderCards() {
     if (row.symbol) universeMeta.set(row.symbol, row);
     if (row.code) universeMeta.set(row.code, row);
   });
-  const cards = state.watchlist.map((symbol) => {
+  const cards = sortedWatchlistSymbols().map((symbol) => {
     try {
       const meta = universeMeta.get(symbol) || {};
       const displayName = meta.name && meta.name !== symbol ? meta.name : activeMarketConfig().label;
@@ -10893,130 +11696,140 @@ function renderCards() {
       if (!item) {
         return `
           <article class="stock-card empty-card${selectedClass}" data-symbol="${symbol}" data-card-symbol="${symbol}">
-            <div class="card-top">
-              <div class="stock-title-block">
-                <h3>${symbol}</h3>
-                <small class="stock-name">${escapeHtml(displayName)}</small>
-              </div>
-              <div class="card-signal-stack">
-                <span class="card-state-chip warn">未刷新</span>
-                <div class="card-actions card-top-actions">
-                  <button class="danger-soft mini-btn" type="button" data-delete-symbol="${symbol}">删除</button>
-                </div>
-              </div>
-            </div>
-            <div class="tag-row card-primary-tags"><span class="tag warn">${watchOriginLabel}</span><span class="tag">${activeMarketConfig().label}</span></div>
-            <div class="decision-row">
-              <span class="muted">等待真实行情</span>
-            </div>
+            <div class="watch-symbol"><h3>${symbol}</h3><small>${escapeHtml(displayName)}</small></div>
+            <div class="watch-spark-empty">走势数据不足</div>
+            <div class="watch-quote"><strong>--</strong><span>等待真实行情</span></div>
+            <span class="watch-signal warn">未刷新</span>
+            <button class="watch-delete" type="button" data-delete-symbol="${symbol}" title="删除 ${symbol}" aria-label="删除 ${symbol}"><i data-lucide="trash-2"></i></button>
           </article>
         `;
       }
       const technicals = normalizeTechnicals(item.technicals);
       const analysis = normalizeAnalysis(item.analysis);
       const isError = analysis.action === "ERROR";
-      const isDegraded = item.marketValidation?.degraded;
-      const sourceClass = isError ? "danger" : isDegraded ? "warn" : "good";
-      const sourceLabel = isError ? errorLabel(item.errorKind) : isDegraded ? "单源真实数据" : item.marketSource;
-      const quoteLabel = item.quote?.source ? `最新价 ${item.quote.delayed ? "延迟" : "实时"}` : "";
-      const alertTag = !isError && isBuyAction(analysis.action)
-        ? `<span class="tag ${analysis.action === "LIGHT_BUY" ? "warn" : "good"}">${actionLabel(analysis.action)} ${formatMoney(analysis.suggestedTradeValue || 0)}</span>`
-        : !isError && ["STRONG_AVOID", "CRITICAL_SELL"].includes(analysis.action)
-          ? `<span class="tag danger">${actionLabel(analysis.action)}</span>`
-        : "";
-      const factorScore = factorScoreForItem(item);
-      const directionText = directionLabel(analysis);
-      const directionProb = directionReliability(analysis);
-      const finalProb = finalReturnProbability(analysis);
-      const maxMove = projectedMaxUpside(analysis);
-      const maxProb = maxUpsideProbability(analysis);
-      const strategyProb = strategyProbability(analysis);
       const cardTone = isError ? "blocked" : isStrictBuyAction(analysis.action) ? "ready" : isRiskAction(analysis.action) ? "danger" : "watch";
-      const indicatorTags = isError ? "" : `
-            ${alertTag}
-            <span class="tag ${tagClass(projectedFinalReturn(analysis), getStrategy().targetUpside, 0)}">结束 ${formatPct(projectedFinalReturn(analysis))}</span>
-            <span class="tag ${tagClass(finalProb, Math.max(55, getStrategy().confidence - 22), 36)}">结束置信 ${Math.round(finalProb)}%</span>
-            <span class="tag ${tagClass(maxMove, getStrategy().targetUpside, 0)}">最高触达 ${formatPct(maxMove)}</span>
-            <span class="tag ${tagClass(maxProb, Math.max(55, getStrategy().confidence - 22), 36)}">触达置信 ${Math.round(maxProb)}%</span>
-            <span class="tag ${tagClass(directionProb, getStrategy().confidence, 40)}">方向 ${directionText} ${Math.round(directionProb)}%</span>
-            <span class="tag ${tagClass(strategyProb, strategyProbabilityTarget(analysis), 45)}">策略达标 ${Math.round(strategyProb)}%</span>
-            <span class="tag ${tagClass(analysis.confidence, getStrategy().confidence, 45)}">综合 ${Math.round(analysis.confidence)}%</span>
-            <span class="tag ${tagClass(factorScore, 8, -6)}">因子 ${factorScore.toFixed(1)}</span>
-            <span class="tag ${tagClass(technicals.rsi, 55, 35)}">RSI ${technicals.rsi.toFixed(1)}</span>
-            <span class="tag ${tagClass(technicals.mainForceProxy, 58, 42)}">主力代理 ${technicals.mainForceProxy.toFixed(0)}</span>`;
-      const subline = isError
-        ? "配置真实行情源后再分析"
-        : `5日 ${formatPct(technicals.change5d)} · 量比 ${technicals.volumeRatio.toFixed(2)}`;
+      const changePercent = Number(item.marketOverlay?.changePercent ?? item.quote?.changePercent);
+      const changeText = Number.isFinite(changePercent) ? formatPct(changePercent) : "当日 --";
+      const changeTone = Number.isFinite(changePercent) ? (changePercent >= 0 ? "positive" : "negative") : "muted";
+      const hasSparkline = !isError && (item.candles || []).length >= 3;
+      const freshness = item.marketOverlay?.stale || item.analysisNeedsRefresh ? "stale" : "fresh";
+      const freshnessLabel = item.marketOverlay?.stale ? "行情较旧" : item.analysisNeedsRefresh ? "待重算" : `${Math.round(analysis.confidence)}%`;
       return `
-        <article class="stock-card${selectedClass} ${isStrictBuyAction(analysis.action) ? "buy-alert" : isRiskAction(analysis.action) ? "risk-alert" : ""}" data-symbol="${symbol}" data-card-symbol="${symbol}">
-          <div class="card-top">
-            <div class="stock-title-block">
-              <h3>${symbol}</h3>
-              <small class="stock-name">${escapeHtml(displayName)}</small>
-            </div>
-            <div class="card-signal-stack">
-              <div class="price">${isError ? "N/A" : formatMoney(technicals.close)}</div>
-              <span class="card-state-chip ${cardTone}">${actionLabel(analysis.action)}</span>
-              <div class="card-actions card-top-actions">
-                <button class="secondary mini-btn" type="button" data-view="${symbol}">详情</button>
-                <button class="danger-soft mini-btn" type="button" data-delete-symbol="${symbol}">删除</button>
-              </div>
-            </div>
+        <article class="stock-card${selectedClass} ${isStrictBuyAction(analysis.action) ? "buy-alert" : isRiskAction(analysis.action) ? "risk-alert" : ""}" data-symbol="${symbol}" data-card-symbol="${symbol}" title="${escapeHtml(`${symbol} · ${item.marketOverlay?.source || item.quote?.source || item.marketSource || "真实行情"} · ${watchOriginLabel}`)}">
+          <div class="watch-symbol"><h3>${symbol}</h3><small>${escapeHtml(displayName)}</small></div>
+          <div class="watch-spark-wrap">${hasSparkline ? `<span class="watch-spark-slot" data-watch-sparkline="${symbol}" aria-label="${symbol} 最近真实走势"></span>` : `<span class="watch-spark-empty">走势数据不足</span>`}</div>
+          <div class="watch-quote">
+            <strong data-card-price>${isError ? "N/A" : formatMoney(technicals.close)}</strong>
+            <span class="${changeTone}" data-card-change>${isError ? "真实行情失败" : changeText}</span>
           </div>
-          ${isError ? "" : `
-            <div class="card-snapshot-grid">
-              <span><b>${formatPct(projectedFinalReturn(analysis))}</b><small>周期结束</small></span>
-              <span><b>${Math.round(strategyProb)}%</b><small>策略达标</small></span>
-              <span><b>${formatPct(maxMove)}</b><small>最高触达</small></span>
-              <span><b>${formatPct(technicals.change5d)}</b><small>5日变化</small></span>
-            </div>
-          `}
-          <div class="tag-row card-primary-tags">
-            <span class="tag ${sourceClass}">${sourceLabel}</span>
-            <span class="tag">${watchOriginLabel}</span>
-            ${quoteLabel ? `<span class="tag good">${quoteLabel}</span>` : ""}
-          </div>
-          <div class="tag-row card-factor-tags">
-            ${indicatorTags}
-          </div>
-          <div class="decision-row">
-            <span class="muted">${subline}</span>
-          </div>
+          <div class="watch-decision"><span class="watch-signal ${cardTone}">${actionLabel(analysis.action)}</span><small class="${freshness}">${freshnessLabel}</small></div>
+          <button class="watch-delete" type="button" data-delete-symbol="${symbol}" title="删除 ${symbol}" aria-label="删除 ${symbol}"><i data-lucide="trash-2"></i></button>
         </article>
       `;
     } catch (error) {
       console.error(`Unable to render card for ${symbol}`, error);
       return `
         <article class="stock-card blocked" data-symbol="${symbol}" data-card-symbol="${symbol}">
-          <div class="card-top">
-            <div class="stock-title-block">
-              <h3>${symbol}</h3>
-              <small class="stock-name">卡片渲染失败</small>
-            </div>
-            <div class="card-actions card-top-actions">
-              <button class="danger-soft mini-btn" type="button" data-delete-symbol="${symbol}">删除</button>
-            </div>
-          </div>
-          <div class="decision-row"><span class="muted">${escapeHtml(compactRuntimeError(error))}</span></div>
+          <div class="watch-symbol"><h3>${symbol}</h3><small>卡片渲染失败</small></div>
+          <div class="watch-spark-empty">${escapeHtml(compactRuntimeError(error))}</div>
+          <div class="watch-quote"><strong>N/A</strong><span>仍可删除或刷新</span></div>
+          <button class="watch-delete" type="button" data-delete-symbol="${symbol}" title="删除 ${symbol}" aria-label="删除 ${symbol}"><i data-lucide="trash-2"></i></button>
         </article>
       `;
     }
   }).join("");
   cardsEl.innerHTML = cards;
+  scheduleWatchlistSparklines(cardsEl);
+  cardsEl.onscroll = () => scheduleWatchlistSparklines(cardsEl);
   cardsEl.onclick = (event) => {
     const deleteButton = event.target.closest("[data-delete-symbol]");
     if (deleteButton) {
       deleteWatchSymbol(deleteButton.dataset.deleteSymbol);
       return;
     }
-    const viewButton = event.target.closest("[data-view]");
-    if (viewButton) {
-      selectWatchSymbol(viewButton.dataset.view);
-      return;
-    }
     const card = event.target.closest("[data-card-symbol]");
     if (card) selectWatchSymbol(card.dataset.cardSymbol);
   };
+  if (state.activePage === "home") renderHomePage();
+}
+
+function patchQuoteOverlayDom(symbol) {
+  const normalized = normalizeSymbolForMarket(symbol, state.market);
+  const item = state.analyses.get(normalized);
+  if (!normalized || !item) return;
+  const overlay = item.marketOverlay || {};
+  const card = [...document.querySelectorAll("[data-card-symbol]")].find((node) => node.dataset.cardSymbol === normalized);
+  if (card) {
+    const price = card.querySelector("[data-card-price]");
+    const change = card.querySelector("[data-card-change]");
+    if (price) price.textContent = formatMoney(item.technicals?.close);
+    if (change) {
+      const value = Number(overlay.changePercent ?? item.quote?.changePercent);
+      change.textContent = Number.isFinite(value) ? formatPct(value) : "当日 --";
+      change.className = Number.isFinite(value) ? (value >= 0 ? "positive" : "negative") : "muted";
+    }
+    const freshness = card.querySelector(".watch-decision small");
+    if (freshness) {
+      freshness.textContent = overlay.stale ? "行情较旧" : item.analysisNeedsRefresh ? "待重算" : `${Math.round(item.analysis?.confidence || 0)}%`;
+      freshness.className = overlay.stale || item.analysisNeedsRefresh ? "stale" : "fresh";
+    }
+    scheduleWatchlistSparklines(card);
+  }
+  if (state.selected !== normalized) return;
+  document.querySelectorAll("[data-detail-live-price]").forEach((node) => {
+    node.textContent = formatMoney(item.technicals?.close);
+  });
+  const detailChange = document.querySelector("[data-detail-live-change]");
+  if (detailChange) {
+    const value = Number(overlay.changePercent ?? item.quote?.changePercent);
+    detailChange.textContent = Number.isFinite(value) ? formatPct(value) : "当日 --";
+    detailChange.className = Number.isFinite(value) ? (value >= 0 ? "positive" : "negative") : "muted";
+  }
+  const staleBadge = $("analysisFreshnessBadge");
+  if (staleBadge) {
+    staleBadge.hidden = !item.analysisNeedsRefresh;
+    staleBadge.textContent = item.analysisNeedsRefresh ? "行情已更新，模型结论待重算" : "";
+  }
+  if ($("analysisSource")) {
+    const verifiedDataTime = item.marketDataAsOf || item.quote?.asOf;
+    const retrievedAt = item.marketRetrievedAt || item.quote?.retrievedAt;
+    const timeText = verifiedDataTime
+      ? ` · 行情时间：${formatSnapshotTime(verifiedDataTime)}`
+      : retrievedAt ? ` · 获取时间：${formatSnapshotTime(retrievedAt)}` : "";
+    $("analysisSource").textContent = `分析：${item.source || "unknown"} · 行情：${overlay.source || item.marketSource || "unknown"}${timeText}${item.analysisAsOf ? ` · 模型时间：${formatSnapshotTime(item.analysisAsOf)}` : ""}`;
+  }
+  scheduleChartRedraw("detail-live", () => renderCharts(item, document));
+}
+
+function patchMonitorAnalysisDom(symbol) {
+  const normalized = normalizeSymbolForMarket(symbol, state.market);
+  const item = state.analyses.get(normalized);
+  if (!normalized || !item) return;
+  const analysis = normalizeAnalysis(item.analysis);
+  const card = [...document.querySelectorAll("[data-card-symbol]")].find((node) => node.dataset.cardSymbol === normalized);
+  if (card) {
+    const signal = card.querySelector(".watch-signal");
+    if (signal) {
+      const tone = analysis.action === "ERROR"
+        ? "blocked"
+        : isStrictBuyAction(analysis.action)
+          ? "ready"
+          : isRiskAction(analysis.action)
+            ? "danger"
+            : "watch";
+      signal.textContent = actionLabel(analysis.action);
+      signal.className = `watch-signal ${tone}`;
+    }
+    const freshness = card.querySelector(".watch-decision small");
+    if (freshness) {
+      freshness.textContent = `${Math.round(analysis.confidence || 0)}%`;
+      freshness.className = "fresh";
+    }
+    card.classList.toggle("buy-alert", isStrictBuyAction(analysis.action));
+    card.classList.toggle("risk-alert", isRiskAction(analysis.action));
+    patchQuoteOverlayDom(normalized);
+  }
+  queueMainRender(state.selected === normalized ? ["summary", "detail"] : ["summary"]);
 }
 
 function renderPendingDetail(symbol) {
@@ -11045,199 +11858,209 @@ function renderPendingDetail(symbol) {
       <button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button>
     </div>
   `;
-  $("refreshSelectedStock")?.addEventListener("click", refreshAll);
+  $("refreshSelectedStock")?.addEventListener("click", () => refreshAll({ manual: true }));
   $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(normalized));
+}
+
+const EVIDENCE_TABS = [
+  ["decision", "决策依据"],
+  ["sources", "数据来源与时效"],
+  ["models", "模型与因子"],
+  ["history", "历史回测"],
+  ["news", "新闻与社媒"],
+];
+
+function evidenceDecisionHtml(item) {
+  const analysis = normalizeAnalysis(item.analysis);
+  const decision = decisionExplanation(item);
+  return `
+    ${item.analysisNeedsRefresh ? `<div class="evidence-notice warn"><strong>行情已更新，模型结论待重算</strong><span>当前价格不会反向修改旧预测；重新分析完成前，请按模型时间理解概率与目标。</span></div>` : ""}
+    <div class="decision-explain-card">
+      <div class="decision-explain-head"><strong>为什么${isBuyAction(analysis.action) ? "买入或关注" : "暂不买入"}</strong><span>买入分数 ${decision.buyScore.toFixed(1)} / 阈值 ${decision.threshold.toFixed(1)}</span></div>
+      <p>${escapeHtml(decision.summary || "当前没有可解释摘要。")}</p>
+      <div class="decision-check-grid">
+        ${decision.checks.length ? decision.checks.map((check) => `
+          <div class="${check.pass ? "pass" : "block"}"><strong>${escapeHtml(check.label)}</strong><span>${escapeHtml(check.note)}</span><em>${check.pass ? "通过" : `差 ${Math.max(0, Number(check.required || 0) - Number(check.value || 0)).toFixed(check.key === "volume" ? 2 : 1)}`}</em></div>
+        `).join("") : `<p class="muted">当前模型没有返回条件拆解。</p>`}
+      </div>
+    </div>`;
+}
+
+function evidenceSourcesHtml(item) {
+  const technicals = normalizeTechnicals(item.technicals);
+  const analysisPrice = asPositiveNumber(item.analysisPrice, technicals.close);
+  const quote = item.marketOverlay || item.quote || {};
+  return `
+    <div class="evidence-time-grid">
+      <div><span>当前行情</span><strong data-detail-live-price>${formatMoney(technicals.close)}</strong><small>${quote.changePercent != null ? formatPct(quote.changePercent) : "当日涨跌未返回"}</small></div>
+      <div><span>模型快照价格</span><strong>${formatMoney(analysisPrice)}</strong><small>${item.analysisAsOf ? formatSnapshotTime(item.analysisAsOf) : "时间未返回"}</small></div>
+      <div><span>行情时间</span><strong>${item.marketDataAsOf ? formatSnapshotTime(item.marketDataAsOf) : item.marketRetrievedAt ? "提供方未返回成交时间" : "未返回"}</strong><small>${item.marketRetrievedAt ? `读取 ${formatSnapshotTime(item.marketRetrievedAt)}` : ""}</small></div>
+      <div><span>行情来源</span><strong>${escapeHtml(quote.source || item.marketSource || "未返回")}</strong><small>${quote.delayed === false ? "实时" : "延迟或缓存"}</small></div>
+    </div>
+    ${item.marketWarning ? `<p class="evidence-source-warning">${escapeHtml(item.marketWarning)}</p>` : ""}
+    <div class="detail-grid evidence-metric-grid">
+      <div class="detail-item"><span>MACD Histogram</span><strong>${technicals.macdHistogram.toFixed(4)}</strong></div>
+      <div class="detail-item"><span>SMA20 / SMA50</span><strong>${technicals.sma20.toFixed(2)} / ${technicals.sma50.toFixed(2)}</strong></div>
+      <div class="detail-item"><span>成交强度代理</span><strong>${technicals.volumeRatio.toFixed(2)}x</strong></div>
+      <div class="detail-item"><span>20日涨跌</span><strong>${formatPct(technicals.change20d)}</strong></div>
+      <div class="detail-item"><span>主力仓位代理</span><strong>${technicals.mainForceProxy.toFixed(0)} / 100</strong></div>
+      <div class="detail-item"><span>数据验证</span><strong>${item.marketValidation?.degraded ? "单源真实数据" : item.marketValidation?.ok ? "双源通过" : "未完成交叉验证"}</strong></div>
+    </div>`;
+}
+
+function evidenceModelsHtml(item) {
+  const analysis = normalizeAnalysis(item.analysis);
+  const ensemble = analysis.ensemble || {};
+  const models = Array.isArray(ensemble.models) ? ensemble.models : [];
+  const factors = factorRows(item.factors);
+  return `
+    <div class="ensemble-summary">
+      <span>方向 ${escapeHtml(ensemble.direction || "n/a")}</span><span>上涨一致度 ${Math.round(ensemble.upsideAgreement || 0)}%</span><span>共识强度 ${Math.round(ensemble.consensusAgreement || 0)}%</span><span>数据源扣分 ${Math.round(ensemble.dataPenalty || 0)}%</span><span>策略达标 ${Math.round(strategyProbability(analysis))}%</span>
+    </div>
+    <div class="ensemble-grid evidence-row-list">
+      ${models.length ? models.map((model) => `<div class="ensemble-card ${model.available === false ? "muted-factor" : ""}"><div><strong>${escapeHtml(model.name || "模型")}</strong><span class="${Number(model.projectedUpside || 0) >= 0 ? "good-text" : "danger-text"}">${formatPct(model.projectedUpside || 0)}</span></div><p>置信 ${Math.round(model.confidence || 0)}% · 权重 ${Math.round((model.normalizedWeight || model.weight || 0) * 100)}%</p><p>${escapeHtml(model.reason || "暂无模型说明")}</p></div>`).join("") : `<p class="muted">集成模型尚未返回可展示结果。</p>`}
+    </div>
+    <h4>因子参与度</h4>
+    <div class="factor-grid evidence-row-list">
+      ${factors.length ? factors.map(([label, factor]) => `<div class="factor-card ${factor.available === false ? "muted-factor" : ""}"><div><strong>${escapeHtml(label)}</strong><span class="${Number(factor.score || 0) >= 0 ? "good-text" : "danger-text"}">${Number(factor.score || 0).toFixed(1)}</span></div><p>${escapeHtml((factor.thesis || ["暂无说明"])[0])}</p></div>`).join("") : `<p class="muted">因子层尚未返回；不会用模拟因子替代。</p>`}
+    </div>`;
+}
+
+function evidenceHistoryHtml(item) {
+  const analysis = normalizeAnalysis(item.analysis);
+  const analog = item.analog || {};
+  return `
+    <div class="evidence-time-grid">
+      <div><span>历史样本</span><strong>${Math.round(analog.count || analog.model?.sampleCount || 0)}</strong><small>相似/训练切片</small></div>
+      <div><span>方向命中</span><strong>${analog.count ? `${asNumber(analog.directionalHitRate ?? analog.winRate).toFixed(0)}%` : "样本不足"}</strong><small>按当前预测周期</small></div>
+      <div><span>目标触达</span><strong>${analog.count ? `${asNumber(analog.strategyHitProbability ?? analog.targetHitRate).toFixed(0)}%` : "样本不足"}</strong><small>目标与止损分离</small></div>
+      <div><span>样本外方向</span><strong>${analog.model?.oosSampleCount ? `${asNumber(analog.model.oosDirectionalAccuracy).toFixed(0)}%` : "未返回"}</strong><small>walk-forward</small></div>
+    </div>
+    <h4>历史相似走势</h4>
+    <ul class="evidence-list">${analog.examples?.length ? analog.examples.slice(0, 10).map((example) => `<li><strong>${escapeHtml(example.date)}</strong><span>${analysis.horizonDays || getStrategy().horizonDays} 日结束 ${formatPct(example.forwardReturn)} · 最高 ${formatPct(example.maxUpside || 0)} · 最大回撤 ${formatPct(example.maxDrawdown || 0)} · 距离 ${asNumber(example.distance).toFixed(2)}</span></li>`).join("") : `<li><span>历史样本不足，暂不把相似走势作为有效证据。</span></li>`}</ul>
+    <div class="evidence-thesis-grid"><div><h4>判断依据</h4><ul>${analysis.thesis.length ? analysis.thesis.map((text) => `<li>${escapeHtml(text)}</li>`).join("") : "<li>未返回判断摘要。</li>"}</ul></div><div><h4>主要风险</h4><ul>${analysis.risks.length ? analysis.risks.map((text) => `<li>${escapeHtml(text)}</li>`).join("") : "<li>未返回风险摘要。</li>"}</ul></div></div>`;
+}
+
+function evidenceNewsHtml(item) {
+  const news = Array.isArray(item.news) ? item.news : [];
+  const newsEmpty = item.signalRefreshedAt ? "当前真实新闻源本轮未返回新闻。" : "新闻尚未完成后台读取。";
+  return `
+    <div class="evidence-news-columns">
+      <div><h4>新闻</h4><ul>${news.length ? news.slice(0, 10).map((row) => `<li><a href="${escapeHtml(row.link || "#")}" target="_blank" rel="noreferrer">${escapeHtml(row.title || "未命名新闻")}</a><span>${escapeHtml(row.publisher || row.source || "")}${row.impactWeight != null ? ` · 权重 ${asNumber(row.impactWeight, 0.4).toFixed(2)}` : ""}</span></li>`).join("") : `<li>${newsEmpty}</li>`}</ul></div>
+      <div><h4>X / YouTube</h4><ul>${item.xPosts?.length ? item.xPosts.slice(0, 5).map((post) => `<li>${escapeHtml(post.text || "")}</li>`).join("") : "<li>X 当前不可用或未配置。</li>"}${item.youtubeItems?.length ? item.youtubeItems.slice(0, 5).map((video) => `<li><a href="${escapeHtml(video.link || "#")}" target="_blank" rel="noreferrer">${escapeHtml(video.title || "视频")}</a></li>`).join("") : "<li>YouTube 当前不可用或未配置。</li>"}</ul></div>
+    </div>
+    ${redditSocialCardHtml(item)}`;
+}
+
+function evidenceTabHtml(item, tab) {
+  if (tab === "sources") return evidenceSourcesHtml(item);
+  if (tab === "models") return evidenceModelsHtml(item);
+  if (tab === "history") return evidenceHistoryHtml(item);
+  if (tab === "news") return evidenceNewsHtml(item);
+  return evidenceDecisionHtml(item);
+}
+
+function bindEvidenceWorkspaceActions(item) {
+  $("openRedditTop10")?.addEventListener("click", () => openRedditSocialModal(item));
+  $("refreshRedditSocial")?.addEventListener("click", () => refreshRedditSocialForItem(item));
+  $("clearRedditSocialCache")?.addEventListener("click", () => clearRedditSocialForItem(item));
+}
+
+function mountEvidenceWorkspace(item, tab = "decision", options = {}) {
+  const host = $("evidenceWorkspace");
+  if (!host) return;
+  const activeTab = EVIDENCE_TABS.some(([key]) => key === tab) ? tab : "decision";
+  state.detailEvidence = { symbol: item.symbol, open: true, tab: activeTab };
+  host.hidden = false;
+  host.innerHTML = `
+    <div class="evidence-workspace-head"><div><span>Research evidence</span><strong>${escapeHtml(item.symbol)} 决策证据</strong></div><small>行情与模型时间分层展示</small></div>
+    <nav class="flow-research-tabs" aria-label="股票研究证据">${EVIDENCE_TABS.map(([key, label]) => `<button class="${key === activeTab ? "active" : ""}" type="button" data-evidence-tab="${key}">${label}</button>`).join("")}</nav>
+    <div id="evidenceContent" class="evidence-content">${evidenceTabHtml(item, activeTab)}</div>`;
+  host.querySelectorAll("[data-evidence-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.detailEvidence.tab = button.dataset.evidenceTab;
+      host.querySelectorAll("[data-evidence-tab]").forEach((node) => node.classList.toggle("active", node === button));
+      $("evidenceContent").innerHTML = evidenceTabHtml(item, state.detailEvidence.tab);
+      bindEvidenceWorkspaceActions(item);
+    });
+  });
+  bindEvidenceWorkspaceActions(item);
+  if (options.scroll) requestAnimationFrame(() => requestAnimationFrame(() => host.scrollIntoView({ behavior: "smooth", block: "start" })));
 }
 
 function renderDetailUnsafe() {
   const selected = normalizeSymbolForMarket(state.selected, state.market);
   let item = selected ? state.analyses.get(selected) : null;
-  if (!item && selected && state.watchlist.includes(selected)) {
-    renderPendingDetail(selected);
-    return;
-  }
+  if (!item && selected && state.watchlist.includes(selected)) return renderPendingDetail(selected);
   item = item || [...state.analyses.values()][0];
-  if (!item) {
-    renderPendingDetail(selected);
-    return;
-  }
+  if (!item) return renderPendingDetail(selected);
   const symbol = normalizeSymbolForMarket(item.symbol, state.market);
   state.selected = symbol;
+  item = { ...item, symbol };
   const technicals = normalizeTechnicals(item.technicals);
   const analysis = normalizeAnalysis(item.analysis);
-  const news = Array.isArray(item.news) ? item.news : [];
-  const newsEmptyText = item.signalRefreshedAt
-    ? "当前真实新闻源本轮未返回新闻。"
-    : "新闻后台读取中；完成后会自动写入。";
   const source = item.source || "unknown";
-  const quoteText = item.quote?.source ? ` · 报价：${item.quote.source}${item.quote.delayed ? "（延迟）" : "（实时）"}` : "";
-  $("analysisSource").textContent = `分析：${source} · 行情：${item.marketSource || "unknown"}${quoteText}`;
+  const verifiedMarketTime = item.marketDataAsOf || item.quote?.asOf;
+  const marketRetrievedAt = item.marketRetrievedAt || item.quote?.retrievedAt;
+  const modelTime = item.analysisAsOf || item.signalRefreshedAt || item.updatedAt || state.snapshotUpdatedAt;
+  const marketTimeText = verifiedMarketTime
+    ? ` · 行情时间：${formatSnapshotTime(verifiedMarketTime)}`
+    : marketRetrievedAt ? ` · 获取时间：${formatSnapshotTime(marketRetrievedAt)}` : "";
+  if ($("analysisSource")) $("analysisSource").textContent = `分析：${source} · 行情：${item.marketOverlay?.source || item.marketSource || "unknown"}${marketTimeText}${modelTime ? ` · 模型时间：${formatSnapshotTime(modelTime)}` : ""}`;
   if (analysis.action === "ERROR") {
-    $("detailPanel").innerHTML = `
-      <h3>${symbol} · ${errorLabel(item.errorKind)}</h3>
-      <p class="tag danger">${item.marketWarning || analysis.thesis?.[0] || "缺少真实行情源。"}</p>
-      <div class="decision-actions">
-        <button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button>
-      </div>
-    `;
+    $("detailPanel").innerHTML = `<h3>${symbol} · ${errorLabel(item.errorKind)}</h3><p class="tag danger">${escapeHtml(item.marketWarning || analysis.thesis?.[0] || "缺少真实行情源。")}</p><div class="decision-actions"><button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button></div>`;
     $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(symbol));
     return;
   }
   const holding = findHolding(symbol);
   const suggestedQty = Math.max(1, Math.floor((analysis.suggestedTradeValue || 0) / Math.max(0.01, technicals.close)));
-  const ensemble = analysis.ensemble || {};
-  const ensembleModels = Array.isArray(ensemble.models) ? ensemble.models : [];
+  const strategy = getStrategy();
+  const targetPrice = technicals.close * (1 + asNumber(strategy.targetUpside, 0) / 100);
+  const stopPrice = technicals.close * (1 - asNumber(strategy.stopLoss, 0) / 100);
   const targetProb = strategyProbability(analysis);
-  const targetProbRequired = strategyProbabilityTarget(analysis);
-  const directionText = directionLabel(analysis);
-  const directionProb = directionReliability(analysis);
-  const magnitudeProb = magnitudeProbability(analysis);
   const finalProb = finalReturnProbability(analysis);
   const maxMove = projectedMaxUpside(analysis);
   const maxProb = maxUpsideProbability(analysis);
-  const decision = decisionExplanation(item);
-  const socialMedia = item.factors?.socialMedia || null;
+  const dailyChange = Number(item.marketOverlay?.changePercent ?? item.quote?.changePercent);
+  const evidenceOpen = state.detailEvidence.open && normalizeSymbolForMarket(state.detailEvidence.symbol, state.market) === symbol;
+  const confidenceOpen = state.detailConfidence.open && normalizeSymbolForMarket(state.detailConfidence.symbol, state.market) === symbol;
   $("detailPanel").innerHTML = `
-    <h3>${symbol} · ${actionLabel(analysis.action)}</h3>
-    <p class="muted">周期 ${analysis.horizonDays || getStrategy().horizonDays} 日 · 结束预估 ${formatPct(projectedFinalReturn(analysis))}/${Math.round(finalProb)}% · 最高触达 ${formatPct(maxMove)}/${Math.round(maxProb)}% · 方向 ${directionText} ${Math.round(directionProb)}% · 策略达标 ${Math.round(targetProb)}% / ${Math.round(targetProbRequired)}% · 综合 ${Math.round(analysis.confidence)}%${analysis.rawConfidence !== analysis.confidence ? `（原始 ${Math.round(analysis.rawConfidence)}%）` : ""}</p>
-    <div class="tag-row detail-tags">
-      ${isBuyAction(analysis.action) ? `<span class="tag ${analysis.action === "LIGHT_BUY" ? "warn" : "good"}">${actionLabel(analysis.action)}，建议票额 ${formatMoney(analysis.suggestedTradeValue || 0)}</span>` : ""}
-      ${["STRONG_AVOID", "CRITICAL_SELL"].includes(analysis.action) ? `<span class="tag danger">${actionLabel(analysis.action)}：下跌倾向 ${Math.round(analysis.downsideConfidence || 0)}%</span>` : ""}
-      ${item.marketValidation ? `<span class="tag ${item.marketValidation.degraded ? "warn" : item.marketValidation.ok ? "good" : "danger"}">${item.marketValidation.degraded ? "单源真实数据" : "双源验证通过"}</span>` : ""}
-      ${item.quote?.source ? `<span class="tag good">${item.quote.delayed ? "延迟最新价" : "实时最新价"}：${formatMoney(item.quote.price)}</span>` : ""}
-      ${item.marketValidation?.degraded ? `<span class="tag warn">已扣减置信度</span>` : ""}
-      ${analysis.calibration?.sampleCount >= 5 ? `<span class="tag ${analysis.calibration.adjustment >= 0 ? "good" : "warn"}">校准 ${analysis.calibration.adjustment >= 0 ? "+" : ""}${analysis.calibration.adjustment}%</span>` : `<span class="tag warn">校准样本收集中</span>`}
-      ${analysis.strategyCalibration?.sampleCount >= 5 ? `<span class="tag ${analysis.strategyCalibration.adjustment >= 0 ? "good" : "warn"}">达标校准 ${analysis.strategyCalibration.adjustment >= 0 ? "+" : ""}${analysis.strategyCalibration.adjustment}%</span>` : `<span class="tag warn">达标校准收集中</span>`}
-      ${analysis.factorSignal?.configApplied ? `<span class="tag good">研究因子配置已接入 · ${factorScoreForItem(item).toFixed(1)}</span>` : `<span class="tag warn">研究因子使用默认权重</span>`}
-      ${socialMedia ? `<span class="tag ${redditSocialStatusClass(socialMedia)}">Reddit社媒 ${Number(socialMedia.score || 0).toFixed(1)} · ${socialMedia.available === false ? "不可用" : `置信 ${Math.round(Number(socialMedia.confidence || 0))}%`}</span>` : `<span class="tag warn">Reddit社媒待读取</span>`}
+    <div class="detail-title-line"><div><h3>${symbol} · ${actionLabel(analysis.action)}</h3><p>周期 ${analysis.horizonDays || strategy.horizonDays} 日 · 模型快照 ${modelTime ? formatSnapshotTime(modelTime) : "未返回"}</p></div><div class="detail-live-quote"><strong data-detail-live-price>${formatMoney(technicals.close)}</strong><span data-detail-live-change class="${Number.isFinite(dailyChange) ? dailyChange >= 0 ? "positive" : "negative" : "muted"}">${Number.isFinite(dailyChange) ? formatPct(dailyChange) : "当日 --"}</span></div></div>
+    <div id="analysisFreshnessBadge" class="analysis-freshness-badge" ${item.analysisNeedsRefresh ? "" : "hidden"}>${item.analysisNeedsRefresh ? "行情已更新，模型结论待重算" : ""}</div>
+    <div class="flow-decision-ribbon" aria-label="量化决策摘要">
+      <div class="flow-verdict"><span>量化决策</span><strong>${actionLabel(analysis.action)}</strong></div><button id="confidenceBreakdownToggle" class="confidence-summary-trigger ${confidenceOpen ? "active" : ""}" type="button" aria-expanded="${confidenceOpen}" aria-controls="confidenceBreakdownPanel"><span>综合置信 <i data-lucide="chevron-down"></i></span><strong>${Math.round(analysis.confidence)}%</strong></button><div><span>周期结束</span><strong class="${projectedFinalReturn(analysis) >= 0 ? "good-text" : "danger-text"}">${formatPct(projectedFinalReturn(analysis))} / ${Math.round(finalProb)}%</strong></div><div><span>最高触达</span><strong>${formatPct(maxMove)} / ${Math.round(maxProb)}%</strong></div><div><span>目标 / 止损</span><strong>${formatMoney(targetPrice)} / <span class="danger-text">${formatMoney(stopPrice)}</span></strong></div><button id="flowEvidenceToggle" type="button">${evidenceOpen ? "收起证据" : "查看证据"}</button>
     </div>
-    <div class="decision-actions">
-      <button id="acceptDecision" type="button">接受并记录决策</button>
-      <button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button>
-    </div>
-    <div class="decision-explain-card">
-      <div class="decision-explain-head">
-        <strong>为什么${isBuyAction(analysis.action) ? "买/关注" : "暂不买"}</strong>
-        <span>买入分数 ${decision.buyScore.toFixed(1)} / 阈值 ${decision.threshold.toFixed(1)}</span>
-      </div>
-      <p>${escapeHtml(decision.summary)}</p>
-      <div class="decision-check-grid">
-        ${decision.checks.map((check) => `
-          <div class="${check.pass ? "pass" : "block"}">
-            <strong>${escapeHtml(check.label)}</strong>
-            <span>${escapeHtml(check.note)}</span>
-            <em>${check.pass ? "通过" : `差 ${Math.max(0, Number(check.required || 0) - Number(check.value || 0)).toFixed(check.key === "volume" ? 2 : 1)}`}</em>
-          </div>
-        `).join("")}
-      </div>
-    </div>
-    <div class="trade-ticket">
-      <div>
-        <strong>${holding ? "持仓调整" : "买入票据"}</strong>
-        <p class="muted">${holding ? `当前持仓 ${holding.qty} 股，均价 ${formatMoney(holding.avgPrice)}，已持有 ${holdingDays(holding)} 天。` : "满足策略时可直接确认买入并写入持仓。"}</p>
-      </div>
-      <label>
-        数量
-        <input id="ticketQty" type="number" min="1" step="1" value="${suggestedQty}">
-      </label>
-      <label>
-        均价
-        <input id="ticketPrice" type="number" min="0" step="0.01" value="${technicals.close.toFixed(2)}">
-      </label>
-      <button id="confirmBuy" type="button">${holding ? "确认补仓" : "确认买入"}</button>
-    </div>
-    ${holding ? `
-      <div class="trade-ticket reduce-ticket">
-        <div>
-          <strong>减仓/卖出</strong>
-          <p class="muted">可只卖出部分仓位；剩余持仓均价保持原均价，已实现盈亏会写回资金基准。</p>
-        </div>
-        <label>
-          卖出数量
-          <input id="reduceQty" type="number" min="1" max="${holding.qty}" step="1" value="${Math.max(1, Math.floor(holding.qty * 0.5))}">
-        </label>
-        <label>
-          成交价
-          <input id="reducePrice" type="number" min="0" step="0.01" value="${technicals.close.toFixed(2)}">
-        </label>
-        <button id="confirmReduce" class="danger-soft" type="button">确认减仓</button>
-      </div>
-    ` : ""}
+    <section id="confidenceBreakdownPanel" class="confidence-breakdown-panel" ${confidenceOpen ? "" : "hidden"}>${confidenceBreakdownHtml(analysis)}</section>
+    <div class="decision-actions compact-actions"><button id="acceptDecision" type="button">接受并记录决策</button><button id="deleteSelectedStock" class="danger-soft" type="button">删除这只股票</button></div>
     ${chartDashboardHtml({ title: "K线" })}
-    <div class="detail-grid">
-      <div class="detail-item"><span>${item.quote?.source ? "最新价" : "收盘价"}</span><strong>${formatMoney(technicals.close)}</strong></div>
-      <div class="detail-item"><span>MACD Histogram</span><strong>${technicals.macdHistogram.toFixed(4)}</strong></div>
-      <div class="detail-item"><span>SMA20 / SMA50</span><strong>${technicals.sma20.toFixed(2)} / ${technicals.sma50.toFixed(2)}</strong></div>
-      <div class="detail-item"><span>换手/成交强度代理</span><strong>${technicals.volumeRatio.toFixed(2)}x</strong></div>
-      <div class="detail-item"><span>20日涨跌</span><strong>${formatPct(technicals.change20d)}</strong></div>
-      <div class="detail-item"><span>主力仓位代理</span><strong>${technicals.mainForceProxy.toFixed(0)} / 100</strong></div>
-      <div class="detail-item"><span>周期结束涨跌</span><strong>${formatPct(projectedFinalReturn(analysis))} · 置信 ${Math.round(finalProb)}%</strong></div>
-      <div class="detail-item"><span>周期内最高触达</span><strong>${formatPct(maxMove)} · 置信 ${Math.round(maxProb)}%</strong></div>
-      <div class="detail-item"><span>原幅度达成率</span><strong>${Math.round(magnitudeProb)}%${analysis.qualityGate?.magnitudeBasis ? ` · ${analysis.qualityGate.magnitudeBasis}` : ""}</strong></div>
-      <div class="detail-item"><span>方向判断</span><strong>${directionText} · ${Math.round(directionProb)}%</strong></div>
-      <div class="detail-item"><span>策略达标概率</span><strong>${Math.round(targetProb)}% / 目标 ${Math.round(targetProbRequired)}%</strong></div>
-      <div class="detail-item"><span>市场环境</span><strong>${ensemble.marketRegime ? `${ensemble.marketRegime.regime || "range"} · ${ensemble.marketRegime.riskLevel || "neutral"} · 阈值+${Math.round(ensemble.marketRegime.buyThresholdBonus || 0)}%` : "等待因子"}</strong></div>
-      <div class="detail-item"><span>历史策略命中</span><strong>${item.analog?.count ? `${asNumber(item.analog.targetHitRate ?? item.analog.winRate).toFixed(0)}% / 结束 ${formatPct(item.analog.averageFinalReturn ?? item.analog.averageForwardReturn)} / 最高 ${formatPct(item.analog.averageMaxUpside || 0)}${item.analog.stopRate != null ? ` · 先止损 ${asNumber(item.analog.stopRate).toFixed(0)}%` : ""}` : "样本不足"}</strong></div>
-      <div class="detail-item"><span>方向/达标拆分</span><strong>${item.analog?.count ? `方向 ${asNumber(item.analog.directionalHitRate ?? item.analog.winRate).toFixed(0)}% · 达标 ${asNumber(item.analog.strategyHitProbability ?? item.analog.targetHitRate ?? 0).toFixed(0)}%` : "样本不足"}</strong></div>
-      <div class="detail-item"><span>自监督预测</span><strong>${item.analog?.model?.sampleCount ? `结束 ${formatPct(item.analog.model.predictedReturn)} · 最高 ${formatPct(item.analog.model.predictedMaxUpside || 0)} · 目标达标 ${asNumber(item.analog.model.targetHitAccuracy ?? item.analog.model.directionalAccuracy).toFixed(0)}%` : "样本不足"}</strong></div>
-      <div class="detail-item"><span>样本外/Meta</span><strong>${item.analog?.model?.oosSampleCount ? `方向 ${asNumber(item.analog.model.oosDirectionalAccuracy ?? item.analog.model.directionalAccuracy).toFixed(0)}% · 最高触达 ${asNumber(item.analog.model.oosMaxUpsideHitAccuracy ?? item.analog.model.maxUpsideHitAccuracy).toFixed(0)}% · P80 ${formatPct(item.analog.model.conformalP80Error)}` : "样本不足"}</strong></div>
-      <div class="detail-item"><span>可用资金 / 建议票额</span><strong>${formatMoney(getCapital().availableCash)} / ${formatMoney(analysis.suggestedTradeValue || 0)}</strong></div>
-      <div class="detail-item"><span>基本面</span><strong>${item.fundamentals ? `PE ${Number(item.fundamentals.peRatio || 0).toFixed(1)} · Yield ${formatPct(Number(item.fundamentals.dividendYield || 0) * 100)}` : "套餐未授权"}</strong></div>
-      <div class="detail-item"><span>X / YouTube 信号</span><strong>${item.xPosts?.length || 0} / ${item.youtubeItems?.length || 0}</strong></div>
-      <div class="detail-item"><span>Reddit 社媒</span><strong>${socialMedia ? `${Number(socialMedia.score || 0).toFixed(1)} · 权重 ${Number(socialMedia.weight || 0).toFixed(2)} · Top ${redditSocialItems(socialMedia).length}` : "待读取"}</strong></div>
-    </div>
-    <h4>多模型集成</h4>
-    <div class="ensemble-summary">
-      <span>方向 ${ensemble.direction || "n/a"}</span>
-      <span>上涨一致度 ${Math.round(ensemble.upsideAgreement || 0)}%</span>
-      <span>共识强度 ${Math.round(ensemble.consensusAgreement || 0)}%</span>
-      <span>数据源扣分 ${Math.round(ensemble.dataPenalty || 0)}%</span>
-      <span>证据奖励 ${Number(ensemble.evidenceBonus || 0).toFixed(1)} / 分歧扣分 ${Number(ensemble.disagreementPenalty || 0).toFixed(1)}</span>
-      <span>策略达标 ${Math.round(targetProb)}% / 门槛 ${Math.round(targetProbRequired)}%</span>
-      <span>动态调权 ${Math.round(ensemble.performanceWeightAdjusted || 0)} 个模型</span>
-      <span>外部复核 ${ensemble.doubleCheckWeighting?.externalModelCount ? `${Number(ensemble.doubleCheckWeighting.externalShare || 0).toFixed(1)}% / 上限 ${Math.round(Number(ensemble.doubleCheckWeighting.maxExternalShare || 0.18) * 100)}%` : "未占权重"}</span>
-      <span>${ensemble.optimizedWeighting?.applied ? `样本外优化权重已启用 · ${Math.round(Number(ensemble.optimizedWeighting.deploymentBlend || 0) * 100)}%` : `权重模式 ${ensemble.weightingMethod || "prior-performance-regime"}`}</span>
-    </div>
-    <div class="ensemble-grid">
-      ${ensembleModels.length ? ensembleModels.map((model) => `
-        <div class="ensemble-card ${model.available === false ? "muted-factor" : ""}">
-          <div><strong>${model.name || "模型"}</strong><span class="${Number(model.projectedUpside || 0) >= 0 ? "good-text" : "danger-text"}">${formatPct(model.projectedUpside || 0)}</span></div>
-          <p>置信 ${Math.round(model.confidence || 0)}% · 权重 ${Math.round((model.normalizedWeight || model.weight || 0) * 100)}%${model.values?.doubleCheckOnly ? " · 仅复核" : ""}${model.values?.optimizedEnsembleWeight != null ? ` · 学习权重 ${Math.round(Number(model.values.optimizedEnsembleWeight || 0) * 100)}%` : ""}${model.values?.performanceWeightMultiplier ? ` · 表现权重 ${Math.round(model.values.performanceWeightMultiplier * 100)}%` : ""}${model.values?.regimeWeightMultiplier ? ` · 环境权重 ${Math.round(model.values.regimeWeightMultiplier * 100)}%` : ""}</p>
-          <p>${model.reason || ""}</p>
-        </div>
-      `).join("") : `<p class="muted">集成模型正在等待分析结果。</p>`}
-    </div>
-    <h4>新增因子层</h4>
-    <div class="factor-grid">
-      ${factorRows(item.factors).length ? factorRows(item.factors).map(([label, factor]) => `
-        <div class="factor-card ${factor.available === false ? "muted-factor" : ""}">
-          <div><strong>${label}</strong><span class="${Number(factor.score || 0) >= 0 ? "good-text" : "danger-text"}">${Number(factor.score || 0).toFixed(1)}</span></div>
-          <p>${(factor.thesis || ["暂无说明"])[0]}</p>
-        </div>
-      `).join("") : `<p class="muted">因子层在后台读取中；完成后会自动参与复核。</p>`}
-    </div>
-    <h4>历史相似走势</h4>
-    <ul>${item.analog?.examples?.length ? item.analog.examples.map((example) => `<li>${example.date} 后 ${analysis.horizonDays || getStrategy().horizonDays} 日：结束 ${formatPct(example.forwardReturn)}，最高 ${formatPct(example.maxUpside || 0)}，最大回撤 ${formatPct(example.maxDrawdown || 0)}，相似距离 ${asNumber(example.distance).toFixed(2)}</li>`).join("") : "<li>历史样本不足，暂不纳入相似走势判断。</li>"}</ul>
-    <h4>判断</h4>
-    <ul>${(analysis.thesis || []).map((itemText) => `<li>${itemText}</li>`).join("")}</ul>
-    <h4>风险</h4>
-    <ul>${(analysis.risks || []).map((itemText) => `<li>${itemText}</li>`).join("")}</ul>
-    <h4>新闻</h4>
-    <ul>${(news || []).slice(0, 8).map((itemNews) => `<li><a href="${itemNews.link}" target="_blank" rel="noreferrer">${itemNews.title}</a> <span class="muted">${itemNews.publisher || itemNews.source || ""} · ${itemNews.categoryLabel || itemNews.category || itemNews.channel || "news"} · ${itemNews.channel || "news"} · 权重 ${asNumber(itemNews.impactWeight, 0.4).toFixed(2)}</span></li>`).join("") || `<li>${newsEmptyText}</li>`}</ul>
-    <h4>X / 一手消息</h4>
-    <ul>${(item.xPosts || []).slice(0, 5).map((post) => `<li>${post.text}</li>`).join("") || "<li>未配置 X_BEARER_TOKEN，暂不读取 X。</li>"}</ul>
-    <h4>YouTube 热门/搜索</h4>
-    <ul>${(item.youtubeItems || []).slice(0, 5).map((video) => `<li><a href="${video.link}" target="_blank" rel="noreferrer">${video.title}</a> <span class="muted">${video.publisher || ""} · ${video.channel || ""}</span></li>`).join("") || "<li>未配置 YOUTUBE_API_KEY，或 YouTube 当前未返回视频。</li>"}</ul>
-    ${redditSocialCardHtml(item)}
-  `;
+    <section id="evidenceWorkspace" class="evidence-workspace" ${evidenceOpen ? "" : "hidden"}></section>
+    <div class="trade-ticket"><div><strong>${holding ? "持仓调整" : "买入票据"}</strong><p class="muted">${holding ? `当前持仓 ${holding.qty} 股，均价 ${formatMoney(holding.avgPrice)}，已持有 ${holdingDays(holding)} 天。` : `策略达标概率 ${Math.round(targetProb)}%，确认后写入模拟持仓。`}</p></div><label>数量<input id="ticketQty" type="number" min="1" step="1" value="${suggestedQty}"></label><label>均价<input id="ticketPrice" type="number" min="0" step="0.01" value="${technicals.close.toFixed(2)}"></label><button id="confirmBuy" type="button">${holding ? "确认补仓" : "确认买入"}</button></div>
+    ${holding ? `<div class="trade-ticket reduce-ticket"><div><strong>减仓/卖出</strong><p class="muted">成交会写入模拟持仓与资金记录。</p></div><label>卖出数量<input id="reduceQty" type="number" min="1" max="${holding.qty}" step="1" value="${Math.max(1, Math.floor(holding.qty * 0.5))}"></label><label>成交价<input id="reducePrice" type="number" min="0" step="0.01" value="${technicals.close.toFixed(2)}"></label><button id="confirmReduce" class="danger-soft" type="button">确认减仓</button></div>` : ""}`;
   $("acceptDecision")?.addEventListener("click", () => saveDecision(item));
   $("deleteSelectedStock")?.addEventListener("click", () => deleteWatchSymbol(symbol));
   $("confirmBuy")?.addEventListener("click", () => buyFromSignal(item));
   $("confirmReduce")?.addEventListener("click", () => reduceFromSignal(item));
   $("expandChart")?.addEventListener("click", () => openChartModal(item));
-  $("openRedditTop10")?.addEventListener("click", () => openRedditSocialModal(item));
-  $("refreshRedditSocial")?.addEventListener("click", () => refreshRedditSocialForItem(item));
-  $("clearRedditSocialCache")?.addEventListener("click", () => clearRedditSocialForItem(item));
+  $("confidenceBreakdownToggle")?.addEventListener("click", () => {
+    const opening = !(state.detailConfidence.open && state.detailConfidence.symbol === symbol);
+    state.detailConfidence = { symbol, open: opening };
+    const panel = $("confidenceBreakdownPanel");
+    const trigger = $("confidenceBreakdownToggle");
+    if (panel) panel.hidden = !opening;
+    if (trigger) {
+      trigger.classList.toggle("active", opening);
+      trigger.setAttribute("aria-expanded", String(opening));
+    }
+  });
+  $("flowEvidenceToggle")?.addEventListener("click", () => {
+    const opening = !(state.detailEvidence.open && state.detailEvidence.symbol === symbol);
+    state.detailEvidence = { symbol, open: opening, tab: state.detailEvidence.tab || "decision" };
+    const host = $("evidenceWorkspace");
+    if (opening) mountEvidenceWorkspace(item, state.detailEvidence.tab, { scroll: true });
+    else if (host) { host.hidden = true; host.replaceChildren(); }
+    $("flowEvidenceToggle").textContent = opening ? "收起证据" : "查看证据";
+  });
+  if (evidenceOpen) mountEvidenceWorkspace(item, state.detailEvidence.tab || "decision");
   requestAnimationFrame(() => renderCharts(item, document));
 }
 
@@ -11344,14 +12167,6 @@ function openChartModal(item) {
   });
   modal.querySelector("#closeChartModal").addEventListener("click", close);
   requestAnimationFrame(() => renderCharts(item, modal));
-}
-
-function chartBounds(values, padding = 0.06) {
-  const finite = values.filter((value) => Number.isFinite(value));
-  const min = Math.min(...finite);
-  const max = Math.max(...finite);
-  const spread = max - min || Math.abs(max) || 1;
-  return { min: min - spread * padding, max: max + spread * padding };
 }
 
 function setupCanvas(canvas) {
@@ -11626,18 +12441,6 @@ function drawLine(ctx, values, min, max, width, height, color) {
   ctx.stroke();
 }
 
-function rangeCount(range) {
-  return { "5D": 5, "1M": 24, "3M": 66, "6M": 132, "9M": 220, ALL: 100000 }[range] || 132;
-}
-
-function xFor(index, count, width, left = 48, right = 14) {
-  return left + (count <= 1 ? 0 : (index / (count - 1)) * (width - left - right));
-}
-
-function yFor(value, min, max, height, top = 12, bottom = 20) {
-  return top + (1 - (value - min) / (max - min || 1)) * (height - top - bottom);
-}
-
 function drawAxis(ctx, bounds, width, height, formatter = (value) => value.toFixed(2)) {
   ctx.fillStyle = "#8ea3ba";
   ctx.font = "11px Inter, system-ui, sans-serif";
@@ -11670,7 +12473,7 @@ function drawTimeAxis(ctx, candles, width, height) {
   ctx.restore();
 }
 
-function drawLastPriceMarker(ctx, value, bounds, width, height, color) {
+function drawLastPriceMarker(ctx, value, bounds, width, height, color, prefix = "") {
   if (!Number.isFinite(Number(value))) return;
   const y = yFor(Number(value), bounds.min, bounds.max, height);
   ctx.save();
@@ -11681,7 +12484,7 @@ function drawLastPriceMarker(ctx, value, bounds, width, height, color) {
   ctx.lineTo(width - 68, y);
   ctx.stroke();
   ctx.setLineDash([]);
-  const label = formatCompactNumber(value, 3);
+  const label = `${prefix}${formatCompactNumber(value, 3)}`;
   ctx.font = "11px Inter, system-ui, sans-serif";
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
@@ -11747,7 +12550,13 @@ function chartDashboardHtml({ expanded = false, showExpand = true, title = "K线
           ${showExpand ? `<button id="expandChart" class="secondary" type="button">放大</button>` : ""}
         </div>
       </div>
-      <div class="chart-legend"><span class="legend green">${escapeHtml(title)}</span>${chartOverlayButtons()}</div>
+      <div class="chart-legend">
+        <span class="legend green">${escapeHtml(title)}</span>
+        <div class="chart-overlay-popover">
+          <button class="secondary mini-btn" data-chart-overlay-toggle type="button" aria-expanded="false">指标</button>
+          <div class="chart-overlay-menu" data-chart-overlay-menu hidden>${chartOverlayButtons()}</div>
+        </div>
+      </div>
       <div class="chart-factor-strip"><span>因子叠合</span>${chartFactorButtons()}</div>
       ${expanded ? `<div class="chart-scroll">` : ""}
         <div class="chart-layer">
@@ -11791,6 +12600,19 @@ function bindChartDashboardControls(item, root = document) {
       syncChartOverlayButtons(dashboard);
       renderCharts(item, root);
     });
+  });
+  const overlayToggle = dashboard.querySelector("[data-chart-overlay-toggle]");
+  const overlayMenu = dashboard.querySelector("[data-chart-overlay-menu]");
+  overlayToggle?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const opening = overlayMenu?.hidden !== false;
+    if (overlayMenu) overlayMenu.hidden = !opening;
+    overlayToggle.setAttribute("aria-expanded", opening ? "true" : "false");
+  });
+  dashboard.addEventListener("click", (event) => {
+    if (!overlayMenu || overlayMenu.hidden || event.target.closest(".chart-overlay-popover")) return;
+    overlayMenu.hidden = true;
+    overlayToggle?.setAttribute("aria-expanded", "false");
   });
   dashboard.querySelectorAll("[data-chart-factor]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -11862,12 +12684,14 @@ function chartFactorButtons() {
 function visibleChartCandles(sourceCandles) {
   const source = Array.isArray(sourceCandles) ? sourceCandles : [];
   const baseCount = Math.min(source.length, rangeCount(state.chartRange));
-  const baseStart = Math.max(0, source.length - baseCount);
+  const availableCount = Math.min(source.length, CHART_MAX_VISIBLE_BARS);
+  const baseStart = Math.max(0, source.length - availableCount);
+  const minZoom = Math.min(1, baseCount / Math.max(1, availableCount));
   const maxZoom = Math.max(1, baseCount / 18);
-  const zoom = clamp(Number(state.chartZoom || 1), 1, maxZoom);
+  const zoom = clamp(Number(state.chartZoom || 1), minZoom, maxZoom);
   state.chartZoom = zoom;
-  const visibleCount = Math.max(8, Math.min(baseCount, Math.round(baseCount / zoom)));
-  const maxOffset = Math.max(0, baseCount - visibleCount);
+  const visibleCount = Math.min(availableCount, Math.max(Math.min(8, availableCount), Math.round(baseCount / zoom)));
+  const maxOffset = Math.max(0, availableCount - visibleCount);
   state.chartOffset = clamp(Math.round(Number(state.chartOffset || 0)), 0, maxOffset);
   const end = source.length - state.chartOffset;
   const start = Math.max(baseStart, end - visibleCount);
@@ -11911,44 +12735,6 @@ function chartAnomalyIndexes(candles) {
           ? "volume"
           : "",
   })).filter((row) => row.type);
-}
-
-function bollingerChartSeries(candles, period = 20, multiplier = 2) {
-  const closes = candles.map((row) => Number(row.close || 0));
-  const middle = sma(closes, period);
-  const upper = [];
-  const lower = [];
-  closes.forEach((close, index) => {
-    const start = Math.max(0, index - period + 1);
-    const slice = closes.slice(start, index + 1);
-    const avg = middle[index] || close;
-    const variance = slice.reduce((sum, value) => sum + (value - avg) ** 2, 0) / Math.max(1, slice.length);
-    const sigma = Math.sqrt(variance);
-    upper.push(avg + multiplier * sigma);
-    lower.push(avg - multiplier * sigma);
-  });
-  return { middle, upper, lower };
-}
-
-function fibonacciChartLevels(candles, lookback = 60) {
-  const rows = candles.slice(-lookback);
-  if (!rows.length) return [];
-  let highIndex = 0;
-  let lowIndex = 0;
-  rows.forEach((row, index) => {
-    if (row.high > rows[highIndex].high) highIndex = index;
-    if (row.low < rows[lowIndex].low) lowIndex = index;
-  });
-  const high = rows[highIndex].high;
-  const low = rows[lowIndex].low;
-  const span = Math.max(high - low, high * 0.0001);
-  const upswing = lowIndex < highIndex;
-  return [0.236, 0.382, 0.5, 0.618, 0.786].map((ratio) => ({
-    ratio,
-    label: `${(ratio * 100).toFixed(1)}%`,
-    price: upswing ? high - span * ratio : low + span * ratio,
-    direction: upswing ? "upswing" : "downswing",
-  }));
 }
 
 function fvgChartZones(candles, lookback = 90) {
@@ -12480,12 +13266,20 @@ function renderCharts(item, root = document) {
   const volumeCanvas = root.querySelector("#volumeChart");
   const macdCanvas = root.querySelector("#macdChart");
   if (!priceCanvas || !volumeCanvas || !macdCanvas) return;
+  const dashboard = root.querySelector("#chartDashboard");
+  const compactDashboard = dashboard?.classList.contains("compact") === true;
+  if (factorCanvas) factorCanvas.hidden = !overlayEnabled("factorPrediction");
+  volumeCanvas.hidden = compactDashboard || !overlayEnabled("volume");
+  macdCanvas.hidden = !overlayEnabled("macd");
 
   const chartKey = chartDataKey(item.symbol, state.chartInterval);
   const cachedChart = state.chartDataCache.get(chartKey);
-  let sourceCandles = normalizeCandles(state.chartInterval === "1d" ? item.candles : cachedChart?.candles);
+  const analysisCandles = normalizeCandles(item.candles);
+  const cachedCandles = normalizeCandles(cachedChart?.candles);
+  let sourceCandles = state.chartInterval === "1d"
+    ? (cachedCandles.length > analysisCandles.length ? cachedCandles : analysisCandles)
+    : cachedCandles;
   if (!sourceCandles?.length) {
-    const dashboard = root.querySelector("#chartDashboard");
     syncChartOverlayButtons(dashboard);
     syncChartFactorButtons(dashboard);
     bindChartDashboardControls(item, root);
@@ -12506,9 +13300,25 @@ function renderCharts(item, root = document) {
     }
     return;
   }
+  const desiredVisibleBars = Math.min(CHART_MAX_VISIBLE_BARS, rangeCount(state.chartRange));
+  const shouldExtendDailyHistory = state.chartInterval === "1d"
+    && sourceCandles.length < desiredVisibleBars
+    && !state.chartLoading.has(chartKey);
+  if (shouldExtendDailyHistory) {
+    state.chartLoading.add(chartKey);
+    fetchChartMarket(item.symbol, "1d")
+      .then(() => renderCharts(item, root))
+      .catch(() => null)
+      .finally(() => state.chartLoading.delete(chartKey));
+  }
   const view = visibleChartCandles(sourceCandles);
   const candles = view.candles;
   if (!candles.length) return;
+  if (dashboard) {
+    dashboard.dataset.visibleBars = String(view.visibleCount);
+    dashboard.dataset.maxVisibleBars = String(CHART_MAX_VISIBLE_BARS);
+    dashboard.dataset.chartZoom = String(view.zoom);
+  }
   const hoverIndex = state.chartHoverIndex == null ? null : clamp(state.chartHoverIndex, 0, candles.length - 1);
   const chartNote = chartFallbackReadout(cachedChart);
 
@@ -12523,6 +13333,10 @@ function renderCharts(item, root = document) {
   const fvgZones = fvgChartZones(candles);
   const orderflow = orderflowRows(candles);
   const factorProjection = factorPredictionSeries(item, candles);
+  const liveQuotePrice = asPositiveNumber(item.marketOverlay?.price ?? item.quote?.price ?? item.technicals?.close);
+  const hasDetachedLiveQuote = item.technicals?.livePriceOverlay === true
+    && Number.isFinite(liveQuotePrice)
+    && Math.abs(liveQuotePrice - Number(candles.at(-1)?.close || 0)) > Math.max(0.0001, liveQuotePrice * 0.00001);
   const priceBounds = chartBounds([
     ...highs,
     ...lows,
@@ -12533,6 +13347,7 @@ function renderCharts(item, root = document) {
     ...(overlayEnabled("fib") ? fibLevels.map((row) => row.price) : []),
     ...(overlayEnabled("fvg") ? fvgZones.flatMap((zone) => [zone.low, zone.high]) : []),
     ...(overlayEnabled("factorPrediction") ? factorProjection.predictionPrice : []),
+    ...(hasDetachedLiveQuote ? [liveQuotePrice] : []),
   ]);
   const price = setupCanvas(priceCanvas);
   drawGrid(price.ctx, price.width, price.height);
@@ -12627,43 +13442,46 @@ function renderCharts(item, root = document) {
     });
   }
   const latestCandle = candles.at(-1);
-  drawLastPriceMarker(price.ctx, latestCandle?.close, priceBounds, price.width, price.height, latestCandle?.close >= latestCandle?.open ? "#43e08a" : "#ff657d");
+  drawLastPriceMarker(price.ctx, latestCandle?.close, priceBounds, price.width, price.height, latestCandle?.close >= latestCandle?.open ? "#43e08a" : "#ff657d", hasDetachedLiveQuote ? "K " : "");
+  if (hasDetachedLiveQuote) drawLastPriceMarker(price.ctx, liveQuotePrice, priceBounds, price.width, price.height, "#d8b86d", "Q ");
   drawTimeAxis(price.ctx, candles, price.width, price.height);
 
-  const volume = setupCanvas(volumeCanvas);
-  drawGrid(volume.ctx, volume.width, volume.height);
-  const maxVolume = Math.max(...candles.map((row) => row.volume || 0), 1);
-  drawAxis(volume.ctx, { min: 0, max: maxVolume }, volume.width, volume.height, (value) => `${(value / 1000000).toFixed(1)}M`);
-  if (overlayEnabled("volume")) candles.forEach((row, index) => {
-    const x = xFor(index, candles.length, volume.width);
-    const barHeight = ((row.volume || 0) / maxVolume) * (volume.height - 28);
-    const up = row.close >= row.open;
-    const gradient = volume.ctx.createLinearGradient(0, volume.height - 18 - barHeight, 0, volume.height - 18);
-    gradient.addColorStop(0, up ? "rgba(67, 224, 138, 0.68)" : "rgba(255, 101, 125, 0.68)");
-    gradient.addColorStop(1, up ? "rgba(67, 224, 138, 0.16)" : "rgba(255, 101, 125, 0.16)");
-    volume.ctx.fillStyle = gradient;
-    volume.ctx.fillRect(x - candleWidth / 2, volume.height - 18 - barHeight, candleWidth, barHeight);
-  });
-  drawTimeAxis(volume.ctx, candles, volume.width, volume.height);
+  const volume = volumeCanvas.hidden ? null : setupCanvas(volumeCanvas);
+  if (volume) {
+    drawGrid(volume.ctx, volume.width, volume.height);
+    const maxVolume = Math.max(...candles.map((row) => row.volume || 0), 1);
+    drawAxis(volume.ctx, { min: 0, max: maxVolume }, volume.width, volume.height, (value) => `${(value / 1000000).toFixed(1)}M`);
+    if (overlayEnabled("volume")) candles.forEach((row, index) => {
+      const x = xFor(index, candles.length, volume.width);
+      const barHeight = ((row.volume || 0) / maxVolume) * (volume.height - 28);
+      const up = row.close >= row.open;
+      const gradient = volume.ctx.createLinearGradient(0, volume.height - 18 - barHeight, 0, volume.height - 18);
+      gradient.addColorStop(0, up ? "rgba(67, 224, 138, 0.68)" : "rgba(255, 101, 125, 0.68)");
+      gradient.addColorStop(1, up ? "rgba(67, 224, 138, 0.16)" : "rgba(255, 101, 125, 0.16)");
+      volume.ctx.fillStyle = gradient;
+      volume.ctx.fillRect(x - candleWidth / 2, volume.height - 18 - barHeight, candleWidth, barHeight);
+    });
+    drawTimeAxis(volume.ctx, candles, volume.width, volume.height);
+  }
 
   const macdSeries = computeMacdSeries(candles);
-  const macd = setupCanvas(macdCanvas);
-  const macdBounds = chartBounds([...macdSeries.macd, ...macdSeries.signal, ...macdSeries.histogram], 0.18);
-  drawGrid(macd.ctx, macd.width, macd.height);
-  drawAxis(macd.ctx, macdBounds, macd.width, macd.height, (value) => value.toFixed(2));
-  const zeroY = yFor(0, macdBounds.min, macdBounds.max, macd.height);
-  macd.ctx.strokeStyle = "rgba(142, 163, 186, 0.46)";
-  macd.ctx.beginPath();
-  macd.ctx.moveTo(48, zeroY);
-  macd.ctx.lineTo(macd.width, zeroY);
-  macd.ctx.stroke();
-  if (overlayEnabled("macd")) macdSeries.histogram.forEach((value, index) => {
-    const x = xFor(index, macdSeries.histogram.length, macd.width);
-    const y = yFor(value, macdBounds.min, macdBounds.max, macd.height);
-    macd.ctx.fillStyle = value >= 0 ? "rgba(34, 197, 94, 0.72)" : "rgba(251, 113, 133, 0.72)";
-    macd.ctx.fillRect(x - candleWidth / 2, Math.min(y, zeroY), candleWidth, Math.max(1, Math.abs(zeroY - y)));
-  });
-  if (overlayEnabled("macd")) {
+  const macd = macdCanvas.hidden ? null : setupCanvas(macdCanvas);
+  if (macd) {
+    const macdBounds = chartBounds([...macdSeries.macd, ...macdSeries.signal, ...macdSeries.histogram], 0.18);
+    drawGrid(macd.ctx, macd.width, macd.height);
+    drawAxis(macd.ctx, macdBounds, macd.width, macd.height, (value) => value.toFixed(2));
+    const zeroY = yFor(0, macdBounds.min, macdBounds.max, macd.height);
+    macd.ctx.strokeStyle = "rgba(142, 163, 186, 0.46)";
+    macd.ctx.beginPath();
+    macd.ctx.moveTo(48, zeroY);
+    macd.ctx.lineTo(macd.width, zeroY);
+    macd.ctx.stroke();
+    macdSeries.histogram.forEach((value, index) => {
+      const x = xFor(index, macdSeries.histogram.length, macd.width);
+      const y = yFor(value, macdBounds.min, macdBounds.max, macd.height);
+      macd.ctx.fillStyle = value >= 0 ? "rgba(34, 197, 94, 0.72)" : "rgba(251, 113, 133, 0.72)";
+      macd.ctx.fillRect(x - candleWidth / 2, Math.min(y, zeroY), candleWidth, Math.max(1, Math.abs(zeroY - y)));
+    });
     drawSeriesLine(macd.ctx, macdSeries.macd, macdBounds, macd.width, macd.height, "#38bdf8");
     drawSeriesLine(macd.ctx, macdSeries.signal, macdBounds, macd.width, macd.height, "#f59e0b");
   }
@@ -12690,16 +13508,15 @@ function renderCharts(item, root = document) {
     if (readout) readout.textContent = chartNote;
   }
 
-  if (factorCanvas) {
+  if (factorCanvas && !factorCanvas.hidden) {
     drawFactorStudyPanel(factorCanvas, candles, factorProjection, hoverIndex);
   }
 
   if (hoverIndex !== null) {
-    drawCrosshair(volume.ctx, hoverIndex, candles.length, volume.width, volume.height);
-    drawCrosshair(macd.ctx, hoverIndex, candles.length, macd.width, macd.height);
+    if (volume) drawCrosshair(volume.ctx, hoverIndex, candles.length, volume.width, volume.height);
+    if (macd) drawCrosshair(macd.ctx, hoverIndex, candles.length, macd.width, macd.height);
   }
 
-  const dashboard = root.querySelector("#chartDashboard");
   syncChartOverlayButtons(dashboard);
   syncChartFactorButtons(dashboard);
   bindChartDashboardControls(item, root);
@@ -12713,7 +13530,7 @@ function renderCharts(item, root = document) {
           state.chartOffset = Math.max(0, Number(state.chartOffset || 0) + Math.round(event.deltaX / WHEEL_PAN_DIVISOR));
         } else {
           const factor = event.deltaY < 0 ? WHEEL_ZOOM_IN : WHEEL_ZOOM_OUT;
-          state.chartZoom = clamp(Number(state.chartZoom || 1) * factor, 1, 30);
+          state.chartZoom = clamp(Number(state.chartZoom || 1) * factor, CHART_MIN_ZOOM, 30);
         }
         saveChartView();
         scheduleChartRedraw("detail", () => renderCharts(item, root));
@@ -12808,7 +13625,8 @@ function setSymbolError(symbol, error) {
   });
 }
 
-async function refreshAll() {
+async function refreshAll(options = {}) {
+  const manual = options?.manual === true || options?.type === "click";
   if (state.isRefreshing) {
     setStatus("上一次刷新还在进行，自动刷新已重新排队");
     if (state.autoRefreshEnabled) scheduleNextAutoRefresh();
@@ -12821,12 +13639,15 @@ async function refreshAll() {
   const isStaleRefresh = () => state.market !== marketKey || state.marketSwitchToken !== switchToken || state.refreshToken !== refreshToken;
   const startedAt = new Date();
   const preparedItems = [];
+  const priorityCommitted = new Set();
+  const refreshButton = $("refreshAll");
+  const refreshUiTask = window.QuantUI?.beginTask(`${activeMarketConfig().label} 股票池刷新`, { button: refreshButton });
   let symbols = [];
   let runtime = getRuntimeSettings();
   try {
     const session = marketState(new Date(), marketKey);
     runtime = getRuntimeSettings();
-    if (!session.canRefresh && !runtime.allowOffHoursFetch) {
+    if (!manual && !session.canRefresh && !runtime.allowOffHoursFetch) {
       const shouldStop = await useSnapshotOrFetch(`当前不在 ${config.code} 交易/收盘刷新窗口`, true);
       if (shouldStop) {
         safeUiStep("安排下一次自动刷新", scheduleNextAutoRefresh);
@@ -12839,9 +13660,9 @@ async function refreshAll() {
     }
     state.isRefreshing = true;
     safeUiStep("保存刷新状态", saveState);
-    const refreshButton = $("refreshAll");
     if (refreshButton) refreshButton.disabled = true;
     symbols = orderedSymbolsForRefresh(marketKey);
+    window.QuantUI?.showSkeletons($("cards"), Math.min(6, symbols.length));
     safeUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("refresh-start", 250, { market: marketKey, maxSymbols: Math.max(20, Math.min(80, symbols.length + 10)) }));
     const accuracyPromise = safeUiStepAsync("同步预测准确率", () => fetchAccuracySummary(true, marketKey));
     await optionalWithin(accuracyPromise, runtime.fastInitialRefresh ? 1200 : 2500, null);
@@ -12858,31 +13679,38 @@ async function refreshAll() {
     await runLimited(symbols, concurrency, async (symbol) => {
       if (isStaleRefresh()) return;
       try {
-        const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh, market: marketKey });
+        const prepared = await prepareSymbol(symbol, { includeSignals: !runtime.fastInitialRefresh, freshMarket: true, market: marketKey });
         if (isStaleRefresh()) return;
         preparedItems.push(prepared);
+        if (prepared.result?.marketOverlay) {
+          applyQuoteOverlays([prepared.result.marketOverlay], marketKey, { render: false });
+          patchQuoteOverlayDom(symbol);
+        }
+        if (symbol === state.selected) {
+          await requestBatchAnalysis([prepared], { localOnly: true, market: marketKey });
+          priorityCommitted.add(symbol);
+        }
         setStatusThrottled(`${symbol} 数据准备完成 · ${preparedItems.length}/${symbols.length}`);
       } catch (error) {
         console.error(error);
         if (!isStaleRefresh()) safeUiStep(`${symbol} 写入失败状态`, () => setSymbolError(symbol, error));
-      } finally {
-        if (!isStaleRefresh()) queueMainRender(["cards", "summary", "detail"]);
       }
     });
     if (isStaleRefresh()) return;
     preparedItems.sort((a, b) => symbols.indexOf(a.symbol) - symbols.indexOf(b.symbol));
-    if (preparedItems.length) {
+    const batchPreparedItems = preparedItems.filter((item) => !priorityCommitted.has(item.symbol));
+    if (batchPreparedItems.length) {
       try {
         setStatus(runtime.fastInitialRefresh
-          ? `快速本地融合 ${preparedItems.length} 只股票，先给出技术/历史/自监督结论...`
-          : `本地模型融合 ${preparedItems.length} 只股票，已纳入新闻/因子，AI 批量分析后台更新...`);
-        const results = await requestBatchAnalysis(preparedItems, { localOnly: true, market: marketKey });
+          ? `快速本地融合 ${batchPreparedItems.length} 只股票，先给出技术/历史/自监督结论...`
+          : `本地模型融合 ${batchPreparedItems.length} 只股票，已纳入新闻/因子，AI 批量分析后台更新...`);
+        const results = await requestBatchAnalysis(batchPreparedItems, { localOnly: true, market: marketKey });
         if (isStaleRefresh()) return;
         const buyAlerts = results.filter((item) => isBuyAction(item.analysis?.action)).length;
         setStatus(`本地融合完成：${buyAlerts} 个买入/轻仓关注提醒，新闻/因子/AI 正在后台复核`);
       } catch (error) {
         console.error(error);
-        if (!isStaleRefresh()) preparedItems.forEach((item) => safeUiStep(`${item.symbol} 写入本地模型失败`, () => setSymbolError(item.symbol, error)));
+        if (!isStaleRefresh()) batchPreparedItems.forEach((item) => safeUiStep(`${item.symbol} 写入本地模型失败`, () => setSymbolError(item.symbol, error)));
       } finally {
         if (!isStaleRefresh()) renderAnalysisPanelsNow();
       }
@@ -12908,7 +13736,8 @@ async function refreshAll() {
     renderAnalysisPanelsNow();
     safeUiStep("刷新失败后安排自动刷新", scheduleNextAutoRefresh);
   } finally {
-    const refreshButton = $("refreshAll");
+    window.QuantUI?.clearBusy($("cards"));
+    refreshUiTask?.finish();
     if (state.refreshToken === refreshToken) {
       if (refreshButton) refreshButton.disabled = false;
       state.isRefreshing = false;
@@ -12925,7 +13754,7 @@ function scheduleNextAutoRefresh() {
     ? asNumber($("refreshInterval").value, 180000)
     : minutesUntilNextRefreshWindow() * 60000;
   state.nextAutoRefreshAt = new Date(Date.now() + interval);
-  state.autoRefreshTimer = setTimeout(refreshAll, Math.min(interval, 2147483647));
+  state.autoRefreshTimer = setTimeout(() => refreshAll({ manual: false }), Math.min(interval, 2147483647));
   setStatus(session.canRefresh || runtime.allowOffHoursFetch
     ? `自动刷新运行中，下一次：${formatClock(state.nextAutoRefreshAt)}`
     : `${activeMarketConfig().code} 休市中，自动刷新暂停；下一次交易窗口：${formatClock(state.nextAutoRefreshAt)}`);
@@ -12940,7 +13769,7 @@ function startAutoRefresh(runNow = false) {
   setStatus(marketState().canRefresh || getRuntimeSettings().allowOffHoursFetch
     ? `自动刷新已启动：每 ${Math.round(interval / 60000)} 分钟`
     : "自动刷新已启动；当前休市，先使用本地快照并等待下一次交易窗口");
-  if (runNow) refreshAll();
+  if (runNow) refreshAll({ manual: true });
   else scheduleNextAutoRefresh();
 }
 
@@ -12958,27 +13787,35 @@ function stashActiveMarketState() {
   sanitizeActiveMarketState();
   state.watchlist = sanitizeSymbolsForMarket(state.watchlist, state.market);
   reconcileWatchlistOrigins(state.market);
+  reconcileWatchlistAddedAt(state.market);
   state.watchlistsByMarket[state.market] = state.watchlist;
   state.analysesByMarket.set(state.market, new Map(state.analyses));
   safeStorage.setItem("watchlistsByMarket", JSON.stringify(state.watchlistsByMarket));
   safeStorage.setItem("watchlistOriginsByMarket", JSON.stringify(state.watchlistOriginsByMarket));
+  safeStorage.setItem("watchlistAddedAtByMarket", JSON.stringify(state.watchlistAddedAtByMarket));
+  safeStorage.setItem("watchlistSortByMarket", JSON.stringify(state.watchlistSortByMarket));
 }
 
 function updateMarketUi() {
   const config = activeMarketConfig();
-  document.title = `${config.title} · Global Quant Watch`;
+  syncWorkspaceLocation(state.activePage);
   const marketCycleButton = $("marketCycleButton");
   if (marketCycleButton) {
-    marketCycleButton.textContent = state.market === "ASX" ? "AUX" : state.market;
+    marketCycleButton.textContent = state.market;
     marketCycleButton.setAttribute("aria-label", `当前${config.label}，点击切换市场`);
-    marketCycleButton.title = `当前${config.label}，点击切换 AUX / US / CN`;
+    marketCycleButton.title = `当前${config.label}，点击切换 ASX / US / CN`;
   }
+  document.querySelectorAll("[data-market-select]").forEach((button) => {
+    const active = button.dataset.marketSelect === state.market;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "true" : "false");
+  });
   const brandMarketTitle = $("brandMarketTitle");
   if (brandMarketTitle) brandMarketTitle.textContent = `${config.label} ${config.code}`;
   const brandSubtitle = $("brandSubtitle");
-  if (brandSubtitle) brandSubtitle.textContent = "Global Quant Watch · 多市场只读分析与提醒";
+  if (brandSubtitle) brandSubtitle.textContent = "真实数据工作区";
   const marketTitle = $("marketTitle");
-  if (marketTitle) marketTitle.textContent = config.title;
+  if (marketTitle) marketTitle.textContent = workspaceTitle(state.activePage, state.market);
   document.querySelectorAll(".currencyLabel").forEach((node) => {
     node.textContent = config.currency;
   });
@@ -12999,13 +13836,19 @@ function updateMarketUi() {
   const agentInitialCapital = $("agentInitialCapital");
   if (agentInitialCapital) agentInitialCapital.value = agentConfigForMarket().initialCapital;
   syncCapitalFields();
+  syncWatchlistSortControls();
   updateSydneyClock();
+  renderHomePage();
 }
 
 async function switchMarket(nextMarket) {
   const market = safeMarket(nextMarket);
   if (market === state.market) return;
   const token = ++state.marketSwitchToken;
+  state.activeMarketAbortController?.abort?.();
+  state.activeMarketAbortController = new AbortController();
+  state.paperAgentEventSource?.close?.();
+  state.paperAgentEventSource = null;
   state.refreshToken += 1;
   state.aiRefreshToken += 1;
   state.isRefreshing = false;
@@ -13017,6 +13860,8 @@ async function switchMarket(nextMarket) {
   if (refreshButton) refreshButton.disabled = false;
   safeUiStep("保存当前市场状态", stashActiveMarketState);
   state.market = market;
+  state.detailEvidence = { symbol: null, open: false, tab: "decision" };
+  state.detailConfidence = { symbol: null, open: false };
   state.watchlist = sanitizeSymbolsForMarket(initialWatchlistForMarket(market), market);
   state.analyses = new Map(state.analysesByMarket.get(market) || []);
   safeUiStep("清理市场状态", sanitizeActiveMarketState);
@@ -13037,20 +13882,26 @@ async function switchMarket(nextMarket) {
     if (restored) evaluateAlerts();
     return restored;
   });
-  queueMainRender(["cards", "summary", "detail", "indexes", "agent"]);
-  safeUiStep("渲染股票池", renderUniversePanel);
-  safeUiStep("渲染涨跌榜", renderMarketMoversPanel);
-  safeUiStep("渲染 AI 选股", renderAiPickPanel);
+  queueMainRender(["cards", "summary", "detail", "indexes", ...(state.activePage === "strategy" ? ["agent"] : [])]);
+  if (state.activePage === "regime") {
+    safeUiStep("渲染股票池", renderUniversePanel);
+    safeUiStep("渲染涨跌榜", renderMarketMoversPanel);
+  }
+  if (state.activePage === "regime") safeUiStep("渲染 AI 选股", renderAiPickPanel);
   deferMarketStepAsync(token, "恢复服务器快照", restoreServerSnapshot, 150, { idle: true, timeout: 3000 });
+  deferMarketStepAsync(token, "恢复后台 Paper Agent", () => loadWorkspaceBootstrap(market), 260, { idle: true, timeout: 5000 });
+  deferMarketStep(token, "连接当前市场事件流", connectRuntimeEventStream, 320, { idle: true });
   deferMarketStep(token, "清理恢复后的市场状态", sanitizeActiveMarketState, 360, { idle: true });
   deferMarketStepAsync(token, "加载研究配置", loadResearchConfig, 560, { idle: true, timeout: 3500 });
-  deferMarketStepAsync(token, "加载预测准确率", () => fetchAccuracySummary(true), 820, { idle: true, timeout: 4500 });
+  deferMarketStepAsync(token, "加载预测准确率", () => state.activePage === "strategy" ? fetchAccuracySummary(true) : false, 820, { idle: true, timeout: 4500 });
   deferMarketStep(token, "后台渲染市场面板", () => {
     evaluateAlerts();
-    queueMainRender(["cards", "summary", "detail", "indexes", "agent"]);
-    renderUniversePanel();
-    renderMarketMoversPanel();
-    renderAiPickPanel();
+    queueMainRender(["cards", "summary", "detail", "indexes", ...(state.activePage === "strategy" ? ["agent"] : [])]);
+    if (state.activePage === "regime") {
+      renderUniversePanel();
+      renderMarketMoversPanel();
+    }
+    if (state.activePage === "regime") renderAiPickPanel();
     setStatus(`已切换到${activeMarketConfig().label}；刷新后读取该市场真实行情`);
   }, 1050, { idle: true });
   if (state.activePage === "sources") {
@@ -13071,6 +13922,8 @@ function cycleMarket() {
     setStatus(`市场切换部分失败：${compactRuntimeError(error)}；可继续切换其它市场`);
   });
 }
+
+window.switchMarket = switchMarket;
 
 async function importPortfolioImage(event) {
   const file = event.target.files?.[0];
@@ -13115,7 +13968,30 @@ async function importPortfolioImage(event) {
   }
 }
 
+function applyQuietGoldChartDefaults() {
+  const migrationKey = "quietGoldChartDefaults:v1";
+  if (safeStorage.getItem(migrationKey) === "true") return;
+  state.chartOverlays = {
+    ...state.chartOverlays,
+    sma20: true,
+    sma50: true,
+    vwap: false,
+    bollinger: false,
+    fib: false,
+    fvg: false,
+    volume: true,
+    profile: false,
+    orderflow: false,
+    factorPrediction: false,
+    macd: false,
+    anomalies: false,
+  };
+  safeStorage.setItem("chartOverlays", JSON.stringify(state.chartOverlays));
+  safeStorage.setItem(migrationKey, "true");
+}
+
 function boot() {
+  state.activeMarketAbortController = new AbortController();
   safeStorage.setItem(`lastAppOpen:${state.market}`, new Date().toISOString());
   window.addEventListener("pagehide", () => {
     safeStorage.setItem(`lastAppClose:${state.market}`, new Date().toISOString());
@@ -13126,8 +14002,26 @@ function boot() {
   document.querySelectorAll("[data-page-target]").forEach((button) => {
     button.addEventListener("click", () => setWorkspacePage(button.dataset.pageTarget));
   });
+  document.querySelectorAll("[data-home-target]").forEach((button) => {
+    button.addEventListener("click", () => setWorkspacePage(button.dataset.homeTarget));
+  });
+  bind("homeOpenDashboard", "click", () => setWorkspacePage("dashboard"));
+  bind("homeOpenStrategy", "click", () => setWorkspacePage("strategy"));
+  bind("homeBrandButton", "click", () => setWorkspacePage("home"));
   bind("marketCycleButton", "click", cycleMarket);
+  bind("watchlistSortKey", "change", (event) => setWatchlistSort(event.target.value));
+  bind("watchlistSortDirection", "click", () => {
+    const current = watchlistSortConfig();
+    setWatchlistSort(current.key, current.direction === "asc" ? "desc" : "asc");
+  });
+  window.addEventListener("resize", () => scheduleWatchlistSparklines($("cards")), { passive: true });
+  applyQuietGoldChartDefaults();
 
+  if (!STARTUP_SAFE_MODE && state.activePage === "home" && safeStorage.getItem("homeExperienceIntroduced:v1") !== "true") {
+    state.activePage = "home";
+    safeStorage.setItem("activeQuantPage", "home");
+    safeStorage.setItem("homeExperienceIntroduced:v1", "true");
+  }
   if (STARTUP_SAFE_MODE) {
     state.activePage = "dashboard";
     safeStorage.setItem("activeQuantPage", "dashboard");
@@ -13136,6 +14030,13 @@ function boot() {
   safeUiStep("清理启动状态", sanitizeActiveMarketState);
   safeUiStep("更新市场 UI", updateMarketUi);
   safeUiStep("保存持仓", savePortfolio);
+  if (!STARTUP_SAFE_MODE) {
+    safeUiStep("优先恢复本地分析与行情", () => {
+      const restored = restoreAnalysisSnapshot();
+      if (restored) evaluateAlerts();
+      return restored;
+    });
+  }
   safeUiStep("渲染基础股票卡片", renderCards);
   safeUiStep("渲染基础持仓概览", renderPortfolioSummary);
   safeUiStep("渲染提醒按钮", renderNotificationButton);
@@ -13146,35 +14047,32 @@ function boot() {
     ? "已进入安全启动模式：先保证页面可操作，旧快照/新闻后台暂不自动加载"
     : "页面已进入可操作状态，历史快照和模型面板正在后台恢复");
 
-  deferUiStep("恢复本地分析快照", () => {
+  deferUiStep("恢复最新服务器行情", async () => {
     if (STARTUP_SAFE_MODE) return false;
-    const restored = restoreAnalysisSnapshot();
-    if (restored) {
-      safeUiStep("快照恢复后渲染卡片", renderCards);
-      safeUiStep("快照恢复后渲染详情", renderDetail);
-      safeUiStep("快照恢复后检查提醒", evaluateAlerts);
-    }
-    return restored;
-  }, 500);
+    return restoreServerSnapshot();
+  }, 60, { idle: false });
+
+  deferUiStep("连接后台工作区", async () => {
+    await loadWorkspaceBootstrap(state.market);
+    connectRuntimeEventStream();
+  }, 180, { idle: false });
+
+  deferUiStep("迁移后台 Paper Agent", migratePaperAgentsToBackend, 1250, { idle: true, timeout: 6000 });
   deferUiStep("恢复大盘快照", () => {
     if (STARTUP_SAFE_MODE) return false;
     loadMarketIndexSnapshot();
     renderMarketIndexPanel();
   }, 900);
-  deferUiStep("恢复服务器快照", async () => {
-    if (STARTUP_SAFE_MODE) return false;
-    return restoreServerSnapshot();
-  }, 1400);
   deferUiStep("加载研究配置", loadResearchConfig, 1700);
-  deferUiStep("加载预测准确率", () => fetchAccuracySummary(true), STARTUP_SAFE_MODE ? 4500 : 2200);
-  deferUiStep("渲染股票池", renderUniversePanel, 2600);
-  deferUiStep("渲染涨跌榜", renderMarketMoversPanel, 2900);
-  deferUiStep("渲染 AI 选股", renderAiPickPanel, 3200);
-  deferUiStep("渲染 Agent", renderAgentPanel, 3500);
-  deferUiStep("渲染最优策略", renderOptimalStrategyPanel, 3800);
-  deferUiStep("渲染历史", renderHistory, 4100);
-  deferUiStep("渲染因子配置", renderFactorConfigPanel, 4400);
-  deferUiStep("渲染策略版本", renderStrategyRevisionPanel, 4700);
+  deferUiStep("加载预测准确率", () => state.activePage === "strategy" ? fetchAccuracySummary(true) : false, STARTUP_SAFE_MODE ? 4500 : 2200);
+  deferUiStep("渲染股票池", () => state.activePage === "regime" ? renderUniversePanel() : false, 2600);
+  deferUiStep("渲染涨跌榜", () => state.activePage === "regime" ? renderMarketMoversPanel() : false, 2900);
+  deferUiStep("渲染 AI 选股", () => state.activePage === "regime" ? renderAiPickPanel() : false, 3200);
+  deferUiStep("渲染 Agent", () => state.activePage === "strategy" ? renderAgentPanel() : false, 3500);
+  deferUiStep("渲染最优策略", () => state.activePage === "strategy" ? renderOptimalStrategyPanel() : false, 3800);
+  deferUiStep("渲染历史", () => state.activePage === "simulation" ? renderHistory() : false, 4100);
+  deferUiStep("渲染因子配置", () => state.activePage === "factors" ? renderFactorConfigPanel() : false, 4400);
+  deferUiStep("渲染策略版本", () => state.activePage === "strategy" ? renderStrategyRevisionPanel() : false, 4700);
   deferUiStep("刷新 API 状态", () => refreshApiStatusBar(false), 5200);
   deferUiStep("排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("startup", 300, { maxSymbols: 60 }), STARTUP_SAFE_MODE ? 6500 : 5600);
   deferUiStep("排队补齐大盘快照", () => {
@@ -13189,7 +14087,7 @@ function boot() {
   deferUiStep("确认启动完成", () => {
     safeStorage.setItem(BOOT_PENDING_KEY, "false");
     if (STARTUP_SAFE_MODE) setStatus("安全启动完成：页面可操作。需要数据时请手动点击刷新或数据源页检查。");
-  }, 12000);
+  }, 2200);
 
   bind("runFeatureAnalysis", "click", runFeatureAnalysis);
   bind("runTradeAnalysis", "click", runTradeAnalysis);
@@ -13299,68 +14197,40 @@ function boot() {
     if ((event.metaKey || event.ctrlKey) && event.key === "Enter") sendAiChat();
   });
 
-  bind("saveAgentCapital", "click", () => {
-    const beforeLedger = getAgentLedger();
-    const before = {
-      capital: agentConfigForMarket().initialCapital,
-      model: agentModelSummary(beforeLedger),
-    };
+  bind("saveAgentCapital", "click", async () => {
     const value = Math.max(100, asNumber($("agentInitialCapital").value, agentConfigForMarket().initialCapital));
-    state.agentConfigByMarket[state.market] = { initialCapital: value };
-    resetLedgerPreservingMemory("capital-reset");
-    appendModelChangeLog({
-      type: "agent-capital",
-      title: "Agent 本金已修改",
-      summary: `单 Agent 初始本金调整为 ${formatMoney(value)}，当前训练周期已归档并重新开始。`,
-      before,
-      after: { capital: value, model: agentModelSummary(getAgentLedger()) },
-      details: { source: "saveAgentCapital" },
-    });
-    renderAgentPanel();
-    renderOptimalStrategyPanel();
-    setStatus(`模拟交易 Agent 本金已设为 ${formatMoney(value)}；当前周期已归档，长期策略记忆已保留`);
-  });
-
-  bind("resetAgents", "click", () => {
-    const before = agentModelSummary(getAgentLedger());
-    resetLedgerPreservingMemory("manual-reset");
-    appendModelChangeLog({
-      type: "agent-reset",
-      title: "Agent 训练周期已归档重置",
-      summary: "当前市场训练周期已归档；长期策略记忆保留，但新周期需重新验证。",
-      before,
-      after: agentModelSummary(getAgentLedger()),
-      details: { source: "manual-reset" },
-    });
-    renderAgentPanel();
-    renderOptimalStrategyPanel();
-    setStatus("当前市场训练周期已归档并重置；长期策略记忆会继续参与后续预测");
-  });
-
-  bind("refreshOptimalStrategy", "click", () => {
-    const rows = [...state.analyses.values()].filter((item) => item?.candles?.length);
-    if (!rows.length) {
-      setStatus("还没有可用于训练的历史K线，请先刷新股票");
-      return;
+    try {
+      await savePaperAgentConfig({ initialCapital: value, enabled: true });
+      setStatus(`后台 Paper Agent 本金已设为 ${formatMoney(value)}；已有持仓、成交和学习记忆均已保留`);
+    } catch (error) {
+      setStatus(`后台 Paper Agent 本金保存失败：${compactDisplayError(error.message)}`);
     }
-    const ledger = getAgentLedger();
-    const before = agentModelSummary(ledger);
-    trainAgentsWithHistoricalReplay(ledger, rows);
-    ledger.updatedAt = new Date().toISOString();
-    state.agentLedgerByMarket[state.market] = ledger;
-    persistAgentMemoryFromLedger(ledger, "manual-replay");
-    saveAgentState();
-    appendModelChangeLog({
-      type: "agent-replay",
-      title: "Agent 最优策略草稿已重放训练",
-      summary: `使用当前股票池 ${rows.length} 只股票做历史重放；结果只进入草稿和本地 Agent 偏置。`,
-      before,
-      after: agentModelSummary(ledger),
-      details: { sampleCount: rows.length, symbols: rows.map((item) => item.symbol).slice(0, 60) },
-    });
-    renderAgentPanel();
-    renderOptimalStrategyPanel();
-    setStatus("Agent 最优策略草稿已用当前股票池叠加训练更新");
+  });
+
+  bind("resetAgents", "click", async () => {
+    const confirmed = window.confirm("确认重置当前市场的 Paper Agent 资金、持仓与成交账本？长期学习记忆会保留，此操作不会发送真实订单。");
+    if (!confirmed) return;
+    try {
+      await resetPaperAgentBackend(true);
+      setStatus("后台 Paper Agent 账本已重置；长期亏损经验保留");
+    } catch (error) {
+      setStatus(`后台 Paper Agent 重置失败：${compactDisplayError(error.message)}`);
+    }
+  });
+
+  bind("refreshOptimalStrategy", "click", async () => {
+    try {
+      const response = await fetch("/api/jobs/backtest", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ market: state.market, symbols: state.watchlist, strategy: getStrategy(), range: "", largeSample: true, productionTraining: true }),
+      });
+      const job = await response.json();
+      if (!response.ok) throw new Error(job.error || "Backtest job failed to queue");
+      setStatus(`历史训练已进入后端作业 ${job.id}；页面可继续操作，完成后由事件流更新`);
+    } catch (error) {
+      setStatus(`历史训练排队失败：${compactDisplayError(error.message)}`);
+    }
   });
 
   bind("totalCapital", "input", () => {
@@ -13458,7 +14328,7 @@ function boot() {
     setStatus("仓位建议已重新计算");
   });
 
-  bind("refreshAll", "click", refreshAll);
+  bind("refreshAll", "click", () => refreshAll({ manual: true }));
   if (state.autoRefreshEnabled) startAutoRefresh(false);
   syncBackendMonitorConfig({ immediate: true });
 }

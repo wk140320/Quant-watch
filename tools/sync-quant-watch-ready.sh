@@ -14,13 +14,19 @@ cd "$PROJECT_ROOT"
 rsync -a \
   --exclude .git \
   --exclude .cache \
+  --exclude catboost_info \
+  --exclude .pnpm-store \
   --exclude .venv \
-  --exclude .env \
-  --exclude .env.local \
+  --include .env.example \
+  --exclude '.env*' \
   --exclude __pycache__ \
   --exclude '*.pyc' \
   --exclude '.DS_Store' \
   --exclude GlobalQuantMonitorLocal.app \
+  --exclude GlobalQuantMonitor.app \
+  --exclude Quant-watch \
+  --exclude node_modules \
+  --exclude 'record*' \
   --exclude Quant-watch-open-source.tar.gz \
   ./ "$DEST/"
 

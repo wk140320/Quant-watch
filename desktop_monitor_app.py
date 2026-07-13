@@ -12,6 +12,7 @@ import http.client
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -54,20 +55,20 @@ DEFAULT_BUDGET_LIMITS = {
     "trainingMarketReserve": 90,
 }
 COLORS = {
-    "bg": "#050A12",
-    "panel": "#0A1420",
-    "panel2": "#0E1A28",
-    "panel3": "#111F2F",
-    "border": "#1E3B53",
-    "border2": "#27516E",
-    "text": "#EAF6FF",
-    "muted": "#8DA7BA",
-    "subtle": "#577086",
-    "accent": "#2DE2C5",
-    "accent2": "#6EA8FE",
-    "gold": "#F2C94C",
-    "danger": "#F05D76",
-    "good": "#45D483",
+    "bg": "#090C10",
+    "panel": "#11161C",
+    "panel2": "#182129",
+    "panel3": "#202B34",
+    "border": "#26323B",
+    "border2": "#34505A",
+    "text": "#F3F7F8",
+    "muted": "#89969D",
+    "subtle": "#66747C",
+    "accent": "#5ED2C7",
+    "accent2": "#83B9EE",
+    "gold": "#E7C06F",
+    "danger": "#F18492",
+    "good": "#72D69A",
 }
 
 
@@ -308,12 +309,12 @@ class MonitorDesktopApp(tk.Tk):
         style.configure("MutedPanel.TLabel", background=COLORS["panel"], foreground=COLORS["muted"])
         style.configure("Title.TLabel", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica", 24, "bold"))
         style.configure("Metric.TLabel", background=COLORS["panel"], foreground=COLORS["text"], font=("Helvetica", 20, "bold"))
-        style.configure("TButton", padding=(13, 8), background="#13263A", foreground=COLORS["text"], borderwidth=0, focusthickness=0)
-        style.map("TButton", background=[("active", "#193854"), ("disabled", "#0B1724")], foreground=[("disabled", COLORS["subtle"])])
-        style.configure("Accent.TButton", background="#143C48", foreground="#D8FFF8")
-        style.configure("Danger.TButton", background="#351620", foreground="#FFDCE3")
-        style.configure("Good.TButton", background="#123522", foreground="#D8FFE5")
-        style.configure("TEntry", fieldbackground="#07101A", foreground=COLORS["text"], insertcolor=COLORS["text"], bordercolor=COLORS["border"])
+        style.configure("TButton", padding=(13, 8), background="#202B34", foreground=COLORS["text"], borderwidth=0, focusthickness=0)
+        style.map("TButton", background=[("active", "#293741"), ("disabled", "#151B21")], foreground=[("disabled", COLORS["subtle"])])
+        style.configure("Accent.TButton", background="#265B55", foreground="#EEFFFC")
+        style.configure("Danger.TButton", background="#45232A", foreground="#FFE8EC")
+        style.configure("Good.TButton", background="#203D2D", foreground="#E9FFF0")
+        style.configure("TEntry", fieldbackground="#0D1217", foreground=COLORS["text"], insertcolor=COLORS["text"], bordercolor=COLORS["border"])
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=22)
@@ -326,7 +327,7 @@ class MonitorDesktopApp(tk.Tk):
         tk.Label(title_block, text="LOCAL DESKTOP DAEMON", bg=COLORS["panel"], fg=COLORS["accent"], font=("Helvetica", 10, "bold"), anchor="w").pack(fill="x")
         tk.Label(title_block, text="Global Quant Watch", bg=COLORS["panel"], fg=COLORS["text"], font=("Helvetica", 25, "bold"), anchor="w").pack(fill="x", pady=(2, 0))
         tk.Label(title_block, text="后端监控、分钟训练、预算和提醒的本地控制台", bg=COLORS["panel"], fg=COLORS["muted"], font=("Helvetica", 12), anchor="w").pack(fill="x", pady=(2, 0))
-        self.status_label = tk.Label(title_block, text="读取中...", bg="#07101A", fg=COLORS["muted"], font=("Helvetica", 11), anchor="w", padx=10, pady=5)
+        self.status_label = tk.Label(title_block, text="读取中...", bg="#0D1217", fg=COLORS["muted"], font=("Helvetica", 11), anchor="w", padx=10, pady=5)
         self.status_label.pack(fill="x", pady=(10, 0))
 
         actions = tk.Frame(header, bg=COLORS["panel"])
@@ -339,6 +340,10 @@ class MonitorDesktopApp(tk.Tk):
         self.toggle_button.pack(fill="x", pady=3)
         self.run_button = ttk.Button(actions, text="立即运行一次", command=self.run_once, style="Accent.TButton")
         self.run_button.pack(fill="x", pady=3)
+        self.login_button = ttk.Button(actions, text="安装登录自启", command=self.install_login_agent)
+        self.login_button.pack(fill="x", pady=3)
+        self.remove_login_button = ttk.Button(actions, text="取消登录自启", command=self.remove_login_agent)
+        self.remove_login_button.pack(fill="x", pady=3)
 
         metrics = ttk.Frame(root)
         metrics.pack(fill="x", pady=(0, 14))
@@ -406,15 +411,15 @@ class MonitorDesktopApp(tk.Tk):
         text = tk.Text(
             panel,
             height=10,
-            bg="#06101A",
-            fg="#D8EDF8",
+            bg="#0D1217",
+            fg="#DCE7EA",
             insertbackground=COLORS["text"],
             relief="flat",
             wrap="word",
             font=("Menlo", 12),
             padx=10,
             pady=9,
-            selectbackground="#1D4F63",
+            selectbackground="#265B55",
         )
         text.pack(fill="both", expand=True, padx=14, pady=(0, 14))
         text.configure(state="disabled")
@@ -424,8 +429,46 @@ class MonitorDesktopApp(tk.Tk):
         self.busy = busy
         self.busy_since = time.time() if busy else 0.0
         state = "disabled" if busy else "normal"
-        for button in [self.start_server_button, self.refresh_button, self.toggle_button, self.run_button]:
+        for button in [self.start_server_button, self.refresh_button, self.toggle_button, self.run_button, self.login_button, self.remove_login_button]:
             button.configure(state=state)
+
+    def install_login_agent(self) -> None:
+        self.set_busy(True)
+        self.status_label.configure(text="正在配置登录自动启动...")
+        self.background(self._install_login_agent_worker)
+
+    def _install_login_agent_worker(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "tools" / "manage_launch_agent.py"), "install"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "登录自启安装失败")[:500])
+        self.after(0, lambda: self.status_label.configure(text="登录自启已安装；后台会在 macOS 登录后自动运行。"))
+        self.after(0, lambda: self.set_busy(False))
+
+    def remove_login_agent(self) -> None:
+        self.set_busy(True)
+        self.status_label.configure(text="正在取消登录自动启动...")
+        self.background(self._remove_login_agent_worker)
+
+    def _remove_login_agent_worker(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "tools" / "manage_launch_agent.py"), "uninstall"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "取消登录自启失败")[:500])
+        self.after(0, lambda: self.status_label.configure(text="登录自启已取消；当前已运行的后台可继续手动控制。"))
+        self.after(0, lambda: self.set_busy(False))
 
     def background(self, target, *args) -> None:
         def runner() -> None:

@@ -1,0 +1,10 @@
+# Core production-training dependencies. CatBoost is preferred when installed;
+# LightGBM remains an independent challenger and runtime fallback.
+numpy>=1.26,<3
+scikit-learn>=1.5,<2
+lightgbm>=4.3,<5
+catboost>=1.2,<2
+
+# Optional research/data-pipeline layer. Install separately when Qlib workflows
+# are needed because pyqlib has platform-specific dependency constraints.
+# pyqlib>=0.9.7

@@ -1,5 +1,7 @@
 # Global Quant Watch
 
+模型训练与生产门控详见 [市场级多任务预测、OOF 集成与生产门控](docs/production-model-training.md)。
+
 A local, read-only multi-market quantitative research workspace for ASX, US stocks, and China A-shares.
 
 It combines real market data providers, a Python quantitative core, technical indicators, macro/news signals, portfolio-aware risk rules, prediction learning, and paper-trading agents. The app does **not** place real trades.
@@ -102,7 +104,9 @@ Common optional keys:
 
 ```bash
 EODHD_API_KEY=
+EODHD_API_KEYS=
 TWELVEDATA_API_KEY=
+TWELVEDATA_API_KEYS=
 ALPHAVANTAGE_API_KEY=
 NEWSAPI_KEY=
 NEWSDATA_API_KEY=
@@ -122,9 +126,12 @@ ATAS_API_KEY=
 ATAS_FEATURE_ENDPOINT=
 FINNHUB_API_KEY=
 TIINGO_API_KEY=
+TIINGO_API_KEYS=
 MARKETAUX_API_KEY=
 FRED_API_KEY=
 ```
+
+`EODHD_API_KEYS`, `TWELVEDATA_API_KEYS`, and `TIINGO_API_KEYS` accept comma-separated backup credentials. The singular key remains primary; backups are tried in order only after quota, authentication, or plan-permission failures. Keys are never round-robin consumed and are never returned to the browser.
 
 OpenAI analysis is disabled by default. To enable it:
 
@@ -143,6 +150,31 @@ OPENAI_API_KEY=
 - Provider-reported trades are not treated as L2. If quotes or aggressor-side fields are absent, the app explicitly marks them unavailable.
 - Authorised tick/L1/L2 rows can be recorded through the local market-data store, but candle proxies are never promoted to true order-book data.
 - ATAS is treated as an optional external feature extractor, not as a market-data source. It receives real feature payloads only when an endpoint is configured.
+- Paper Agents are backend-owned and persisted in SQLite. Browser refreshes only update the display; they do not advance the Paper ledger.
+- Changing Paper Agent capital preserves positions, trades, and learning memory. Browser migration is non-destructive: an empty or poorer browser ledger cannot replace a richer backend ledger.
+- Paper fills require an open market, a real provider source, a positive price, and a current completed bar timestamp. Live broker execution is always disabled.
+
+## Background Runtime
+
+The default trading-session cadence is 3 minutes for holdings, 10 minutes for other watchlist symbols, and 5 minutes for minute-model training on at most two priority symbols. The daily request envelope reserves 80% for live monitoring, 15% for minute training, and 5% for manual/failover work; the minute training set keeps an 80/20 persisted-history versus newly completed-bar target when enough history exists.
+
+Open `GlobalQuantMonitor.app` to start, pause, inspect, or manually run the backend monitor. The controller also provides **安装登录自启** and **取消登录自启** actions. Login startup is implemented as a user LaunchAgent and runs `server.mjs` from this project without copying API keys into the plist.
+
+The local control plane exposes:
+
+```text
+GET  /api/workspace/bootstrap?market=ASX
+GET  /api/paper-agents?market=ASX
+POST /api/paper-agents/config
+POST /api/paper-agents/reset
+POST /api/paper-agents/migrate
+GET  /api/paper-agents/events?market=ASX
+GET  /api/runtime/stream
+POST /api/jobs/training|backtest|news|reddit|monitor
+GET  /api/jobs/:id
+```
+
+News refresh windows and hourly Reddit cache warmup are scheduled by the backend while it is running. Long backtests and enrichment refreshes are asynchronous jobs, so the dashboard remains usable.
 
 ## Useful Commands
 
@@ -158,19 +190,29 @@ npm run check:providers
 ## Project Structure
 
 ```text
-index.html                Browser UI
-styles.css                App styling
-app.js                    Frontend state, charts, alerts, UI rendering
-server.mjs                Local HTTP server, providers, analysis, calibration
-quant_client.py           Python local CLI/Tk client for core analysis workflows
-quant_core/               Python feature, factor, trade, risk, provider-budget, and SQLite control core
-tests/                    Python quantitative core tests
-docs/upgrade-roadmap.md   Incremental upgrade requirements and acceptance roadmap
-docs/source-project-study.md Verified source-project distillation and architecture mapping
-docs/word-requirements-audit.md Requirement-by-requirement verification status
-tools/check-providers.mjs Provider smoke test helper
-.env.example              Safe environment template
+index.html                  Browser shell and versioned asset entry points
+frontend/runtime/           UI scheduling, progress, loading, and transition runtime
+frontend/domain/            Market configuration and cross-market symbol rules
+frontend/charts/            Technical series and chart-coordinate mathematics
+frontend/styles/            Design tokens and final high-density shell styling
+frontend/vendor/lucide/     Vendored local icon runtime and licence
+styles.css                  Legacy feature and chart styles during decomposition
+app.js                      Frontend compatibility orchestrator
+backend/http/               Static and HTTP transport modules
+backend/config/             Local environment and secret-source loading
+backend/providers/          Shared Provider HTTP, timeout, and redaction layer
+server.mjs                  Node compatibility entry point and API orchestration
+quant_client.py             Python local CLI/Tk client
+quant_core/                 Features, factors, backtests, models, risk, and persistence
+tests/                      Node and Python regression coverage
+docs/architecture.md        Ownership boundaries and extraction order
+docs/design-system.md       Colour, geometry, motion and page hierarchy contract
+docs/upgrade-roadmap.md     Incremental requirements and acceptance roadmap
+tools/check-providers.mjs   Provider smoke test helper
+.env.example                Safe environment template
 ```
+
+See [docs/architecture.md](docs/architecture.md) for runtime boundaries, performance rules, and the staged decomposition plan.
 
 ## Privacy And Secrets
 

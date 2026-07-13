@@ -635,3 +635,42 @@ high_path_volatility
 These flags lower `labelConfidence` and increase `labelNoiseScore`. Ridge, logistic, KNN analogs, method-weight calibration, residual calibration, and reported historical metrics use the reduced `sampleWeight`.
 
 Leakage rule: path-noise metrics are computed only for historical labels whose full future horizon is complete. They are never computed for the live prediction row.
+
+## Weighted Wilson Reliability Interval
+
+Backtest hit rates are point estimates. A 62% hit rate with a small or low-quality sample should not be treated the same as a 62% hit rate with many independent high-quality samples. The reliability gate computes weighted Wilson intervals:
+
+```text
+weights = sampleWeight
+effectiveN = (sum(weights)^2) / sum(weights^2)
+p = weighted_mean(binaryOutcome)
+z = 1.64485  # two-sided 90% interval
+
+denominator = 1 + z^2 / effectiveN
+center = (p + z^2 / (2 * effectiveN)) / denominator
+margin = z * sqrt((p * (1-p) + z^2/(4*effectiveN)) / effectiveN) / denominator
+
+lowerBound = center - margin
+upperBound = center + margin
+```
+
+Computed intervals:
+
+```text
+target.lowerBound = conservative lower bound for target-before-stop rate
+stop.upperBound = conservative upper bound for stop-before-target rate
+direction.lowerBound = conservative lower bound for direction hit rate
+```
+
+Reliability score:
+
+```text
+score = 100
+  - max(0, 55 - targetLowerBound) * 1.25
+  - max(0, 52 - directionLowerBound) * 0.8
+  - max(0, stopUpperBound - 52) * 0.9
+  - max(0, 14 - effectiveN) * 2.15
+  - max(0, targetMargin - 16) * 0.75
+```
+
+High-confidence labels require not only strong observed hit rates, but also acceptable lower/upper statistical bounds.
