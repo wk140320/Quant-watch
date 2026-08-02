@@ -4,12 +4,14 @@ import json
 import importlib.util
 import socket
 import sys
+import traceback
 from typing import Any
 
 from alpha_mining import analyze_alpha_evolution
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features
 from historical_backtest import batch_historical_backtest, run_historical_backtest
 from local_model import train_local_model_suite
+from model_reporting import generate_model_report
 from paper_agents import configure as configure_paper_agents
 from paper_agents import list_agent_events, load_state as load_paper_agent_state
 from paper_agents import migrate as migrate_paper_agents
@@ -227,6 +229,22 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
             market=str(payload.get("market") or "ASX"),
             symbol=str(payload.get("symbol") or ""),
         )
+        if result.get("available") is False:
+            result["alpha_evolution"] = {
+                "available": False,
+                "deferred": False,
+                "framework": "quantaalpha_inspired_local_evolution",
+                "reason": "Alpha evolution is disabled until the real-candle evidence threshold is met.",
+            }
+            return result
+        if payload.get("include_alpha_evolution", True) is False:
+            result["alpha_evolution"] = {
+                "available": False,
+                "deferred": True,
+                "framework": "quantaalpha_inspired_local_evolution",
+                "reason": "Alpha evolution is executed as a separate background stage.",
+            }
+            return result
         try:
             result["alpha_evolution"] = analyze_alpha_evolution(
                 payload.get("candles") or [],
@@ -306,6 +324,12 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return result
     if operation == "production-model-train":
         return train_market_multitask(payload)
+    if operation == "model-report-generate":
+        return generate_model_report(
+            root=payload.get("root"),
+            markets=payload.get("markets"),
+            output_dir=payload.get("output_dir", payload.get("outputDir")),
+        )
     if operation == "trade-analysis":
         return analyze_trades(
             payload.get("trades") or [],
@@ -359,13 +383,51 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
     raise ValueError(f"Unknown Python quant core operation: {operation}")
 
 
-def main() -> None:
+def response_for(payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
     try:
-        payload = json.load(sys.stdin)
         result = dispatch(payload)
-        print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, separators=(",", ":")))
+        response = {"ok": True, "result": result}
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, separators=(",", ":")))
+        response = {
+            "ok": False,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+        if "--debug-errors" in sys.argv:
+            response["traceback"] = traceback.format_exc(limit=8)
+    if request_id is not None:
+        response["request_id"] = request_id
+    return response
+
+
+def persistent_main() -> None:
+    for line in sys.stdin:
+        text = line.strip()
+        if not text:
+            continue
+        request_id: str | None = None
+        try:
+            payload = json.loads(text)
+            request_id = str(payload.pop("__request_id", "") or "")
+            response = response_for(payload, request_id)
+        except Exception as exc:
+            response = {
+                "ok": False,
+                "request_id": request_id,
+                "error": f"Invalid persistent worker request: {exc}",
+                "error_type": type(exc).__name__,
+            }
+        print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def main() -> None:
+    if "--persistent" in sys.argv:
+        persistent_main()
+        return
+    payload = json.load(sys.stdin)
+    response = response_for(payload)
+    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+    if response.get("ok") is not True:
         raise SystemExit(1)
 
 

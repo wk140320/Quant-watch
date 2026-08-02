@@ -190,6 +190,7 @@ button.secondary,
 }
 
 .market-menu-trigger {
+  position: relative;
   z-index: 2;
   width: 32px;
   height: 32px;
@@ -201,6 +202,8 @@ button.secondary,
   background: #151814;
   color: #d8bd79;
   box-shadow: 0 5px 14px rgba(0, 0, 0, 0.2);
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
   transition: color 160ms ease, border-color 160ms ease, background 160ms ease, transform 180ms var(--qw-ease-out);
 }
 
@@ -234,6 +237,9 @@ button.secondary,
   box-shadow: var(--qw-shadow-high);
   transform-origin: top left;
   animation: market-menu-in 150ms var(--qw-ease-out) both;
+  pointer-events: auto;
+  touch-action: manipulation;
+  isolation: isolate;
 }
 
 .market-menu[hidden] {
@@ -251,6 +257,7 @@ button.secondary,
   justify-content: space-between;
   background: transparent;
   box-shadow: none;
+  touch-action: manipulation;
 }
 
 .market-menu button.active {

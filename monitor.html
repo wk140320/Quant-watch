@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#090a09">
     <title>模型运行中枢 · Global Quant Watch</title>
-    <link rel="stylesheet" href="/monitor.css?v=20260714-model-ops-4">
+    <link rel="stylesheet" href="/monitor.css?v=20260717-stable-load-2">
   </head>
   <body>
     <header class="app-header">
@@ -173,6 +173,42 @@
           <p>关闭后台后停止抓行情、训练和提醒；Paper Agent 仍不会向券商发送真实订单。</p>
         </div>
         <div class="control-layout">
+          <section class="control-surface supervisor-ops-surface">
+            <div class="surface-heading">
+              <div><p class="eyebrow">Autonomous training governance</p><h3>AI 训练监工</h3></div>
+              <span id="supervisorStatePill" class="status-pill">读取中</span>
+            </div>
+            <section class="supervisor-manual-console" aria-labelledby="manualSupervisorTitle">
+              <div class="supervisor-manual-heading">
+                <div><p class="eyebrow">Human in the loop</p><h4 id="manualSupervisorTitle">人工监工操作台</h4></div>
+                <span id="supervisorControlState" class="status-pill">等待状态</span>
+              </div>
+              <div class="supervisor-manual-grid">
+                <label class="supervisor-scope-control">
+                  <span><strong>自动监工总开关</strong><small>控制新周期与自动返工调度</small></span>
+                  <span class="monitor-switch"><input id="supervisorMasterToggle" type="checkbox"><span></span></span>
+                </label>
+                <label class="supervisor-scope-control">
+                  <span><strong id="supervisorMarketLabel">ASX 市场监工</strong><small>只影响当前选择的市场</small></span>
+                  <span class="monitor-switch"><input id="supervisorMarketToggle" type="checkbox"><span></span></span>
+                </label>
+                <label class="supervisor-operator-note">
+                  <span>操作备注</span>
+                  <input id="supervisorOperatorNote" type="text" maxlength="160" autocomplete="off" placeholder="例如：补充额度后重新验收">
+                </label>
+              </div>
+              <div class="inline-actions supervisor-manual-actions">
+                <button id="runSupervisor" class="command-button" type="button"><i data-lucide="play"></i><span>启动 / 要求返工</span></button>
+                <button id="reviewSupervisor" class="command-button secondary" type="button"><i data-lucide="scan-search"></i><span>重新验收最近产物</span></button>
+                <button id="refreshSupervisor" class="icon-button" type="button" title="刷新监工状态" aria-label="刷新监工状态"><i data-lucide="refresh-cw"></i></button>
+                <span id="supervisorHint">训练失败会自动返工；连续不达标时通知你协助。</span>
+              </div>
+            </section>
+            <div id="supervisorOverview" class="supervisor-ops-overview"></div>
+            <div id="supervisorReviewers" class="supervisor-ops-reviewers"></div>
+            <div id="supervisorOperatorLog" class="supervisor-operator-log"></div>
+            <div id="supervisorLogs" class="supervisor-ops-logs"></div>
+          </section>
           <section class="control-surface schedule-surface">
             <div class="surface-heading">
               <h3>刷新与训练频率</h3>
@@ -224,6 +260,6 @@
     </main>
 
     <script src="/frontend/vendor/lucide/lucide.min.js?v=1.8.0"></script>
-    <script src="/monitor-app.js?v=20260714-model-ops-4"></script>
+    <script src="/monitor-app.js?v=20260717-fast-market-switch-3"></script>
   </body>
 </html>

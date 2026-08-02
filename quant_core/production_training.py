@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 
 from data_quality import assess_candle_quality, label_confidence_for_window
 from historical_backtest import (
-    FEATURE_NAMES,
     adaptive_barriers,
     apply_standardizer,
     clamp,
@@ -41,6 +40,24 @@ EVENT_FEATURE_NAMES = [
     "macroRisk",
     "sourceQuality",
     "freshnessScore",
+]
+
+CORE_TECHNICAL_FEATURE_NAMES = [
+    "bias",
+    "change5",
+    "change20",
+    "volumeRatio",
+    "macdHist",
+    "volatility",
+    "rangePosition",
+    "gap",
+    "closeLocation",
+    "trueRange",
+    "buyPressure5",
+    "volumeAccel",
+    "profilePocDistance",
+    "liquidityShock",
+    "reversalPressure",
 ]
 
 MODEL_OUTPUT_KEYS = [
@@ -198,8 +215,25 @@ def build_market_dataset(
     join_violation_count = 0
     historical_universe_rows = 0
     action_adjusted_rows = 0
+    cross_market_rows_excluded = 0
     source_names: set[str] = set()
+    event_item_count = sum(
+        1
+        for item in items or []
+        if isinstance(item, dict)
+        and isinstance(item.get("pointInTimeFeatures") or item.get("point_in_time_features") or item.get("events"), list)
+        and bool(item.get("pointInTimeFeatures") or item.get("point_in_time_features") or item.get("events"))
+    )
+    event_features_enabled = event_item_count / max(1, len(items or [])) >= 0.60
+    active_feature_names = [
+        *CORE_TECHNICAL_FEATURE_NAMES,
+        *(EVENT_FEATURE_NAMES if event_features_enabled else []),
+    ]
     for item in items or []:
+        item_market = str(item.get("market") or "").upper()
+        if item_market and item_market != key:
+            cross_market_rows_excluded += 1
+            continue
         symbol = str(item.get("symbol") or "").upper()
         candles = sanitize_candles(item.get("candles") or [])
         if not symbol or len(candles) < 70:
@@ -245,7 +279,9 @@ def build_market_dataset(
                 excluded_future_rows += int(pit["futureRowsExcluded"])
                 join_violation_count += int(pit["joinViolationCount"])
                 event_values = pit["values"]
-                x = [number(feature.get(name)) for name in FEATURE_NAMES] + [number(event_values.get(name)) for name in EVENT_FEATURE_NAMES]
+                x = [number(feature.get(name)) for name in CORE_TECHNICAL_FEATURE_NAMES]
+                if event_features_enabled:
+                    x.extend(number(event_values.get(name)) for name in EVENT_FEATURE_NAMES)
                 liquidity_weight = clamp(math.sqrt(max(0.0, number(candles[index].get("volume"))) / max(1.0, median_volume)), 0.25, 1.0)
                 recency_weight = 0.85 + 0.15 * index / max(1, len(candles) - 1)
                 training_weight, evaluation_weight = _dataset_row_weight(
@@ -265,6 +301,7 @@ def build_market_dataset(
                     "sector": str(item.get("sector") or "Unknown"),
                     "horizon": horizon,
                     "x": x,
+                    "featureNames": active_feature_names,
                     "eventX": [number(event_values.get(name)) for name in EVENT_FEATURE_NAMES],
                     "feature": feature,
                     "regime": _regime_label(feature),
@@ -294,6 +331,17 @@ def build_market_dataset(
                     "pitJoinViolationCount": pit["joinViolationCount"],
                     "source": str(item.get("source") or "unknown"),
                 })
+    unique_dataset: list[dict[str, Any]] = []
+    seen_dataset_rows: set[tuple[str, str, str, int]] = set()
+    duplicate_rows_excluded = 0
+    for row in dataset:
+        identity = (str(row["market"]), str(row["symbol"]), str(row["date"]), int(row["horizon"]))
+        if identity in seen_dataset_rows:
+            duplicate_rows_excluded += 1
+            continue
+        seen_dataset_rows.add(identity)
+        unique_dataset.append(row)
+    dataset = unique_dataset
     _rank_cross_section(dataset)
     by_horizon: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in dataset:
@@ -318,6 +366,17 @@ def build_market_dataset(
         join_violation_count=join_violation_count,
         historical_universe_rows=historical_universe_rows,
         action_adjusted_rows=action_adjusted_rows,
+        duplicate_rows_excluded=duplicate_rows_excluded,
+        cross_market_rows_excluded=cross_market_rows_excluded,
+    )
+    summary["activeFeatureNames"] = active_feature_names
+    summary["activeFeatureCount"] = len(active_feature_names)
+    summary["eventFeaturesEnabled"] = event_features_enabled
+    summary["eventItemCoveragePct"] = round(event_item_count / max(1, len(items or [])) * 100.0, 3)
+    summary["featurePolicy"] = (
+        "Core 15 low-redundancy technical features plus point-in-time event features."
+        if event_features_enabled
+        else "Core 15 low-redundancy technical features; event features withheld because point-in-time coverage is below 60%."
     )
     return {"rows": dataset, "summary": summary}
 
@@ -352,6 +411,8 @@ def dataset_profile(
     join_violation_count: int,
     historical_universe_rows: int,
     action_adjusted_rows: int,
+    duplicate_rows_excluded: int = 0,
+    cross_market_rows_excluded: int = 0,
 ) -> dict[str, Any]:
     dates = sorted({str(row.get("date")) for row in rows if row.get("date")})
     symbols = sorted({str(row.get("symbol")) for row in rows if row.get("symbol")})
@@ -380,6 +441,8 @@ def dataset_profile(
         "pointInTimeJoinViolationCount": join_violation_count,
         "historicalUniverseCoveragePct": round(historical_universe_rows / max(1, item_count) * 100.0, 3),
         "corporateActionCoveragePct": round(action_adjusted_rows / max(1, item_count) * 100.0, 3),
+        "duplicateRowsExcluded": int(duplicate_rows_excluded),
+        "crossMarketRowsExcluded": int(cross_market_rows_excluded),
         "sources": source_names,
         "firstStageTarget": target,
         "coverageVsTargetPct": round(min(100.0, len(rows) / max(1, target["rows"]) * 100.0), 4),
@@ -502,7 +565,7 @@ def _sklearn_baseline_predictions(train: list[dict[str, Any]], test: list[dict[s
         return None
     try:
         import numpy as np  # type: ignore
-        from sklearn.linear_model import LogisticRegression, Ridge, SGDClassifier  # type: ignore
+        from sklearn.linear_model import BayesianRidge, LogisticRegression, Ridge, SGDClassifier  # type: ignore
         from sklearn.preprocessing import StandardScaler  # type: ignore
 
         x_train = np.asarray([row["x"] for row in train], dtype=float)
@@ -514,8 +577,36 @@ def _sklearn_baseline_predictions(train: list[dict[str, Any]], test: list[dict[s
 
         ridge_return = Ridge(alpha=2.0, random_state=13)
         ridge_return.fit(scaled_train, [row["actualReturn"] for row in train], sample_weight=sample_weight)
+        bayesian_return = BayesianRidge(alpha_1=1e-6, alpha_2=1e-6, lambda_1=1e-6, lambda_2=1e-6)
+        try:
+            bayesian_return.fit(scaled_train, [row["actualReturn"] for row in train], sample_weight=sample_weight)
+        except TypeError:
+            bayesian_return.fit(scaled_train, [row["actualReturn"] for row in train])
         ridge_rank = Ridge(alpha=2.6, random_state=17)
         ridge_rank.fit(scaled_train, [row["returnRank"] for row in train], sample_weight=sample_weight)
+
+        path_labels = np.asarray([
+            2 if number(row.get("actualTarget")) >= 0.5
+            else 0 if number(row.get("actualStop")) >= 0.5
+            else 1
+            for row in train
+        ], dtype=int)
+        path_model = LogisticRegression(
+            C=0.55,
+            solver="lbfgs",
+            max_iter=600,
+            random_state=29,
+            class_weight="balanced",
+        )
+        path_model.fit(scaled_train, path_labels, sample_weight=sample_weight)
+        path_matrix = path_model.predict_proba(scaled_test)
+        path_classes = {int(label): index for index, label in enumerate(path_model.classes_)}
+
+        def path_probability(label: int) -> list[float]:
+            position = path_classes.get(label)
+            if position is None:
+                return [0.0 for _ in test]
+            return [number(row[position]) for row in path_matrix]
 
         def binary_predictions(target_key: str, *, elastic: bool = False) -> list[float]:
             target = np.asarray([1 if number(row[target_key]) >= 0.5 else 0 for row in train], dtype=int)
@@ -538,13 +629,15 @@ def _sklearn_baseline_predictions(train: list[dict[str, Any]], test: list[dict[s
             return [number(value) for value in model.predict_proba(scaled_test)[:, 1]]
 
         return {
-            "family": "sklearn-logistic-ridge-elasticnet",
-            "baselineReturn": [number(value) for value in ridge_return.predict(scaled_test)],
-            "target": binary_predictions("actualTarget"),
+            "family": "sklearn-bayesian-ridge-multinomial-logistic",
+            "baselineReturn": [number(value) for value in bayesian_return.predict(scaled_test)],
+            "ridgeReturn": [number(value) for value in ridge_return.predict(scaled_test)],
+            "target": path_probability(2),
             "elasticTarget": binary_predictions("actualTarget", elastic=True),
-            "stop": binary_predictions("actualStop"),
-            "timeout": binary_predictions("actualTimeout"),
+            "stop": path_probability(0),
+            "timeout": path_probability(1),
             "rank": [number(value) for value in ridge_rank.predict(scaled_test)],
+            "pathModel": "multinomial-logistic-joint-target-stop-timeout",
         }
     except Exception:
         return None
@@ -570,63 +663,112 @@ def _fallback_baseline_predictions(train: list[dict[str, Any]], test: list[dict[
 
 def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]], *, enabled: bool) -> dict[str, Any] | None:
     status = model_library_status()
-    if not enabled or len(train) < 500:
+    train_dates = sorted({str(row.get("date")) for row in train})
+    cross_sections = defaultdict(set)
+    for row in train:
+        cross_sections[str(row.get("date"))].add(str(row.get("symbol")))
+    median_cross_section = median([len(symbols) for symbols in cross_sections.values()]) if cross_sections else 0
+    if not enabled or len(train) < 5_000 or len(train_dates) < 250 or median_cross_section < 30:
         return None
     x_train = [row["x"] for row in train]
     x_test = [row["x"] for row in test]
     sample_weight = [number(row.get("trainingWeight"), 1.0) for row in train]
     try:
         if status["catboost"]:
-            from catboost import CatBoostClassifier, CatBoostRanker, CatBoostRegressor  # type: ignore
+            from catboost import CatBoostClassifier, CatBoostRegressor  # type: ignore
 
-            target = CatBoostClassifier(iterations=160, depth=6, learning_rate=0.045, loss_function="Logloss", verbose=False, random_seed=17, thread_count=2)
-            stop = CatBoostClassifier(iterations=160, depth=6, learning_rate=0.045, loss_function="Logloss", verbose=False, random_seed=19, thread_count=2)
-            timeout = CatBoostClassifier(iterations=160, depth=6, learning_rate=0.045, loss_function="Logloss", verbose=False, random_seed=21, thread_count=2)
-            target.fit(x_train, [row["actualTarget"] for row in train], sample_weight=sample_weight)
-            stop.fit(x_train, [row["actualStop"] for row in train], sample_weight=sample_weight)
-            timeout.fit(x_train, [row["actualTimeout"] for row in train], sample_weight=sample_weight)
-            ordered = sorted(range(len(train)), key=lambda index: (train[index]["date"], train[index]["symbol"]))
-            ranker = CatBoostRanker(iterations=160, depth=6, learning_rate=0.045, loss_function="QueryRMSE", verbose=False, random_seed=23, thread_count=2)
-            ranker.fit(
-                [x_train[index] for index in ordered],
-                [train[index]["rankRelevance"] for index in ordered],
-                group_id=[train[index]["date"] for index in ordered],
-                sample_weight=[sample_weight[index] for index in ordered],
+            validation_date_count = max(20, min(60, int(len(train_dates) * 0.15)))
+            validation_dates = set(train_dates[-validation_date_count:])
+            fit_indexes = [
+                index for index, row in enumerate(train)
+                if str(row.get("date")) not in validation_dates and not row.get("ambiguousBarrierOrder")
+            ]
+            validation_indexes = [
+                index for index, row in enumerate(train)
+                if str(row.get("date")) in validation_dates and not row.get("ambiguousBarrierOrder")
+            ]
+            if len(fit_indexes) < 2_000 or len(validation_indexes) < 300:
+                return None
+            path = CatBoostClassifier(
+                iterations=360,
+                depth=4,
+                learning_rate=0.035,
+                loss_function="MultiClass",
+                l2_leaf_reg=8.0,
+                random_strength=0.35,
+                bootstrap_type="Bernoulli",
+                subsample=0.80,
+                od_type="Iter",
+                od_wait=35,
+                verbose=False,
+                random_seed=17,
+                thread_count=2,
             )
+            path.fit(
+                [x_train[index] for index in fit_indexes],
+                [train[index]["barrierClass"] for index in fit_indexes],
+                sample_weight=[sample_weight[index] for index in fit_indexes],
+                eval_set=(
+                    [x_train[index] for index in validation_indexes],
+                    [train[index]["barrierClass"] for index in validation_indexes],
+                ),
+                use_best_model=True,
+            )
+            path_matrix = path.predict_proba(x_test)
+            path_classes = {
+                int(label): index
+                for index, label in enumerate(getattr(path, "classes_", [0, 1, 2]))
+            }
+
+            def path_probability(label: int) -> list[float]:
+                position = path_classes.get(label)
+                if position is None:
+                    return [0.0 for _ in test]
+                return [number(row[position]) for row in path_matrix]
+
             quantiles = []
             for alpha in (0.1, 0.5, 0.9):
-                model = CatBoostRegressor(iterations=160, depth=6, learning_rate=0.045, loss_function=f"Quantile:alpha={alpha}", verbose=False, random_seed=29, thread_count=2)
-                model.fit(x_train, [row["actualReturn"] for row in train], sample_weight=sample_weight)
+                model = CatBoostRegressor(
+                    iterations=360,
+                    depth=4,
+                    learning_rate=0.035,
+                    loss_function=f"Quantile:alpha={alpha}",
+                    l2_leaf_reg=8.0,
+                    random_strength=0.35,
+                    bootstrap_type="Bernoulli",
+                    subsample=0.80,
+                    od_type="Iter",
+                    od_wait=35,
+                    verbose=False,
+                    random_seed=29,
+                    thread_count=2,
+                )
+                model.fit(
+                    [x_train[index] for index in fit_indexes],
+                    [train[index]["actualReturn"] for index in fit_indexes],
+                    sample_weight=[sample_weight[index] for index in fit_indexes],
+                    eval_set=(
+                        [x_train[index] for index in validation_indexes],
+                        [train[index]["actualReturn"] for index in validation_indexes],
+                    ),
+                    use_best_model=True,
+                )
                 quantiles.append([number(value) for value in model.predict(x_test)])
-            challenger_target = None
-            if status["lightgbm"]:
-                try:
-                    import lightgbm as lgb  # type: ignore
-
-                    challenger = lgb.LGBMClassifier(
-                        objective="binary",
-                        n_estimators=140,
-                        learning_rate=0.04,
-                        num_leaves=15,
-                        max_depth=7,
-                        subsample=0.82,
-                        colsample_bytree=0.78,
-                        reg_lambda=1.2,
-                        verbosity=-1,
-                        n_jobs=2,
-                    )
-                    challenger.fit(x_train, [row["actualTarget"] for row in train], sample_weight=sample_weight)
-                    challenger_target = [number(row[1]) for row in challenger.predict_proba(x_test, validate_features=False)]
-                except Exception:
-                    challenger_target = None
             return {
-                "family": "catboost+lightgbm-challenger" if challenger_target is not None else "catboost",
-                "target": [number(row[1]) for row in target.predict_proba(x_test)],
-                "stop": [number(row[1]) for row in stop.predict_proba(x_test)],
-                "timeout": [number(row[1]) for row in timeout.predict_proba(x_test)],
-                "rank": [number(value) for value in ranker.predict(x_test)],
+                "family": "catboost-shallow-joint-path-quantile",
+                "target": path_probability(2),
+                "stop": path_probability(0),
+                "timeout": path_probability(1),
+                "rank": None,
                 "quantiles": quantiles,
-                "challengerTarget": challenger_target,
+                "challengerTarget": path_probability(2),
+                "trainingPolicy": {
+                    "depth": 4,
+                    "earlyStoppingRounds": 35,
+                    "validationDates": validation_date_count,
+                    "jointPathModel": True,
+                    "rankerWithheld": median_cross_section < 50,
+                },
             }
         if status["lightgbm"]:
             return _lightgbm_fold_predictions(train, test)
@@ -647,40 +789,81 @@ def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str,
         x_train = [row["x"] for row in train]
         x_test = [row["x"] for row in test]
         sample_weight = [number(row.get("trainingWeight"), 1.0) for row in train]
-        common = {"n_estimators": 160, "learning_rate": 0.04, "num_leaves": 15, "max_depth": 7, "subsample": 0.82, "colsample_bytree": 0.78, "reg_lambda": 1.2, "verbosity": -1, "n_jobs": 2}
-        target = lgb.LGBMClassifier(objective="binary", **common)
-        stop = lgb.LGBMClassifier(objective="binary", **common)
-        timeout = lgb.LGBMClassifier(objective="binary", **common)
-        target.fit(x_train, [row["actualTarget"] for row in train], sample_weight=sample_weight)
-        stop.fit(x_train, [row["actualStop"] for row in train], sample_weight=sample_weight)
-        timeout.fit(x_train, [row["actualTimeout"] for row in train], sample_weight=sample_weight)
-        ordered_rows = sorted(train, key=lambda row: (row["date"], row["symbol"]))
-        groups: list[int] = []
-        last_date = None
-        for row in ordered_rows:
-            if row["date"] != last_date:
-                groups.append(0)
-                last_date = row["date"]
-            groups[-1] += 1
-        ranker = lgb.LGBMRanker(objective="lambdarank", **common)
-        ranker.fit(
-            [row["x"] for row in ordered_rows],
-            [row["rankRelevance"] for row in ordered_rows],
-            group=groups,
-            sample_weight=[row["trainingWeight"] for row in ordered_rows],
+        dates = sorted({str(row.get("date")) for row in train})
+        validation_date_count = max(20, min(60, int(len(dates) * 0.15)))
+        validation_dates = set(dates[-validation_date_count:])
+        fit_indexes = [
+            index for index, row in enumerate(train)
+            if str(row.get("date")) not in validation_dates and not row.get("ambiguousBarrierOrder")
+        ]
+        validation_indexes = [
+            index for index, row in enumerate(train)
+            if str(row.get("date")) in validation_dates and not row.get("ambiguousBarrierOrder")
+        ]
+        if len(fit_indexes) < 2_000 or len(validation_indexes) < 300:
+            return {"error": "LightGBM fold lacks a separate chronological validation block.", "family": "lightgbm_error"}
+        common = {
+            "n_estimators": 400,
+            "learning_rate": 0.035,
+            "num_leaves": 15,
+            "max_depth": 4,
+            "min_child_samples": 80,
+            "subsample": 0.80,
+            "colsample_bytree": 0.76,
+            "reg_lambda": 8.0,
+            "reg_alpha": 0.2,
+            "verbosity": -1,
+            "n_jobs": 2,
+        }
+        path = lgb.LGBMClassifier(objective="multiclass", num_class=3, **common)
+        path.fit(
+            [x_train[index] for index in fit_indexes],
+            [train[index]["barrierClass"] for index in fit_indexes],
+            sample_weight=[sample_weight[index] for index in fit_indexes],
+            eval_set=(
+                [x_train[index] for index in validation_indexes],
+                [train[index]["barrierClass"] for index in validation_indexes],
+            ),
+            callbacks=[lgb.early_stopping(35, verbose=False)],
         )
+        path_matrix = path.predict_proba(x_test, validate_features=False)
+        path_classes = {int(label): index for index, label in enumerate(path.classes_)}
+
+        def path_probability(label: int) -> list[float]:
+            position = path_classes.get(label)
+            if position is None:
+                return [0.0 for _ in test]
+            return [number(row[position]) for row in path_matrix]
+
         quantiles = []
         for alpha in (0.1, 0.5, 0.9):
             model = lgb.LGBMRegressor(objective="quantile", alpha=alpha, **common)
-            model.fit(x_train, [row["actualReturn"] for row in train], sample_weight=sample_weight)
+            model.fit(
+                [x_train[index] for index in fit_indexes],
+                [train[index]["actualReturn"] for index in fit_indexes],
+                sample_weight=[sample_weight[index] for index in fit_indexes],
+                eval_set=(
+                    [x_train[index] for index in validation_indexes],
+                    [train[index]["actualReturn"] for index in validation_indexes],
+                ),
+                callbacks=[lgb.early_stopping(35, verbose=False)],
+            )
             quantiles.append([number(value) for value in model.predict(x_test)])
         return {
-            "family": "lightgbm",
-            "target": [number(row[1]) for row in target.predict_proba(x_test, validate_features=False)],
-            "stop": [number(row[1]) for row in stop.predict_proba(x_test, validate_features=False)],
-            "timeout": [number(row[1]) for row in timeout.predict_proba(x_test, validate_features=False)],
-            "rank": [number(value) for value in ranker.predict(x_test)],
+            "family": "lightgbm-shallow-joint-path-quantile",
+            "target": path_probability(2),
+            "stop": path_probability(0),
+            "timeout": path_probability(1),
+            "rank": None,
             "quantiles": quantiles,
+            "challengerTarget": path_probability(2),
+            "trainingPolicy": {
+                "depth": 4,
+                "earlyStoppingRounds": 35,
+                "validationDates": validation_date_count,
+                "jointPathModel": True,
+                "rankerWithheld": True,
+            },
         }
     except Exception as exc:  # noqa: BLE001 - optional model family must not block baselines.
         return {"error": str(exc), "family": "lightgbm_error"}
@@ -688,7 +871,8 @@ def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str,
 
 def _event_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]]) -> list[float | None] | None:
     event_train = [row for row in train if number(row.get("eventCoverage")) > 0]
-    if len(event_train) < 80 or sum(row["actualTarget"] for row in event_train) < 12:
+    coverage = len(event_train) / max(1, len(train))
+    if coverage < 0.60 or len(event_train) < 500 or sum(row["actualTarget"] for row in event_train) < 50:
         return None
     mapped_train = [{**row, "x": row["eventX"]} for row in event_train]
     mapped_test = [{**row, "x": row["eventX"]} for row in test]
@@ -709,7 +893,8 @@ def feature_drift_summary(train: list[dict[str, Any]], test: list[dict[str, Any]
 
     train_sample = sampled(train)
     test_sample = sampled(test)
-    feature_names = [*FEATURE_NAMES, *EVENT_FEATURE_NAMES]
+    feature_names = list(train_sample[0].get("featureNames") or CORE_TECHNICAL_FEATURE_NAMES)
+    feature_names = feature_names[: len(train_sample[0].get("x") or [])]
     drift_rows = []
     for feature_index, name in enumerate(feature_names):
         train_values = sorted(number(row["x"][feature_index]) for row in train_sample)
@@ -769,7 +954,8 @@ def _fold_oof_predictions(fold: dict[str, Any], *, enable_tree_models: bool) -> 
         target_probability_rows = tree["target"]
         stop_probability = tree["stop"]
         timeout_probability = tree["timeout"]
-        rank_scores = tree["rank"]
+        if tree.get("rank") is not None:
+            rank_scores = tree["rank"]
         quantiles = tree["quantiles"]
     else:
         q_models = [fit_quantile_linear(train, alpha) for alpha in (0.1, 0.5, 0.9)]
@@ -1282,16 +1468,28 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
     production_evidence = all(production_checks.values())
     research_eligible = len(rows) >= int(thresholds["researchMinRows"]) and len(meta_test) >= 20
     deployment_status = "shadow" if research_eligible else "research"
+    active_feature_names = list(rows[0].get("featureNames") or CORE_TECHNICAL_FEATURE_NAMES) if rows else list(CORE_TECHNICAL_FEATURE_NAMES)
     version_basis = {
         "market": market,
         "horizon": horizon,
         "dates": [dates[0] if dates else None, dates[-1] if dates else None],
         "rows": len(rows),
-        "features": [*FEATURE_NAMES, *EVENT_FEATURE_NAMES],
+        "features": active_feature_names,
         "weights": [round(value, 8) for value in weights],
         "calibrator": calibrator,
     }
     model_version = f"{market.lower()}-{horizon}d-{stable_hash(version_basis, 12)}"
+    for row in oof:
+        row["modelVersion"] = model_version
+        row["predictionId"] = stable_hash({
+            "market": row.get("market"),
+            "symbol": row.get("symbol"),
+            "signalAt": row.get("signalAt") or row.get("date"),
+            "horizon": horizon,
+            "labelDefinition": "atr-adaptive-triple-barrier-next-session-entry-v2",
+            "featureSchemaHash": stable_hash(active_feature_names),
+            "modelVersion": model_version,
+        }, 32)
     oof_artifact = persist_oof_artifact(oof, config.get("artifactDir"), model_version)
     return {
         "available": True,
@@ -1389,9 +1587,16 @@ def aggregate_dataset_profiles(profiles: list[dict[str, Any]], market: str) -> d
         "pointInTimeCoveragePct": round(weighted_coverage, 4),
         "futureFeatureRowsExcluded": sum(int(row.get("futureFeatureRowsExcluded") or 0) for row in profiles),
         "pointInTimeJoinViolationCount": sum(int(row.get("pointInTimeJoinViolationCount") or 0) for row in profiles),
+        "duplicateRowsExcluded": sum(int(row.get("duplicateRowsExcluded") or 0) for row in profiles),
+        "crossMarketRowsExcluded": sum(int(row.get("crossMarketRowsExcluded") or 0) for row in profiles),
         "historicalUniverseCoveragePct": min((number(row.get("historicalUniverseCoveragePct")) for row in profiles), default=0.0),
         "corporateActionCoveragePct": min((number(row.get("corporateActionCoveragePct")) for row in profiles), default=0.0),
         "sources": sorted({source for row in profiles for source in row.get("sources") or []}),
+        "activeFeatureNames": list(profiles[0].get("activeFeatureNames") or CORE_TECHNICAL_FEATURE_NAMES),
+        "activeFeatureCount": int(profiles[0].get("activeFeatureCount") or len(CORE_TECHNICAL_FEATURE_NAMES)),
+        "eventFeaturesEnabled": all(bool(row.get("eventFeaturesEnabled")) for row in profiles),
+        "eventItemCoveragePct": min((number(row.get("eventItemCoveragePct")) for row in profiles), default=0.0),
+        "featurePolicy": profiles[0].get("featurePolicy") or "Core low-redundancy feature set.",
         "firstStageTarget": target,
         "coverageVsTargetPct": round(min(100.0, minimum_horizon_rows / max(1, target["rows"]) * 100.0), 4),
         "sampleMeaning": profiles[0].get("sampleMeaning") or {},
@@ -1402,8 +1607,31 @@ def aggregate_dataset_profiles(profiles: list[dict[str, Any]], market: str) -> d
 def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
     market = str(payload.get("market") or "ASX").upper()
     raw_horizons = payload.get("horizons") or payload.get("horizon_days") or payload.get("horizonDays") or [5, 15, 30]
-    horizons = sorted({max(1, int(number(value, 15))) for value in (raw_horizons if isinstance(raw_horizons, list) else [raw_horizons])})
+    requested_horizons = sorted({max(1, int(number(value, 15))) for value in (raw_horizons if isinstance(raw_horizons, list) else [raw_horizons])})
     items = payload.get("items") or []
+    panel_dates: dict[str, set[str]] = defaultdict(set)
+    panel_symbols: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or (item.get("market") and str(item.get("market")).upper() != market):
+            continue
+        symbol = str(item.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        panel_symbols.add(symbol)
+        for candle in item.get("candles") or []:
+            day = str(candle.get("date") or "")[:10] if isinstance(candle, dict) else ""
+            if day:
+                panel_dates[day].add(symbol)
+    minimum_daily_breadth = max(5, min(50, math.ceil(len(panel_symbols) * 0.5)))
+    usable_panel_dates = sum(1 for symbols in panel_dates.values() if len(symbols) >= minimum_daily_breadth)
+    preferred_short_horizon = 5 if 5 in requested_horizons else min(requested_horizons or [5])
+    if usable_panel_dates < 500 or len(panel_symbols) < 50:
+        horizons = [preferred_short_horizon]
+    elif usable_panel_dates < 1_000 or len(panel_symbols) < 100:
+        horizons = [value for value in requested_horizons if value <= 15] or [preferred_short_horizon]
+    else:
+        horizons = requested_horizons
+    withheld_horizons = [value for value in requested_horizons if value not in horizons]
     target_upside = number(payload.get("target_upside", payload.get("targetUpside")), 5.0)
     stop_loss = number(payload.get("stop_loss", payload.get("stopLoss")), 4.0)
     transaction_cost_bps = payload.get("transaction_cost_bps", payload.get("transactionCostBps"))
@@ -1431,17 +1659,38 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
         )
         dataset_profiles.append(dataset["summary"])
         horizon_models.append(train_horizon_model(dataset["rows"], market=market, horizon=horizon, config=config))
+    for horizon in withheld_horizons:
+        horizon_models.append({
+            "available": False,
+            "horizon": horizon,
+            "status": "withheld_limited_data",
+            "reason": (
+                f"{horizon}d training is withheld until the market panel reaches at least "
+                f"{'500 dates and 50 symbols' if horizon <= 15 else '1,000 dates and 100 symbols'}; "
+                f"current synchronized evidence is {usable_panel_dates} dates and {len(panel_symbols)} symbols."
+            ),
+            "productionEvidencePassed": False,
+            "productionActivationBlocked": True,
+        })
+    horizon_models.sort(key=lambda row: int(row.get("horizon") or 0))
     summary = aggregate_dataset_profiles(dataset_profiles, market)
     historical_universe_ok = number(summary.get("historicalUniverseCoveragePct")) >= 95.0
     corporate_actions_ok = number(summary.get("corporateActionCoveragePct")) >= 95.0
     pit_ok = int(summary.get("pointInTimeJoinViolationCount") or 0) == 0
+    sample_isolation_ok = int(summary.get("duplicateRowsExcluded") or 0) == 0 and int(summary.get("crossMarketRowsExcluded") or 0) == 0
     available_models = [model for model in horizon_models if model.get("available")]
     event_history_ok = number(summary.get("pointInTimeCoveragePct")) >= 20.0
     universe_breadth_ok = int(summary.get("symbolCount") or 0) >= int(MARKET_DATA_TARGETS.get(market, MARKET_DATA_TARGETS["ASX"])["symbols"])
-    evidence_passed = len(available_models) == len(horizons) and all(model.get("productionEvidencePassed") for model in available_models)
-    production_data_ready = historical_universe_ok and corporate_actions_ok and pit_ok and event_history_ok and universe_breadth_ok
+    evidence_passed = (
+        not withheld_horizons
+        and len(available_models) == len(horizons)
+        and all(model.get("productionEvidencePassed") for model in available_models)
+    )
+    production_data_ready = historical_universe_ok and corporate_actions_ok and pit_ok and sample_isolation_ok and event_history_ok and universe_breadth_ok
     training_as_of = datetime.now(timezone.utc).isoformat()
-    schema = [*FEATURE_NAMES, *EVENT_FEATURE_NAMES]
+    schema = list(summary.get("activeFeatureNames") or CORE_TECHNICAL_FEATURE_NAMES)
+    data_version = stable_hash({"summary": summary, "sources": summary.get("sources")})
+    feature_schema_hash = stable_hash(schema)
     downgrade_reasons = []
     for model in available_models:
         metrics = model.get("metrics") or {}
@@ -1463,9 +1712,10 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
     )
     manifest = {
         "model_version": f"{market.lower()}-multitask-{stable_hash([model.get('modelVersion') for model in horizon_models], 12)}",
+        "training_run_id": f"{market.lower()}-{training_as_of[:19].replace(':', '').replace('-', '')}-{stable_hash([data_version, feature_schema_hash, requested_horizons], 10)}",
         "training_as_of": training_as_of,
-        "data_version": stable_hash({"summary": summary, "sources": summary.get("sources")}),
-        "feature_schema_hash": stable_hash(schema),
+        "data_version": data_version,
+        "feature_schema_hash": feature_schema_hash,
         "universe_version": stable_hash(sorted({str(item.get("universeVersion") or item.get("universeAsOf") or item.get("symbol")) for item in payload.get("items") or []})),
         "label_definition": "atr-adaptive-triple-barrier-next-session-entry-v2",
         "fold_metrics": [{"horizon": model.get("horizon"), "folds": model.get("foldMetrics", [])} for model in horizon_models],
@@ -1476,7 +1726,16 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
         "available": bool(summary.get("rawRows")),
         "framework": "market-level-multitask-oof-calibrated-stack",
         "market": market,
-        "horizons": horizons,
+        "horizons": requested_horizons,
+        "trainedHorizons": horizons,
+        "withheldHorizons": withheld_horizons,
+        "limitedDataPolicy": {
+            "active": bool(withheld_horizons),
+            "usablePanelDates": usable_panel_dates,
+            "panelSymbols": len(panel_symbols),
+            "minimumDailyBreadth": minimum_daily_breadth,
+            "policy": "Train 5d first; unlock 15d after 500 synchronized dates/50 symbols and 30d after 1,000 dates/100 symbols.",
+        },
         "architecture": [
             "multi-task market dataset",
             "purged walk-forward OOF base predictions",
@@ -1499,6 +1758,7 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
                 "historicalUniversePointInTime": historical_universe_ok,
                 "corporateActionsAdjusted": corporate_actions_ok,
                 "pointInTimeJoin": pit_ok,
+                "sampleIsolation": sample_isolation_ok,
                 "pointInTimeEventHistory": event_history_ok,
                 "marketUniverseBreadth": universe_breadth_ok,
                 "allHorizonEvidence": evidence_passed,

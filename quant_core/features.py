@@ -737,19 +737,29 @@ def _factor_cluster_map(names: list[str], matrix: dict[str, dict[str, float]], t
     return cluster_lookup
 
 
-def _factor_prediction_metrics(predictions: list[float], actuals: list[float]) -> dict[str, float]:
+def _factor_prediction_metrics(predictions: list[float], actuals: list[float], cost_bps: float = 18.0) -> dict[str, float]:
     if not predictions or not actuals:
-        return {"samples": 0, "mae": 0.0, "rmse": 0.0, "direction_hit_rate_pct": 0.0, "ic": 0.0, "rank_ic": 0.0}
+        return {"samples": 0, "mae": 0.0, "mase": 0.0, "rmse": 0.0, "direction_hit_rate_pct": 0.0, "ic": 0.0, "rank_ic": 0.0, "avg_net_signal_return_pct": 0.0}
     rows = list(zip(predictions, actuals))
     errors = [prediction - actual for prediction, actual in rows]
     hits = sum(1 for prediction, actual in rows if (prediction >= 0 and actual >= 0) or (prediction < 0 and actual < 0))
+    naive_scale = mean(abs(actuals[index] - actuals[index - 1]) for index in range(1, len(actuals))) if len(actuals) > 1 else 0.0
+    mae = mean(abs(error) for error in errors)
+    one_way_cost_pct = max(0.0, number(cost_bps)) / 100.0
+    net_signal_returns = [
+        (actual if prediction >= 0 else -actual) - one_way_cost_pct
+        for prediction, actual in rows
+    ]
     return {
         "samples": len(rows),
-        "mae": round(mean(abs(error) for error in errors), 4),
+        "mae": round(mae, 4),
+        "mase": round(mae / max(1e-9, naive_scale), 4) if naive_scale > 0 else 0.0,
         "rmse": round(math.sqrt(mean(error * error for error in errors)), 4),
         "direction_hit_rate_pct": round(hits / len(rows) * 100, 2),
         "ic": round(_pearson(predictions, actuals), 4),
         "rank_ic": round(_spearman(predictions, actuals), 4),
+        "avg_net_signal_return_pct": round(mean(net_signal_returns), 5),
+        "cost_bps": round(max(0.0, number(cost_bps)), 3),
     }
 
 
@@ -833,6 +843,43 @@ def _equal_factor_baseline(
     ]
 
 
+def _factor_walk_forward_folds(
+    factor_series: dict[str, list[float]],
+    labels: list[float],
+    names: list[str],
+    horizon: int,
+    penalty: float,
+    fold_count: int = 5,
+) -> list[dict[str, Any]]:
+    sample_count = len(labels)
+    purge = max(1, horizon)
+    first_test = max(60 + purge, int(sample_count * 0.45))
+    available = sample_count - first_test
+    fold_size = max(8, available // max(1, fold_count))
+    folds: list[dict[str, Any]] = []
+    for fold in range(fold_count):
+        test_start = first_test + fold * fold_size
+        test_end = sample_count if fold == fold_count - 1 else min(sample_count, test_start + fold_size)
+        train_end = test_start - purge
+        if train_end < 55 or test_end - test_start < 8:
+            continue
+        train_indexes = list(range(train_end))
+        test_indexes = list(range(test_start, test_end))
+        model = _fit_factor_ridge(factor_series, labels, names, train_indexes, penalty)
+        predictions = [model["predict"](index) for index in test_indexes]
+        metrics = _factor_prediction_metrics(predictions, [labels[index] for index in test_indexes])
+        folds.append({
+            "fold": fold + 1,
+            "train": len(train_indexes),
+            "test": len(test_indexes),
+            "test_start": test_start,
+            "test_end": test_end,
+            **metrics,
+            "positive": metrics["rank_ic"] > 0 and metrics["avg_net_signal_return_pct"] > 0,
+        })
+    return folds
+
+
 def _factor_ml_combo_validation(
     factor_series: dict[str, list[float]],
     labels: list[float],
@@ -891,9 +938,35 @@ def _factor_ml_combo_validation(
     test_metrics = _factor_prediction_metrics(test_predictions, test_actuals)
     equal_metrics = _factor_prediction_metrics(equal_predictions, test_actuals)
     momentum_metrics = _factor_prediction_metrics(momentum_predictions, test_actuals)
+    walk_forward_folds = _factor_walk_forward_folds(
+        factor_series,
+        labels,
+        names,
+        horizon,
+        selected["penalty"],
+        fold_count=5,
+    )
+    positive_folds = sum(1 for fold in walk_forward_folds if fold.get("positive"))
     direction_lift = test_metrics["direction_hit_rate_pct"] - max(50.0, equal_metrics["direction_hit_rate_pct"], momentum_metrics["direction_hit_rate_pct"])
     mae_lift = min(equal_metrics["mae"], momentum_metrics["mae"]) - test_metrics["mae"]
-    active = direction_lift >= -1.0 and (direction_lift > 0.5 or mae_lift > 0.05 or test_metrics["ic"] > max(0.0, equal_metrics["ic"], momentum_metrics["ic"]))
+    baseline_mae = min(equal_metrics["mae"], momentum_metrics["mae"])
+    independent_test_blocks = len(test_indexes) / max(1, horizon)
+    admission_checks = {
+        "independentTestBlocks": independent_test_blocks >= 12,
+        "directionLift": direction_lift >= 1.0,
+        "maeImprovement": mae_lift > 0 and mae_lift / max(1e-9, baseline_mae) >= 0.01,
+        "positiveIc": test_metrics["ic"] > 0,
+        "positiveRankIc": test_metrics["rank_ic"] > 0,
+        "validationIc": number(selected["validation"].get("ic")) > 0,
+        "validationRankIc": number(selected["validation"].get("rank_ic")) > 0,
+        "walkForwardFoldCount": len(walk_forward_folds) >= 5,
+        "walkForwardStability": positive_folds >= 4,
+        "netCostImprovement": test_metrics["avg_net_signal_return_pct"] > max(
+            equal_metrics["avg_net_signal_return_pct"],
+            momentum_metrics["avg_net_signal_return_pct"],
+        ),
+    }
+    active = all(admission_checks.values())
     abs_total = sum(abs(weight) for weight in deployment["weights"]) or 1.0
     coefficients = [
         {
@@ -931,9 +1004,61 @@ def _factor_ml_combo_validation(
         ],
         "direction_lift_pct": round(direction_lift, 3),
         "mae_lift_pct": round(mae_lift, 4),
+        "mae_lift_relative_pct": round(mae_lift / max(1e-9, baseline_mae) * 100, 4),
+        "independent_test_blocks": round(independent_test_blocks, 3),
+        "walk_forward_folds": walk_forward_folds,
+        "positive_walk_forward_folds": positive_folds,
+        "admission_checks": admission_checks,
+        "failed_checks": [name for name, passed in admission_checks.items() if not passed],
         "coefficients": coefficients,
         "model_risk": "active" if active else "research_only",
-        "guardrail": "A learned factor-combo weight is advisory unless it beats simple baselines on the holdout window.",
+        "guardrail": "Activation requires positive holdout IC/RankIC, at least 1% MAE improvement, positive direction lift, and 12 independent test blocks.",
+    }
+
+
+def _factor_evidence_score(
+    row: dict[str, Any],
+    *,
+    quantile_spread: float,
+    turnover_penalty: float,
+    redundancy_penalty: float,
+    decay_penalty: float,
+    model_weight: float,
+    ml_active: bool,
+) -> dict[str, Any]:
+    predictive = clamp((abs(number(row.get("ic"))) + abs(number(row.get("rank_ic")))) * 45, 0, 20)
+    economic = clamp(max(0.0, quantile_spread) * 2.2 - turnover_penalty * 0.45, 0, 15)
+    incremental = clamp((12 if ml_active else 0) + max(0.0, model_weight) * 30, 0, 15)
+    stability = clamp(
+        max(0.0, number(row.get("positive_window_share_pct"), number(row.get("positive_day_share_pct"))) - 45) * 0.3
+        + number(row.get("stability")) * 2
+        - decay_penalty * 0.65,
+        0,
+        15,
+    )
+    execution = clamp(10 - turnover_penalty, 0, 10)
+    redundancy = clamp(10 - redundancy_penalty, 0, 10)
+    inferred_quality = 100.0 if number(row.get("date_count")) >= 120 and number(row.get("sample_count")) >= 1000 else 60.0
+    data_quality = clamp(number(row.get("quality_score"), inferred_quality) / 10, 0, 10)
+    explainability = 5 if str(row.get("formula") or "").strip() else 0
+    breakdown = {
+        "predictiveSignal": round(predictive, 2),
+        "economicReturn": round(economic, 2),
+        "incrementalValue": round(incremental, 2),
+        "stability": round(stability, 2),
+        "execution": round(execution, 2),
+        "redundancy": round(redundancy, 2),
+        "dataQuality": round(data_quality, 2),
+        "explainability": round(explainability, 2),
+    }
+    total = sum(breakdown.values())
+    return {
+        "score": round(total, 2),
+        "maximum": 100,
+        "breakdown": breakdown,
+        "researchPass": total >= 60,
+        "shadowPass": total >= 70 and ml_active,
+        "policy": "100-point audit score; hard OOS, leakage, cost and redundancy gates still override the total.",
     }
 
 
@@ -1001,6 +1126,15 @@ def _dynamic_factor_research(
             - max(0.0, number(row.get("quality_gate", {}).get("max_overlap_correlation")) - 0.72) * 16
         )
         reasons: list[str] = []
+        evidence_score = _factor_evidence_score(
+            row,
+            quantile_spread=quantile_spread,
+            turnover_penalty=turnover_penalty,
+            redundancy_penalty=redundancy_penalty,
+            decay_penalty=decay_penalty,
+            model_weight=ml_weight_lookup.get(name, 0.0),
+            ml_active=ml_backtest.get("active") is True,
+        )
         if not row.get("quality_pass"):
             reasons.append("six_gate_not_all_passed")
         if number(row.get("score")) < 8:
@@ -1013,11 +1147,20 @@ def _dynamic_factor_research(
             reasons.append("high_turnover_cost_proxy")
         if ml_backtest.get("available") and not ml_backtest.get("active") and ml_weight_lookup.get(name, 0.0) < 0.03:
             reasons.append("ml_combo_holdout_not_supportive")
-        admitted = not reasons or (
-            row.get("quality_pass")
+        if ml_backtest.get("available") and not ml_backtest.get("active"):
+            reasons.append("factor_combo_failed_strict_oos_gate")
+        if evidence_score["score"] < 70:
+            reasons.append("factor_evidence_score_below_70")
+        admitted = (
+            not reasons
+            and bool(row.get("quality_pass"))
             and not redundant
-            and number(row.get("score")) >= 14
-            and (not ml_backtest.get("available") or ml_weight_lookup.get(name, 0.0) >= 0.03 or abs(number(row.get("ic"))) >= 0.08)
+            and number(row.get("score")) >= 8
+            and ml_backtest.get("active") is True
+            and ml_weight_lookup.get(name, 0.0) >= 0.03
+            and number(row.get("ic")) * direction > 0
+            and number(row.get("rank_ic")) * direction > 0
+            and evidence_score["shadowPass"]
         )
         candidate = {
             "name": name,
@@ -1040,6 +1183,7 @@ def _dynamic_factor_research(
                 "cluster_size": cluster.get("size", 1),
                 "members": cluster.get("members", [name]),
             },
+            "evidence_score": evidence_score,
             "reasons": reasons or ["passed_dynamic_admission"],
             "latest_value": row.get("latest_value"),
         }
@@ -1047,11 +1191,13 @@ def _dynamic_factor_research(
 
     admitted_rows = [row for row in candidates if row["status"] == "admitted" and row["base_score"] > 0]
     if not admitted_rows:
-        admitted_rows = sorted([row for row in candidates if row["base_score"] > 0], key=lambda item: item["base_score"], reverse=True)[:5]
-        for row in admitted_rows:
+        research_rows = sorted([row for row in candidates if row["base_score"] > 0], key=lambda item: item["base_score"], reverse=True)[:5]
+        for row in research_rows:
             row["status"] = "research_only"
             if "fallback_top_candidate" not in row["reasons"]:
                 row["reasons"].append("fallback_top_candidate")
+    else:
+        research_rows = []
     temperature = max(4.0, stddev(row["base_score"] for row in admitted_rows) or 6.0)
     exp_rows = [(row, math.exp(clamp(row["base_score"] / temperature, -8, 8))) for row in admitted_rows]
     exp_total = sum(value for _, value in exp_rows) or 1.0
@@ -1094,7 +1240,7 @@ def _dynamic_factor_research(
         + min(12, len(admitted_rows) * 1.1)
         - max(0, len(candidates) - len(admitted_rows)) * 0.08,
         0,
-        86,
+        86 if admitted_rows else 45,
     )
     return {
         "framework": "dynamic-factor-admission-and-ml-weighting",
@@ -1102,6 +1248,7 @@ def _dynamic_factor_research(
         "horizon_days": horizon,
         "candidate_count": len(candidates),
         "admitted_count": len(admitted_rows),
+        "research_candidate_count": len(research_rows),
         "watchlist_count": len([row for row in candidates if row["status"] == "watchlist"]),
         "redundancy_threshold": 0.72,
         "weight_formula": "softmax(IC + RankIC + quantile spread + stability + ML holdout weight - turnover - redundancy - decay penalties)",
@@ -1119,6 +1266,7 @@ def _dynamic_factor_research(
             "Six-gate factor quality must pass or remain research-only.",
             "Highly correlated factors share a cluster; only the best generalizing factor receives full admission.",
             "ML combo weights are selected only on validation and reported on a later holdout test.",
+            "The 100-point evidence score must reach 70, but cannot override a failed OOS, cost, stability, leakage, or redundancy gate.",
             "Recent IC decay, turnover proxy, and redundancy reduce active weight.",
         ],
     }
@@ -1463,8 +1611,106 @@ def _gradient_accumulation_training(
 def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: str = "", market: str = "ASX") -> dict[str, Any]:
     rows = sanitize_candles(candles)
     horizon = max(1, min(60, int(horizon or 15)))
-    if len(rows) < max(70, horizon + 35):
-        raise ValueError("Factor lab requires at least 70 real candle rows.")
+    required_rows = max(70, horizon + 35)
+    if len(rows) < required_rows:
+        real_rows = len(rows)
+        return {
+            "available": False,
+            "status": "insufficient_data",
+            "production_eligible": False,
+            "market": market,
+            "symbol": symbol,
+            "horizon_days": horizon,
+            "row_count": real_rows,
+            "sample_count": max(0, real_rows - 20 - horizon),
+            "label": f"future_return_{horizon}d",
+            "labels": {
+                "future_close_return": f"future_return_{horizon}d",
+                "future_window_vwap_return": f"future_vwap_return_{horizon}d",
+                "future_close_return_mean_pct": None,
+                "future_window_vwap_return_mean_pct": None,
+            },
+            "method": "point-in-time real-candle factor audit; model fitting is disabled until the minimum evidence threshold is met",
+            "reason": (
+                f"Only {real_rows} real daily candle rows are available; "
+                f"{required_rows} are required for the {horizon}-day purged walk-forward evaluation."
+            ),
+            "sample_audit": {
+                "real_rows": real_rows,
+                "required_rows": required_rows,
+                "missing_rows": max(0, required_rows - real_rows),
+                "horizon_days": horizon,
+                "synthetic_rows": 0,
+                "model_training_allowed": False,
+                "alpha_evolution_allowed": False,
+                "production_eligible": False,
+            },
+            "factors": [],
+            "series": {
+                "horizon_days": horizon,
+                "factor_names": [],
+                "rows": [],
+                "note": "No factor score is produced from insufficient evidence. No synthetic candles were added.",
+            },
+            "factor_library": [],
+            "correlation_matrix": {},
+            "high_overlap": [],
+            "quality_gate": {
+                "method": "factor quality gates remain closed until enough real point-in-time rows are available",
+                "pass_count": 0,
+                "factor_count": 0,
+                "pass_rate_pct": 0.0,
+                "all_pass": False,
+                "checks": ["sample_size", "dimensionless", "richness", "no_future_leakage", "missing_values", "outliers", "standardization"],
+                "rows": [],
+            },
+            "validation": {
+                "status": "insufficient_data",
+                "available": False,
+                "checkpoints": [],
+                "purge_samples": horizon,
+                "embargo_samples": max(2, horizon // 3),
+                "rollback_recommended": False,
+                "recommendation": "Collect or restore more real daily history, then rerun the factor experiment.",
+            },
+            "training_controls": {
+                "status": "insufficient_data",
+                "available": False,
+                "checkpoints": [],
+                "gradient_accumulation_batches": 0,
+                "batch_size": 0,
+                "optimizer_steps": 0,
+                "training_samples": 0,
+                "validation_samples": 0,
+                "test_samples": 0,
+                "rollback_applied": False,
+            },
+            "factor_research": {
+                "available": False,
+                "status": "insufficient_data",
+                "framework": "dynamic-factor-admission-and-ml-weighting",
+                "candidate_count": 0,
+                "admitted_count": 0,
+                "research_candidate_count": 0,
+                "weights": [],
+                "candidates": [],
+                "live_signal": {"available": False, "score": None, "weight_pct": 0},
+                "ml_backtest": {"available": False, "active": False, "reason": "insufficient_real_rows"},
+                "leakage_control": "No model was fitted and no factor weight was admitted from the short sample.",
+            },
+            "dynamic_factor_weights": {
+                "available": False,
+                "status": "insufficient_data",
+                "weights": [],
+                "candidates": [],
+                "admitted_count": 0,
+            },
+            "guardrails": [
+                "Only real provider or persisted real candles are accepted; no synthetic rows are generated.",
+                "Insufficient samples never enter dynamic factor weights, alpha evolution, or production prediction.",
+                "The evidence threshold grows with the prediction horizon so purge and holdout windows remain valid.",
+            ],
+        }
 
     closes = [row["close"] for row in rows]
     volumes = [row["volume"] for row in rows]
@@ -1552,6 +1798,9 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
     for index in range(20, len(rows) - horizon):
         close = closes[index]
         recent = rows[index - 19 : index + 1]
+        # These structure factors only depend on their declared 20-60 bar lookbacks.
+        # Bounding the prefix avoids quadratic recomputation without changing point-in-time values.
+        structure_window = rows[max(0, index - 69) : index + 1]
         typical_notional = sum(((row["high"] + row["low"] + row["close"]) / 3) * row["volume"] for row in recent)
         volume_sum = sum(row["volume"] for row in recent)
         vwap = typical_notional / volume_sum if volume_sum else close
@@ -1560,10 +1809,10 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         low_20 = min(row["low"] for row in recent)
         volume_mean_20 = mean(volumes[index - 19 : index + 1])
         volume_mean_5 = mean(volumes[index - 4 : index + 1])
-        bollinger_current = _bollinger_series(rows[: index + 1])[-1]
-        fibonacci_current = _fibonacci_snapshot(rows[: index + 1])
+        bollinger_current = _bollinger_series(recent)[-1]
+        fibonacci_current = _fibonacci_snapshot(structure_window, lookback=60)
         fib_618_price = next((item["price"] for item in fibonacci_current.get("levels", []) if item["label"] == "61.8%"), close)
-        wyckoff_current = _wyckoff_proxy(rows[: index + 1])
+        wyckoff_current = _wyckoff_proxy(structure_window, lookback=60)
         volume_profile_current = _volume_profile(rows[max(0, index - 59) : index + 1], bucket_count=16)
         profile_poc = number((volume_profile_current.get("point_of_control") or {}).get("mid"), close)
         value_area = volume_profile_current.get("value_area") or {}
@@ -1595,8 +1844,8 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         factor_series["bollinger_percent_b"].append(bollinger_current["percent_b"])
         factor_series["bollinger_bandwidth"].append(bollinger_current["bandwidth_pct"])
         factor_series["fib_618_closeness"].append(-abs(pct_change(fib_618_price, close)))
-        factor_series["fvg_pressure"].append(_fvg_pressure(rows[: index + 1], lookback=50))
-        factor_series["ict_sweep_pressure"].append(_ict_pressure(rows[: index + 1], lookback=50))
+        factor_series["fvg_pressure"].append(_fvg_pressure(structure_window, lookback=50))
+        factor_series["ict_sweep_pressure"].append(_ict_pressure(structure_window, lookback=50))
         factor_series["wyckoff_phase_score"].append(number(wyckoff_current.get("phase_score")))
         factor_series["orderflow_pressure"].append(orderflow_pressure)
         factor_series["effort_vs_result"].append(volume_ratio / (abs(current_return) + 0.25))
@@ -1716,6 +1965,9 @@ def analyze_factors(candles: list[dict[str, Any]], horizon: int = 15, symbol: st
         )
 
     return {
+        "available": True,
+        "status": "ready",
+        "production_eligible": False,
         "market": market,
         "symbol": symbol,
         "horizon_days": horizon,
@@ -1999,6 +2251,44 @@ def _panel_equal_baseline(train_rows: list[dict[str, Any]], test_rows: list[dict
     ]
 
 
+def _panel_walk_forward_folds(
+    rows: list[dict[str, Any]],
+    factor_names: list[str],
+    horizon: int,
+    penalty: float,
+    fold_count: int = 5,
+) -> list[dict[str, Any]]:
+    dates = sorted({row["date"] for row in rows})
+    purge = max(1, min(20, horizon))
+    first_test = max(60 + purge, int(len(dates) * 0.45))
+    fold_size = max(8, (len(dates) - first_test) // max(1, fold_count))
+    folds: list[dict[str, Any]] = []
+    for fold in range(fold_count):
+        test_start = first_test + fold * fold_size
+        test_end = len(dates) if fold == fold_count - 1 else min(len(dates), test_start + fold_size)
+        train_end = test_start - purge
+        if train_end < 40 or test_end - test_start < 8:
+            continue
+        train_dates = set(dates[:train_end])
+        test_dates = set(dates[test_start:test_end])
+        train_rows = [row for row in rows if row["date"] in train_dates]
+        test_rows = [row for row in rows if row["date"] in test_dates]
+        if not train_rows or not test_rows:
+            continue
+        model = _fit_panel_ridge(train_rows, factor_names, penalty)
+        predictions = [model["predict"](row) for row in test_rows]
+        metrics = _factor_prediction_metrics(predictions, [row["label"] for row in test_rows])
+        folds.append({
+            "fold": fold + 1,
+            "train_dates": len(train_dates),
+            "test_dates": len(test_dates),
+            "test_rows": len(test_rows),
+            **metrics,
+            "positive": metrics["rank_ic"] > 0 and metrics["avg_net_signal_return_pct"] > 0,
+        })
+    return folds
+
+
 def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], horizon: int) -> dict[str, Any]:
     dates = sorted({row["date"] for row in rows})
     purge = max(1, min(20, horizon))
@@ -2041,7 +2331,18 @@ def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], hori
     momentum_name = "momentum_20" if "momentum_20" in factor_names else factor_names[0]
     momentum_predictions = _panel_equal_baseline(deployment_rows, test_rows, [momentum_name])
     momentum_metrics = _factor_prediction_metrics(momentum_predictions, actuals)
+    walk_forward_folds = _panel_walk_forward_folds(
+        rows,
+        factor_names,
+        horizon,
+        selected["penalty"],
+        fold_count=5,
+    )
+    positive_folds = sum(1 for fold in walk_forward_folds if fold.get("positive"))
     direction_lift = test_metrics["direction_hit_rate_pct"] - max(50.0, equal_metrics["direction_hit_rate_pct"], momentum_metrics["direction_hit_rate_pct"])
+    baseline_mae = min(equal_metrics["mae"], momentum_metrics["mae"])
+    mae_lift = baseline_mae - test_metrics["mae"]
+    independent_test_blocks = len(test_dates) / max(1, horizon)
     abs_total = sum(abs(value) for value in deployment["weights"]) or 1.0
     coefficients = [
         {
@@ -2053,7 +2354,22 @@ def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], hori
         for index, name in enumerate(factor_names)
     ]
     coefficients.sort(key=lambda row: row["abs_weight_pct"], reverse=True)
-    active = direction_lift > 0.5 or test_metrics["rank_ic"] > max(0.0, equal_metrics["rank_ic"], momentum_metrics["rank_ic"])
+    admission_checks = {
+        "independentTestBlocks": independent_test_blocks >= 12,
+        "directionLift": direction_lift >= 1.0,
+        "maeImprovement": mae_lift > 0 and mae_lift / max(1e-9, baseline_mae) >= 0.01,
+        "positiveIc": test_metrics["ic"] > 0,
+        "positiveRankIc": test_metrics["rank_ic"] > 0,
+        "validationIc": number(selected["validation"].get("ic")) > 0,
+        "validationRankIc": number(selected["validation"].get("rank_ic")) > 0,
+        "walkForwardFoldCount": len(walk_forward_folds) >= 5,
+        "walkForwardStability": positive_folds >= 4,
+        "netCostImprovement": test_metrics["avg_net_signal_return_pct"] > max(
+            equal_metrics["avg_net_signal_return_pct"],
+            momentum_metrics["avg_net_signal_return_pct"],
+        ),
+    }
+    active = all(admission_checks.values())
     return {
         "available": True,
         "active": active,
@@ -2079,6 +2395,13 @@ def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], hori
             {"name": f"single_{momentum_name}", **momentum_metrics},
         ],
         "direction_lift_pct": round(direction_lift, 3),
+        "mae_lift_pct": round(mae_lift, 4),
+        "mae_lift_relative_pct": round(mae_lift / max(1e-9, baseline_mae) * 100, 4),
+        "independent_test_blocks": round(independent_test_blocks, 3),
+        "walk_forward_folds": walk_forward_folds,
+        "positive_walk_forward_folds": positive_folds,
+        "admission_checks": admission_checks,
+        "failed_checks": [name for name, passed in admission_checks.items() if not passed],
         "coefficients": coefficients,
         "guardrail": "Inactive unless holdout direction/rank IC beats simple baselines.",
     }
@@ -2170,6 +2493,15 @@ def analyze_cross_sectional_factors(
                 decay_penalty += 5
             redundancy_penalty = 10 if redundant else 0
             model_gain = ml_lookup.get(name, 0.0) * (16 if ml.get("active") else 7)
+            evidence_score = _factor_evidence_score(
+                row,
+                quantile_spread=number(row.get("quantile_spread_pct")),
+                turnover_penalty=2.0,
+                redundancy_penalty=redundancy_penalty,
+                decay_penalty=decay_penalty,
+                model_weight=ml_lookup.get(name, 0.0),
+                ml_active=ml.get("active") is True,
+            )
             base_score = (
                 abs(number(row["daily_rank_ic_mean"])) * 42
                 + abs(number(row["sector_neutral_rank_ic"])) * 28
@@ -2181,15 +2513,30 @@ def analyze_cross_sectional_factors(
                 - decay_penalty
             )
             reasons = []
-            if row["date_count"] < 12:
+            if row["date_count"] < 120:
                 reasons.append("too_few_cross_section_dates")
+            if len({panel_row["symbol"] for panel_row in panel_rows}) < 30:
+                reasons.append("too_few_cross_section_symbols")
             if abs(number(row["daily_rank_ic_mean"])) < 0.005 and abs(number(row["sector_neutral_rank_ic"])) < 0.005:
                 reasons.append("weak_cross_section_rank_ic")
+            if number(row["daily_rank_ic_mean"]) * row["direction"] <= 0:
+                reasons.append("non_positive_directed_rank_ic")
+            if number(row["sector_neutral_rank_ic"]) * row["direction"] <= 0:
+                reasons.append("non_positive_sector_neutral_rank_ic")
             if redundant:
                 reasons.append(f"redundant_with_{leader}")
             if decay_penalty >= 4:
                 reasons.append("recent_cross_section_decay")
-            admitted = not reasons and base_score > 0
+            if ml.get("active") is not True:
+                reasons.append("cross_section_combo_failed_strict_oos_gate")
+            if evidence_score["score"] < 70:
+                reasons.append("factor_evidence_score_below_70")
+            admitted = (
+                not reasons
+                and base_score > 0
+                and ml_lookup.get(name, 0.0) >= 0.03
+                and evidence_score["shadowPass"]
+            )
             candidate = {
                 **row,
                 "status": "admitted" if admitted else "watchlist",
@@ -2201,15 +2548,18 @@ def analyze_cross_sectional_factors(
                     "leader": leader,
                     "members": cluster.get("members", [name]),
                 },
+                "evidence_score": evidence_score,
                 "reasons": reasons or ["passed_cross_section_admission"],
             }
             candidates.append(candidate)
         active_candidates = [row for row in candidates if row["status"] == "admitted" and row["base_score"] > 0]
         if not active_candidates:
-            active_candidates = sorted([row for row in candidates if row["base_score"] > 0], key=lambda item: item["base_score"], reverse=True)[:6]
-            for row in active_candidates:
+            research_candidates = sorted([row for row in candidates if row["base_score"] > 0], key=lambda item: item["base_score"], reverse=True)[:6]
+            for row in research_candidates:
                 row["status"] = "research_only"
                 row["reasons"].append("fallback_top_cross_section_candidate")
+        else:
+            research_candidates = []
         temperature = max(4.0, stddev(row["base_score"] for row in active_candidates) or 6.0)
         exp_rows = [(row, math.exp(clamp(row["base_score"] / temperature, -8, 8))) for row in active_candidates]
         exp_total = sum(value for _, value in exp_rows) or 1.0
@@ -2235,6 +2585,7 @@ def analyze_cross_sectional_factors(
             "min_symbols_per_date": min_symbols,
             "factor_count": len(factor_names),
             "admitted_count": len(active_candidates),
+            "research_candidate_count": len(research_candidates),
             "weights": sorted(weights, key=lambda item: item["weight_pct"], reverse=True),
             "factors": sorted(candidates, key=lambda item: item["base_score"], reverse=True),
             "ml_backtest": ml,
@@ -2273,5 +2624,6 @@ def analyze_cross_sectional_factors(
             "Require sector-neutral evidence when sector labels are available.",
             "Penalize highly correlated duplicate factors and recent IC decay.",
             "Use ML holdout coefficients only when they beat equal-weight and momentum baselines.",
+            "Require a 100-point evidence score of at least 70 plus five walk-forward folds with at least four positive after costs.",
         ],
     }

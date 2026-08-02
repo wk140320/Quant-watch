@@ -6,6 +6,7 @@ process.env.SERVER_DISABLE_LISTEN = "true";
 const {
   alpacaQuoteRows,
   alpacaRows,
+  alpacaSnapshotQuoteFromPayload,
   alpacaTradeRows,
   aiProviderStatus,
   analysisBatchLimit,
@@ -24,18 +25,29 @@ const {
   sanitizeUniverseRows,
   scoreRedditSocialPosts,
   fetchRedditSocialFactor,
+  factorLabInputSignature,
+  mergeRealCandleSources,
   historicalBacktestFactor,
   backendMarketSession,
   backendDueQuoteJobs,
   backendMonitorBudgetLimits,
   computeServerTechnicals,
+  compactWorkspaceSnapshot,
   marketAnalysisEventFromMonitorResult,
   marketOverlayFromHistoryPayload,
+  mergeServerSnapshots,
   mergeQuoteIntoCandles,
+  normalizePredictionSample,
+  summarizePredictionSamples,
+  directionalOutcomeHit,
+  pathOutcomeHit,
+  intervalTouchOutcomeHit,
   predictionCandlesWithQuote,
   projectedMaxDownsideConfidenceMetrics,
   normalizeQuote,
+  officialUniverseContainsSymbol,
   realtimeQuoteQuality,
+  recentVerifiedOverlayBatch,
   selectBestRealtimeQuote,
   sanitizeQuoteChangeAgainstCandles,
   validMarketQuoteDate,
@@ -45,6 +57,7 @@ const {
   trainIntradayLinearModel,
   stockAnalysisHistoryRows,
   tradeFootprintRows,
+  tencentCnQuoteFromEncoded,
   tushareRows,
   universePayload,
 } = await import("../server.mjs");
@@ -57,6 +70,161 @@ const {
 test("Versioned static assets are immutable while HTML remains fresh", () => {
   assert.equal(cacheControlFor(new URL("http://local/frontend/styles/shell.css?v=1"), "/app/frontend/styles/shell.css"), "public, max-age=31536000, immutable");
   assert.equal(cacheControlFor(new URL("http://local/"), "/app/index.html"), "no-store");
+});
+
+test("Factor lab cache signatures invalidate when the latest real bar changes", () => {
+  const rows = [
+    { date: "2026-07-27", open: 10, high: 11, low: 9, close: 10.5, volume: 1000 },
+    { date: "2026-07-28", open: 10.5, high: 12, low: 10, close: 11.2, volume: 1200 },
+  ];
+  const first = factorLabInputSignature("ASX", "BHP", 15, rows);
+  const same = factorLabInputSignature("ASX", "BHP.AX", 15, rows);
+  const changed = factorLabInputSignature("ASX", "BHP", 15, [
+    rows[0],
+    { ...rows[1], close: 11.3 },
+  ]);
+  assert.equal(first, same);
+  assert.match(first, /^factor-lab-evidence-v2\|/);
+  assert.notEqual(first, changed);
+});
+
+test("Factor lab history merges only unique real candle dates with live rows taking precedence", () => {
+  const merged = mergeRealCandleSources([
+    {
+      source: "snapshot-real",
+      role: "snapshot",
+      candles: [
+        { date: "2026-07-25", open: 10, high: 11, low: 9, close: 10, volume: 100 },
+        { date: "2026-07-26", open: 10, high: 11, low: 9, close: 10.5, volume: 110 },
+      ],
+    },
+    {
+      source: "market-history-cache",
+      role: "persistent-cache",
+      candles: [
+        { date: "2026-07-26", open: 10.4, high: 11, low: 10, close: 10.7, volume: 120 },
+        { date: "2026-07-27", open: 10.7, high: 12, low: 10.5, close: 11.5, volume: 130 },
+      ],
+    },
+    {
+      source: "live-provider",
+      role: "live-provider",
+      candles: [
+        { date: "2026-07-27", open: 10.8, high: 12, low: 10.6, close: 11.8, volume: 150 },
+        { date: "2026-07-28", open: 11.8, high: 12.2, low: 11.4, close: 12, volume: 160 },
+      ],
+    },
+  ], 20);
+  assert.equal(merged.candles.length, 4);
+  assert.deepEqual(merged.candles.map((row) => row.date), [
+    "2026-07-25",
+    "2026-07-26",
+    "2026-07-27",
+    "2026-07-28",
+  ]);
+  assert.equal(merged.candles.find((row) => row.date === "2026-07-27").close, 11.8);
+  assert.deepEqual(merged.sources, ["snapshot-real", "market-history-cache", "live-provider"]);
+});
+
+test("Prediction evidence rejects cross-market rows and deduplicates immutable decisions", () => {
+  const base = {
+    market: "US",
+    symbol: "AAPL",
+    asOfDate: "2026-07-01",
+    signalAt: "2026-07-01T20:00:00Z",
+    close: 200,
+    horizonDays: 5,
+    targetUpside: 5,
+    stopLoss: 4,
+    modelVersion: "us-model-v1",
+    featureSchemaHash: "features-v2",
+    direction: "upside",
+    confidence: 70,
+  };
+  assert.equal(normalizePredictionSample(base, "ASX"), null);
+  const first = normalizePredictionSample(base, "US");
+  const duplicate = normalizePredictionSample({ ...base, id: "legacy-random-id", createdAt: "2026-07-02T00:00:00Z" }, "US");
+  assert.equal(first.predictionId, duplicate.predictionId);
+  const summary = summarizePredictionSamples([
+    { ...first, outcome: { resolved: true, forwardReturnPct: -1, targetWins: true, stopWins: false, hitTarget: true, hitStop: false } },
+    { ...duplicate, outcome: { resolved: true, forwardReturnPct: -1, targetWins: true, stopWins: false, hitTarget: true, hitStop: false } },
+  ], "US");
+  assert.equal(summary.rawTotal, 2);
+  assert.equal(summary.uniqueDecisions, 1);
+  assert.equal(summary.independentDates, 1);
+});
+
+test("Prediction report separates final direction, barrier path, and interval touch", () => {
+  const sample = {
+    direction: "upside",
+    targetUpside: 5,
+    stopLoss: 4,
+    outcome: {
+      resolved: true,
+      forwardReturnPct: -1.2,
+      targetWins: true,
+      stopWins: false,
+      hitTarget: true,
+      hitStop: true,
+    },
+  };
+  assert.equal(directionalOutcomeHit(sample), false);
+  assert.equal(pathOutcomeHit(sample), true);
+  assert.equal(intervalTouchOutcomeHit(sample), true);
+});
+
+test("Workspace bootstrap keeps valid candles while dropping heavy factor internals", () => {
+  const heavy = Array.from({ length: 5000 }, (_, index) => ({ index, value: index / 10 }));
+  const snapshot = compactWorkspaceSnapshot({
+    market: "US",
+    watchlist: ["AAPL"],
+    analyses: [{
+      symbol: "AAPL",
+      market: "US",
+      candles: Array.from({ length: 60 }, (_, index) => ({ date: `2026-05-${String((index % 28) + 1).padStart(2, "0")}`, open: 100, high: 102, low: 99, close: 101, volume: 1000, orderflow: heavy })),
+      technicals: { close: 101, rsi: 55, volumeRatio: 1.2, mainForceProxy: 52 },
+      analysis: { action: "HOLD_WATCH", confidence: 61, thesis: ["test"] },
+      factors: { factorResearch: { available: true, score: 3, thesis: ["useful"], backtestRows: heavy } },
+    }],
+  });
+  assert.equal(snapshot.analyses[0].candles.length, 48);
+  assert.equal(snapshot.analyses[0].technicals.rsi, 55);
+  assert.equal(snapshot.analyses[0].factors.factorResearch.score, 3);
+  assert.equal("backtestRows" in snapshot.analyses[0].factors.factorResearch, false);
+  assert.ok(JSON.stringify(snapshot).length < 50000);
+});
+
+test("Concurrent snapshot saves preserve newly added symbols and the newest analysis", () => {
+  const analysis = (symbol, analysisAsOf, close) => ({
+    symbol,
+    market: "ASX",
+    analysisAsOf,
+    candles: [{ date: "2026-07-17", open: close, high: close, low: close, close, volume: 1000 }],
+    technicals: { close, rsi: 50, volumeRatio: 1, mainForceProxy: 50 },
+    analysis: { action: "HOLD_WATCH", confidence: 50 },
+  });
+  const merged = mergeServerSnapshots({
+    market: "ASX",
+    updatedAt: "2026-07-20T09:30:00.000Z",
+    watchlist: ["WBT", "CBA"],
+    selected: "WBT",
+    analyses: [
+      analysis("WBT", "2026-07-20T09:29:00.000Z", 5.41),
+      analysis("CBA", "2026-07-20T09:28:00.000Z", 171.2),
+    ],
+  }, {
+    market: "ASX",
+    updatedAt: "2026-07-20T09:31:00.000Z",
+    watchlist: ["CBA", "BHP"],
+    selected: "BHP",
+    analyses: [
+      analysis("CBA", "2026-07-20T09:20:00.000Z", 170),
+      analysis("BHP", "2026-07-20T09:31:00.000Z", 57.54),
+    ],
+  }, "ASX");
+  assert.deepEqual(new Set(merged.watchlist), new Set(["WBT", "CBA", "BHP"]));
+  assert.equal(merged.analyses.find((item) => item.symbol === "CBA").technicals.close, 171.2);
+  assert.equal(merged.selected, "BHP");
 });
 
 test("Static file resolution stays inside the application root", () => {
@@ -97,6 +265,55 @@ test("Alpaca quotes preserve real bid and ask fields", () => {
   assert.equal(rows[0].bid_price, 101.2);
   assert.equal(rows[0].ask_size, 9);
   assert.deepEqual(rows[0].conditions, ["R"]);
+});
+
+test("Alpaca batch snapshot rows preserve provider time and previous close", () => {
+  const quote = alpacaSnapshotQuoteFromPayload("AAPL", {
+    latestTrade: { p: 212.34, t: "2026-07-16T19:59:58.000Z" },
+    latestQuote: { bp: 212.32, ap: 212.35, t: "2026-07-16T19:59:59.000Z" },
+    dailyBar: { o: 210, h: 213, l: 209.5, v: 1234567 },
+    prevDailyBar: { c: 209.8 },
+  }, "iex");
+  assert.equal(quote.symbol, "AAPL");
+  assert.equal(quote.price, 212.34);
+  assert.equal(quote.previousClose, 209.8);
+  assert.equal(quote.asOf, "2026-07-16T19:59:58.000Z");
+  assert.equal(quote.timeVerified, true);
+});
+
+test("Tencent batch quote rows preserve exchange time and lot volume", () => {
+  const parts = Array.from({ length: 40 }, () => "");
+  parts[3] = "12.34";
+  parts[4] = "12.10";
+  parts[5] = "12.15";
+  parts[30] = "20260717145958";
+  parts[31] = "0.24";
+  parts[32] = "1.98";
+  parts[33] = "12.50";
+  parts[34] = "12.00";
+  parts[36] = "12345";
+  const quote = tencentCnQuoteFromEncoded("600519", parts.join("~"));
+  assert.equal(quote.price, 12.34);
+  assert.equal(quote.previousClose, 12.1);
+  assert.equal(quote.volume, 1234500);
+  assert.equal(quote.asOf, "2026-07-17T06:59:58.000Z");
+  assert.equal(quote.exchange, "SSE");
+});
+
+test("Repeated quote batches reuse only very recent verified real overlays", () => {
+  const nowMs = Date.parse("2026-07-17T06:00:00.000Z");
+  const recent = recentVerifiedOverlayBatch([
+    { symbol: "AAPL", market: "US", price: 210, source: "alpaca-iex-us-snapshot", retrievedAt: "2026-07-17T05:59:55.000Z", stale: false },
+    { symbol: "MSFT", market: "US", price: 500, source: "alpaca-iex-us-snapshot", retrievedAt: "2026-07-17T05:59:54.000Z", stale: false },
+  ], ["AAPL", "MSFT"], "US", { nowMs, maxAgeMs: 12_000 });
+  assert.equal(recent.length, 2);
+  assert.equal(recent[0].symbol, "AAPL");
+  assert.equal(recentVerifiedOverlayBatch([
+    { symbol: "AAPL", market: "US", price: 210, retrievedAt: "2026-07-17T05:59:30.000Z", stale: false },
+  ], ["AAPL"], "US", { nowMs, maxAgeMs: 12_000 }), null);
+  assert.equal(recentVerifiedOverlayBatch([
+    { symbol: "AAPL", market: "US", price: 210, retrievedAt: "2026-07-17T05:59:59.000Z", stale: true },
+  ], ["AAPL"], "US", { nowMs, maxAgeMs: 12_000 }), null);
 });
 
 test("US trade footprint buckets real ticks into candle price levels without claiming L2", () => {
@@ -179,6 +396,15 @@ test("Universe rows are market-normalized, deduplicated, and pageable", () => {
   assert.equal(payload.count, 1);
   assert.equal(payload.filteredCount, 1);
   assert.equal(payload.rows[0].name, "BHP Group");
+});
+
+test("ASX official universe validation rejects cross-exchange AUX mappings", () => {
+  const rows = [
+    { code: "BHP", symbol: "BHP.AX" },
+    { code: "CBA", symbol: "CBA.AX" },
+  ];
+  assert.equal(officialUniverseContainsSymbol(rows, "BHP.AX", "ASX"), true);
+  assert.equal(officialUniverseContainsSymbol(rows, "AUX.AX", "ASX"), false);
 });
 
 test("Quota classifier recognises limited providers", () => {
@@ -663,6 +889,30 @@ test("Open-market strict freshness rejects retrieval-time-only quotes", () => {
   }, "ASX", new Date("2026-07-13T05:00:00.000Z"), { strict: true, symbol: "CAR" });
   assert.equal(quality.usable, false);
   assert.match(quality.reason, /verified provider timestamp/i);
+});
+
+test("Fresh ASX official retrieval-time quote is displayable for strict refresh without becoming a candle", () => {
+  const now = new Date("2026-07-13T05:00:30.000Z");
+  const quote = normalizeQuote({
+    symbol: "MIN",
+    price: 56.93,
+    previousClose: 58.3,
+    retrievedAt: "2026-07-13T05:00:00.000Z",
+    timeVerified: false,
+    retrievalTimeTrusted: true,
+    source: "asx-official-company-header",
+  }, "ASX", 58.3);
+  const quality = realtimeQuoteQuality(quote, "ASX", now, { strict: true, symbol: "MIN" });
+  assert.equal(quality.usable, true);
+  assert.equal(quality.retrievalTimeTrusted, true);
+  const candles = mergeQuoteIntoCandles([
+    { date: "2026-07-10", open: 58, high: 59, low: 57, close: 58.3, volume: 1000 },
+  ], quote, "ASX", now);
+  assert.equal(candles.length, 1);
+  assert.equal(candles[0].close, 58.3);
+  const predictionRows = predictionCandlesWithQuote(candles, quote, "ASX", now);
+  assert.equal(predictionRows.at(-1).close, 56.93);
+  assert.equal(predictionRows.at(-1).predictionOnly, true);
 });
 
 test("Backend technicals and intraday model train from completed minute bars", () => {

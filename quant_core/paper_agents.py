@@ -390,12 +390,52 @@ def decision_score(agent: dict[str, Any], item: dict[str, Any], market_bias: flo
     return _clamp(38 + (confidence-50)*0.5 + final_return*3.2 + max_upside*1.1 + (trend-50)*0.24 + (volume-1)*8 + evidence*0.08 + market_bias*0.9 + learned, 0, 100)
 
 
-def _cost_pct(market: str, item: dict[str, Any]) -> float:
-    base = {"ASX": 0.08, "US": 0.045, "CN": 0.07}[market]
-    volume = _number(_technicals(item).get("volumeRatio"), 1)
-    illiquidity = 0.09 if volume < 0.65 else 0.045 if volume < 0.9 else 0.0
-    degraded = 0.025 if (item.get("marketValidation") or {}).get("degraded") else 0.0
-    return round(base + illiquidity + degraded, 4)
+def _cost_model(market: str, item: dict[str, Any], notional: float = 0.0) -> dict[str, Any]:
+    technicals = _technicals(item)
+    price = max(0.0000001, _number(item.get("price"), _number(technicals.get("close"), 1)))
+    commission_pct = {"ASX": 0.08, "US": 0.045, "CN": 0.07}[market]
+    bid = _number(item.get("bid"), _number((item.get("l1") or {}).get("bid")))
+    ask = _number(item.get("ask"), _number((item.get("l1") or {}).get("ask")))
+    explicit_spread = _number(item.get("spreadPct"), _number(technicals.get("spreadPct")))
+    if explicit_spread > 0:
+        spread_pct = explicit_spread / 2
+    elif bid > 0 and ask >= bid:
+        spread_pct = (ask - bid) / max(0.0000001, (ask + bid) / 2) * 50
+    else:
+        spread_pct = {"ASX": 0.055, "US": 0.025, "CN": 0.045}[market]
+
+    volume_ratio = max(0.05, _number(technicals.get("volumeRatio"), 1))
+    atr_pct = abs(_number(technicals.get("atrPct"), _number(item.get("atrPct"), 1.2)))
+    volatility_slippage_pct = min(0.45, 0.012 + atr_pct * 0.012 + max(0, 0.9-volume_ratio) * 0.08)
+    degraded_pct = 0.025 if (item.get("marketValidation") or {}).get("degraded") else 0.0
+
+    average_dollar_volume = _number(
+        item.get("averageDollarVolume"),
+        _number(technicals.get("averageDollarVolume"), _number(technicals.get("averageVolume20")) * price),
+    )
+    max_participation = {"ASX": 0.01, "US": 0.005, "CN": 0.008}[market]
+    participation = notional / average_dollar_volume if notional > 0 and average_dollar_volume > 0 else 0.0
+    impact_pct = min(0.8, (0.055 + atr_pct * 0.008) * math.sqrt(max(0.0, participation)))
+    max_trade_notional = average_dollar_volume * max_participation if average_dollar_volume > 0 else None
+    capacity_blocked = bool(max_trade_notional is not None and notional > max_trade_notional * 1.05)
+    total_pct = commission_pct + spread_pct + volatility_slippage_pct + impact_pct + degraded_pct
+    return {
+        "totalPct": round(total_pct, 4),
+        "commissionPct": round(commission_pct, 4),
+        "halfSpreadPct": round(spread_pct, 4),
+        "volatilitySlippagePct": round(volatility_slippage_pct, 4),
+        "marketImpactPct": round(impact_pct, 4),
+        "degradedDataPenaltyPct": round(degraded_pct, 4),
+        "participationRatePct": round(participation * 100, 5),
+        "averageDollarVolume": round(average_dollar_volume, 2) if average_dollar_volume > 0 else None,
+        "maxTradeNotional": round(max_trade_notional, 2) if max_trade_notional is not None else None,
+        "capacityBlocked": capacity_blocked,
+        "method": "commission+half-spread+volatility-slippage+sqrt-impact",
+    }
+
+
+def _cost_pct(market: str, item: dict[str, Any], notional: float = 0.0) -> float:
+    return _number(_cost_model(market, item, notional).get("totalPct"))
 
 
 def _source_is_real(source: str) -> bool:
@@ -436,14 +476,14 @@ def _threshold(agent: dict[str, Any]) -> float:
     return _clamp(STYLE_ENTRY.get(agent.get("style"), 58) - _number((agent.get("learning") or {}).get("confidenceBias"))*0.35, 49, 68)
 
 
-def _trade_event(agent: dict[str, Any], item: dict[str, Any], event_type: str, qty: float, price: float, reason: str, cost_pct: float, pnl_pct: float = 0.0) -> dict[str, Any]:
+def _trade_event(agent: dict[str, Any], item: dict[str, Any], event_type: str, qty: float, price: float, reason: str, cost_model: dict[str, Any], pnl_pct: float = 0.0) -> dict[str, Any]:
     market = _market(item.get("market"))
     bar_ts = str(item.get("barTs") or item.get("priceTs") or item.get("updatedAt") or "")
     return {
         "createdAt": _now(), "market": market, "agentId": agent["id"], "agentName": agent["name"],
         "symbol": str(item.get("symbol") or "").upper(), "barTs": bar_ts, "type": event_type,
         "side": "BUY" if event_type == "paper-buy" else "SELL", "qty": qty, "price": price,
-        "pnlPct": pnl_pct, "reason": reason, "slippagePct": cost_pct, "source": item.get("source"),
+        "pnlPct": pnl_pct, "reason": reason, "slippagePct": _number(cost_model.get("totalPct")), "costModel": cost_model, "source": item.get("source"),
         "idempotencyKey": _event_key(market, agent["id"], str(item.get("symbol") or "").upper(), bar_ts, event_type),
         "order_execution_enabled": False, "orderSent": False,
     }
@@ -507,13 +547,14 @@ def step(payload: dict[str, Any]) -> dict[str, Any]:
                     reason = "time-exit"
                 if not reason:
                     continue
-                cost_pct = _cost_pct(market, item)
                 qty = _number(position.get("qty"))
                 gross = qty * price
+                cost_model = _cost_model(market, item, gross)
+                cost_pct = _number(cost_model.get("totalPct"))
                 net = gross * (1-cost_pct/100)
                 cost_basis = _number(position.get("costBasis"), qty*_number(position.get("avgPrice")))
                 realised = (net-cost_basis)/max(0.0000001, cost_basis)*100
-                event = _trade_event(agent, item, "paper-sell", qty, price, reason, cost_pct, realised)
+                event = _trade_event(agent, item, "paper-sell", qty, price, reason, cost_model, realised)
                 if not _record_event(connection, event):
                     continue
                 agent["cash"] = _number(agent.get("cash")) + net
@@ -534,19 +575,25 @@ def step(payload: dict[str, Any]) -> dict[str, Any]:
                 if score < _threshold(agent):
                     continue
                 price = item["price"]
-                cost_pct = _cost_pct(market, item)
-                gross_per_share = price*(1+cost_pct/100)
-                if _number(agent.get("cash")) < gross_per_share:
-                    continue
                 cash_pct, equity_pct, max_pct = STYLE_SIZING[agent["style"]]
                 current = agent["positions"].get(item["symbol"])
                 current_value = _number(current.get("qty") if current else 0)*price
                 max_value = max(_number(agent.get("equity"))*max_pct, _number(agent.get("initialCapital"))*min(0.06, max_pct))
                 ticket = min(_number(agent.get("cash"))*cash_pct, _number(agent.get("equity"))*equity_pct*_number(agent["learning"].get("aggressiveness"), 1), max_value-current_value)
+                preliminary_cost = _cost_model(market, item, max(0.0, ticket))
+                max_trade_notional = _number(preliminary_cost.get("maxTradeNotional"), 0)
+                if max_trade_notional > 0:
+                    ticket = min(ticket, max_trade_notional)
+                cost_model = _cost_model(market, item, max(0.0, ticket))
+                cost_pct = _number(cost_model.get("totalPct"))
+                gross_per_share = price*(1+cost_pct/100)
+                if _number(agent.get("cash")) < gross_per_share:
+                    continue
                 qty = math.floor(ticket/gross_per_share)
                 if qty <= 0:
                     continue
-                event = _trade_event(agent, item, "paper-buy", qty, price, f"score {score:.1f} / threshold {_threshold(agent):.1f}", cost_pct)
+                cost_model = _cost_model(market, item, qty*price)
+                event = _trade_event(agent, item, "paper-buy", qty, price, f"score {score:.1f} / threshold {_threshold(agent):.1f}", cost_model)
                 if not _record_event(connection, event):
                     continue
                 gross = qty*price

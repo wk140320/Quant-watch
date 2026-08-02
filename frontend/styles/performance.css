@@ -16,17 +16,23 @@
 
 /* A mostly opaque application header does not need a costly full-strength blur. */
 html:not([data-active-workspace="home"]) .terminal-header {
-  -webkit-backdrop-filter: blur(10px) saturate(108%);
-  backdrop-filter: blur(10px) saturate(108%);
+  -webkit-backdrop-filter: blur(6px) saturate(104%);
+  backdrop-filter: blur(6px) saturate(104%);
 }
 
 /* Compositor hints are scoped to short transitions instead of remaining active. */
 .quant-page-section.ui-page-enter {
   will-change: opacity, transform;
+  animation: ui-page-enter-fast 210ms var(--qw-ease-out) both;
 }
 
 .quant-page-section:not(.ui-page-enter) {
   will-change: auto;
+}
+
+@keyframes ui-page-enter-fast {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

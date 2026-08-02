@@ -120,10 +120,44 @@ test("Visual workspaces keep research layouts and local artwork available", asyn
   ]);
 });
 
+test("Strategy workspace keeps navigation and active panels on the full grid", async () => {
+  const [html, strategyCss] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/styles/strategy-workspace.css", import.meta.url), "utf8"),
+  ]);
+  const strategyLink = html.indexOf("/frontend/styles/strategy-workspace.css");
+  const supervisorLink = html.indexOf("/frontend/styles/training-supervisor.css");
+  assert.ok(strategyLink > supervisorLink);
+  assert.match(strategyCss, /"strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav"/);
+  assert.match(strategyCss, /\.strategy-workspace-nav\s*\{[\s\S]*grid-area:\s*strategy-nav/);
+  assert.match(strategyCss, /\.model-report-board\s*\{[\s\S]*grid-area:\s*reports/);
+  assert.match(strategyCss, /@media \(max-width: 860px\)[\s\S]*"chat chat chat chat chat chat chat chat chat chat chat chat"/);
+});
+
 test("Frontend refreshes strict quote overlays before byte-bounded model batches", async () => {
   const source = await readFile(new URL("../app.js", import.meta.url), "utf8");
   assert.match(source, /\/api\/quotes\/batch/);
   assert.match(source, /function quoteOverlayTimestamp/);
+  assert.match(source, /function quoteOverlayForSymbol/);
+  assert.match(source, /if \(!item\) \{[\s\S]*quoteOnlyChanged = true/);
+  assert.match(source, /return changed \|\| cacheChanged/);
+  assert.match(source, /hasQuote \? "模型待分析" : "未刷新"/);
+  assert.match(source, /data-card-price/);
+  assert.match(source, /function hydratePendingModelAnalyses/);
+  assert.match(source, /function schedulePendingModelHydration/);
+  assert.match(source, /function modelAnalysisNeedsHydration/);
+  assert.match(source, /item\?\.analysisNeedsRefresh === true/);
+  assert.match(source, /const hydrationSymbols = \[state\.selected, \.\.\.state\.watchlist\]/);
+  assert.match(source, /if \(payload\.snapshot\) \{/);
+  assert.doesNotMatch(source, /if \(state\.analyses\.size === 0 && payload\.snapshot\)/);
+  assert.match(source, /走势图与本地模型补齐完成/);
+  assert.match(source, /pendingModelHydrationToken \+= 1/);
+  assert.match(source, /function rejectUnsupportedListing/);
+  assert.match(source, /AUX 当前是加拿大 TSXV 代码/);
+  assert.match(source, /function scheduleWorkspaceBootstrapRetry/);
+  assert.match(source, /正在自动重连/);
+  assert.match(source, /switchToken !== state\.marketSwitchToken/);
+  assert.match(source, /cancelWorkspaceBootstrapRetry\(\)/);
   assert.match(source, /function analysisRequestChunks/);
   assert.match(source, /maxBytes \|\| 1_250_000/);
   assert.match(source, /applyStoredQuoteOverlays\(marketKey\)/);
@@ -141,6 +175,12 @@ test("Market selection and dense research views avoid cramped horizontal panels"
   assert.match(shell, /setMarketMenuOpen/);
   assert.match(shell, /document\.body\.appendChild\(marketMenu\)/);
   assert.match(shell, /positionMarketMenu/);
+  assert.match(shell, /function requestMarketSwitch/);
+  assert.match(shell, /while \(pendingMarket\)/);
+  assert.match(shell, /await Promise\.all\(\[/);
+  assert.doesNotMatch(source, /bind\("marketCycleButton", "click", cycleMarket\)/);
+  assert.match(source, /safeUiStep\("隔离并渲染目标市场视图", renderMarketSwitchShell\)/);
+  assert.match(source, /function renderMarketSwitchShell\(\)[\s\S]*cards\.replaceChildren\(\)[\s\S]*renderCards\(\)/);
   assert.match(source, /class="learning-tablist" role="tablist"/);
   assert.equal((source.match(/data-learning-panel=/g) || []).length, 3);
   assert.match(source, /<div class="chart-tools">[\s\S]*chart-overlay-popover[\s\S]*expandChart/);
@@ -162,7 +202,38 @@ test("Workspace rendering skips hidden dashboards and defers secondary simulatio
   assert.match(source, /deferWorkspaceStep\(next, workspaceToken, "加载风险评估"/);
   assert.doesNotMatch(bootSource, /safeUiStep\("渲染基础股票卡片", renderCards\)/);
   assert.doesNotMatch(bootSource, /safeUiStep\("渲染基础持仓概览", renderPortfolioSummary\)/);
+  assert.doesNotMatch(bootSource, /restoreServerSnapshot\(\)/);
+  assert.match(bootSource, /loadWorkspaceBootstrap\(state\.market, \{ timeoutMs: 3500 \}\)/);
   assert.match(runtime, /const clipped = itemRect\.left/);
   assert.match(html, /frontend\/styles\/performance\.css/);
   assert.match(performanceCss, /content-visibility: auto/);
+});
+
+test("Main and desktop shells use bounded local-first loading", async () => {
+  const [html, source, httpRuntime, monitor, swift, server] = await Promise.all([
+    readFile(new URL("../index.html", import.meta.url), "utf8"),
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/runtime/http.js", import.meta.url), "utf8"),
+    readFile(new URL("../monitor-app.js", import.meta.url), "utf8"),
+    readFile(new URL("../tools/GlobalQuantMonitorMain.swift", import.meta.url), "utf8"),
+    readFile(new URL("../server.mjs", import.meta.url), "utf8"),
+  ]);
+  assert.match(source, /beginTask\("恢复本地工作区"\)/);
+  assert.match(source, /loadWorkspaceBootstrap\(state\.market, \{ timeoutMs: 3500 \}\)/);
+  assert.match(source, /\/api\/jobs\/factor-lab/);
+  assert.match(source, /waitForFactorLabJob/);
+  assert.match(source, /data-factor-lab-status="insufficient_data"/);
+  assert.match(source, /真实历史不足，未训练、未生成生产权重/);
+  assert.match(source, /includeEvolution: false/);
+  assert.match(source, /因子进化由独立调度器执行/);
+  assert.match(source, /任务在独立后台进程运行/);
+  assert.doesNotMatch(html, /class="[^"]*training-supervisor-board/);
+  assert.doesNotMatch(source, /deferWorkspaceStep\([^)]*"读取 AI 训练监工"/);
+  assert.match(server, /initializeTrainingSupervisor\(\)/);
+  assert.match(server, /startTrainingSupervisorScheduler\(\)/);
+  assert.match(httpRuntime, /method !== "GET"/);
+  assert.match(monitor, /backend-monitor\/status\?compact=1/);
+  assert.match(monitor, /const compact = fullTrajectory \? "" : "&compact=1"/);
+  assert.match(monitor, /api\/model-trajectories/);
+  assert.match(swift, /api\/ping/);
 });

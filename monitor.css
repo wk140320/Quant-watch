@@ -82,7 +82,7 @@ select:focus-visible {
   border-bottom: 1px solid var(--line-soft);
   background: rgba(9, 10, 9, 0.94);
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.16);
-  backdrop-filter: blur(22px) saturate(112%);
+  backdrop-filter: blur(8px) saturate(106%);
 }
 
 .brand {
@@ -1166,6 +1166,355 @@ h3 {
   min-height: auto;
 }
 
+.supervisor-ops-surface {
+  grid-column: 1 / -1;
+  min-height: auto;
+  background:
+    linear-gradient(140deg, rgba(198, 163, 90, 0.055), transparent 40%),
+    var(--surface-0);
+}
+
+.supervisor-ops-surface .surface-heading > div h3 {
+  margin-top: 4px;
+}
+
+.supervisor-manual-console {
+  margin: 16px 0;
+  padding: 16px 0;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.supervisor-manual-heading,
+.supervisor-scope-control,
+.supervisor-operator-rows article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.supervisor-manual-heading h4 {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+.supervisor-manual-grid {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.7fr) minmax(190px, 0.7fr) minmax(280px, 1.6fr);
+  gap: 10px;
+  margin-top: 13px;
+}
+
+.supervisor-scope-control,
+.supervisor-operator-note {
+  min-width: 0;
+  min-height: 52px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(225, 199, 126, 0.18);
+  background: rgba(242, 240, 233, 0.018);
+}
+
+.supervisor-scope-control strong,
+.supervisor-scope-control small,
+.supervisor-operator-note span {
+  display: block;
+}
+
+.supervisor-scope-control strong,
+.supervisor-operator-note span {
+  color: var(--text);
+  font-size: 10px;
+}
+
+.supervisor-scope-control small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.supervisor-operator-note input {
+  width: 100%;
+  min-height: 30px;
+  margin-top: 6px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+}
+
+.supervisor-manual-actions {
+  margin-top: 13px;
+}
+
+.supervisor-manual-actions .command-button.secondary {
+  border-color: var(--line);
+  background: transparent;
+  color: var(--text-soft);
+}
+
+.supervisor-manual-actions #supervisorHint {
+  min-width: 220px;
+  flex: 1;
+  color: var(--muted);
+  font-size: 9px;
+  text-align: right;
+}
+
+.supervisor-ops-overview {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.65fr) minmax(280px, 1.35fr) minmax(210px, 0.85fr);
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--line-soft);
+}
+
+.supervisor-ops-stat {
+  min-width: 0;
+  padding: 15px;
+  background: rgba(13, 15, 13, 0.92);
+}
+
+.supervisor-ops-stat span,
+.supervisor-ops-stat small,
+.supervisor-reviewer-row p {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.supervisor-ops-stat strong {
+  display: block;
+  margin: 5px 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.supervisor-ops-reviewers {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.supervisor-reviewer-row {
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(17, 19, 16, 0.62);
+}
+
+.supervisor-reviewer-row header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.supervisor-reviewer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+}
+
+.monitor-switch {
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.monitor-switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-height: 1px;
+  margin: 0;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.monitor-switch span {
+  position: relative;
+  width: 27px;
+  height: 15px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(242, 240, 233, 0.04);
+}
+
+.monitor-switch span::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  content: "";
+  transition: transform 160ms var(--ease), background 160ms ease;
+}
+
+.monitor-switch input:checked + span {
+  border-color: rgba(91, 170, 145, 0.38);
+  background: var(--green-soft);
+}
+
+.monitor-switch input:checked + span::after {
+  background: var(--green);
+  transform: translateX(12px);
+}
+
+.monitor-switch input:focus-visible + span {
+  outline: 2px solid rgba(225, 199, 126, 0.55);
+  outline-offset: 2px;
+}
+
+.supervisor-reviewer-row strong,
+.supervisor-reviewer-row small {
+  display: block;
+}
+
+.supervisor-reviewer-row strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.supervisor-reviewer-row small {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.supervisor-reviewer-row p {
+  min-height: 28px;
+  margin: 9px 0 0;
+}
+
+.supervisor-ops-actions {
+  justify-content: space-between;
+}
+
+.supervisor-operator-log {
+  margin-top: 14px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.supervisor-operator-rows {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 9px;
+  background: var(--line-soft);
+}
+
+.supervisor-operator-rows article {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--surface-0);
+}
+
+.supervisor-operator-rows strong {
+  color: var(--text);
+  font-size: 9px;
+}
+
+.supervisor-operator-rows time,
+.supervisor-operator-rows small {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.supervisor-operator-rows p {
+  margin: 5px 0 3px;
+  color: var(--text-soft);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.supervisor-ops-logs {
+  margin-top: 14px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.supervisor-log-title,
+.supervisor-log-grid > section > header,
+.supervisor-log-grid article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.supervisor-log-title strong {
+  font-size: 11px;
+}
+
+.supervisor-log-title span,
+.supervisor-log-grid small,
+.supervisor-log-grid time {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.supervisor-log-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.supervisor-log-grid > section {
+  min-width: 0;
+  max-height: 260px;
+  padding: 11px 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(13, 15, 13, 0.62);
+  scrollbar-width: thin;
+}
+
+.supervisor-log-grid > section > header strong {
+  font-size: 10px;
+}
+
+.supervisor-log-grid article {
+  padding: 9px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.supervisor-log-grid article:first-of-type {
+  margin-top: 8px;
+}
+
+.supervisor-log-grid article p {
+  margin: 6px 0 0;
+  color: var(--text-soft);
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.supervisor-log-grid article > small {
+  display: block;
+  margin-top: 5px;
+  line-height: 1.45;
+}
+
 .surface-heading {
   align-items: center;
   margin-bottom: 18px;
@@ -1437,6 +1786,30 @@ select:focus {
     display: none;
   }
 
+  .supervisor-ops-overview {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .supervisor-manual-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .supervisor-operator-note {
+    grid-column: 1 / -1;
+  }
+
+  .supervisor-ops-stat:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .supervisor-ops-reviewers {
+    grid-template-columns: 1fr;
+  }
+
+  .supervisor-log-grid {
+    grid-template-columns: 1fr;
+  }
+
   .metric-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1632,6 +2005,28 @@ select:focus {
 
   .control-grid {
     grid-template-columns: 1fr;
+  }
+
+  .supervisor-ops-overview,
+  .supervisor-ops-reviewers,
+  .supervisor-manual-grid,
+  .supervisor-operator-rows {
+    grid-template-columns: 1fr;
+  }
+
+  .supervisor-operator-note {
+    grid-column: auto;
+  }
+
+  .supervisor-ops-actions,
+  .supervisor-manual-actions {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .supervisor-manual-actions #supervisorHint {
+    min-width: 0;
+    text-align: left;
   }
 }
 

@@ -187,6 +187,14 @@ def _rolling_ic(values: list[float], labels: list[float]) -> list[float]:
     ]
 
 
+def _correlation_p_value(correlation: float, samples: int) -> float:
+    if samples < 4:
+        return 1.0
+    bounded = max(-0.999999, min(0.999999, correlation))
+    statistic = abs(bounded) * math.sqrt(max(1.0, (samples - 2) / max(1e-12, 1.0 - bounded * bounded)))
+    return max(0.0, min(1.0, math.erfc(statistic / math.sqrt(2.0))))
+
+
 def _evaluate_candidate(candidate: dict[str, Any], labels: list[float], accepted: list[dict[str, Any]]) -> dict[str, Any]:
     values = _clip(candidate["values"])
     count = len(values)
@@ -237,6 +245,8 @@ def _evaluate_candidate(candidate: dict[str, Any], labels: list[float], accepted
         "train_ic": round(train_ic, 4),
         "validation_ic": round(valid_ic, 4),
         "test_ic": round(test_ic, 4),
+        "test_ic_p_value": round(_correlation_p_value(test_ic, max(0, count - valid_end)), 6),
+        "incremental_oos_contribution": round(abs(test_ic) * max(0.0, 1.0 - max_overlap), 6),
         "fitness": round(fitness, 3),
         "generalization_score": round(generalization_score, 1),
         "overfit_penalty": round(overfit_penalty, 3),
@@ -505,10 +515,39 @@ def analyze_alpha_evolution(
             "operation": "mutation+crossover+redundancy_filter",
         })
     best = []
-    for row in pool[:10]:
+    top_pool = pool[:10]
+    ordered_p_values = sorted(
+        [(index, number(row.get("test_ic_p_value"), 1.0)) for index, row in enumerate(top_pool)],
+        key=lambda item: item[1],
+    )
+    q_values = [1.0 for _ in top_pool]
+    running_q = 1.0
+    for reverse_rank, (index, p_value) in enumerate(reversed(ordered_p_values), start=1):
+        rank = len(top_pool) - reverse_rank + 1
+        running_q = min(running_q, p_value * len(top_pool) / max(1, rank))
+        q_values[index] = min(1.0, running_q)
+    promoted = 0
+    for index, row in enumerate(top_pool):
         clean = {key: value for key, value in row.items() if key not in {"values", "_values"}}
         clean["latest_value"] = round(row["_values"][-1], 4)
         clean["lineage"] = row.get("lineage", [])[-8:]
+        clean["fdr_q_value"] = round(q_values[index], 6)
+        checks = {
+            "sixGateQuality": bool(row.get("quality_gate", {}).get("pass")),
+            "validationDirection": number(row.get("validation_ic")) * number(row.get("direction"), 1) > 0,
+            "testDirection": number(row.get("test_ic")) * number(row.get("direction"), 1) > 0,
+            "rankDirection": number(row.get("rank_ic")) * number(row.get("direction"), 1) > 0,
+            "fdr": q_values[index] <= 0.10,
+            "generalization": number(row.get("generalization_score")) >= 75,
+            "rollingStability": number(row.get("positive_window_share_pct")) >= 60,
+            "incrementalOos": number(row.get("incremental_oos_contribution")) >= 0.005,
+            "notOverfit": row.get("overfit_flag") is not True,
+        }
+        clean["promotion_checks"] = checks
+        clean["promotion_status"] = "research_candidate" if all(checks.values()) else "rejected_oos"
+        clean["failed_checks"] = [name for name, passed in checks.items() if not passed]
+        if clean["promotion_status"] == "research_candidate":
+            promoted += 1
         best.append(clean)
     return {
         "market": market,
@@ -526,6 +565,13 @@ def analyze_alpha_evolution(
         ],
         "trajectory": trajectory,
         "best_candidates": best,
+        "candidate_admission": {
+            "promotedResearchCandidates": promoted,
+            "testedCandidates": len(pool),
+            "fdrMethod": "Benjamini-Hochberg over final candidate holdout IC p-values",
+            "pboGuard": "Candidates with unstable rolling IC, sign flips, or a large train-holdout gap remain rejected.",
+            "automaticProductionActivation": False,
+        },
         "advanced_models": {
             "gbm": _gbm_forecast(rows, horizon),
             "regime": _regime_proxy(rows),

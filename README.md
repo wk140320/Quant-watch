@@ -40,6 +40,7 @@ This project is for research and personal analysis only. It is not financial adv
 - Optional official FRED macro factor with a shared cache so it is not re-requested per stock.
 - Optional Alpaca IEX US bars and Tushare China A-share daily bars, both governed by the limited-source budget.
 - External AI fallback chain: OpenAI first, then SiliconFlow or Tencent Hunyuan when configured. Provider status is exposed without revealing keys.
+- Persistent AI training supervisor: OpenAI, SiliconFlow, and Tencent Hunyuan review the same versioned OOF evidence independently; deterministic gates remain authoritative and failed cycles are automatically reworked with stricter or broader training plans.
 - Optional ATAS feature adapter endpoint for external order-flow/feature extraction. Without `ATAS_FEATURE_ENDPOINT` or `ATAS_BASE_URL`, the app reports the adapter as reserved and sends no request.
 - Local-only IBKR Paper/TWS readiness checks and audit-only paper-order intents. Broker order transmission and live trading are forcibly disabled.
 
@@ -162,6 +163,8 @@ Open `GlobalQuantMonitor.app` to inspect model trajectories, start or pause the 
 
 The model-operations workspace reads persisted local evidence rather than inventing a visual history. `GET /api/model-trajectories?market=ASX` normalizes calibration, factor research, alpha evolution, intraday learning, adaptive correction, and Paper Agent events into one explainable timeline with formulas, sample counts, reasons, guardrails, and improvement/degradation states.
 
+The training supervisor persists each market cycle under `.cache/training-supervisor/`. A cycle moves through queued, training, reviewing, automatic rework, accepted, or needs-attention states. Acceptance requires both the deterministic point-in-time/OOF/calibration/cost gate and at least two independent AI approvals. Rework may expand the universe and history or tighten ensemble constraints, but it never lowers acceptance thresholds. An accepted cycle remains Shadow/Research evidence; it cannot place live orders or promote itself directly to production.
+
 The local control plane exposes:
 
 ```text
@@ -172,9 +175,16 @@ POST /api/paper-agents/reset
 POST /api/paper-agents/migrate
 GET  /api/paper-agents/events?market=ASX
 GET  /api/runtime/stream
+GET  /api/training-supervisor/status?market=ASX
+GET  /api/training-supervisor/logs?market=ASX&provider=openai
+POST /api/training-supervisor/run
+POST /api/training-supervisor/review
+POST /api/training-supervisor/config
 POST /api/jobs/training|backtest|news|reddit|monitor
 GET  /api/jobs/:id
 ```
+
+GlobalQuantMonitor 的“后台控制”页包含人工监工操作台：可以暂停总调度、暂停单个市场、独立启停三位 AI、填写操作备注、要求返工或重新验收最近完整产物。所有人工动作写入 `.cache/training-supervisor/events.jsonl`；人工操作不能跳过 OOF、PIT、校准、漂移与成本后期望门槛，也不能直接批准生产部署。
 
 News refresh windows and hourly Reddit cache warmup are scheduled by the backend while it is running. Long backtests and enrichment refreshes are asynchronous jobs, so the dashboard remains usable.
 

@@ -57,7 +57,14 @@ function createRuntimeEventHub(options = {}) {
   return {
     publish,
     subscribe,
-    summary: () => ({ clients: clients.size, lastEventId: sequence, recent: history.slice(-20) }),
+    summary: (options = {}) => {
+      const recentLimit = Math.max(0, Math.min(historyLimit, Number(options.recentLimit ?? 20)));
+      return {
+        clients: clients.size,
+        lastEventId: sequence,
+        recent: recentLimit > 0 ? history.slice(-recentLimit) : [],
+      };
+    },
   };
 }
 

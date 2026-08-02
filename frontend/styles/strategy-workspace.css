@@ -1,0 +1,88 @@
+/* Strategy workspace layout authority. Keep this stylesheet last. */
+html[data-active-workspace="strategy"] .main {
+  grid-template-columns: repeat(12, minmax(0, 1fr)) !important;
+  grid-template-areas:
+    "topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar"
+    "strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav"
+    "constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints"
+    "reports reports reports reports reports reports reports reports reports reports reports reports"
+    "accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy"
+    "agent agent agent agent agent agent agent agent agent agent agent agent"
+    "optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal"
+    "chat chat chat chat chat chat history history history history history history" !important;
+  align-items: start;
+}
+
+html[data-active-workspace="strategy"] .strategy-workspace-nav {
+  grid-area: strategy-nav;
+  align-self: start;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+}
+
+html[data-active-workspace="strategy"] .strategy-tab-track {
+  display: grid !important;
+  grid-template-columns: repeat(5, minmax(112px, 1fr)) !important;
+  width: 100%;
+  min-width: 0;
+}
+
+html[data-active-workspace="strategy"] [data-strategy-panel] {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+
+html[data-active-workspace="strategy"] .strategy-constraints-board {
+  grid-area: constraints;
+}
+
+html[data-active-workspace="strategy"] .model-report-board {
+  grid-area: reports;
+}
+
+html[data-active-workspace="strategy"] .accuracy-board {
+  grid-area: accuracy;
+}
+
+html[data-active-workspace="strategy"] .agent-board {
+  grid-area: agent;
+}
+
+html[data-active-workspace="strategy"] .strategy-board {
+  grid-area: optimal;
+}
+
+html[data-active-workspace="strategy"] .ai-chat-board {
+  grid-area: chat;
+}
+
+html[data-active-workspace="strategy"] .strategy-history-board {
+  grid-area: history;
+}
+
+@media (max-width: 860px) {
+  html[data-active-workspace="strategy"] .main {
+    grid-template-areas:
+      "topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar"
+      "strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav strategy-nav"
+      "constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints"
+      "reports reports reports reports reports reports reports reports reports reports reports reports"
+      "accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy"
+      "agent agent agent agent agent agent agent agent agent agent agent agent"
+      "optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal"
+      "chat chat chat chat chat chat chat chat chat chat chat chat"
+      "history history history history history history history history history history history history" !important;
+  }
+
+  html[data-active-workspace="strategy"] .strategy-tab-track {
+    display: flex !important;
+    flex-wrap: nowrap !important;
+    overflow-x: auto;
+  }
+
+  html[data-active-workspace="strategy"] .strategy-tab-track button {
+    flex: 0 0 112px;
+  }
+}

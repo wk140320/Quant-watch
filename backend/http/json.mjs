@@ -6,13 +6,21 @@ function httpError(statusCode, message) {
   return error;
 }
 
-function sendJson(res, status, payload) {
-  res.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-  });
-  res.end(JSON.stringify(payload));
+function sendJson(res, status, payload, extraHeaders = {}) {
+  if (res.destroyed || res.writableEnded) return false;
+  try {
+    res.writeHead(status, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      ...extraHeaders,
+    });
+    res.end(JSON.stringify(payload));
+    return true;
+  } catch (error) {
+    if (error?.code !== "EPIPE" && error?.code !== "ECONNRESET") throw error;
+    return false;
+  }
 }
 
 async function readJsonBody(req, options = {}) {

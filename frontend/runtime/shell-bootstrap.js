@@ -19,6 +19,8 @@
   let appLoaded = false;
   let appPromise = null;
   let clockTimer = null;
+  let pendingMarket = null;
+  let marketCommitPromise = null;
 
   function storageGet(key) {
     return typeof storage.getItem === "function" ? storage.getItem(key) : null;
@@ -141,6 +143,36 @@
     return { market, config };
   }
 
+  function flushPendingMarket() {
+    if (!appLoaded || typeof globalScope.switchMarket !== "function" || marketCommitPromise || !pendingMarket) {
+      return marketCommitPromise || Promise.resolve(false);
+    }
+    marketCommitPromise = (async () => {
+      while (pendingMarket) {
+        const next = pendingMarket;
+        pendingMarket = null;
+        await globalScope.switchMarket(next);
+      }
+      return true;
+    })().catch((error) => {
+      console.error("Direct market switch failed", error);
+      return false;
+    }).finally(() => {
+      marketCommitPromise = null;
+      if (pendingMarket) flushPendingMarket();
+    });
+    return marketCommitPromise;
+  }
+
+  function requestMarketSwitch(value) {
+    const next = safeMarket(value);
+    storageSet("selectedMarket", next);
+    pendingMarket = next;
+    updateShellMarket();
+    flushPendingMarket();
+    return next;
+  }
+
   function updatePageChrome(page) {
     const next = VALID_PAGES.has(page) ? page : "home";
     const market = currentMarket();
@@ -220,12 +252,15 @@
     document.documentElement.dataset.appState = "loading";
     const task = globalScope.QuantUI?.beginTask?.("加载完整工作台");
     appPromise = (async () => {
-      await loadScript("quant-chart-math", "/frontend/charts/math.js?v=20260712-chart-split");
-      await loadScript("quant-http-runtime", "/frontend/runtime/http.js?v=20260712-runtime-split");
-      await loadScript("quant-full-app", "/app.js?v=20260714-workspace-performance-1");
+      await Promise.all([
+        loadScript("quant-chart-math", "/frontend/charts/math.js?v=20260714-workspace-fast-1"),
+        loadScript("quant-http-runtime", "/frontend/runtime/http.js?v=20260717-stable-load-2"),
+      ]);
+      await loadScript("quant-full-app", "/app.js?v=20260729-factor-lab-robust-v76");
       appLoaded = true;
       globalScope.__quantAppLoaded = true;
       document.documentElement.dataset.appState = "ready";
+      await flushPendingMarket();
       return true;
     })().catch((error) => {
       console.error("Full workspace load failed", error);
@@ -266,12 +301,10 @@
       loadFullApp("strategy");
     });
     document.getElementById("marketCycleButton")?.addEventListener("click", (event) => {
-      if (appLoaded) return;
       event.preventDefault();
       const market = currentMarket();
       const index = Math.max(0, MARKET_ORDER.indexOf(market));
-      storageSet("selectedMarket", MARKET_ORDER[(index + 1) % MARKET_ORDER.length]);
-      updateShellMarket();
+      requestMarketSwitch(MARKET_ORDER[(index + 1) % MARKET_ORDER.length]);
     });
     document.getElementById("homeBrandButton")?.addEventListener("click", (event) => {
       if (appLoaded) return;
@@ -303,8 +336,12 @@
     const setMarketMenuOpen = (opening, { focusFirst = false } = {}) => {
       if (!marketMenu || !marketMenuButton) return;
       marketMenu.hidden = !opening;
+      marketMenu.dataset.open = opening ? "true" : "false";
       marketMenuButton.setAttribute("aria-expanded", opening ? "true" : "false");
-      if (opening) positionMarketMenu();
+      if (opening) {
+        positionMarketMenu();
+        globalScope.requestAnimationFrame?.(positionMarketMenu);
+      }
       if (opening && focusFirst) marketMenu.querySelector("[data-market-select]")?.focus();
     };
     marketMenuButton?.addEventListener("click", (event) => {
@@ -323,17 +360,12 @@
         event.preventDefault();
         const next = safeMarket(button.dataset.marketSelect);
         setMarketMenuOpen(false);
-        if (appLoaded && typeof globalScope.switchMarket === "function") {
-          globalScope.switchMarket(next).catch((error) => console.error("Direct market switch failed", error));
-          return;
-        }
-        storageSet("selectedMarket", next);
-        updateShellMarket();
+        requestMarketSwitch(next);
       });
     });
     document.addEventListener("click", (event) => {
       if (!marketMenu || marketMenu.hidden) return;
-      if (event.target.closest(".market-switcher")) return;
+      if (marketMenu.contains(event.target) || marketMenuButton?.contains(event.target)) return;
       setMarketMenuOpen(false);
     });
     document.addEventListener("keydown", (event) => {
@@ -367,7 +399,7 @@
     else loadFullApp(page);
   }
 
-  globalScope.QuantShell = Object.freeze({ loadFullApp, showHome, updateShellMarket });
+  globalScope.QuantShell = Object.freeze({ loadFullApp, showHome, updateShellMarket, requestMarketSwitch });
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bootShell, { once: true });
   else bootShell();
 }(typeof window !== "undefined" ? window : globalThis));

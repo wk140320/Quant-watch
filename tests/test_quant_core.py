@@ -1,3 +1,5 @@
+import gzip
+import json
 import sys
 import tempfile
 import unittest
@@ -13,6 +15,16 @@ from data_quality import assess_candle_quality  # noqa: E402
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features  # noqa: E402
 from historical_backtest import adaptive_barriers, outcome_window, run_historical_backtest  # noqa: E402
 from local_model import train_local_model_suite  # noqa: E402
+from model_reporting import (  # noqa: E402
+    block_bootstrap_ci,
+    build_report_evidence,
+    classification_metrics,
+    factor_model_reports,
+    prediction_id,
+    quantile_metrics,
+    rank_metrics,
+    read_oof_rows,
+)
 from paper_agents import configure as configure_paper_agents, list_agent_events, load_state as load_paper_agent_state, migrate as migrate_paper_agents, step as step_paper_agents  # noqa: E402
 from provider_budget import provider_plan  # noqa: E402
 from production_training import build_market_dataset, fit_constrained_stack, point_in_time_features, purged_walk_forward_folds  # noqa: E402
@@ -208,6 +220,8 @@ class QuantCoreTests(unittest.TestCase):
 
     def test_factor_lab_has_walk_forward_scores(self):
         result = analyze_factors(candles(180), horizon=10, symbol="TEST", market="US")
+        self.assertTrue(result["available"])
+        self.assertEqual(result["status"], "ready")
         self.assertGreater(result["sample_count"], 60)
         self.assertGreater(len(result["factors"]), 4)
         self.assertIn("momentum_5", result["correlation_matrix"])
@@ -241,11 +255,40 @@ class QuantCoreTests(unittest.TestCase):
         research = result["factor_research"]
         self.assertEqual(research["framework"], "dynamic-factor-admission-and-ml-weighting")
         self.assertGreater(research["candidate_count"], 10)
-        self.assertGreater(len(research["weights"]), 0)
+        self.assertEqual(
+            len(research["weights"]) > 0,
+            research["admitted_count"] > 0,
+        )
+        self.assertTrue(all(row["status"] == "admitted" for row in research["weights"]))
         self.assertIn("ml_backtest", research)
         self.assertIn("leakage_control", research)
         self.assertIn("admission_status", result["factors"][0])
         self.assertIn("dynamic_weight_pct", result["factors"][0])
+
+    def test_factor_lab_returns_stable_insufficient_evidence_result(self):
+        result = analyze_factors(candles(48), horizon=15, symbol="SHORT", market="ASX")
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "insufficient_data")
+        self.assertEqual(result["sample_audit"]["real_rows"], 48)
+        self.assertEqual(result["sample_audit"]["required_rows"], 70)
+        self.assertEqual(result["sample_audit"]["synthetic_rows"], 0)
+        self.assertFalse(result["sample_audit"]["model_training_allowed"])
+        self.assertFalse(result["factor_research"]["ml_backtest"]["active"])
+        self.assertEqual(result["factor_research"]["weights"], [])
+        self.assertEqual(result["factors"], [])
+
+    def test_factor_lab_worker_skips_evolution_for_insufficient_evidence(self):
+        result = dispatch({
+            "operation": "factor-lab",
+            "market": "ASX",
+            "symbol": "SHORT",
+            "horizon_days": 15,
+            "candles": candles(55),
+            "include_alpha_evolution": True,
+        })
+        self.assertFalse(result["available"])
+        self.assertFalse(result["alpha_evolution"]["available"])
+        self.assertIn("evidence threshold", result["alpha_evolution"]["reason"])
 
     def test_alpha_evolution_generates_audited_candidates(self):
         result = analyze_alpha_evolution(candles(180), horizon=10, symbol="TEST", market="US")
@@ -262,18 +305,23 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("generalization_score", first)
         self.assertIn("overfit_penalty", first)
         self.assertIn("overfit_flag", first)
+        self.assertIn("fdr_q_value", first)
+        self.assertIn("promotion_checks", first)
+        self.assertIn(first["promotion_status"], {"research_candidate", "rejected_oos"})
         self.assertNotIn("_values", first)
 
     def test_cross_sectional_factor_research_generates_market_weights(self):
         result = analyze_cross_sectional_factors(panel_items(230), market="US", horizons=[5, 10, 30], min_symbols=4)
         self.assertTrue(result["available"])
         self.assertEqual(result["framework"], "market-cross-sectional-factor-research")
-        self.assertGreater(len(result["aggregate_weights"]), 0)
+        self.assertEqual(result["aggregate_weights"], [])
         available = [row for row in result["horizon_results"] if row["available"]]
         self.assertGreaterEqual(len(available), 2)
         first = available[0]
         self.assertIn("ml_backtest", first)
         self.assertIn("weights", first)
+        self.assertEqual(first["admitted_count"], 0)
+        self.assertGreater(first["research_candidate_count"], 0)
         self.assertIn("leakage_control", result)
 
     def test_qlib_readiness_operation_is_optional(self):
@@ -459,6 +507,151 @@ class QuantCoreTests(unittest.TestCase):
             test_index = dates.index(fold["testStart"])
             self.assertGreaterEqual(test_index - train_index - 1, 12)
 
+    def test_market_dataset_quarantines_cross_market_and_duplicate_rows(self):
+        items = panel_items(120)
+        items[0]["market"] = "US"
+        cross_market = {**items[1], "market": "ASX", "symbol": "BHP"}
+        duplicate = {**items[0], "candles": [dict(row) for row in items[0]["candles"]]}
+        dataset = build_market_dataset(
+            [*items, cross_market, duplicate],
+            market="US",
+            horizons=[5],
+            target_upside=3,
+            stop_loss=3,
+        )
+        self.assertEqual(dataset["summary"]["crossMarketRowsExcluded"], 1)
+        self.assertGreater(dataset["summary"]["duplicateRowsExcluded"], 0)
+        identities = {
+            (row["market"], row["symbol"], row["date"], row["horizon"])
+            for row in dataset["rows"]
+        }
+        self.assertEqual(len(identities), len(dataset["rows"]))
+
+    def test_model_reporting_metrics_use_strict_oof_rows(self):
+        rows = []
+        for index in range(40):
+            actual = 1 if index % 2 == 0 else 0
+            rows.append({
+                "market": "US",
+                "symbol": f"S{index % 8}",
+                "date": f"2026-01-{index // 8 + 1:02d}",
+                "actualTarget": actual,
+                "ensembleProbability": 0.88 if actual else 0.12,
+                "actualReturn": 2.0 if actual else -1.5,
+                "rankerPrediction": 0.8 if actual else 0.2,
+                "quantileP10": -2.0,
+                "quantileP50": 1.5 if actual else -1.0,
+                "quantileP90": 3.0,
+            })
+        metrics = classification_metrics(rows, "ensembleProbability")
+        self.assertEqual(metrics["accuracyPct"], 100)
+        self.assertEqual(metrics["precisionPct"], 100)
+        self.assertEqual(metrics["recallPct"], 100)
+        self.assertEqual(metrics["f1Pct"], 100)
+        self.assertGreater(metrics["brierSkillScore"], 0)
+        self.assertLess(metrics["ecePct"], 15)
+        self.assertTrue(rank_metrics(rows)["available"])
+        self.assertTrue(quantile_metrics(rows)["available"])
+        interval = block_bootstrap_ci(
+            rows,
+            lambda sample: classification_metrics(sample, "ensembleProbability")["accuracyPct"],
+            samples=100,
+            seed=7,
+        )
+        self.assertTrue(interval["available"])
+        self.assertEqual(interval["low"], 100)
+        self.assertEqual(interval["high"], 100)
+
+    def test_prediction_id_is_stable_and_versioned(self):
+        row = {
+            "market": "US",
+            "symbol": "AAPL",
+            "signalAt": "2026-01-05T21:00:00Z",
+            "horizon": 15,
+        }
+        manifest = {
+            "label_definition": "triple-barrier-v2",
+            "feature_schema_hash": "features-v4",
+            "model_version": "us-15d-v1",
+        }
+        first = prediction_id(row, manifest)
+        self.assertEqual(first, prediction_id(dict(row), dict(manifest)))
+        self.assertNotEqual(first, prediction_id(row, {**manifest, "model_version": "us-15d-v2"}))
+
+    def test_oof_reader_deduplicates_and_quarantines_cross_market_rows(self):
+        manifest = {
+            "label_definition": "triple-barrier-v2",
+            "feature_schema_hash": "features-v4",
+            "model_version": "us-15d-v1",
+        }
+        valid = {
+            "market": "US",
+            "symbol": "AAPL",
+            "date": "2026-01-05",
+            "signalAt": "2026-01-05T21:00:00Z",
+            "availableAt": "2026-01-05T20:00:00Z",
+            "horizon": 15,
+            "actualTarget": 1,
+            "ensembleProbability": 0.7,
+        }
+        cross_market = {**valid, "market": "ASX", "symbol": "BHP"}
+        future = {
+            **valid,
+            "symbol": "MSFT",
+            "availableAt": "2026-01-06T01:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "oof.jsonl.gz"
+            with gzip.open(path, "wt", encoding="utf-8") as stream:
+                for row in (valid, dict(valid), cross_market, future):
+                    stream.write(json.dumps(row) + "\n")
+            clean, audit = read_oof_rows(path, manifest, "US")
+        self.assertEqual(len(clean), 2)
+        self.assertEqual(audit["duplicateRows"], 1)
+        self.assertEqual(audit["crossMarketRows"], 1)
+        self.assertEqual(audit["futureAvailabilityRows"], 1)
+
+    def test_report_evidence_is_honest_when_registries_are_missing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            evidence = build_report_evidence(Path(temp_dir), ["ASX", "US", "CN"])
+        self.assertFalse(evidence["productionReady"])
+        self.assertEqual(len(evidence["markets"]), 3)
+        self.assertTrue(all(not market["registryAvailable"] for market in evidence["markets"]))
+        self.assertTrue(all("no market-level registry" in blocker for blocker in evidence["blockers"]))
+
+    def test_model_report_quarantines_legacy_factor_admission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            directory = root / ".cache" / "models" / "factor-research"
+            directory.mkdir(parents=True)
+            (directory / "asx-bhp.json").write_text(json.dumps({
+                "market": "ASX",
+                "symbol": "BHP.AX",
+                "sampleCount": 500,
+                "candidateCount": 12,
+                "admittedCount": 7,
+                "mlBacktest": {"active": True},
+            }), "utf-8")
+            report = factor_model_reports(root, "ASX")[0]
+        self.assertEqual(report["status"], "quarantined")
+        self.assertTrue(report["legacyQuarantined"])
+        self.assertEqual(report["reportedAdmittedCount"], 7)
+        self.assertEqual(report["admittedCount"], 0)
+        self.assertFalse(report["eligibleForLiveWeight"])
+
+    def test_worker_generates_json_html_and_word_model_report(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = dispatch({
+                "operation": "model-report-generate",
+                "root": temp_dir,
+                "markets": ["US"],
+            })
+            self.assertTrue(Path(result["jsonPath"]).exists())
+            self.assertTrue(Path(result["htmlPath"]).exists())
+            self.assertTrue(Path(result["docxPath"]).exists())
+            self.assertTrue(Path(result["permanentDocxPath"]).exists())
+            self.assertFalse(result["evidence"]["productionReady"])
+
     def test_constrained_stack_is_non_negative_normalized_and_capped(self):
         rows = []
         for index in range(120):
@@ -499,7 +692,13 @@ class QuantCoreTests(unittest.TestCase):
             self.assertFalse(result["productionEligibility"]["eligible"])
             artifact = model["oofArtifact"]
             self.assertIsNotNone(artifact)
-            self.assertTrue((Path(temp_dir) / artifact["filename"]).exists())
+            artifact_path = Path(temp_dir) / artifact["filename"]
+            self.assertTrue(artifact_path.exists())
+            self.assertTrue(result["manifest"]["training_run_id"])
+            with gzip.open(artifact_path, "rt", encoding="utf-8") as stream:
+                first_oof = json.loads(next(stream))
+            self.assertEqual(len(first_oof["predictionId"]), 32)
+            self.assertEqual(first_oof["modelVersion"], model["modelVersion"])
 
     def test_worker_dispatch_exposes_local_model_train(self):
         result = dispatch({"operation": "local-model-train", "market": "US", "samples": prediction_samples()})
@@ -521,6 +720,19 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("factor_research", result)
         self.assertGreater(result["factor_research"]["candidate_count"], 10)
         self.assertIn("live_signal", result["factor_research"])
+
+    def test_factor_lab_can_defer_alpha_evolution_to_background_stage(self):
+        result = dispatch({
+            "operation": "factor-lab",
+            "market": "ASX",
+            "symbol": "BHP",
+            "horizon_days": 15,
+            "candles": candles(140),
+            "include_alpha_evolution": False,
+        })
+        self.assertGreater(result["sample_count"], 50)
+        self.assertTrue(result["alpha_evolution"]["deferred"])
+        self.assertFalse(result["alpha_evolution"]["available"])
         self.assertIn("quality_gate", result)
 
     def test_worker_dispatch_exposes_cross_sectional_factor_research(self):
@@ -532,7 +744,8 @@ class QuantCoreTests(unittest.TestCase):
             "min_symbols": 4,
         })
         self.assertTrue(result["available"])
-        self.assertGreater(len(result["aggregate_weights"]), 0)
+        self.assertEqual(result["aggregate_weights"], [])
+        self.assertTrue(all(row.get("admitted_count") == 0 for row in result["horizon_results"] if row.get("available")))
         self.assertEqual(result["framework"], "market-cross-sectional-factor-research")
 
     def test_worker_dispatch_exposes_historical_backtest(self):
@@ -851,6 +1064,8 @@ class QuantCoreTests(unittest.TestCase):
             first = step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": [item]})
             self.assertTrue(first["events"])
             self.assertTrue(all(event["order_execution_enabled"] is False for event in first["events"]))
+            self.assertTrue(all(event["costModel"]["method"].startswith("commission+") for event in first["events"]))
+            self.assertTrue(all(event["costModel"]["totalPct"] >= event["costModel"]["commissionPct"] for event in first["events"]))
             second = step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": [item]})
             self.assertEqual(second["events"], [])
             saved = load_paper_agent_state("US", db_path)

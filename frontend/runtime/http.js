@@ -21,7 +21,8 @@
   async function requestJson(url, options) {
     const settings = options || {};
     const method = String(settings.method || "GET").toUpperCase();
-    const uiTask = globalScope.QuantUI?.beginTask(`${method} ${url}`);
+    const showProgress = settings.progress === true || (settings.progress !== false && method !== "GET");
+    const uiTask = showProgress ? globalScope.QuantUI?.beginTask(`${method} ${url}`) : null;
     let response;
     try {
       response = await globalScope.fetch(url, settings);

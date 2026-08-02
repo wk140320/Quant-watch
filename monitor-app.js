@@ -20,6 +20,8 @@ const state = {
   busy: false,
   chartHitTargets: [],
   refreshController: null,
+  lastTrajectoryFetchAt: 0,
+  statusDetailed: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -111,11 +113,92 @@ function currentEvent() {
 
 function setBusy(busy) {
   state.busy = busy;
-  ["toggleBackend", "runOnce", "saveSchedule", "refreshStatus"].forEach((id) => {
+  ["toggleBackend", "runOnce", "saveSchedule", "refreshStatus", "runSupervisor", "reviewSupervisor", "refreshSupervisor", "supervisorMasterToggle", "supervisorMarketToggle"].forEach((id) => {
     const button = $(id);
     if (button) button.disabled = busy;
   });
   $("refreshStatus")?.classList.toggle("spinning", busy);
+}
+
+const SUPERVISOR_STATES = Object.freeze({
+  idle: ["等待周期", ""],
+  queued: ["已排队", "blue"],
+  training: ["训练中", "blue"],
+  reviewing: ["三方验收中", "blue"],
+  rework_scheduled: ["自动返工", "gold"],
+  accepted: ["本周期通过", "good"],
+  needs_attention: ["需要协助", "danger"],
+});
+
+function renderTrainingSupervisor(status) {
+  const supervisor = status?.trainingSupervisor || {};
+  const cycle = supervisor.markets?.[state.market] || supervisor.market || {};
+  const [stateLabel, stateTone] = SUPERVISOR_STATES[cycle.status] || [cycle.status || "未初始化", ""];
+  const pill = $("supervisorStatePill");
+  pill.textContent = stateLabel;
+  pill.className = `status-pill ${stateTone}`;
+  const evaluation = cycle.evaluation || {};
+  const plan = cycle.currentPlan || {};
+  const activeJob = supervisor.activeJobs?.[state.market] || null;
+  const jobDetail = activeJob?.detail || {};
+  const passed = (evaluation.checks || []).filter((check) => check.passed).length;
+  const blockingFailed = (evaluation.checks || []).filter((check) => check.blocking && !check.passed).length;
+  const masterToggle = $("supervisorMasterToggle");
+  const marketToggle = $("supervisorMarketToggle");
+  masterToggle.checked = supervisor.enabled !== false;
+  marketToggle.checked = cycle.enabled !== false;
+  masterToggle.disabled = state.busy;
+  marketToggle.disabled = state.busy;
+  $("supervisorMarketLabel").textContent = `${MARKET_LABELS[state.market] || state.market} 市场监工`;
+  const controlState = $("supervisorControlState");
+  controlState.textContent = supervisor.enabled === false ? "自动调度已暂停" : cycle.enabled === false ? "本市场已暂停" : "人工控制可用";
+  controlState.className = `status-pill ${supervisor.enabled === false || cycle.enabled === false ? "gold" : "good"}`;
+  $("supervisorOverview").innerHTML = `
+    <div class="supervisor-ops-stat"><span>训练周期</span><strong>${escapeHtml(cycle.cycleId ? String(cycle.cycleId).slice(-18) : "等待首轮")}</strong><small>尝试 ${Number(cycle.attempt || 0)}/${Number(cycle.maxAttempts || supervisor.config?.maxAttempts || 0)}</small></div>
+    <div class="supervisor-ops-stat"><span>${activeJob ? "后台作业进度" : "样本外硬门槛"}</span><strong>${activeJob ? `${Math.round(Number(activeJob.progress || 0) * 100)}%` : `${Number(evaluation.score || 0)} / 100`}</strong><small>${activeJob ? `${escapeHtml(jobDetail.phase || activeJob.status || "training")} · ${Number(jobDetail.completed || 0)}/${Number(jobDetail.total || plan.limit || 0)}${jobDetail.symbol ? ` · ${escapeHtml(jobDetail.symbol)}` : ""}` : `${passed}/${(evaluation.checks || []).length} 通过 · ${blockingFailed} 条阻塞 · 只接受 OOF 证据`}</small></div>
+    <div class="supervisor-ops-stat"><span>下一动作</span><strong>${escapeHtml(cycle.status === "training" ? "后台训练进行中" : cycle.status === "reviewing" ? "独立 AI 审核" : cycle.status === "rework_scheduled" ? "自动启动返工" : cycle.status === "accepted" ? "等待下个周期" : "等待调度")}</strong><small>${activeJob ? `更新 ${escapeHtml(formatTime(activeJob.updatedAt, { full: true }))}` : `${escapeHtml(formatTime(cycle.nextActionAt || cycle.nextCycleAt, { full: true }))} · ${Number(plan.limit || 0)} 只 / ${escapeHtml(plan.range || "待定")} / ${Number(plan.foldCount || 0)} 折`}</small></div>
+  `;
+  const reviewMap = new Map((cycle.reviewers || []).map((review) => [review.provider, review]));
+  const providers = supervisor.providers || [];
+  $("supervisorReviewers").innerHTML = providers.length ? providers.map((provider) => {
+    const review = reviewMap.get(provider.id);
+    const enabled = provider.enabled !== false;
+    const verdict = !enabled || review?.disabled ? ["已关闭", ""]
+      : review?.available === false ? ["失败", "danger"]
+      : review?.verdict === "accept" ? ["通过", "good"]
+        : review?.verdict === "needs_data" ? ["补数据", "gold"]
+          : review?.verdict === "rework" ? ["返工", "gold"]
+            : provider.configured && provider.active ? ["待审核", "blue"] : ["未配置", "danger"];
+    return `
+      <article class="supervisor-reviewer-row">
+        <header><div><strong>${escapeHtml(provider.label)}</strong><small>${escapeHtml(provider.model || "")}</small></div><div class="supervisor-reviewer-actions">${statusPill(verdict[0], verdict[1])}<label class="monitor-switch" title="${enabled ? "关闭" : "开启"}${escapeHtml(provider.label)}"><input type="checkbox" data-supervisor-provider="${escapeHtml(provider.id)}" ${enabled ? "checked" : ""}><span></span></label></div></header>
+        <p>${escapeHtml(!enabled ? "已手动关闭：不调用、不消耗额度、不计验收票。" : review?.rationale || provider.role || "独立审核本地训练产物。")}</p>
+      </article>
+    `;
+  }).join("") : `<div class="muted-line">尚未读取 AI 提供方配置。</div>`;
+  const logs = (supervisor.logs || []).filter((event) => !event.market || event.market === state.market);
+  const operatorLogs = logs.filter((event) => event.type === "operator-action").slice(0, 8);
+  $("supervisorOperatorLog").innerHTML = `
+    <div class="supervisor-log-title"><strong>人工操作审计</strong><span>${operatorLogs.length} 条最近记录</span></div>
+    <div class="supervisor-operator-rows">
+      ${operatorLogs.length ? operatorLogs.map((event) => {
+        const changes = (event.changes || []).map((change) => `${change.field}: ${change.from ? "开" : "关"} → ${change.to ? "开" : "关"}`).join("；");
+        return `<article><div><strong>${escapeHtml(event.action || "manual-action")}</strong><time>${escapeHtml(formatTime(event.createdAt, { full: true }))}</time></div><p>${escapeHtml(event.operatorNote || changes || event.outcome || "人工操作")}</p><small>${escapeHtml(event.outcome || "recorded")}${changes && event.operatorNote ? ` · ${escapeHtml(changes)}` : ""}</small></article>`;
+      }).join("") : `<p class="muted-line">尚无人工操作记录。</p>`}
+    </div>
+  `;
+  $("supervisorLogs").innerHTML = `
+    <div class="supervisor-log-title"><strong>三方监工日志</strong><span>${logs.length} 条本地记录</span></div>
+    <div class="supervisor-log-grid">
+      ${providers.map((provider) => {
+        const rows = logs.filter((event) => event.type === "reviewer-verdict" && event.provider === provider.id).slice(0, 5);
+        return `<section><header><strong>${escapeHtml(provider.label)}</strong><small>${provider.enabled === false ? "关闭" : "开启"}</small></header>${rows.length ? rows.map((event) => `<article><div>${statusPill(event.disabled ? "未调用" : event.verdict === "accept" ? "通过" : event.available === false ? "失败" : event.verdict === "needs_data" ? "补数据" : "返工", event.verdict === "accept" && !event.disabled ? "good" : event.available === false && !event.disabled ? "danger" : "gold")}<time>${escapeHtml(formatTime(event.reviewedAt || event.createdAt))}</time></div><p>${escapeHtml(event.rationale || event.error || "未附加说明")}</p>${event.blockingIssues?.length ? `<small>阻塞：${escapeHtml(event.blockingIssues.join("；"))}</small>` : ""}</article>`).join("") : `<p class="muted-line">尚无审核日志。</p>`}</section>`;
+      }).join("")}
+    </div>
+  `;
+  $("supervisorHint").textContent = cycle.lastError
+    ? `最近阻塞：${cycle.lastError}`
+    : "训练失败会自动返工；连续不达标时发送桌面/手机通知。";
 }
 
 function renderStatusSummary(status) {
@@ -421,6 +504,7 @@ function renderControls(status) {
   $("watchMinutes").value = Math.round(Number(config.refresh?.watchMs || 300000) / 60000);
   $("trainingMinutes").value = Math.round(Number(config.refresh?.trainingMs || 120000) / 60000);
   $("trainingSymbols").value = Number(config.training?.symbolLimit || 3);
+  renderTrainingSupervisor(status);
   renderSessions(status);
   renderBudget(status);
   renderPools(status);
@@ -495,9 +579,13 @@ function renderAudit(payload) {
   `).join("") : `<div class="event-inspector-empty">暂无符合筛选条件的模型事件。</div>`;
 }
 
-function renderAll() {
+function renderAll(options = {}) {
   renderStatusSummary(state.status);
-  renderControls(state.status);
+  if (state.view === "control") renderControls(state.status);
+  if (options.statusOnly) {
+    refreshIcons();
+    return;
+  }
   const payload = currentTrajectory();
   renderTrajectorySummary(payload);
   renderPipeline(payload);
@@ -507,32 +595,55 @@ function renderAll() {
   refreshIcons();
 }
 
-async function refreshStatus({ quiet = false } = {}) {
+async function refreshStatus({ quiet = false, detailed = false, trajectory = null, fullTrajectory = false } = {}) {
   if (!quiet) setBusy(true);
   state.refreshController?.abort();
   const controller = new AbortController();
   state.refreshController = controller;
+  const timeout = window.setTimeout(() => controller.abort(), detailed || fullTrajectory ? 8000 : 4500);
+  const shouldLoadTrajectory = trajectory == null
+    ? !quiet || Date.now() - state.lastTrajectoryFetchAt > 2 * 60 * 1000
+    : trajectory;
   try {
-    const [statusResult, trajectoryResult] = await Promise.allSettled([
-      fetchJson("/api/backend-monitor/status", { signal: controller.signal }),
-      fetchJson(`/api/model-trajectories?market=${encodeURIComponent(state.market)}&limit=240`, { signal: controller.signal }),
-    ]);
-    if (statusResult.status === "fulfilled") state.status = statusResult.value;
-    if (trajectoryResult.status === "fulfilled") state.trajectoriesByMarket[state.market] = trajectoryResult.value;
-    if (statusResult.status === "rejected" && trajectoryResult.status === "rejected") {
-      throw statusResult.reason || trajectoryResult.reason;
+    const statusUrl = detailed ? "/api/backend-monitor/status" : "/api/backend-monitor/status?compact=1";
+    const requests = [fetchJson(statusUrl, { signal: controller.signal })];
+    if (shouldLoadTrajectory) {
+      const compact = fullTrajectory ? "" : "&compact=1";
+      requests.push(fetchJson(`/api/model-trajectories?market=${encodeURIComponent(state.market)}&limit=${fullTrajectory ? 240 : 80}${compact}`, { signal: controller.signal }));
     }
-    renderAll();
-    if (trajectoryResult.status === "rejected") {
+    const [statusResult, trajectoryResult] = await Promise.allSettled(requests);
+    if (statusResult.status === "fulfilled") state.status = statusResult.value;
+    if (statusResult.status === "fulfilled") state.statusDetailed = detailed;
+    if (trajectoryResult?.status === "fulfilled") {
+      state.trajectoriesByMarket[state.market] = trajectoryResult.value;
+      state.lastTrajectoryFetchAt = Date.now();
+    }
+    if (statusResult.status === "rejected" && (!trajectoryResult || trajectoryResult.status === "rejected")) {
+      throw statusResult.reason || trajectoryResult?.reason || new Error("本地状态读取失败");
+    }
+    renderAll({ statusOnly: !shouldLoadTrajectory || trajectoryResult?.status !== "fulfilled" });
+    if (trajectoryResult?.status === "rejected") {
       $("statusText").textContent = `后台状态可用；模型动线读取失败：${trajectoryResult.reason?.message || "未知错误"}`;
     }
   } catch (error) {
     if (error?.name !== "AbortError") $("statusText").textContent = `读取失败：${error.message}`;
+    else if (state.refreshController === controller) $("statusText").textContent = "读取超时；已保留上次本地状态，可立即重试";
   } finally {
+    window.clearTimeout(timeout);
     if (state.refreshController === controller) state.refreshController = null;
     if (!quiet) setBusy(false);
     refreshIcons();
   }
+}
+
+async function refreshInitialView() {
+  if (currentTrajectory()) renderAll();
+  await refreshStatus({ trajectory: false });
+  window.setTimeout(() => {
+    if (state.view === "models" && !currentTrajectory()) {
+      refreshStatus({ quiet: true, trajectory: true });
+    }
+  }, 120);
 }
 
 async function saveConfig(nextConfig) {
@@ -598,6 +709,83 @@ async function runOnce() {
   }
 }
 
+async function runSupervisor() {
+  setBusy(true);
+  try {
+    $("supervisorHint").textContent = `${MARKET_LABELS[state.market] || state.market} 训练监工正在安排本轮任务`;
+    const result = await fetchJson("/api/training-supervisor/run", {
+      method: "POST",
+      body: JSON.stringify({ market: state.market, reason: "manual-monitor-app", source: "GlobalQuantMonitor", operatorNote: $("supervisorOperatorNote").value.trim() }),
+    });
+    $("supervisorHint").textContent = result.reason === "already-running"
+      ? "本市场训练已在运行；监工会继续跟进和验收。"
+      : `训练周期已${result.queued ? "排队" : "启动"}；失败将自动返工。`;
+    await refreshStatus({ quiet: true });
+  } catch (error) {
+    $("supervisorHint").textContent = `推动失败：${error.message}`;
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function reviewSupervisor() {
+  setBusy(true);
+  try {
+    $("supervisorHint").textContent = "正在读取最近完整训练产物并重新执行硬门槛与三方验收";
+    const result = await fetchJson("/api/training-supervisor/review", {
+      method: "POST",
+      body: JSON.stringify({ market: state.market, source: "GlobalQuantMonitor", operatorNote: $("supervisorOperatorNote").value.trim() }),
+    });
+    $("supervisorHint").textContent = result.reason === "already-running"
+      ? "当前训练或验收正在运行，本次重新验收请求已写入审计日志。"
+      : result.reason === "no-complete-job"
+        ? "当前市场没有可重新验收的完整训练产物。"
+        : "最近训练产物已重新验收；结论与阻断项已写入三方日志。";
+    await refreshStatus({ quiet: true });
+  } catch (error) {
+    $("supervisorHint").textContent = `重新验收失败：${error.message}`;
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function toggleSupervisorScope(scope, enabled) {
+  setBusy(true);
+  try {
+    const payload = {
+      market: state.market,
+      source: "GlobalQuantMonitor",
+      operatorNote: $("supervisorOperatorNote").value.trim(),
+      ...(scope === "global" ? { enabled } : { marketEnabled: enabled }),
+    };
+    await fetchJson("/api/training-supervisor/config", { method: "POST", body: JSON.stringify(payload) });
+    await refreshStatus({ quiet: true });
+    $("supervisorHint").textContent = scope === "global"
+      ? `自动监工总调度已${enabled ? "开启" : "暂停"}。`
+      : `${MARKET_LABELS[state.market] || state.market} 市场监工已${enabled ? "开启" : "暂停"}。`;
+  } catch (error) {
+    $("supervisorHint").textContent = `监工范围切换失败：${error.message}`;
+    await refreshStatus({ quiet: true });
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function toggleSupervisorReviewer(provider, enabled) {
+  try {
+    $("supervisorHint").textContent = `${enabled ? "开启" : "关闭"} ${provider} 监工...`;
+    await fetchJson("/api/training-supervisor/config", {
+      method: "POST",
+      body: JSON.stringify({ market: state.market, reviewer: provider, reviewerEnabled: enabled, source: "GlobalQuantMonitor", operatorNote: $("supervisorOperatorNote").value.trim() }),
+    });
+    await refreshStatus({ quiet: true });
+    $("supervisorHint").textContent = `${provider} 监工已${enabled ? "开启" : "关闭"}，重启后仍保持。`;
+  } catch (error) {
+    $("supervisorHint").textContent = `监工开关失败：${error.message}`;
+    await refreshStatus({ quiet: true });
+  }
+}
+
 function switchView(view) {
   state.view = view;
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
@@ -607,7 +795,15 @@ function switchView(view) {
     panel.classList.toggle("active", active);
   });
   if (view === "models") requestAnimationFrame(() => drawTrajectory(currentFamily()?.trajectory || []));
-  if (view === "audit") renderAudit(currentTrajectory());
+  if (view === "models" && !currentTrajectory()) refreshStatus({ quiet: true, trajectory: true });
+  if (view === "control") {
+    renderControls(state.status);
+    if (!state.statusDetailed) refreshStatus({ detailed: true, trajectory: false });
+  }
+  if (view === "audit") {
+    renderAudit(currentTrajectory());
+    refreshStatus({ detailed: false, trajectory: true, fullTrajectory: true });
+  }
   if (view !== "audit") $("auditTimeline").replaceChildren();
   refreshIcons();
 }
@@ -641,6 +837,19 @@ $("refreshStatus").addEventListener("click", () => refreshStatus());
 $("toggleBackend").addEventListener("click", toggleBackend);
 $("saveSchedule").addEventListener("click", saveSchedule);
 $("runOnce").addEventListener("click", runOnce);
+$("runSupervisor").addEventListener("click", runSupervisor);
+$("reviewSupervisor").addEventListener("click", reviewSupervisor);
+$("refreshSupervisor").addEventListener("click", () => refreshStatus());
+$("supervisorMasterToggle").addEventListener("change", (event) => toggleSupervisorScope("global", event.target.checked));
+$("supervisorMarketToggle").addEventListener("change", (event) => toggleSupervisorScope("market", event.target.checked));
+$("supervisorReviewers").addEventListener("change", (event) => {
+  const input = event.target.closest("[data-supervisor-provider]");
+  if (!input) return;
+  input.disabled = true;
+  toggleSupervisorReviewer(input.dataset.supervisorProvider, input.checked).finally(() => {
+    if (input.isConnected) input.disabled = false;
+  });
+});
 $("trajectoryChart").addEventListener("pointermove", chartPointer);
 $("trajectoryChart").addEventListener("pointerleave", () => { $("chartTooltip").hidden = true; });
 
@@ -651,7 +860,8 @@ $("marketTabs").addEventListener("click", (event) => {
   state.selectedFamily = null;
   state.selectedEventKey = null;
   document.querySelectorAll("[data-market]").forEach((item) => item.classList.toggle("active", item.dataset.market === state.market));
-  refreshStatus();
+  renderAll({ statusOnly: !currentTrajectory() });
+  refreshInitialView();
 });
 
 document.querySelector(".view-tabs").addEventListener("click", (event) => {
@@ -700,5 +910,5 @@ window.addEventListener("resize", () => {
 });
 
 refreshIcons();
-refreshStatus();
-window.setInterval(() => refreshStatus({ quiet: true }), 30000);
+refreshInitialView();
+window.setInterval(() => refreshStatus({ quiet: true, detailed: state.view === "control", trajectory: false }), 30000);

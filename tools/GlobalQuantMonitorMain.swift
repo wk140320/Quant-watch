@@ -2,7 +2,7 @@ import AppKit
 import WebKit
 
 private let monitorURL = URL(string: "http://127.0.0.1:8787/monitor.html")!
-private let statusURL = URL(string: "http://127.0.0.1:8787/api/backend-monitor/status")!
+private let statusURL = URL(string: "http://127.0.0.1:8787/api/ping")!
 
 final class MonitorAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var window: NSWindow!
@@ -115,14 +115,14 @@ final class MonitorAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDel
 
     private func checkBackend(startIfNeeded: Bool) {
         var request = URLRequest(url: statusURL)
-        request.timeoutInterval = 1.5
+        request.timeoutInterval = 0.8
         URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
             guard let self else { return }
             let ok = error == nil && (response as? HTTPURLResponse)?.statusCode == 200
             DispatchQueue.main.async {
                 if ok {
                     self.retryWorkItem?.cancel()
-                    self.webView.load(URLRequest(url: monitorURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10))
+                    self.webView.load(URLRequest(url: monitorURL, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 6))
                     return
                 }
                 if startIfNeeded && self.serverProcess == nil {

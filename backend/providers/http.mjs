@@ -91,6 +91,12 @@ async function fetchJsonWithCurl(url, timeoutMs = 10000, extraHeaders = {}) {
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
+    child.stdout.on("error", (error) => {
+      if (error?.code !== "EPIPE") reject(error);
+    });
+    child.stderr.on("error", (error) => {
+      if (error?.code !== "EPIPE") reject(error);
+    });
     child.on("error", reject);
     child.on("close", (code) => {
       clearTimeout(timer);

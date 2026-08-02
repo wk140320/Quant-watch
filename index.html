@@ -4,14 +4,16 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Global Quant Watch</title>
-    <link rel="stylesheet" href="/styles.css?v=20260624-detail-safe">
+    <link rel="stylesheet" href="/styles.css?v=20260728-supervisor-background-1">
     <link rel="stylesheet" href="/frontend/styles/tokens.css?v=20260712-graphite-system">
     <link rel="stylesheet" href="/frontend/styles/shell.css?v=20260713-provider-pool-ledger-17">
     <link rel="stylesheet" href="/frontend/styles/visual-workspaces.css?v=20260713-visual-workspaces-2">
     <link rel="stylesheet" href="/frontend/styles/institutional-polish.css?v=20260713-institutional-polish-2">
-    <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260713-market-menu-20">
+    <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260714-market-switch-performance-1">
     <link rel="stylesheet" href="/frontend/styles/simulation-layout.css?v=20260714-simulation-boundary-1">
-    <link rel="stylesheet" href="/frontend/styles/performance.css?v=20260714-workspace-performance-1">
+    <link rel="stylesheet" href="/frontend/styles/performance.css?v=20260717-stable-load-2">
+    <link rel="stylesheet" href="/frontend/styles/training-supervisor.css?v=20260714-training-supervisor-2">
+    <link rel="stylesheet" href="/frontend/styles/strategy-workspace.css?v=20260729-strategy-layout-3">
   </head>
   <body>
     <div class="app-shell">
@@ -271,7 +273,18 @@
           </div>
         </section>
 
-        <section class="portfolio-board strategy-constraints-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="strategy-workspace-nav quant-page-section" data-quant-page="strategy" data-strategy-nav hidden>
+          <div class="strategy-tab-track" role="tablist" aria-label="策略与模型工作区">
+            <button type="button" role="tab" data-strategy-tab="overview">决策总览</button>
+            <button type="button" role="tab" data-strategy-tab="accuracy">准确率证据</button>
+            <button type="button" role="tab" data-strategy-tab="training">模型训练</button>
+            <button type="button" role="tab" data-strategy-tab="agent">Paper Agent</button>
+            <button type="button" role="tab" data-strategy-tab="settings">策略设置</button>
+          </div>
+          <p class="strategy-tab-caption">研究结果、训练证据和纸面执行分开呈现；Research / Shadow 模型不会被包装成可下单概率。</p>
+        </section>
+
+        <section class="portfolio-board strategy-constraints-board quant-page-section" data-quant-page="strategy" data-strategy-panel="settings" hidden>
           <div class="section-head">
             <div>
               <h2>策略约束</h2>
@@ -596,7 +609,53 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="portfolio-board accuracy-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board model-report-board quant-page-section" data-quant-page="strategy" data-strategy-panel="training" hidden>
+          <div class="section-head model-report-head">
+            <div>
+              <p class="section-kicker">Immutable OOF evidence</p>
+              <h2>全模型训练报告</h2>
+              <p>分类、排序、收益区间、因子、分钟模型、Paper Agent 与 AI 监工分别使用适合任务的指标；缺失证据不会补造分数。</p>
+            </div>
+            <div class="inline-actions">
+              <button id="refreshModelReports" class="secondary icon-text-button" type="button"><i data-lucide="refresh-cw"></i><span>刷新报告</span></button>
+              <button id="generateModelReport" class="primary icon-text-button" type="button"><i data-lucide="file-chart-column"></i><span>生成新报告</span></button>
+            </div>
+          </div>
+          <div class="model-report-filters" aria-label="模型报告筛选">
+            <label>模型族
+              <select id="modelReportFamily">
+                <option value="all">全部</option>
+                <option value="market_multitask" selected>市场级多任务</option>
+                <option value="intraday">分钟模型</option>
+                <option value="factor_research">因子研究</option>
+                <option value="paper_agent">Paper Agent</option>
+                <option value="ai_supervisor">AI 监工</option>
+              </select>
+            </label>
+            <label>周期
+              <select id="modelReportHorizon">
+                <option value="all">全部</option>
+                <option value="5">5 日</option>
+                <option value="15">15 日</option>
+                <option value="30">30 日</option>
+              </select>
+            </label>
+            <label>状态
+              <select id="modelReportStatus">
+                <option value="all">全部</option>
+                <option value="evidence_insufficient">证据不足</option>
+                <option value="research">Research</option>
+                <option value="shadow_candidate">Shadow candidate</option>
+                <option value="paper">Paper</option>
+              </select>
+            </label>
+          </div>
+          <div id="modelReportPanel" class="model-report-panel" aria-live="polite">
+            <div class="training-supervisor-loading"><span class="status-orbit"></span><span>正在读取本地模型证据</span></div>
+          </div>
+        </section>
+
+        <section class="portfolio-board accuracy-board quant-page-section" data-quant-page="strategy" data-strategy-panel="accuracy" hidden>
           <div class="section-head">
             <h2>预测学习与准确率</h2>
             <div class="inline-actions">
@@ -609,7 +668,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="portfolio-board agent-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board agent-board quant-page-section" data-quant-page="strategy" data-strategy-panel="agent" hidden>
           <div class="section-head">
             <h2>模拟交易 Agent</h2>
             <div class="agent-controls">
@@ -630,7 +689,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="portfolio-board strategy-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board strategy-board quant-page-section" data-quant-page="strategy" data-strategy-panel="agent" hidden>
           <div class="section-head">
             <h2>Agent 最优策略</h2>
             <button id="refreshOptimalStrategy" class="secondary" type="button">更新草稿</button>
@@ -640,7 +699,7 @@ CBA,20,118.50</textarea>
           </div>
         </section>
 
-        <section class="portfolio-board ai-chat-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board ai-chat-board quant-page-section" data-quant-page="strategy" data-strategy-panel="overview" hidden>
           <div class="section-head">
             <h2>AI策略对话</h2>
             <button id="sendAiChat" class="secondary" type="button">发送</button>
@@ -651,7 +710,7 @@ CBA,20,118.50</textarea>
           <textarea id="aiChatInput" rows="3" placeholder="例如：我昨天买入WOW今天跌了2%，请结合当前持仓和策略告诉我是否要止损、减仓还是继续持有。"></textarea>
         </section>
 
-        <section class="portfolio-board strategy-history-board quant-page-section" data-quant-page="strategy" hidden>
+        <section class="portfolio-board strategy-history-board quant-page-section" data-quant-page="strategy" data-strategy-panel="overview" hidden>
           <div class="section-head">
             <div>
               <h2>策略版本记录</h2>
@@ -705,9 +764,9 @@ CBA,20,118.50</textarea>
     <script src="/frontend/runtime/icons.js?v=20260713-icons-2"></script>
     <script src="/frontend/domain/market.js?v=20260712-market-isolation-2"></script>
     <script src="/frontend/runtime/storage.js?v=20260713-storage-contract-1"></script>
-    <script src="/frontend/runtime/ui-runtime.js?v=20260714-workspace-performance-1"></script>
+    <script src="/frontend/runtime/ui-runtime.js?v=20260717-stable-load-2"></script>
     <script src="/frontend/runtime/home-motion.js?v=20260712-home-motion"></script>
     <script src="/frontend/runtime/flow-navigation.js?v=20260713-flow-navigation-2"></script>
-    <script src="/frontend/runtime/shell-bootstrap.js?v=20260714-workspace-performance-1"></script>
+    <script src="/frontend/runtime/shell-bootstrap.js?v=20260729-factor-lab-robust-v76"></script>
   </body>
 </html>

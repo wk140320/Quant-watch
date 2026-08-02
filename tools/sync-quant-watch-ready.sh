@@ -27,6 +27,7 @@ rsync -a \
   --exclude GlobalQuantMonitor.app \
   --exclude Quant-watch \
   --exclude node_modules \
+  --exclude reports \
   --exclude 'record*' \
   --exclude Quant-watch-open-source.tar.gz \
   ./ "$DEST/"

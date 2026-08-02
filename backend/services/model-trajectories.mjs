@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const FAMILY_DEFINITIONS = Object.freeze({
@@ -42,13 +42,21 @@ const FAMILY_DEFINITIONS = Object.freeze({
     description: "根据已揭晓结果缩放误差惩罚，并限制单次调整幅度。",
     order: 5,
   },
+  training: {
+    id: "training",
+    name: "生产训练与验收",
+    shortName: "训练验收",
+    stage: "训练与部署",
+    description: "记录数据审计、OOF 训练、报告生成、监工验收、返工与部署状态。",
+    order: 6,
+  },
   agent: {
     id: "agent",
     name: "Paper Agent 学习",
     shortName: "Agent 学习",
     stage: "纸面执行",
     description: "用纸面成交复盘策略偏置，不触发真实券商订单。",
-    order: 6,
+    order: 7,
   },
 });
 
@@ -59,6 +67,7 @@ const EVENT_FAMILY = Object.freeze({
   "model-change-log-alpha-evolution": "alpha",
   "model-change-log-minute-learning": "intraday",
   "model-change-log-adaptive-micro-tuning": "adaptive",
+  "model-change-log-production-training": "training",
 });
 
 function finiteNumber(value) {
@@ -87,6 +96,7 @@ function familyForRow(row = {}) {
   if (type.includes("alpha")) return "alpha";
   if (type.includes("minute") || type.includes("intraday")) return "intraday";
   if (type.includes("calibrat") || type.includes("weight")) return "calibration";
+  if (type.includes("training") || type.includes("supervisor") || type.includes("production") || type.includes("backtest")) return "training";
   if (type.includes("tuning") || type.includes("adjust")) return "adaptive";
   return "agent";
 }
@@ -156,6 +166,10 @@ function eventMetrics(row = {}, family = familyForRow(row)) {
       value: metrics.adjustmentScale === null ? null : metrics.adjustmentScale * 100,
       unit: "%",
     };
+  } else if (family === "training") {
+    metrics.primaryMetric = metrics.directionalAccuracy !== null && metrics.directionalAccuracy !== undefined
+      ? { label: "OOF 方向命中", value: metrics.directionalAccuracy, unit: "%" }
+      : { label: "训练证据样本", value: metrics.sampleCount, unit: "" };
   } else {
     metrics.primaryMetric = { label: "策略综合分", value: afterScore, unit: "" };
   }
@@ -199,6 +213,10 @@ function eventChanges(payload = {}, family = "agent") {
   if (family === "intraday") {
     return [`分钟模型使用 ${Number(payload.sampleCount || 0)} 条已完成样本更新`];
   }
+  if (family === "training") {
+    const verdict = payload.verdict || payload.status || payload.event || "待验收";
+    return [`训练周期状态：${verdict}`];
+  }
   if (payload.summary) return [String(payload.summary)];
   return [];
 }
@@ -222,6 +240,10 @@ function eventImpact(family, metrics = {}) {
   }
   if (family === "intraday" && metrics.directionalAccuracy !== null && metrics.directionalAccuracy !== undefined) {
     return metrics.directionalAccuracy >= 50 ? "improved" : "watch";
+  }
+  if (family === "training") {
+    const status = String(metrics.status || "").toLowerCase();
+    return status.includes("fail") || status.includes("rework") ? "degraded" : "neutral";
   }
   if (family === "agent" && metrics.beforeScore !== null && metrics.afterScore !== null) {
     return metrics.afterScore > metrics.beforeScore ? "improved" : metrics.afterScore < metrics.beforeScore ? "degraded" : "neutral";
@@ -304,12 +326,17 @@ function modelStatus(family, latest = null, intradaySnapshot = null) {
       : { code: "collecting", label: "采样中", tone: "warn" };
   }
   if (family === "adaptive") return { code: "guarded", label: "护栏微调", tone: "gold" };
+  if (family === "training") {
+    if (latest?.status === "complete" || latest?.status === "accepted") return { code: "ready", label: "已验收", tone: "good" };
+    if (latest?.status === "failed" || latest?.status === "rework") return { code: "rework", label: "需返工", tone: "warn" };
+    return { code: "research", label: "训练中", tone: "blue" };
+  }
   if (family === "agent") return { code: "paper", label: "Paper", tone: "blue" };
   if (latest?.status === "active") return { code: "active", label: "已激活", tone: "good" };
   return { code: "research", label: "研究中", tone: "muted" };
 }
 
-function buildModelFamily(family, events = [], intradaySnapshot = null) {
+function buildModelFamily(family, events = [], intradaySnapshot = null, options = {}) {
   const definition = FAMILY_DEFINITIONS[family];
   const ordered = [...events].sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
   const latest = ordered.at(-1) || null;
@@ -323,7 +350,7 @@ function buildModelFamily(family, events = [], intradaySnapshot = null) {
       eventId: event.id,
     }))
     .filter((point) => point.at && point.value !== null)
-    .slice(-48);
+    .slice(-(options.compact ? 24 : 48));
   const status = modelStatus(family, latest, intradaySnapshot);
   return {
     ...definition,
@@ -334,7 +361,9 @@ function buildModelFamily(family, events = [], intradaySnapshot = null) {
     primaryMetric: latest?.metrics?.primaryMetric || null,
     sampleCount: latest?.metrics?.sampleCount ?? intradaySnapshot?.sampleCount ?? 0,
     trajectory: primaryPoints,
-    events: [...events].sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || ""))).slice(0, 80),
+    events: [...events]
+      .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+      .slice(0, Math.max(options.compact ? 6 : 8, Number(options.eventLimit || 80))),
   };
 }
 
@@ -368,10 +397,13 @@ async function readJson(path, fallback = null) {
   }
 }
 
-async function readJsonLines(path) {
+async function readJsonLines(path, options = {}) {
   try {
     const text = await readFile(path, "utf8");
-    return text.split(/\r?\n/).filter(Boolean).map((line) => {
+    const maxLines = Math.max(0, Number(options.maxLines || 0));
+    const lines = text.split(/\r?\n/).filter(Boolean);
+    const selected = maxLines > 0 ? lines.slice(-maxLines) : lines;
+    return selected.map((line) => {
       try {
         return JSON.parse(line);
       } catch {
@@ -390,6 +422,7 @@ function buildModelTrajectoryPayload({
   predictionWeights = null,
   intradaySnapshot = null,
   limit = 180,
+  compact = false,
 } = {}) {
   const normalized = records.map((row) => {
     const event = normalizeModelEvent(row);
@@ -401,8 +434,12 @@ function buildModelTrajectoryPayload({
   const grouped = Object.fromEntries(Object.keys(FAMILY_DEFINITIONS).map((family) => [family, []]));
   for (const event of allEvents) grouped[event.family].push(event);
   const families = Object.keys(FAMILY_DEFINITIONS)
-    .map((family) => buildModelFamily(family, grouped[family], family === "intraday" ? intradaySnapshot : null))
-    .filter((family) => family.eventCount || (family.id === "intraday" && intradaySnapshot))
+    .map((family) => buildModelFamily(
+      family,
+      grouped[family],
+      family === "intraday" ? intradaySnapshot : null,
+      { eventLimit: compact ? 6 : 80, compact },
+    ))
     .sort((a, b) => a.order - b.order);
   const lastChangeAt = allEvents[0]?.createdAt || calibration?.savedAt || predictionWeights?.savedAt || intradaySnapshot?.updatedAt || null;
   const guardedEvents = allEvents.filter((event) => event.guardrails.length);
@@ -441,30 +478,47 @@ function buildModelTrajectoryPayload({
       noTradeGate: calibration.noTradeGate || null,
     } : null,
     families,
-    timeline: allEvents.slice(0, timelineLimit),
-    horizonWeights,
+    timeline: compact ? [] : allEvents.slice(0, timelineLimit),
+    horizonWeights: compact ? horizonWeights.slice(0, 3) : horizonWeights,
     pipeline: pipelineStages({ families, calibration, predictionWeights }),
   };
 }
 
-async function loadModelTrajectories({ snapshotBasePath, market = "ASX", limit = 180 } = {}) {
+async function loadModelTrajectories({ snapshotBasePath, market = "ASX", limit = 180, compact = false } = {}) {
   if (!snapshotBasePath) throw new Error("snapshotBasePath is required");
   const key = String(market || "ASX").toUpperCase();
   const slug = key.toLowerCase();
+  const sourcePaths = [
+    join(snapshotBasePath, "records", `model-change-log-${slug}.jsonl`),
+    join(snapshotBasePath, `model-calibration-${slug}.json`),
+    join(snapshotBasePath, "models", `prediction-weight-calibration-${slug}.json`),
+    join(snapshotBasePath, "backend-monitor", `intraday-model-${slug}.json`),
+  ];
+  const compactCachePath = join(snapshotBasePath, `model-trajectories-compact-${slug}.json`);
+  const sourceMtimeMs = Math.max(0, ...(await Promise.all(sourcePaths.map((path) => stat(path).then((row) => row.mtimeMs).catch(() => 0)))));
+  if (compact) {
+    const cached = await readJson(compactCachePath);
+    if (cached?.payload?.ok && Number(cached.sourceMtimeMs || 0) >= sourceMtimeMs) return cached.payload;
+  }
   const [records, calibration, predictionWeights, intradaySnapshot] = await Promise.all([
-    readJsonLines(join(snapshotBasePath, "records", `model-change-log-${slug}.jsonl`)),
-    readJson(join(snapshotBasePath, `model-calibration-${slug}.json`)),
-    readJson(join(snapshotBasePath, "models", `prediction-weight-calibration-${slug}.json`)),
-    readJson(join(snapshotBasePath, "backend-monitor", `intraday-model-${slug}.json`)),
+    readJsonLines(sourcePaths[0], { maxLines: compact ? 240 : 0 }),
+    readJson(sourcePaths[1]),
+    readJson(sourcePaths[2]),
+    readJson(sourcePaths[3]),
   ]);
-  return buildModelTrajectoryPayload({
+  const result = buildModelTrajectoryPayload({
     market: key,
     records,
     calibration,
     predictionWeights,
     intradaySnapshot,
     limit,
+    compact,
   });
+  if (compact) {
+    await writeFile(compactCachePath, JSON.stringify({ sourceMtimeMs, savedAt: new Date().toISOString(), payload: result }), "utf8").catch(() => null);
+  }
+  return result;
 }
 
 export {
