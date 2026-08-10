@@ -644,6 +644,18 @@ def analyze_features(
 def _pearson(xs: list[float], ys: list[float]) -> float:
     if len(xs) != len(ys) or len(xs) < 3:
         return 0.0
+    if len(xs) >= 5_000:
+        try:
+            import numpy as np  # type: ignore
+
+            left = np.asarray(xs, dtype=np.float64)
+            right = np.asarray(ys, dtype=np.float64)
+            if float(np.std(left)) <= 1e-12 or float(np.std(right)) <= 1e-12:
+                return 0.0
+            value = float(np.corrcoef(left, right)[0, 1])
+            return value if math.isfinite(value) else 0.0
+        except (ImportError, MemoryError, ValueError):
+            pass
     avg_x, avg_y = mean(xs), mean(ys)
     numerator = sum((x - avg_x) * (y - avg_y) for x, y in zip(xs, ys))
     denom_x = math.sqrt(sum((x - avg_x) ** 2 for x in xs))
@@ -667,6 +679,21 @@ def _ranks(values: list[float]) -> list[float]:
 
 
 def _spearman(xs: list[float], ys: list[float]) -> float:
+    if len(xs) != len(ys) or len(xs) < 3:
+        return 0.0
+    if len(xs) >= 5_000:
+        try:
+            import numpy as np  # type: ignore
+            from scipy.stats import rankdata  # type: ignore
+
+            left = rankdata(np.asarray(xs, dtype=np.float64), method="average")
+            right = rankdata(np.asarray(ys, dtype=np.float64), method="average")
+            if float(np.std(left)) <= 1e-12 or float(np.std(right)) <= 1e-12:
+                return 0.0
+            value = float(np.corrcoef(left, right)[0, 1])
+            return value if math.isfinite(value) else 0.0
+        except (ImportError, MemoryError, ValueError):
+            pass
     return _pearson(_ranks(xs), _ranks(ys))
 
 
@@ -2124,8 +2151,9 @@ def _panel_factor_metrics(
     rows: list[dict[str, Any]],
     factor_name: str,
     min_symbols: int,
+    by_date: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    by_date = _group_by_date(rows)
+    by_date = by_date or _group_by_date(rows)
     daily: list[dict[str, Any]] = []
     for date, date_rows in sorted(by_date.items()):
         clean = [
@@ -2196,13 +2224,16 @@ def _panel_factor_metrics(
 
 
 def _fit_panel_ridge(rows: list[dict[str, Any]], factor_names: list[str], penalty: float, epochs: int = 80) -> dict[str, Any]:
-    centers = {name: mean(row["factors"].get(name, 0.0) for row in rows) for name in factor_names}
-    scales = {name: stddev(row["factors"].get(name, 0.0) for row in rows) or 1.0 for name in factor_names}
-    label_center = mean(row["label"] for row in rows)
-    label_scale = stddev(row["label"] for row in rows) or 1.0
-    weights = [0.0] * len(factor_names)
-    bias = 0.0
-    learning_rate = 0.028
+    max_fit_rows = 80_000
+    if len(rows) > max_fit_rows:
+        step = len(rows) / max_fit_rows
+        fit_rows = [rows[min(len(rows) - 1, int(index * step))] for index in range(max_fit_rows)]
+    else:
+        fit_rows = rows
+    centers = {name: mean(row["factors"].get(name, 0.0) for row in fit_rows) for name in factor_names}
+    scales = {name: stddev(row["factors"].get(name, 0.0) for row in fit_rows) or 1.0 for name in factor_names}
+    label_center = mean(row["label"] for row in fit_rows)
+    label_scale = stddev(row["label"] for row in fit_rows) or 1.0
 
     def vector(row: dict[str, Any]) -> list[float]:
         return [
@@ -2210,40 +2241,79 @@ def _fit_panel_ridge(rows: list[dict[str, Any]], factor_names: list[str], penalt
             for name in factor_names
         ]
 
-    for epoch in range(epochs):
-        decay = 1.0 / (1.0 + epoch * 0.02)
-        for row in rows:
-            x = vector(row)
-            target = clamp((number(row["label"]) - label_center) / label_scale, -6, 6)
-            prediction = bias + sum(weight * value for weight, value in zip(weights, x))
-            error = prediction - target
-            for position, value in enumerate(x):
-                weights[position] -= learning_rate * decay * clamp(error * value + penalty * weights[position], -4, 4)
-            bias -= learning_rate * decay * clamp(error, -4, 4)
+    weights = [0.0] * len(factor_names)
+    bias = 0.0
+    try:
+        import numpy as np  # type: ignore
+
+        matrix = np.asarray([vector(row) for row in fit_rows], dtype=np.float64)
+        targets = np.asarray([
+            clamp((number(row["label"]) - label_center) / label_scale, -6, 6)
+            for row in fit_rows
+        ], dtype=np.float64)
+        design = np.column_stack([np.ones(len(matrix), dtype=np.float64), matrix])
+        gram = design.T @ design / max(1, len(matrix))
+        rhs = design.T @ targets / max(1, len(matrix))
+        regularizer = np.eye(design.shape[1], dtype=np.float64) * max(0.0, float(penalty))
+        regularizer[0, 0] = 0.0
+        coefficients = np.linalg.solve(gram + regularizer + np.eye(design.shape[1]) * 1e-10, rhs)
+        bias = float(coefficients[0])
+        weights = [float(value) for value in coefficients[1:]]
+    except Exception:
+        # Dependency-free fallback for minimal installations and singular matrices.
+        learning_rate = 0.028
+        fallback_epochs = min(epochs, 40)
+        for epoch in range(fallback_epochs):
+            decay = 1.0 / (1.0 + epoch * 0.02)
+            for row in fit_rows:
+                x = vector(row)
+                target = clamp((number(row["label"]) - label_center) / label_scale, -6, 6)
+                prediction = bias + sum(weight * value for weight, value in zip(weights, x))
+                error = prediction - target
+                for position, value in enumerate(x):
+                    weights[position] -= learning_rate * decay * clamp(error * value + penalty * weights[position], -4, 4)
+                bias -= learning_rate * decay * clamp(error, -4, 4)
 
     def predict(row: dict[str, Any]) -> float:
         normalized = bias + sum(weight * value for weight, value in zip(weights, vector(row)))
         return normalized * label_scale + label_center
 
-    return {"weights": weights, "bias": bias, "predict": predict}
+    def predict_many(target_rows: list[dict[str, Any]]) -> list[float]:
+        if not target_rows:
+            return []
+        try:
+            import numpy as np  # type: ignore
+
+            matrix = np.asarray([vector(row) for row in target_rows], dtype=np.float64)
+            output = (matrix @ np.asarray(weights, dtype=np.float64) + bias) * label_scale + label_center
+            return [float(value) for value in output]
+        except (ImportError, MemoryError, ValueError):
+            return [predict(row) for row in target_rows]
+
+    return {"weights": weights, "bias": bias, "predict": predict, "predict_many": predict_many, "fitRows": len(fit_rows), "sourceRows": len(rows)}
 
 
 def _panel_equal_baseline(train_rows: list[dict[str, Any]], test_rows: list[dict[str, Any]], factor_names: list[str]) -> list[float]:
+    if len(train_rows) > 80_000:
+        step = len(train_rows) / 80_000
+        fit_rows = [train_rows[min(len(train_rows) - 1, int(index * step))] for index in range(80_000)]
+    else:
+        fit_rows = train_rows
     directions = {}
     centers = {}
     scales = {}
     for name in factor_names:
-        values = [number(row["factors"].get(name)) for row in train_rows]
-        labels = [number(row["label"]) for row in train_rows]
+        values = [number(row["factors"].get(name)) for row in fit_rows]
+        labels = [number(row["label"]) for row in fit_rows]
         directions[name] = 1 if _spearman(values, labels) >= 0 else -1
         centers[name] = mean(values)
         scales[name] = stddev(values) or 1.0
     train_scores = [
         mean(clamp((number(row["factors"].get(name)) - centers[name]) / scales[name], -6, 6) * directions[name] for name in factor_names)
-        for row in train_rows
+        for row in fit_rows
     ]
-    label_center = mean(row["label"] for row in train_rows)
-    scale = (stddev(row["label"] for row in train_rows) or 1.0) / (stddev(train_scores) or 1.0)
+    label_center = mean(row["label"] for row in fit_rows)
+    scale = (stddev(row["label"] for row in fit_rows) or 1.0) / (stddev(train_scores) or 1.0)
     score_center = mean(train_scores)
     return [
         (mean(clamp((number(row["factors"].get(name)) - centers[name]) / scales[name], -6, 6) * directions[name] for name in factor_names) - score_center) * scale + label_center
@@ -2276,7 +2346,7 @@ def _panel_walk_forward_folds(
         if not train_rows or not test_rows:
             continue
         model = _fit_panel_ridge(train_rows, factor_names, penalty)
-        predictions = [model["predict"](row) for row in test_rows]
+        predictions = model["predict_many"](test_rows)
         metrics = _factor_prediction_metrics(predictions, [row["label"] for row in test_rows])
         folds.append({
             "fold": fold + 1,
@@ -2287,6 +2357,36 @@ def _panel_walk_forward_folds(
             "positive": metrics["rank_ic"] > 0 and metrics["avg_net_signal_return_pct"] > 0,
         })
     return folds
+
+
+def _panel_correlation_matrix(rows: list[dict[str, Any]], factor_names: list[str]) -> dict[str, dict[str, float]]:
+    """Compute the factor matrix in one vectorized pass for large market panels."""
+    try:
+        import numpy as np  # type: ignore
+
+        columns = [
+            np.fromiter((number(row["factors"].get(name)) for row in rows), dtype=float, count=len(rows))
+            for name in factor_names
+        ]
+        values = np.column_stack(columns)
+        correlations = np.corrcoef(values, rowvar=False)
+        correlations = np.nan_to_num(correlations, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(correlations, 1.0)
+        return {
+            left: {right: round(float(correlations[left_index, right_index]), 4) for right_index, right in enumerate(factor_names)}
+            for left_index, left in enumerate(factor_names)
+        }
+    except (ImportError, MemoryError, ValueError):
+        return {
+            left: {
+                right: round(_pearson(
+                    [number(row["factors"].get(left)) for row in rows],
+                    [number(row["factors"].get(right)) for row in rows],
+                ), 4)
+                for right in factor_names
+            }
+            for left in factor_names
+        }
 
 
 def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], horizon: int) -> dict[str, Any]:
@@ -2314,7 +2414,7 @@ def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], hori
     selected: dict[str, Any] | None = None
     for penalty in [0.01, 0.03, 0.08, 0.16, 0.32, 0.64]:
         model = _fit_panel_ridge(train_rows, factor_names, penalty)
-        predictions = [model["predict"](row) for row in validation_rows]
+        predictions = model["predict_many"](validation_rows)
         metrics = _factor_prediction_metrics(predictions, [row["label"] for row in validation_rows])
         score = metrics["direction_hit_rate_pct"] + max(0.0, metrics["rank_ic"]) * 35 - metrics["mae"] * 1.4
         candidate = {"penalty": penalty, "model": model, "validation": metrics, "score": score}
@@ -2323,7 +2423,7 @@ def _panel_ml_backtest(rows: list[dict[str, Any]], factor_names: list[str], hori
     assert selected is not None
     deployment_rows = [row for row in rows if row["date"] in set(dates[:validation_end])]
     deployment = _fit_panel_ridge(deployment_rows, factor_names, selected["penalty"], epochs=100)
-    predictions = [deployment["predict"](row) for row in test_rows]
+    predictions = deployment["predict_many"](test_rows)
     actuals = [row["label"] for row in test_rows]
     test_metrics = _factor_prediction_metrics(predictions, actuals)
     equal_predictions = _panel_equal_baseline(deployment_rows, test_rows, factor_names)
@@ -2446,7 +2546,7 @@ def analyze_cross_sectional_factors(
                 "source": item["source"],
             })
         date_groups = _group_by_date(panel_rows)
-        usable_dates = [date for date, rows in date_groups.items() if len({row["symbol"] for row in rows}) >= min_symbols]
+        usable_dates = sorted(date for date, rows in date_groups.items() if len({row["symbol"] for row in rows}) >= min_symbols)
         panel_rows = [row for row in panel_rows if row["date"] in set(usable_dates)]
         if len(panel_rows) < min_symbols * 20:
             horizon_results.append({
@@ -2457,18 +2557,20 @@ def analyze_cross_sectional_factors(
                 "symbol_depths": symbol_depths,
             })
             continue
-        matrix = {
-            left: {
-                right: round(_pearson(
-                    [number(row["factors"].get(left)) for row in panel_rows],
-                    [number(row["factors"].get(right)) for row in panel_rows],
-                ), 4)
-                for right in factor_names
-            }
-            for left in factor_names
-        }
+        outer_split = max(12, min(len(usable_dates) - 1, int(len(usable_dates) * 0.68)))
+        selection_dates = set(usable_dates[:outer_split])
+        outer_test_dates = set(usable_dates[min(len(usable_dates), outer_split + max(1, horizon)):])
+        selection_rows = [row for row in panel_rows if row["date"] in selection_dates]
+        outer_test_rows = [row for row in panel_rows if row["date"] in outer_test_dates]
+        matrix = _panel_correlation_matrix(selection_rows, factor_names)
         clusters = _factor_cluster_map(factor_names, matrix, threshold=0.72)
-        stats = [_panel_factor_metrics(panel_rows, name, min_symbols) for name in factor_names]
+        selection_by_date = _group_by_date(selection_rows)
+        outer_test_by_date = _group_by_date(outer_test_rows)
+        stats = [_panel_factor_metrics(selection_rows, name, min_symbols, selection_by_date) for name in factor_names]
+        outer_stats = {
+            name: _panel_factor_metrics(outer_test_rows, name, min_symbols, outer_test_by_date)
+            for name in factor_names
+        }
         ml_names = [
             row["name"] for row in stats
             if row["date_count"] >= 12 and abs(number(row["daily_rank_ic_mean"])) >= 0.005
@@ -2485,6 +2587,7 @@ def analyze_cross_sectional_factors(
         candidates = []
         for row in stats:
             name = row["name"]
+            outer = outer_stats.get(name, {})
             cluster = clusters.get(name, {"cluster": "solo", "members": [name], "size": 1})
             leader = leaders.get(cluster["cluster"], name)
             redundant = cluster.get("size", 1) > 1 and name != leader
@@ -2515,6 +2618,10 @@ def analyze_cross_sectional_factors(
             reasons = []
             if row["date_count"] < 120:
                 reasons.append("too_few_cross_section_dates")
+            if number(outer.get("date_count")) < 30:
+                reasons.append("too_few_untouched_outer_dates")
+            if number(outer.get("daily_rank_ic_mean")) * number(row.get("direction"), 1) <= 0:
+                reasons.append("outer_oos_rank_ic_not_positive")
             if len({panel_row["symbol"] for panel_row in panel_rows}) < 30:
                 reasons.append("too_few_cross_section_symbols")
             if abs(number(row["daily_rank_ic_mean"])) < 0.005 and abs(number(row["sector_neutral_rank_ic"])) < 0.005:
@@ -2539,6 +2646,7 @@ def analyze_cross_sectional_factors(
             )
             candidate = {
                 **row,
+                "outer_oos": outer,
                 "status": "admitted" if admitted else "watchlist",
                 "base_score": round(base_score, 4),
                 "dynamic_weight_pct": 0.0,
@@ -2597,6 +2705,14 @@ def analyze_cross_sectional_factors(
                 if abs(matrix[left][right]) >= 0.72
             ], key=lambda item: abs(item["correlation"]), reverse=True)[:30],
             "symbol_depths": symbol_depths,
+            "nested_selection": {
+                "selection_rows": len(selection_rows),
+                "selection_dates": len(selection_dates),
+                "purge_dates": max(1, horizon),
+                "outer_test_rows": len(outer_test_rows),
+                "outer_test_dates": len(outer_test_dates),
+                "selectionUsesOuterTest": False,
+            },
         })
     aggregate = [
         {
@@ -2618,7 +2734,7 @@ def analyze_cross_sectional_factors(
         "factor_library": [{"name": name, "formula": formula} for name, formula in PANEL_FACTOR_FORMULAS.items()],
         "aggregate_weights": sorted(aggregate, key=lambda item: item["weight_pct"], reverse=True),
         "horizon_results": horizon_results,
-        "leakage_control": "For each date, factors use only candles at or before t; labels are future returns. ML split is chronological by date with purge/embargo between train, validation, and test.",
+        "leakage_control": "For each date, factors use only candles at or before t. Correlation, clustering, direction and candidate selection use the outer training window only; the purged outer test is untouched until final evidence scoring.",
         "admission_policy": [
             "Prefer factors with stable daily Rank IC across the market.",
             "Require sector-neutral evidence when sector labels are available.",

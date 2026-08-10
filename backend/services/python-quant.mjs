@@ -17,6 +17,22 @@ const LOW_PRIORITY_OPERATIONS = new Set([
   "historical-backtest-batch",
   "local-model-train",
   "production-model-train",
+  "production-model-recover-oof",
+]);
+const DATA_OPERATIONS = new Set([
+  "data-lake-upsert",
+  "data-lake-read",
+  "data-lake-panel-read",
+  "data-lake-panel-upsert",
+  "data-lake-summary",
+  "data-lake-pit-upsert",
+  "data-lake-pit-batch-upsert",
+  "data-lake-pit-read",
+  "data-lake-backfill-local-caches",
+]);
+const MAINTENANCE_OPERATIONS = new Set([
+  "data-lake-audit",
+  "training-artifact-maintenance",
 ]);
 
 function positiveInteger(value, fallback, minimum = 1, maximum = 32) {
@@ -57,10 +73,26 @@ function createPythonQuantClient(options = {}) {
       queue: [],
       workers: [],
     },
+    ingest: {
+      name: "ingest",
+      size: positiveInteger(options.ingestWorkers ?? process.env.PYTHON_CORE_INGEST_WORKERS, 1, 1, 2),
+      maxQueue: positiveInteger(options.ingestQueueLimit ?? process.env.PYTHON_CORE_INGEST_QUEUE_LIMIT, 96, 1, 500),
+      queue: [],
+      workers: [],
+    },
+    maintenance: {
+      name: "maintenance",
+      size: positiveInteger(options.maintenanceWorkers ?? process.env.PYTHON_CORE_MAINTENANCE_WORKERS, 1, 1, 2),
+      maxQueue: positiveInteger(options.maintenanceQueueLimit ?? process.env.PYTHON_CORE_MAINTENANCE_QUEUE_LIMIT, 8, 1, 50),
+      queue: [],
+      workers: [],
+    },
   };
   let closed = false;
 
   function laneFor(operation) {
+    if (MAINTENANCE_OPERATIONS.has(String(operation))) return lanes.maintenance;
+    if (DATA_OPERATIONS.has(String(operation))) return lanes.ingest;
     if (FACTOR_OPERATIONS.has(String(operation))) return lanes.factor;
     return LOW_PRIORITY_OPERATIONS.has(String(operation)) ? lanes.research : lanes.interactive;
   }
@@ -147,6 +179,7 @@ function createPythonQuantClient(options = {}) {
     if (!task || task.settled) return;
     task.settled = true;
     clearTimeout(task.timer);
+    clearTimeout(task.queueTimer);
     task.cleanup?.();
     task.reject(error);
   }
@@ -155,6 +188,7 @@ function createPythonQuantClient(options = {}) {
     if (!task || task.settled) return;
     task.settled = true;
     clearTimeout(task.timer);
+    clearTimeout(task.queueTimer);
     task.cleanup?.();
     task.resolve(value);
   }
@@ -195,6 +229,8 @@ function createPythonQuantClient(options = {}) {
       const task = lane.queue.shift();
       worker.active = task;
       clearTimeout(worker.idleTimer);
+      clearTimeout(task.queueTimer);
+      task.queueTimer = null;
       task.startedAt = Date.now();
       task.timer = setTimeout(() => {
         const error = Object.assign(
@@ -346,6 +382,7 @@ function createPythonQuantClient(options = {}) {
         resolve,
         reject,
         timer: null,
+        queueTimer: null,
         settled: false,
         cleanup: null,
       };
@@ -363,6 +400,22 @@ function createPythonQuantClient(options = {}) {
       task.cleanup = () => options.signal?.removeEventListener?.("abort", onAbort);
       options.signal?.addEventListener?.("abort", onAbort, { once: true });
       lane.queue.push(task);
+      const defaultQueueTimeoutMs = lane.name === "research"
+        ? 30 * 60_000
+        : lane.name === "ingest" || lane.name === "maintenance"
+          ? 3 * 60_000
+          : 5 * 60_000;
+      const queueTimeoutMs = Math.max(5_000, Number(process.env[`PYTHON_CORE_${lane.name.toUpperCase()}_QUEUE_TIMEOUT_MS`] || defaultQueueTimeoutMs));
+      task.queueTimer = setTimeout(() => {
+        const queuedIndex = lane.queue.findIndex((entry) => entry.id === task.id);
+        if (queuedIndex < 0) return;
+        lane.queue.splice(queuedIndex, 1);
+        rejectTask(task, Object.assign(
+          new Error(`Python ${lane.name} queue wait exceeded ${queueTimeoutMs}ms before ${task.operation} could start.`),
+          { code: "PYTHON_CORE_QUEUE_TIMEOUT", lane: lane.name, operation: task.operation },
+        ));
+      }, queueTimeoutMs);
+      task.queueTimer.unref?.();
       dispatchLane(lane);
     });
   }

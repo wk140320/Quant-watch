@@ -18,6 +18,8 @@ This project is for research and personal analysis only. It is not financial adv
 - News and macro signal aggregation from configured providers plus free fallbacks where available.
 - Portfolio-aware alerts, stop-loss checks, position sizing, and cash reserve rules.
 - Prediction sample tracking with hit-rate buckets, failure penalties, confidence calibration, and learning visibility.
+- Versioned continuous learning with immutable 5-day OOF evidence, fixed-test and rolling progress curves, hard Champion/Challenger promotion gates, and explicit no-improvement records.
+- A local Parquet + DuckDB data lake with Qlib-compatible OHLCV columns, canonical market keys, incremental deduplication, and cached feature/backtest reuse.
 - Paper-trading agents that preserve strategy memory across reset cycles.
 - Local snapshots for off-hours or provider outage fallback.
 - Multi-page workspaces for monitoring, bottom-level feature analysis, factor experiments, market regime, strategy review, simulation, and account readiness.
@@ -130,6 +132,9 @@ TIINGO_API_KEY=
 TIINGO_API_KEYS=
 MARKETAUX_API_KEY=
 FRED_API_KEY=
+SIMFIN_API_KEY=
+FMP_API_KEY=
+OPENFIGI_API_KEY=
 ```
 
 `EODHD_API_KEYS`, `TWELVEDATA_API_KEYS`, and `TIINGO_API_KEYS` accept comma-separated backup credentials. The singular key remains primary; backups are tried in order only after quota, authentication, or plan-permission failures. Keys are never round-robin consumed and are never returned to the browser.
@@ -154,6 +159,21 @@ OPENAI_API_KEY=
 - Paper Agents are backend-owned and persisted in SQLite. Browser refreshes only update the display; they do not advance the Paper ledger.
 - Changing Paper Agent capital preserves positions, trades, and learning memory. Browser migration is non-destructive: an empty or poorer browser ledger cannot replace a richer backend ledger.
 - Paper fills require an open market, a real provider source, a positive price, and a current completed bar timestamp. Live broker execution is always disabled.
+- Historical US fundamentals combine SEC Company Facts with SimFin `asreported=true` statements. FMP contributes cached delisting and symbol-change events; OpenFIGI validates current identifiers but is deliberately excluded from historical-universe coverage.
+- PIT enrichment is a background data-lake job. Provider failures are isolated per source, and current snapshots never receive a historical-availability flag unless the provider supplies a verifiable publication or effective timestamp.
+
+## Model Training And Evidence
+
+P0-P2 uses immutable model versions, point-in-time data versions, strict OOF gates, and separate market-level and stock-level factor evidence. See [P0-P2 completion and evidence boundary](docs/p0-p2-completion.md) for current sample sizes, metrics, and unresolved data-coverage blockers.
+
+Local factor research can be reproduced without blocking the web server:
+
+```bash
+.venv/bin/python tools/run_factor_research.py --market ASX --scope market --limit 200 --min-rows 750 --horizons 5
+.venv/bin/python tools/run_factor_research.py --market ASX --scope stock --symbols BHP,CBA,CPU,CAR,MIN --min-rows 260 --horizons 5
+```
+
+Research completion is not production approval. Failed OOF, calibration, stability, or cost gates keep the artifact in Research/Shadow with zero live execution weight.
 
 ## Background Runtime
 
@@ -164,6 +184,10 @@ Open `GlobalQuantMonitor.app` to inspect model trajectories, start or pause the 
 The model-operations workspace reads persisted local evidence rather than inventing a visual history. `GET /api/model-trajectories?market=ASX` normalizes calibration, factor research, alpha evolution, intraday learning, adaptive correction, and Paper Agent events into one explainable timeline with formulas, sample counts, reasons, guardrails, and improvement/degradation states.
 
 The training supervisor persists each market cycle under `.cache/training-supervisor/`. A cycle moves through queued, training, reviewing, automatic rework, accepted, or needs-attention states. Acceptance requires both the deterministic point-in-time/OOF/calibration/cost gate and at least two independent AI approvals. Rework may expand the universe and history or tighten ensemble constraints, but it never lowers acceptance thresholds. An accepted cycle remains Shadow/Research evidence; it cannot place live orders or promote itself directly to production.
+
+Continuous learning is evidence-driven rather than run-count-driven. Daily evaluation resolves matured labels without refitting; weekly Challenger training requires at least 100 newly resolved labels across five independent dates; monthly full training requires at least 1,000 resolved rows across 120 dates. Only the 5-day model can be promoted in the first stage. A Challenger must improve fixed-test direction accuracy by at least one percentage point, avoid regression in four of five folds, keep positive Brier Skill and ECE at or below 5%, and pass high-confidence signal checks. Failed or unchanged runs remain visible but never replace the Champion.
+
+Paper Agent `generation_v1` is archived read-only as the historical loss baseline. `generation_v2` starts in Shadow mode with separate capital, OOF-only nightly replay, weekly parameter updates, six-position/12%-per-stock/25%-per-sector limits, at least 25% cash, and loss-streak circuit breakers. Observational or in-sample predictions cannot update its policy.
 
 The local control plane exposes:
 
@@ -182,6 +206,9 @@ POST /api/training-supervisor/review
 POST /api/training-supervisor/config
 POST /api/jobs/training|backtest|news|reddit|monitor
 GET  /api/jobs/:id
+GET  /api/learning-progress?market=ASX
+GET  /api/training-runs/:id
+GET  /api/agent-generations?market=ASX
 ```
 
 GlobalQuantMonitor 的“后台控制”页包含人工监工操作台：可以暂停总调度、暂停单个市场、独立启停三位 AI、填写操作备注、要求返工或重新验收最近完整产物。所有人工动作写入 `.cache/training-supervisor/events.jsonl`；人工操作不能跳过 OOF、PIT、校准、漂移与成本后期望门槛，也不能直接批准生产部署。

@@ -253,7 +253,13 @@ const state = {
   modelReports: [],
   activeModelReport: null,
   modelReportLoading: false,
+  modelReportLoadToken: 0,
   modelReportJobId: null,
+  learningProgress: null,
+  learningTrajectories: null,
+  learningProgressLoading: false,
+  learningProgressLoadToken: 0,
+  agentGenerations: null,
   marketIndexes: [],
   marketIndexSignal: null,
   marketIndexChartSymbol: safeStorage.getItem("marketIndexChartSymbol") || null,
@@ -3089,7 +3095,9 @@ function openStrategyWorkspaceTab(tab) {
     deferUiStep("加载准确率证据", () => fetchAccuracySummary(true), 20, { idle: true });
   } else if (next === "training") {
     renderModelReportPanel();
-    deferUiStep("读取模型训练报告", () => loadModelReports({ quiet: true }), 20, { idle: true });
+    renderLearningProgressPanel();
+    deferUiStep("读取持续学习证据", () => loadLearningProgress({ quiet: true }), 10, { idle: true });
+    deferUiStep("读取模型训练报告", () => loadModelReports({ quiet: true }), 80, { idle: true });
   } else if (next === "agent") {
     renderAgentPanel();
     renderOptimalStrategyPanel();
@@ -3153,7 +3161,9 @@ function setWorkspacePage(page, options = {}) {
       deferWorkspaceStep(next, workspaceToken, "加载准确率证据", () => fetchAccuracySummary(true), 25, { idle: true, timeout: 1400 });
     } else if (strategyTab === "training") {
       renderModelReportPanel();
-      deferWorkspaceStep(next, workspaceToken, "读取模型训练报告", () => loadModelReports({ quiet: true }), 25, { idle: true, timeout: 1400 });
+      renderLearningProgressPanel();
+      deferWorkspaceStep(next, workspaceToken, "读取持续学习证据", () => loadLearningProgress({ quiet: true }), 10, { idle: true, timeout: 1400 });
+      deferWorkspaceStep(next, workspaceToken, "读取模型训练报告", () => loadModelReports({ quiet: true }), 80, { idle: true, timeout: 1600 });
     } else if (strategyTab === "agent") {
       deferWorkspaceStep(next, workspaceToken, "读取 Paper Agent", () => loadPaperAgentBackend(state.market, { silent: true }), 10, { frame: true });
       deferWorkspaceStep(next, workspaceToken, "渲染 Agent", renderAgentPanel, 30, { frame: true });
@@ -6297,15 +6307,17 @@ function modelReportMetric(value, digits = 1, suffix = "") {
 
 function modelReportPrimaryMetrics(model = {}) {
   if (model.family === "market_multitask") {
-    const ensemble = (model.classifiers || []).find((row) => row.id === "ensembleProbability");
+    const ensemble = (model.classifiers || []).find((row) => row.id === "directionProbability")
+      || (model.classifiers || []).find((row) => row.id === "ensembleProbability");
     const metrics = ensemble?.metrics || {};
     return [
-      ["Accuracy", modelReportMetric(metrics.accuracyPct, 1, "%")],
+      ["方向 Balanced Accuracy", modelReportMetric(metrics.balancedAccuracyPct, 1, "%")],
       ["Precision", modelReportMetric(metrics.precisionPct, 1, "%")],
       ["Recall", modelReportMetric(metrics.recallPct, 1, "%")],
       ["F1", modelReportMetric(metrics.f1Pct, 1, "%")],
       ["Brier Skill", modelReportMetric(metrics.brierSkillScore, 3)],
       ["ECE", modelReportMetric(metrics.ecePct, 1, "%")],
+      ["概率分辨率", metrics.probabilityResolutionPassed ? "通过" : `不足 · σ ${modelReportMetric(metrics.probabilityStd, 3)}`],
     ];
   }
   if (model.family === "paper_agent") {
@@ -6345,7 +6357,7 @@ function modelReportCardHtml(model = {}) {
           row.name || row.id,
           "分类",
           modelReportMetric(values.samples, 0),
-          modelReportMetric(values.accuracyPct, 1, "%"),
+          modelReportMetric(values.balancedAccuracyPct, 1, "%"),
           modelReportMetric(values.f1Pct, 1, "%"),
           modelReportMetric(values.brierSkillScore, 3),
         ];
@@ -6388,12 +6400,12 @@ function modelReportCardHtml(model = {}) {
       <div class="model-evidence-metrics">
         ${metrics.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join("")}
       </div>
-      <p>样本 ${formatCompactNumber(sampleCount, 0)}${model.sampleAudit?.independentDates != null ? ` · 独立测试日 ${formatCompactNumber(model.sampleAudit.independentDates, 0)}` : ""}。${escapeHtml(model.reason || model.rationale || model.note || "指标来自本地不可变训练证据。")}</p>
+      <p>样本 ${formatCompactNumber(sampleCount, 0)}${model.sampleAudit?.independentDates != null ? ` · OOF 覆盖日期 ${formatCompactNumber(model.sampleAudit.independentDates, 0)}` : ""}。${escapeHtml(model.reason || model.rationale || model.note || "指标来自本地不可变训练证据。")}</p>
       ${taskRows.length ? `
         <details class="model-task-detail">
           <summary>查看每个模型与任务指标</summary>
           <div class="model-task-table">
-            <div class="head"><span>模型/输出</span><span>任务</span><span>样本</span><span>Accuracy/IC</span><span>F1/MAE</span><span>Brier/Lift</span></div>
+            <div class="head"><span>模型/输出</span><span>任务</span><span>样本</span><span>Balanced Acc./IC</span><span>F1/MAE</span><span>Brier/Lift</span></div>
             ${taskRows.map((row) => `<div>${row.map((value) => `<span>${escapeHtml(String(value))}</span>`).join("")}</div>`).join("")}
           </div>
         </details>
@@ -6401,6 +6413,203 @@ function modelReportCardHtml(model = {}) {
       ${reasons.length ? `<details><summary>查看阻断项</summary><div class="model-report-blockers">${reasons.map((reason) => `<span>${escapeHtml(String(reason))}</span>`).join("")}</div></details>` : ""}
     </article>
   `;
+}
+
+function learningMetric(value, digits = 1, suffix = "%") {
+  return Number.isFinite(Number(value)) ? `${Number(value).toFixed(digits)}${suffix}` : "证据不足";
+}
+
+function drawLearningProgressChart() {
+  const canvas = $("learningProgressChart");
+  if (!canvas || !state.learningProgress || canvas.offsetParent === null) return;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(320, Math.round(rect.width || 720));
+  const height = 260;
+  const ratio = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const fixed = state.learningProgress.curves?.fixed || [];
+  const rolling = state.learningProgress.curves?.rolling || [];
+  const all = [...fixed, ...rolling].filter((point) => Number.isFinite(Number(point.metrics?.accuracyPct)));
+  const left = 46;
+  const right = width - 18;
+  const top = 22;
+  const bottom = height - 34;
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.lineWidth = 1;
+  [40, 50, 60, 70, 80].forEach((tick) => {
+    const y = bottom - (tick - 35) / 50 * (bottom - top);
+    ctx.strokeStyle = tick === 50 ? "rgba(231,192,111,.25)" : "rgba(216,226,232,.08)";
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(right, y);
+    ctx.stroke();
+    ctx.fillStyle = "#89969d";
+    ctx.fillText(`${tick}%`, 8, y + 4);
+  });
+  if (!all.length) {
+    ctx.fillStyle = "#89969d";
+    ctx.textAlign = "center";
+    ctx.fillText("尚无可绘制的已解析精度证据", width / 2, height / 2);
+    ctx.textAlign = "left";
+    return;
+  }
+  const chronology = [...all].sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  const index = new Map(chronology.map((point, position) => [point.id, position]));
+  const xFor = (point) => left + (index.get(point.id) || 0) / Math.max(1, chronology.length - 1) * (right - left);
+  const yFor = (point) => bottom - (Math.max(35, Math.min(85, Number(point.metrics.accuracyPct))) - 35) / 50 * (bottom - top);
+  const line = (points, color, dashed = false) => {
+    const rows = points.filter((point) => index.has(point.id) && Number.isFinite(Number(point.metrics?.accuracyPct)));
+    if (!rows.length) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash(dashed ? [5, 5] : []);
+    ctx.beginPath();
+    rows.forEach((point, position) => {
+      const x = xFor(point);
+      const y = yFor(point);
+      if (position) ctx.lineTo(x, y);
+      else ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+    rows.forEach((point) => {
+      ctx.beginPath();
+      ctx.arc(xFor(point), yFor(point), 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.restore();
+  };
+  line(rolling, "#83b9ee", true);
+  line(fixed, "#e7c06f", false);
+  ctx.fillStyle = "#e7c06f";
+  ctx.fillRect(left, height - 14, 14, 2);
+  ctx.fillStyle = "#c8d2d7";
+  ctx.fillText("固定 OOF", left + 20, height - 10);
+  ctx.strokeStyle = "#83b9ee";
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.moveTo(left + 94, height - 13);
+  ctx.lineTo(left + 108, height - 13);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#c8d2d7";
+  ctx.fillText("滚动观察", left + 114, height - 10);
+}
+
+function renderLearningProgressPanel() {
+  const summary = $("learningProgressSummary");
+  const promotion = $("learningPromotionPanel");
+  const generation = $("agentGenerationPanel");
+  const familiesPanel = $("learningEvidenceFamilies");
+  if (!summary || !promotion || !generation || state.activePage !== "strategy") return;
+  const progress = state.learningProgress;
+  if (!progress) {
+    summary.innerHTML = `<div><span>Champion</span><strong>尚无</strong></div><div><span>5日准确率</span><strong>读取中</strong></div><div><span>独立日期</span><strong>--</strong></div><div><span>本地数据湖</span><strong>--</strong></div><div><span>训练成功率</span><strong>--</strong></div>`;
+    return;
+  }
+  const champion = progress.champion;
+  const observed = progress.observed || {};
+  const latestStrict = progress.latestRun?.evidenceType === "strict_oof" ? progress.latestRun : null;
+  const primaryEvidence = champion || progress.challenger || latestStrict || observed;
+  const accuracyLabel = champion
+    ? "Champion准确率"
+    : progress.challenger
+      ? "最佳OOF准确率"
+      : latestStrict
+        ? "最新OOF准确率"
+        : `${observed.horizon === 5 ? "5日" : "旧周期观察"}准确率`;
+  const reliability = progress.jobReliability || {};
+  summary.innerHTML = `
+    <div><span>Champion</span><strong class="${champion ? "learning-gate-pass" : "learning-gate-hold"}">${escapeHtml(champion?.modelVersion || "未晋级")}</strong></div>
+    <div><span>${accuracyLabel}</span><strong>${learningMetric(primaryEvidence.metrics?.accuracyPct)}</strong></div>
+    <div><span>独立日期</span><strong>${formatCompactNumber(primaryEvidence.samples?.independentDates || 0, 0)} / 120</strong></div>
+    <div><span>本地数据湖</span><strong>${formatCompactNumber(progress.dataLake?.rows || 0, 0)} 行</strong></div>
+    <div><span>训练成功率</span><strong>${learningMetric(reliability.successPct)}</strong></div>
+  `;
+  const blockers = [...new Set([...(progress.blockers || []), ...(progress.challenger?.promotion?.blockers || [])])];
+  promotion.innerHTML = `
+    <h4>${champion ? "当前 Champion 已通过硬门槛" : "晋级仍被阻断"}</h4>
+    <div class="learning-blocker-list">
+      ${(blockers.length ? blockers : ["固定 OOF、概率校准和 Top-K 证据均已通过"]).map((item) => `<span>${escapeHtml(String(item))}</span>`).join("")}
+    </div>
+  `;
+  const current = state.agentGenerations?.current;
+  const constraint = current?.constraintCompliance;
+  generation.innerHTML = `
+    <span>${escapeHtml(current?.generationId || "generation_v2")}</span>
+    <strong>${current ? `${learningMetric(current.winRatePct)} 胜率 · ${formatCompactNumber(current.closedTrades || 0, 0)} 笔平仓` : "Agent 证据读取中"}</strong>
+    <small>${escapeHtml(constraint && !constraint.compliant ? `约束修复中：${constraint.violations} 项违规，已冻结新增买入并渐退` : current?.promotionBlockers?.[0] || "旧账本保留为只读基准")}</small>
+  `;
+  if (familiesPanel) {
+    const labels = { training: "模型训练", factor: "因子研究", alpha: "Alpha 进化", minute: "分钟学习", acceptance: "训练验收", agent: "Agent 学习" };
+    const counts = state.learningTrajectories?.counts || [];
+    familiesPanel.innerHTML = Object.entries(labels).map(([family, label]) => {
+      const rows = counts.filter((row) => row.family === family);
+      const total = rows.reduce((sum, row) => sum + Number(row.count || 0), 0);
+      const complete = rows.filter((row) => row.status === "complete").reduce((sum, row) => sum + Number(row.count || 0), 0);
+      const failed = rows.filter((row) => row.status === "failed").reduce((sum, row) => sum + Number(row.count || 0), 0);
+      return `<div class="learning-evidence-family"><span>${label}</span><strong>${total ? `${formatCompactNumber(total, 0)} 次运行` : "尚未运行"}</strong><small>${total ? `完成 ${formatCompactNumber(complete, 0)} · 失败 ${formatCompactNumber(failed, 0)}` : "不是 0 分，而是没有可用运行证据"}</small></div>`;
+    }).join("");
+  }
+  requestUiFrame(drawLearningProgressChart);
+}
+
+async function loadLearningProgress(options = {}) {
+  const market = safeMarket(options.market || state.market);
+  const requestToken = ++state.learningProgressLoadToken;
+  state.learningProgressLoading = true;
+  try {
+    const [progress, generations, trajectories] = await Promise.all([
+      requestJson(`/api/learning-progress?market=${encodeURIComponent(market)}`),
+      requestJson(`/api/agent-generations?market=${encodeURIComponent(market)}`).catch(() => null),
+      requestJson(`/api/learning-trajectories?market=${encodeURIComponent(market)}&limit=600`).catch(() => null),
+    ]);
+    if (market !== state.market || requestToken !== state.learningProgressLoadToken) return null;
+    state.learningProgress = progress;
+    state.agentGenerations = generations;
+    state.learningTrajectories = trajectories;
+    renderLearningProgressPanel();
+    return progress;
+  } catch (error) {
+    console.warn("Unable to load continuous learning evidence", error);
+    if (!options.quiet) setStatus(`持续学习证据读取失败：${compactDisplayError(error.message || error)}`);
+    return null;
+  } finally {
+    if (requestToken === state.learningProgressLoadToken) state.learningProgressLoading = false;
+  }
+}
+
+async function runLearningMode(mode = "evaluate") {
+  const labels = { evaluate: "评估", incremental: "增量训练", weekly: "周度 Challenger", full: "全量训练" };
+  try {
+    setStatus(`${activeMarketConfig().label} ${labels[mode] || mode}已提交到后台`);
+    const result = await requestJson("/api/training-supervisor/run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ market: state.market, mode, reason: `manual-${mode}`, source: "continuous-learning-ui" }),
+    });
+    if (mode === "evaluate" && result.id) {
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        const job = await requestJson(`/api/jobs/${encodeURIComponent(result.id)}`);
+        if (job.status === "complete" || job.status === "failed") break;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      await loadLearningProgress({ quiet: true });
+      setStatus("持续学习评估已更新；没有新证据时不会重复拟合");
+    } else {
+      setStatus(`${labels[mode] || mode}将在后台运行，未通过门槛的 Challenger 不会覆盖 Champion`);
+    }
+    return result;
+  } catch (error) {
+    setStatus(`${labels[mode] || mode}提交失败：${compactDisplayError(error.message || error)}`);
+    return null;
+  }
 }
 
 function renderModelReportPanel() {
@@ -6451,18 +6660,18 @@ function renderModelReportPanel() {
 }
 
 async function loadModelReports(options = {}) {
-  if (state.modelReportLoading) return state.activeModelReport;
   const market = safeMarket(options.market || state.market);
+  const requestToken = ++state.modelReportLoadToken;
   state.modelReportLoading = true;
   if (!options.quiet) renderModelReportPanel();
   try {
     const payload = await requestJson(`/api/model-reports?market=${encodeURIComponent(market)}&limit=20`);
-    if (market !== state.market) return null;
+    if (market !== state.market || requestToken !== state.modelReportLoadToken) return null;
     state.modelReports = payload.reports || [];
     const latest = state.modelReports[0];
-    state.activeModelReport = latest
-      ? await requestJson(latest.links.json)
-      : null;
+    const evidence = latest ? await requestJson(latest.links.json) : null;
+    if (market !== state.market || requestToken !== state.modelReportLoadToken) return null;
+    state.activeModelReport = evidence;
     renderModelReportPanel();
     return state.activeModelReport;
   } catch (error) {
@@ -6473,7 +6682,7 @@ async function loadModelReports(options = {}) {
     }
     return null;
   } finally {
-    state.modelReportLoading = false;
+    if (requestToken === state.modelReportLoadToken) state.modelReportLoading = false;
   }
 }
 
@@ -8308,7 +8517,8 @@ function productionTrainingSummaryHtml(training = null) {
         return `
           <div class="boost-row">
             <strong>${row.horizon || "-"}日 · ${escapeHtml(row.deploymentStatus || "research")} · OOF ${formatCompactNumber(row.oofRows || 0, 0)}</strong>
-            <span>BSS ${numberOrPending(metrics.brierSkillScore, 3)} · ECE ${numberOrPending(metrics.ecePct, 2)}% · 校准斜率 ${numberOrPending(metrics.calibrationSlope, 2)} · Rank IC ${numberOrPending(ranking.rankIc, 3)} · Top-K lift ${ranking.topDecileLift == null ? "n/a" : formatPct(ranking.topDecileLift)}</span>
+            <span>BSS ${numberOrPending(metrics.brierSkillScore, 3)} · ECE ${numberOrPending(metrics.ecePct, 2)}% · 概率分辨率 ${metrics.probabilityResolutionPassed ? "通过" : "不足"} · Rank IC ${numberOrPending(ranking.rankIc, 3)} · NDCG ${numberOrPending(ranking.ndcgAtK, 3)}</span>
+            <p>Top10目标先到 ${numberOrPending(ranking.top10TargetFirstRatePct, 1)}% · Top10方向 ${numberOrPending(ranking.top10DirectionHitRatePct, 1)}% · Top-K lift ${ranking.topDecileLift == null ? "n/a" : formatPct(ranking.topDecileLift)} · 回撤 ${ranking.maxDrawdownPct == null ? "n/a" : formatPct(-Math.abs(Number(ranking.maxDrawdownPct)))}</p>
             <p>目标/止损/超时 ${row.eventCounts?.target || 0}/${row.eventCounts?.stop || 0}/${row.eventCounts?.timeout || 0} · CQR覆盖 ${quantile.observedCoveragePct == null ? "n/a" : `${Number(quantile.observedCoveragePct).toFixed(1)}%`} · EV ${row.expectedValue?.expectedValuePct == null ? "n/a" : formatPct(row.expectedValue.expectedValuePct)}</p>
             ${weights.length ? `<p class="muted small-text">受约束权重：${weights.map(([name, value]) => `${escapeHtml(name)} ${Math.round(Number(value) * 100)}%`).join(" · ")}</p>` : ""}
             ${failed.length ? `<p class="muted small-text">生产门控未通过：${failed.map(escapeHtml).join("、")}</p>` : ""}
@@ -8888,8 +9098,8 @@ function localSignalModelsHtml(signalModels = null, deepLearning = null, diagnos
   const diagnosticRows = `
     ${split.sampleCount ? `
       <div class="boost-row">
-        <strong>时间序列验证 · Purged Walk-forward</strong>
-        <span>样本 ${split.sampleCount || 0} · 训练 ${split.trainSamples || 0} · 验证 ${split.validationSamples || 0} · 测试 ${split.testSamples || 0} · embargo ${split.embargoSamples || 0}</span>
+        <strong>${split.legacyProvisional ? "Legacy / Provisional 本地诊断" : "时间序列验证"} · Purged Walk-forward</strong>
+        <span>样本 ${split.sampleCount || 0} · 独立信号日 ${split.trainDates || 0}/${split.validationDates || 0}/${split.testDates || 0} · 日期交叉 ${split.dateOverlapCount || 0} · embargo ${split.embargoSamples || 0}</span>
         <p>${escapeHtml(split.note || "训练、验证、测试按时间顺序切分，并在窗口之间留隔离带，降低未来函数和标签重叠风险。")}</p>
       </div>
     ` : ""}
@@ -10697,6 +10907,7 @@ function connectRuntimeEventStream() {
         state.accuracySummary.historicalPredictionModel = job.result.savedModel;
       }
       renderAccuracyPanel();
+      if (state.activePage === "strategy") loadLearningProgress({ quiet: true });
       const trainingCount = job.result.trainingSymbols?.length || job.result.symbolCount || 0;
       const production = job.result.productionTraining;
       setStatus(`市场级训练完成：${trainingCount} 只股票，${formatCompactNumber(production?.dataset?.rawRows || job.result.sampleTotal || 0, 0)} 行，候选状态 ${production?.manifest?.deployment_status || "research"}`);
@@ -10709,6 +10920,20 @@ function connectRuntimeEventStream() {
       loadModelReports({ quiet: true });
       setStatus("新的全模型训练报告已完成并保存到本地");
     }
+  });
+  ["learning.training_recorded", "learning.model_promoted", "paper-agent.replay", "paper-agent.generations_ready"].forEach((eventName) => {
+    stream.addEventListener(eventName, (event) => {
+      try {
+        const envelope = JSON.parse(event.data || "{}");
+        const payload = envelope.payload || envelope;
+        if (payload.market && safeMarket(payload.market) !== state.market) return;
+        if (state.activePage === "strategy" && activeStrategyWorkspaceTab() === "training") {
+          loadLearningProgress({ quiet: true });
+        }
+      } catch {
+        // A malformed progress event cannot interrupt the workspace.
+      }
+    });
   });
   stream.addEventListener("job.failed", (event) => {
     try {
@@ -15004,6 +15229,15 @@ async function switchMarket(nextMarket) {
   state.chartDataCache.clear();
   state.stockPicker = { forecast: [], today: [], rejected: [], failures: [], updatedAt: null };
   state.latestFactorLab = null;
+  state.learningProgressLoadToken += 1;
+  state.modelReportLoadToken += 1;
+  state.learningProgressLoading = false;
+  state.modelReportLoading = false;
+  state.learningProgress = null;
+  state.learningTrajectories = null;
+  state.agentGenerations = null;
+  state.modelReports = [];
+  state.activeModelReport = null;
   state.snapshotUpdatedAt = safeStorage.getItem(snapshotTimeKey()) || null;
   safeUiStep("保存市场选择", () => {
     safeStorage.setItem("selectedMarket", state.market);
@@ -15011,6 +15245,10 @@ async function switchMarket(nextMarket) {
   });
   safeUiStep("更新市场 UI", updateMarketUi);
   safeUiStep("隔离并渲染目标市场视图", renderMarketSwitchShell);
+  if (state.activePage === "strategy" && activeStrategyWorkspaceTab() === "training") {
+    safeUiStep("清空旧市场学习证据", renderLearningProgressPanel);
+    safeUiStep("清空旧市场训练报告", renderModelReportPanel);
+  }
   setStatus(`已切换到${activeMarketConfig().label}；基础面板已可操作，历史数据后台恢复中`);
   state.marketIndexes = [];
   state.marketIndexSignal = null;
@@ -15030,6 +15268,8 @@ async function switchMarket(nextMarket) {
   deferMarketStep(token, "清理恢复后的市场状态", sanitizeActiveMarketState, 360, { idle: true });
   deferMarketStepAsync(token, "加载研究配置", loadResearchConfig, 560, { idle: true, timeout: 3500 });
   deferMarketStepAsync(token, "加载预测准确率", () => state.activePage === "strategy" ? fetchAccuracySummary(true) : false, 820, { idle: true, timeout: 4500 });
+  deferMarketStepAsync(token, "加载持续学习证据", () => state.activePage === "strategy" && activeStrategyWorkspaceTab() === "training" ? loadLearningProgress({ quiet: true }) : false, 900, { idle: true, timeout: 4500 });
+  deferMarketStepAsync(token, "加载模型训练报告", () => state.activePage === "strategy" && activeStrategyWorkspaceTab() === "training" ? loadModelReports({ quiet: true }) : false, 980, { idle: true, timeout: 4500 });
   deferMarketStep(token, "后台渲染市场面板", () => {
     evaluateAlerts();
     queueActiveMainRender();
@@ -15297,6 +15537,9 @@ function boot() {
     setStatus("模型训练报告已刷新");
   });
   bind("generateModelReport", "click", generateModelReportNow);
+  bind("evaluateLearning", "click", () => runLearningMode("evaluate"));
+  bind("runWeeklyLearning", "click", () => runLearningMode("weekly"));
+  bind("runFullLearning", "click", () => runLearningMode("full"));
   ["modelReportFamily", "modelReportHorizon", "modelReportStatus"].forEach((id) => {
     bind(id, "change", renderModelReportPanel);
   });

@@ -22,26 +22,32 @@ function jobSignature(type, payload = {}) {
 function createJobManager(options = {}) {
   const basePath = options.basePath;
   const publish = typeof options.publish === "function" ? options.publish : () => {};
+  const onTerminal = typeof options.onTerminal === "function" ? options.onTerminal : async () => {};
+  const onPersist = typeof options.onPersist === "function" ? options.onPersist : async () => {};
   const handlers = new Map();
   const running = new Map();
   const controllers = new Map();
   const pending = [];
   const maxConcurrent = Math.max(1, Math.min(8, Number(options.maxConcurrent || process.env.BACKGROUND_JOB_CONCURRENCY || 2)));
+  const heavyTypes = new Set(["backtest", "historical-backtest-symbol", "factor-lab", "factor-evolution", "model-report"]);
+  const maxHeavyConcurrent = Math.max(1, Math.min(2, Number(process.env.BACKGROUND_HEAVY_JOB_CONCURRENCY || 1)));
   const maxQueue = Math.max(maxConcurrent, Math.min(500, Number(options.maxQueue || process.env.BACKGROUND_JOB_QUEUE_LIMIT || 48)));
   let activeCount = 0;
+  let activeHeavyCount = 0;
   if (!basePath) throw new Error("Job manager requires a persistence directory.");
 
   const pathFor = (id) => join(basePath, `${String(id).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
 
-  async function save(job) {
+  async function save(job, phase = "update") {
     await mkdir(basePath, { recursive: true });
     await writeFile(pathFor(job.id), JSON.stringify(job, null, 2), "utf8");
+    await onPersist({ ...job }, { phase, trajectory: ["queued", "checkpoint", "complete", "failure", "cancelled", "retry"].includes(phase) });
     return job;
   }
 
   async function saveBestEffort(job, phase = "update") {
     try {
-      await save(job);
+      await save(job, phase);
       return true;
     } catch (error) {
       publish("job.persistence_error", {
@@ -67,7 +73,14 @@ function createJobManager(options = {}) {
   function failureCategory(error) {
     const text = String(error?.message || error || "").toLowerCase();
     if (text.includes("timed out") || text.includes("timeout")) return "timeout";
-    if (text.includes("restart") || text.includes("interrupted")) return "interrupted";
+    if (
+      text.includes("restart")
+      || text.includes("interrupted")
+      || text.includes("client closed")
+      || text.includes("client is closed")
+      || text.includes("worker closed")
+      || text.includes("worker exited")
+    ) return "interrupted";
     if (text.includes("quota") || text.includes("rate limit") || text.includes("429")) return "provider_quota";
     if (text.includes("memory") || text.includes("heap") || text.includes("killed")) return "resource_exhaustion";
     if (text.includes("data") || text.includes("sample") || text.includes("history")) return "data_evidence";
@@ -82,12 +95,40 @@ function createJobManager(options = {}) {
     try {
       files = (await readdir(basePath, { withFileTypes: true }))
         .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .filter((entry) => !type || entry.name.startsWith(`${type.replace(/[^a-zA-Z0-9-]/g, "-")}-`))
         .map((entry) => entry.name);
     } catch {
       return { count: 0, jobs: [] };
     }
+    const timestampFromFilename = (filename) => Number(filename.match(/-(\d{13})-[a-zA-Z0-9]{8}\.json$/)?.[1] || 0);
+    files.sort((left, right) => timestampFromFilename(right) - timestampFromFilename(left) || right.localeCompare(left));
+    const compact = (job) => ({
+      id: job.id,
+      type: job.type,
+      market: job.market,
+      status: job.status,
+      progress: job.progress,
+      detail: job.detail,
+      error: job.error,
+      failureCategory: job.failureCategory,
+      attempt: job.attempt,
+      maxAttempts: job.maxAttempts,
+      trainingRunId: job.trainingRunId,
+      createdAt: job.createdAt,
+      startedAt: job.startedAt,
+      updatedAt: job.updatedAt,
+      finishedAt: job.finishedAt,
+      heartbeatAt: job.heartbeatAt,
+      resultSummary: job.result && typeof job.result === "object" ? {
+        available: job.result.available,
+        framework: job.result.framework,
+        market: job.result.market,
+        productionEligible: job.result.productionEligibility?.eligible ?? job.result.productionEligible,
+      } : null,
+    });
     const rows = [];
     for (const filename of files) {
+      if (rows.length >= limit) break;
       try {
         const job = JSON.parse(await readFile(join(basePath, filename), "utf8"));
         if (type && job.type !== type) continue;
@@ -99,13 +140,13 @@ function createJobManager(options = {}) {
           job.updatedAt = new Date().toISOString();
           await saveBestEffort(job, "restart-reconciliation");
         }
-        rows.push(job);
+        rows.push(compact(job));
       } catch {
         // Corrupt job files remain isolated and do not block the job list.
       }
     }
     rows.sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")));
-    return { count: Math.min(rows.length, limit), jobs: rows.slice(0, limit) };
+    return { count: rows.length, jobs: rows };
   }
 
   async function reconcile() {
@@ -118,28 +159,68 @@ function createJobManager(options = {}) {
       return { scanned: 0, repaired: 0 };
     }
     let repaired = 0;
+    let resumed = 0;
     for (const filename of files) {
       try {
         const job = JSON.parse(await readFile(join(basePath, filename), "utf8"));
         if (!["running", "queued"].includes(job.status)) continue;
-        job.status = "failed";
-        job.error = "Background job was interrupted before the backend completed it.";
-        job.failureCategory = "interrupted";
-        job.finishedAt = new Date().toISOString();
-        job.updatedAt = job.finishedAt;
-        job.heartbeatAt = job.finishedAt;
-        await saveBestEffort(job, "startup-reconciliation");
+        const maxAttempts = Math.max(Number(job.maxAttempts || 1), job.type === "backtest" ? 3 : 2);
+        const restartBudgetExhausted = job.resumedAfterRestart === true
+          && Number(job.attempt || 1) >= maxAttempts;
+        const resumable = !restartBudgetExhausted
+          && Number(job.runtimeVersion || 0) >= 2
+          && [
+            "backtest",
+            "historical-backtest-symbol",
+            "factor-lab",
+            "factor-evolution",
+            "model-report",
+            "agent-replay",
+            "pit-enrichment",
+          ].includes(String(job.type))
+          && handlers.has(String(job.type));
+        if (resumable) {
+          const previousRuntimeVersion = Number(job.runtimeVersion || 0);
+          job.migratedFromRuntimeVersion = job.migratedFromRuntimeVersion || previousRuntimeVersion;
+          job.runtimeVersion = 3;
+          job.maxAttempts = maxAttempts;
+          job.attempt = Math.min(job.maxAttempts, Number(job.attempt || 1) + 1);
+          job.status = "queued";
+          job.progress = Math.min(Number(job.progress || 0), 0.1);
+          job.error = null;
+          job.failureCategory = null;
+          job.resumedAfterRestart = true;
+          job.payload = { ...(job.payload || {}), resume: true, trainingRunId: job.trainingRunId };
+          job.updatedAt = new Date().toISOString();
+          job.heartbeatAt = job.updatedAt;
+          running.set(job.id, job);
+          pending.push(job);
+          await saveBestEffort(job, "startup-resume");
+          resumed += 1;
+        } else {
+          job.status = "failed";
+          job.error = restartBudgetExhausted
+            ? "Background job exhausted its restart budget; persisted fold checkpoints remain available to a new training run."
+            : "Background job was interrupted before the backend completed it.";
+          job.failureCategory = restartBudgetExhausted ? "restart_budget_exhausted" : "interrupted";
+          job.finishedAt = new Date().toISOString();
+          job.updatedAt = job.finishedAt;
+          job.heartbeatAt = job.finishedAt;
+          await saveBestEffort(job, "startup-reconciliation");
+        }
         repaired += 1;
       } catch {
         // A damaged task file is isolated and cannot block startup.
       }
     }
-    if (repaired) publish("job.reconciled", { scanned: files.length, repaired });
-    return { scanned: files.length, repaired };
+    if (resumed) pump();
+    if (repaired) publish("job.reconciled", { scanned: files.length, repaired, resumed });
+    return { scanned: files.length, repaired, resumed };
   }
 
   function isRunning(id) {
-    return running.has(id);
+    const job = running.get(id);
+    return Boolean(job && ["queued", "running"].includes(job.status));
   }
 
   function register(type, handler) {
@@ -154,11 +235,14 @@ function createJobManager(options = {}) {
     let requeued = false;
     try {
       job.status = "running";
+      job.error = null;
+      job.failureCategory = null;
+      delete job.finishedAt;
       job.progress = 0.05;
       job.updatedAt = new Date().toISOString();
       job.heartbeatAt = job.updatedAt;
       job.queueWaitMs = Math.max(0, Date.now() - new Date(job.createdAt).getTime());
-      await save(job);
+      await save(job, "running");
       publish("job.running", { id: job.id, type: job.type, market: job.market, queueWaitMs: job.queueWaitMs });
       const update = async (progress, detail = {}) => {
         if (controller.signal.aborted) {
@@ -168,8 +252,22 @@ function createJobManager(options = {}) {
         job.updatedAt = new Date().toISOString();
         job.heartbeatAt = job.updatedAt;
         job.detail = detail;
-        await save(job);
+        await save(job, "progress");
         publish("job.progress", { id: job.id, type: job.type, progress: job.progress, detail });
+      };
+      const checkpoint = async (name, value = {}) => {
+        const key = String(name || "checkpoint").replace(/[^a-zA-Z0-9_-]/g, "_");
+        job.checkpoints = job.checkpoints || {};
+        job.checkpoints[key] = {
+          ...(job.checkpoints[key] || {}),
+          ...value,
+          completedAt: new Date().toISOString(),
+        };
+        job.updatedAt = new Date().toISOString();
+        job.heartbeatAt = job.updatedAt;
+        await save(job, "checkpoint");
+        publish("job.checkpoint", { id: job.id, type: job.type, market: job.market, name: key });
+        return job.checkpoints[key];
       };
       heartbeatTimer = setInterval(() => {
         job.heartbeatAt = new Date().toISOString();
@@ -177,17 +275,30 @@ function createJobManager(options = {}) {
         void saveBestEffort(job, "heartbeat");
       }, 10_000);
       heartbeatTimer.unref?.();
-      job.result = await handler(job.payload, update, { signal: controller.signal, job });
+      job.result = await handler(job.payload, update, {
+        signal: controller.signal,
+        job,
+        checkpoint,
+        checkpoints: job.checkpoints || {},
+      });
       if (controller.signal.aborted) {
         throw Object.assign(new Error("Background job was cancelled."), { code: "JOB_CANCELLED" });
       }
       job.status = "complete";
+      job.error = null;
+      job.failureCategory = null;
       job.progress = 1;
       job.updatedAt = new Date().toISOString();
       job.heartbeatAt = job.updatedAt;
       job.runTimeMs = Math.max(0, Date.now() - new Date(job.startedAt || job.createdAt).getTime());
-      await save(job);
+      await save(job, "complete");
       publish("job.complete", { id: job.id, type: job.type, market: job.market, runTimeMs: job.runTimeMs });
+      await onTerminal({ ...job }).catch((error) => publish("job.terminal_callback_error", {
+        id: job.id,
+        type: job.type,
+        market: job.market,
+        error: error?.message || String(error),
+      }));
     } catch (error) {
       job.error = error.message || String(error);
       job.failureCategory = error?.code === "JOB_CANCELLED" ? "cancelled" : failureCategory(error);
@@ -198,11 +309,22 @@ function createJobManager(options = {}) {
         job.finishedAt = job.updatedAt;
         await saveBestEffort(job, "cancelled");
         publish("job.cancelled", { id: job.id, type: job.type, market: job.market });
+        await onTerminal({ ...job }).catch(() => null);
         return;
       }
       const retryable = ["timeout", "interrupted", "resource_exhaustion"].includes(job.failureCategory);
       if (retryable && Number(job.attempt || 1) < Number(job.maxAttempts || 1)) {
         job.attempt = Number(job.attempt || 1) + 1;
+        job.payload = {
+          ...job.payload,
+          rework: {
+            ...(job.payload?.rework || {}),
+            reason: job.failureCategory,
+            previousAttempt: job.attempt - 1,
+            resourceScale: Math.min(2.5, 1 + (job.attempt - 1) * 0.5),
+            requestedAt: new Date().toISOString(),
+          },
+        };
         job.status = "queued";
         job.progress = Math.min(Number(job.progress || 0), 0.10);
         job.nextRetryAt = new Date(Date.now() + 1_000).toISOString();
@@ -224,11 +346,13 @@ function createJobManager(options = {}) {
         job.status = "failed";
         await saveBestEffort(job, "failure");
         publish("job.failed", { id: job.id, type: job.type, market: job.market, error: job.error });
+        await onTerminal({ ...job }).catch(() => null);
       }
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       controllers.delete(job.id);
       activeCount = Math.max(0, activeCount - 1);
+      if (heavyTypes.has(job.type)) activeHeavyCount = Math.max(0, activeHeavyCount - 1);
       if (!requeued) running.delete(job.id);
       pump();
     }
@@ -236,8 +360,13 @@ function createJobManager(options = {}) {
 
   function pump() {
     while (activeCount < maxConcurrent && pending.length) {
-      const job = pending.shift();
+      const runnableIndex = pending.findIndex((candidate) => (
+        !heavyTypes.has(candidate.type) || activeHeavyCount < maxHeavyConcurrent
+      ));
+      if (runnableIndex < 0) break;
+      const [job] = pending.splice(runnableIndex, 1);
       activeCount += 1;
+      if (heavyTypes.has(job.type)) activeHeavyCount += 1;
       job.startedAt = new Date().toISOString();
       setTimeout(() => {
         void execute(job);
@@ -264,7 +393,7 @@ function createJobManager(options = {}) {
       id: `${String(type).replace(/[^a-z0-9-]/gi, "-")}-${Date.now()}-${randomUUID().slice(0, 8)}`,
       type: String(type),
       signature,
-      runtimeVersion: 2,
+      runtimeVersion: 3,
       market: payload.market || null,
       status: "queued",
       progress: 0,
@@ -276,14 +405,17 @@ function createJobManager(options = {}) {
       attempt: 1,
       maxAttempts: Math.max(1, Math.min(3, Number(
         payload.maxAttempts
-        || (String(type) === "factor-lab" ? process.env.FACTOR_LAB_JOB_ATTEMPTS || 2 : 1)
+        || (String(type) === "backtest"
+          ? process.env.BACKTEST_JOB_ATTEMPTS || 3
+          : String(type) === "factor-lab" ? process.env.FACTOR_LAB_JOB_ATTEMPTS || 2 : 1)
       ))),
       result: null,
       error: null,
+      checkpoints: {},
     };
     running.set(job.id, job);
     pending.push(job);
-    await save(job);
+    await save(job, "queued");
     publish("job.queued", {
       id: job.id,
       type: job.type,
@@ -310,6 +442,18 @@ function createJobManager(options = {}) {
       job.finishedAt = job.updatedAt;
       await saveBestEffort(job, "cancelled-while-queued");
       publish("job.cancelled", { id: job.id, type: job.type, market: job.market });
+      await onTerminal({ ...job }).catch(() => null);
+      return job;
+    }
+    if (!running.has(id)) {
+      job.status = "cancelled";
+      job.error = "Persisted background job was cancelled after its original runtime ended.";
+      job.failureCategory = "cancelled";
+      job.updatedAt = new Date().toISOString();
+      job.finishedAt = job.updatedAt;
+      await saveBestEffort(job, "cancelled-after-restart");
+      publish("job.cancelled", { id: job.id, type: job.type, market: job.market });
+      await onTerminal({ ...job }).catch(() => null);
       return job;
     }
     controllers.get(id)?.abort();
@@ -324,6 +468,8 @@ function createJobManager(options = {}) {
       active: activeCount,
       queued: pending.length,
       maxConcurrent,
+      activeHeavy: activeHeavyCount,
+      maxHeavyConcurrent,
       maxQueue,
       running: [...running.values()]
         .filter((job) => job.status === "running")

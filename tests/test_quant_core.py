@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,10 +13,23 @@ sys.path.insert(0, str(ROOT / "quant_core"))
 
 from alpha_mining import analyze_alpha_evolution  # noqa: E402
 from data_quality import assess_candle_quality  # noqa: E402
+from data_lake import (  # noqa: E402
+    audit as audit_data_lake,
+    read_panel as read_data_lake_panel,
+    read_pit_panel as read_data_lake_pit_panel,
+    read_rows as read_data_lake_rows,
+    summary as data_lake_summary,
+    upsert as upsert_data_lake,
+    upsert_panel as upsert_data_lake_panel,
+    upsert_pit_batches,
+    upsert_pit_records,
+)
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features  # noqa: E402
 from historical_backtest import adaptive_barriers, outcome_window, run_historical_backtest  # noqa: E402
-from local_model import train_local_model_suite  # noqa: E402
+from local_model import split_audit, split_supervised_rows, train_local_model_suite  # noqa: E402
 from model_reporting import (  # noqa: E402
+    _job_header,
+    _job_summary,
     block_bootstrap_ci,
     build_report_evidence,
     classification_metrics,
@@ -25,9 +39,9 @@ from model_reporting import (  # noqa: E402
     rank_metrics,
     read_oof_rows,
 )
-from paper_agents import configure as configure_paper_agents, list_agent_events, load_state as load_paper_agent_state, migrate as migrate_paper_agents, step as step_paper_agents  # noqa: E402
+from paper_agents import configure as configure_paper_agents, list_agent_events, list_generations as list_paper_agent_generations, load_state as load_paper_agent_state, migrate as migrate_paper_agents, replay_oof as replay_paper_agents, save_state as save_paper_agent_state, step as step_paper_agents, upgrade_generation as upgrade_paper_agent_generation  # noqa: E402
 from provider_budget import provider_plan  # noqa: E402
-from production_training import build_market_dataset, fit_constrained_stack, point_in_time_features, purged_walk_forward_folds  # noqa: E402
+from production_training import _date_level_regime_predictions, _event_fold_predictions, _fallback_baseline_predictions, _fold_checkpoint_context, _load_latest_eligible_dataset_cache, _save_dataset_cache, brier_skilled_models, build_market_dataset, calibration_metrics, fit_constrained_stack, fit_probability_calibrator, point_in_time_features, purged_walk_forward_folds, recover_oof_artifacts, verified_pit_coverage  # noqa: E402
 from risk import assess_portfolio, build_paper_order_intent  # noqa: E402
 from store import append_event, control_plane_summary, list_events, list_market_rows, market_data_summary, record_market_rows, record_order_intent  # noqa: E402
 from trades import analyze_trades  # noqa: E402
@@ -94,6 +108,8 @@ def prediction_samples(count=48):
     pattern = [-3.0, -1.8, -0.7, 0.4, 1.1, 2.2, 3.1, 4.0, 1.6, -0.4, 2.7, -2.4]
     rows = []
     for index in range(count):
+        signal_date = date(2026, 1, 2) + timedelta(days=index)
+        resolved_date = signal_date + timedelta(days=15)
         actual = pattern[index % len(pattern)] + (0.03 if index % 2 == 0 else -0.02)
         target_wins = actual >= 2.0
         stop_wins = actual <= -2.0
@@ -104,8 +120,8 @@ def prediction_samples(count=48):
                 "id": f"unit-{index}",
                 "market": "US",
                 "symbol": "UNIT",
-                "createdAt": f"2026-03-{(index % 28) + 1:02d}T09:{index % 60:02d}:00Z",
-                "asOfDate": f"2026-03-{(index % 28) + 1:02d}",
+                "createdAt": f"{signal_date.isoformat()}T09:{index % 60:02d}:00Z",
+                "asOfDate": signal_date.isoformat(),
                 "action": "WATCH_BUY" if target_wins else "HOLD_WATCH",
                 "confidence": 62 if target_wins else 44,
                 "predictionConfidence": 62 if target_wins else 44,
@@ -140,7 +156,7 @@ def prediction_samples(count=48):
                 },
                 "outcome": {
                     "resolved": True,
-                    "resolvedAt": f"2026-04-{(index % 28) + 1:02d}T09:{index % 60:02d}:00Z",
+                    "resolvedAt": f"{resolved_date.isoformat()}T09:{index % 60:02d}:00Z",
                     "forwardReturnPct": actual,
                     "maxUpsidePct": max(0, actual + 0.8),
                     "maxDrawdownPct": min(0, actual - 1.2),
@@ -351,13 +367,14 @@ class QuantCoreTests(unittest.TestCase):
         self.assertIn("buyPressure5", feature_head["featureNames"])
         self.assertIn("profileDistance", feature_head["featureNames"])
         self.assertIn("volumeAccel", feature_head["featureNames"])
-        self.assertEqual(result["splitAudit"]["method"], "purged_walk_forward_embargo")
+        self.assertEqual(result["splitAudit"]["method"], "signal-date-grouped-purged-walk-forward-embargo")
+        self.assertEqual(result["splitAudit"]["dateOverlapCount"], 0)
         self.assertGreater(result["splitAudit"]["testSamples"], 0)
         self.assertIn("target", result["calibrationDiagnostics"])
         self.assertIn("stop", result["calibrationDiagnostics"])
         self.assertEqual(result["noTradeGate"]["framework"], "no-trade-quality-gate")
         self.assertGreater(result["noTradeGate"]["sampleCount"], 0)
-        self.assertEqual(result["signalModels"]["splitAudit"]["method"], "purged_walk_forward_embargo")
+        self.assertEqual(result["signalModels"]["splitAudit"]["method"], "signal-date-grouped-purged-walk-forward-embargo")
         self.assertIn("noTradeGate", result["signalModels"])
         self.assertIn("lightgbm", result)
         self.assertIn("tripleBarrier", result)
@@ -485,8 +502,8 @@ class QuantCoreTests(unittest.TestCase):
     def test_point_in_time_join_excludes_future_rows_without_counting_a_leak(self):
         item = {
             "pointInTimeFeatures": [
-                {"available_at": "2025-02-01T08:00:00Z", "values": {"eventSentiment": 0.7}},
-                {"available_at": "2025-05-01T08:00:00Z", "values": {"eventSentiment": -0.9}},
+                {"event_time": "2025-02-01T08:00:00Z", "available_at": "2025-02-01T08:00:00Z", "historicalAvailabilityVerified": True, "values": {"eventSentiment": 0.7}},
+                {"event_time": "2025-05-01T08:00:00Z", "available_at": "2025-05-01T08:00:00Z", "historicalAvailabilityVerified": True, "values": {"eventSentiment": -0.9}},
             ]
         }
         joined = point_in_time_features(item, "2025-03-01", "US")
@@ -495,10 +512,41 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(joined["joinViolationCount"], 0)
         self.assertGreater(joined["values"]["eventSentiment"], 0)
 
+    def test_unverified_point_in_time_rows_are_blocked_and_audited(self):
+        joined = point_in_time_features({
+            "pointInTimeFeatures": [{
+                "event_time": "2025-02-01T08:00:00Z",
+                "available_at": "2025-02-01T08:00:00Z",
+                "historicalAvailabilityVerified": False,
+                "values": {"eventSentiment": 1.0},
+            }],
+        }, "2025-03-01", "US")
+        self.assertEqual(joined["sourceRows"], 0)
+        self.assertEqual(joined["unverifiedRowsExcluded"], 1)
+        self.assertEqual(joined["joinViolationCount"], 1)
+        self.assertEqual(joined["values"]["eventSentiment"], 0.0)
+
+    def test_local_model_split_keeps_each_signal_date_in_one_partition(self):
+        rows = [
+            {"date": (date(2024, 1, 1) + timedelta(days=day)).isoformat(), "symbol": f"S{symbol}"}
+            for day in range(80) for symbol in range(5)
+        ]
+        train, validation, test = split_supervised_rows(rows)
+        train_dates = {row["date"] for row in train}
+        validation_dates = {row["date"] for row in validation}
+        test_dates = {row["date"] for row in test}
+        self.assertFalse(train_dates & validation_dates)
+        self.assertFalse(train_dates & test_dates)
+        self.assertFalse(validation_dates & test_dates)
+        self.assertEqual(split_audit(rows)["dateOverlapCount"], 0)
+
     def test_market_dataset_and_purged_folds_keep_training_before_test(self):
         dataset = build_market_dataset(panel_items(230), market="US", horizons=[5], target_upside=3, stop_loss=3)
         self.assertGreater(dataset["summary"]["rawRows"], 500)
         self.assertEqual(dataset["summary"]["pointInTimeJoinViolationCount"], 0)
+        self.assertIn("xsMomentum5Rank", dataset["summary"]["activeFeatureNames"])
+        self.assertIn("actualDirection", dataset["rows"][0])
+        self.assertEqual(len(dataset["rows"][0]["x"]), dataset["summary"]["activeFeatureCount"])
         folds = purged_walk_forward_folds(dataset["rows"], horizon=5, fold_count=3, embargo_days=7, min_train_dates=70, test_dates=25)
         self.assertGreaterEqual(len(folds), 2)
         dates = sorted({row["date"] for row in dataset["rows"]})
@@ -506,6 +554,48 @@ class QuantCoreTests(unittest.TestCase):
             train_index = dates.index(fold["trainEnd"])
             test_index = dates.index(fold["testStart"])
             self.assertGreaterEqual(test_index - train_index - 1, 12)
+
+    def test_adjusted_prices_do_not_claim_verified_corporate_action_history(self):
+        adjusted_only = panel_items(120)
+        for item in adjusted_only:
+            item["corporateActionAdjusted"] = True
+            for index, candle in enumerate(item["candles"]):
+                candle["date"] = (date(2024, 1, 2) + timedelta(days=index)).isoformat()
+        dataset = build_market_dataset(adjusted_only, market="US", horizons=[5], target_upside=3, stop_loss=3)
+        self.assertEqual(dataset["summary"]["adjustedPriceCoveragePct"], 100.0)
+        self.assertEqual(dataset["summary"]["corporateActionCoveragePct"], 0.0)
+
+        with_verified_history = panel_items(120)
+        for item in with_verified_history:
+            item["corporateActionAdjusted"] = True
+            for index, candle in enumerate(item["candles"]):
+                candle["date"] = (date(2024, 1, 2) + timedelta(days=index)).isoformat()
+            item["corporateActions"] = [{
+                "event_time": "2024-01-01T00:00:00Z",
+                "available_at": "2024-01-01T00:00:00Z",
+                "historicalAvailabilityVerified": True,
+            }]
+        verified = build_market_dataset(with_verified_history, market="US", horizons=[5], target_upside=3, stop_loss=3)
+        self.assertEqual(verified["summary"]["adjustedPriceCoveragePct"], 100.0)
+        self.assertEqual(verified["summary"]["corporateActionCoveragePct"], 100.0)
+
+    def test_event_fold_predicts_each_oof_row_without_batch_shape_error(self):
+        train = [
+            {
+                "eventCoverage": 1.0,
+                "eventX": [1.0, index / 700.0, (index % 7) / 7.0],
+                "actualTarget": 1.0 if index % 3 else 0.0,
+                "trainingWeight": 1.0,
+            }
+            for index in range(700)
+        ]
+        test = [
+            {"eventCoverage": 1.0, "eventX": [1.0, index / 20.0, (index % 5) / 5.0]}
+            for index in range(20)
+        ]
+        predictions = _event_fold_predictions(train, test)
+        self.assertEqual(len(predictions), len(test))
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in predictions))
 
     def test_market_dataset_quarantines_cross_market_and_duplicate_rows(self):
         items = panel_items(120)
@@ -561,6 +651,58 @@ class QuantCoreTests(unittest.TestCase):
         self.assertTrue(interval["available"])
         self.assertEqual(interval["low"], 100)
         self.assertEqual(interval["high"], 100)
+
+    def test_model_report_job_summary_reads_bounded_headers_from_large_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / ".cache" / "background-jobs"
+            jobs.mkdir(parents=True)
+            complete = jobs / "backtest-large.json"
+            complete.write_text(
+                '{"id":"backtest-large","type":"backtest","runtimeVersion":3,'
+                '"market":"CN","status":"complete","createdAt":"2026-08-10T00:00:00Z",'
+                '"updatedAt":"2026-08-10T00:01:00Z","result":{"rows":"'
+                + ("x" * 2_000_000)
+                + '"}}',
+                "utf-8",
+            )
+            failed = jobs / "backtest-failed.json"
+            failed.write_text(
+                '{"id":"backtest-failed","type":"backtest","runtimeVersion":3,'
+                '"market":"CN","status":"failed","failureCategory":"oof_training",'
+                '"createdAt":"2026-08-10T00:02:00Z","updatedAt":"2026-08-10T00:03:00Z"}',
+                "utf-8",
+            )
+            self.assertEqual(_job_header(complete)["status"], "complete")
+            summary = _job_summary(root)
+            self.assertEqual(summary["total"], 2)
+            self.assertEqual(summary["status"]["complete"], 1)
+            self.assertEqual(summary["failureCategories"]["oof_training"], 1)
+
+    def test_direction_reporting_uses_final_return_label_not_target_path(self):
+        rows = [
+            {
+                "date": f"2026-02-{index + 1:02d}",
+                "actualTarget": 0,
+                "actualDirection": 1 if index % 2 == 0 else 0,
+                "directionProbability": 0.8 if index % 2 == 0 else 0.2,
+                "actualReturn": 1.0 if index % 2 == 0 else -1.0,
+            }
+            for index in range(20)
+        ]
+        metrics = classification_metrics(rows, "directionProbability", "actualDirection")
+        self.assertEqual(metrics["balancedAccuracyPct"], 100)
+        self.assertGreater(metrics["brierSkillScore"], 0)
+
+    def test_reporting_auc_handles_tied_scores_with_rank_statistic(self):
+        rows = [
+            {"date": "2026-03-01", "actualDirection": 0, "directionProbability": 0.1},
+            {"date": "2026-03-02", "actualDirection": 1, "directionProbability": 0.2},
+            {"date": "2026-03-03", "actualDirection": 0, "directionProbability": 0.2},
+            {"date": "2026-03-04", "actualDirection": 1, "directionProbability": 0.9},
+        ]
+        metrics = classification_metrics(rows, "directionProbability", "actualDirection")
+        self.assertEqual(metrics["rocAuc"], 0.875)
 
     def test_prediction_id_is_stable_and_versioned(self):
         row = {
@@ -667,9 +809,147 @@ class QuantCoreTests(unittest.TestCase):
         self.assertAlmostEqual(sum(weights), 1.0, places=7)
         self.assertTrue(all(0 <= value <= 0.400001 for value in weights))
 
+    def test_meta_stack_rejects_models_worse_than_the_class_prior(self):
+        rows = [
+            {
+                "actualTarget": target,
+                "evaluationWeight": 1.0,
+                "good": 0.8 if target else 0.2,
+                "bad": 0.1 if target else 0.9,
+            }
+            for target in ([0, 1] * 80)
+        ]
+        kept, rejected = brier_skilled_models(rows, ["good", "bad"])
+        self.assertEqual(kept, ["good"])
+        self.assertEqual(rejected[0]["model"], "bad")
+
+    def test_isotonic_requires_independent_dates_not_only_many_stock_rows(self):
+        probabilities = [0.35, 0.65] * 2500
+        actuals = [0.0, 1.0] * 2500
+        calibrator = fit_probability_calibrator(probabilities, actuals, independent_dates=60)
+        self.assertEqual(calibrator["method"], "shrinkage")
+        self.assertLessEqual(calibrator["alpha"], 0.5)
+
+    def test_large_isotonic_calibration_uses_bounded_pure_python_pav(self):
+        probabilities = [0.20, 0.40, 0.60, 0.80] * 1500
+        actuals = [0.0, 0.0, 1.0, 1.0] * 1500
+        calibrator = fit_probability_calibrator(probabilities, actuals, independent_dates=180)
+        self.assertEqual(calibrator["method"], "isotonic")
+        self.assertEqual(calibrator["implementation"], "pure-python-pool-adjacent-violators")
+        self.assertLessEqual(calibrator["blocks"], 4)
+        self.assertEqual(calibrator["inputRows"], 6000)
+
+    def test_calibrator_method_is_selected_on_chronological_holdout(self):
+        probabilities = []
+        actuals = []
+        dates = []
+        for day in range(50):
+            current = (date(2020, 1, 1) + timedelta(days=day)).isoformat()
+            for index in range(20):
+                actual = 1.0 if index % 2 else 0.0
+                probabilities.append(0.72 if actual else 0.28)
+                actuals.append(actual)
+                dates.append(current)
+        calibrator = fit_probability_calibrator(
+            probabilities,
+            actuals,
+            independent_dates=50,
+            dates=dates,
+        )
+        self.assertIn(calibrator["method"], {"identity", "shrinkage", "platt"})
+        self.assertEqual(calibrator["selection"]["validationDates"], 10)
+        self.assertEqual(calibrator["selection"]["validationRows"], 200)
+        self.assertIn(calibrator["selection"]["selectedMethod"], {"identity", "shrinkage", "platt"})
+
+    def test_direction_metrics_report_selective_high_confidence_accuracy(self):
+        rows = []
+        probabilities = []
+        for index in range(1000):
+            actual = 1.0 if index % 2 else 0.0
+            confident = index < 100
+            probability = (0.92 if actual else 0.08) if confident else (0.51 if actual else 0.49)
+            rows.append({
+                "date": (date(2020, 1, 1) + timedelta(days=index // 5)).isoformat(),
+                "actualDirection": actual,
+                "actualReturn": 1.0 if actual else -1.0,
+                "evaluationWeight": 1.0,
+            })
+            probabilities.append(probability)
+        metrics = calibration_metrics(rows, probabilities, actual_key="actualDirection")
+        self.assertEqual(metrics["selectiveTop10CoveragePct"], 10.0)
+        self.assertEqual(metrics["selectiveTop10AccuracyPct"], 100.0)
+        self.assertGreater(metrics["selectiveTop10Accuracy95LowerPct"], 90.0)
+
+    def test_date_level_regime_model_uses_current_cross_section_only(self):
+        names = [
+            "change5", "change20", "volatility", "volumeRatio",
+            "xsMomentum5Rank", "xsMomentum20Rank", "xsLowVolatilityRank", "marketBreadth5",
+        ]
+        train = []
+        for day in range(300):
+            positive = day % 4 in {0, 1, 2}
+            breadth = 0.8 if positive else -0.8
+            for symbol in range(8):
+                train.append({
+                    "date": f"2024-{day // 28 + 1:02d}-{day % 28 + 1:02d}",
+                    "symbol": f"S{symbol}",
+                    "featureNames": names,
+                    "x": [breadth, breadth, 0.2, 1.0, 0.5, 0.5, 0.5, breadth],
+                    "actualReturn": 1.0 if positive else -1.0,
+                })
+        test = [{
+            "date": "2030-01-02",
+            "symbol": f"T{symbol}",
+            "featureNames": names,
+            "x": [0.8, 0.8, 0.2, 1.0, 0.5, 0.5, 0.5, 0.8],
+        } for symbol in range(6)]
+        probabilities = _date_level_regime_predictions(train, test)
+        self.assertEqual(len(probabilities), len(test))
+        self.assertTrue(all(value > 0.5 for value in probabilities))
+
+    def test_python_baseline_fallback_returns_one_prediction_per_test_row(self):
+        train = []
+        for index in range(80):
+            target = 1.0 if index % 2 else 0.0
+            train.append({
+                "x": [1.0, index / 80],
+                "actualReturn": target - 0.5,
+                "actualTarget": target,
+                "actualStop": 1.0 - target,
+                "actualTimeout": 0.0,
+                "actualDirection": target,
+                "returnRank": index / 80,
+                "trainingWeight": 1.0,
+            })
+        result = _fallback_baseline_predictions(train, train[-7:])
+        self.assertTrue(all(len(result[key]) == 7 for key in [
+            "baselineReturn", "direction", "elasticDirection", "target", "elasticTarget", "stop", "timeout", "rank",
+        ]))
+        self.assertEqual(result["trainingRows"], len(train))
+        self.assertEqual(result["fullTrainingRows"], len(train))
+
+    def test_fold_checkpoint_signature_tracks_values_code_dependencies_and_configuration(self):
+        rows = [{
+            "date": "2024-01-02", "symbol": "AAA", "x": [0.1, 0.2],
+            "actualTarget": 1.0, "actualStop": 0.0, "actualTimeout": 0.0,
+            "actualDirection": 1.0, "actualReturn": 2.0, "trainingWeight": 1.0,
+            "featureNames": ["one", "two"],
+        }]
+        folds = [{"fold": 0, "train": rows, "test": rows, "trainStart": "2024-01-02", "trainEnd": "2024-01-02", "testStart": "2024-01-03", "testEnd": "2024-01-03"}]
+        with tempfile.TemporaryDirectory() as directory:
+            config = {"checkpointDir": directory, "foldCount": 5, "embargoDays": 7, "minTrainDates": 500, "testDates": 120}
+            original = _fold_checkpoint_context(rows, folds, market="US", horizon=5, config=config)
+            changed_rows = [{**rows[0], "x": [0.1, 0.25]}]
+            changed = _fold_checkpoint_context(changed_rows, folds, market="US", horizon=5, config=config)
+            changed_config = _fold_checkpoint_context(rows, folds, market="US", horizon=5, config={**config, "embargoDays": 10})
+        self.assertNotEqual(original["signature"], changed["signature"])
+        self.assertNotEqual(original["signature"], changed_config["signature"])
+        self.assertIn("trainingSourceHash", original["payload"])
+        self.assertIn("dependencyVersions", original["payload"])
+
     def test_worker_trains_market_multitask_candidate_and_persists_oof(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            result = dispatch({
+            payload = {
                 "operation": "production-model-train",
                 "market": "US",
                 "items": panel_items(240),
@@ -682,12 +962,17 @@ class QuantCoreTests(unittest.TestCase):
                 "production_embargo_days": 7,
                 "enable_tree_models": False,
                 "artifact_dir": temp_dir,
-            })
+                "checkpoint_dir": temp_dir,
+            }
+            result = dispatch(payload)
             self.assertTrue(result["available"])
             self.assertEqual(result["framework"], "market-level-multitask-oof-calibrated-stack")
             model = result["horizonModels"][0]
             self.assertTrue(model["available"])
             self.assertIn("elasticPrediction", model["models"] + [row.get("model") for row in model["prunedModels"]])
+            self.assertIn("directionMetrics", model)
+            self.assertIn("directionProbability", model["oofSchema"])
+            self.assertTrue(model["directionModels"])
             self.assertEqual(model["leakageControl"]["entry"], "next-session VWAP/open")
             self.assertFalse(result["productionEligibility"]["eligible"])
             artifact = model["oofArtifact"]
@@ -699,6 +984,8 @@ class QuantCoreTests(unittest.TestCase):
                 first_oof = json.loads(next(stream))
             self.assertEqual(len(first_oof["predictionId"]), 32)
             self.assertEqual(first_oof["modelVersion"], model["modelVersion"])
+            resumed = dispatch(payload)["horizonModels"][0]
+            self.assertEqual(resumed["foldCheckpoint"]["resumedFolds"], 3)
 
     def test_worker_dispatch_exposes_local_model_train(self):
         result = dispatch({"operation": "local-model-train", "market": "US", "samples": prediction_samples()})
@@ -1040,6 +1327,7 @@ class QuantCoreTests(unittest.TestCase):
     def test_paper_agents_persist_and_dedupe_real_bar(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = str(Path(directory) / "agents.sqlite3")
+            configure_paper_agents({"db_path": db_path, "market": "US", "config": {"requireStrictOof": False}})
             item = {
                 "market": "US",
                 "symbol": "AAPL",
@@ -1105,6 +1393,7 @@ class QuantCoreTests(unittest.TestCase):
     def test_paper_agent_empty_browser_migration_cannot_erase_backend_ledger(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = str(Path(directory) / "agents.sqlite3")
+            configure_paper_agents({"db_path": db_path, "market": "US", "config": {"requireStrictOof": False}})
             item = {
                 "market": "US", "symbol": "AAPL", "price": 200.0,
                 "barTs": "2026-07-13T14:35:00Z", "source": "alpaca-us-real-bars", "fresh": True,
@@ -1144,6 +1433,7 @@ class QuantCoreTests(unittest.TestCase):
     def test_paper_agent_capital_update_preserves_trades_and_positions(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = str(Path(directory) / "agents.sqlite3")
+            configure_paper_agents({"db_path": db_path, "market": "US", "config": {"requireStrictOof": False}})
             item = {
                 "market": "US", "symbol": "AAPL", "price": 200.0,
                 "barTs": "2026-07-13T14:35:00Z", "source": "alpaca-us-real-bars", "fresh": True,
@@ -1157,6 +1447,486 @@ class QuantCoreTests(unittest.TestCase):
             self.assertEqual(updated["config"]["initialCapital"], 25000)
             self.assertEqual(sum(len(agent["trades"]) for agent in updated["ledger"]["agents"]), sum(len(agent["trades"]) for agent in before["ledger"]["agents"]))
             self.assertEqual(sum(len(agent["positions"]) for agent in updated["ledger"]["agents"]), sum(len(agent["positions"]) for agent in before["ledger"]["agents"]))
+
+    def test_data_lake_keeps_markets_isolated_and_deduplicates_candles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = {
+                "root": directory,
+                "symbol": "CAR",
+                "interval": "1d",
+                "source": "unit-real",
+                "candles": [
+                    {"date": "2026-07-01", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 1000},
+                    {"date": "2026-07-02", "open": 10.5, "high": 12, "low": 10, "close": 11.5, "volume": 1200},
+                ],
+            }
+            first = upsert_data_lake({**base, "market": "ASX"})
+            second = upsert_data_lake({**base, "market": "ASX"})
+            upsert_data_lake({**base, "market": "US"})
+            self.assertEqual(first["rows"], 2)
+            self.assertEqual(second["rows"], 2)
+            self.assertEqual(read_data_lake_rows({"root": directory, "market": "ASX", "symbol": "CAR"})["rows"], 2)
+            evidence = data_lake_summary({"root": directory})
+            self.assertEqual(evidence["markets"]["ASX"], 2)
+            self.assertEqual(evidence["markets"]["US"], 2)
+            with self.assertRaisesRegex(ValueError, "Cross-market"):
+                upsert_data_lake({**base, "market": "ASX", "symbol": "600900"})
+
+    def test_data_lake_interval_key_content_version_and_invalid_ohlc_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = {
+                "root": directory, "market": "US", "symbol": "AAPL", "source": "unit-us",
+                "candles": [{"date": "2026-07-01", "open": 100, "high": 102, "low": 99, "close": 101, "volume": 1000}],
+            }
+            daily = upsert_data_lake({**base, "interval": "1d"})
+            weekly = upsert_data_lake({**base, "interval": "1wk"})
+            self.assertNotEqual(daily["data_version"], weekly["data_version"])
+            changed = upsert_data_lake({**base, "interval": "1d", "candles": [{**base["candles"][0], "close": 101.5}]})
+            self.assertNotEqual(daily["data_version"], changed["data_version"])
+            invalid = upsert_data_lake({
+                **base, "interval": "1d",
+                "candles": [{"date": "2026-07-02", "open": 100, "high": 98, "low": 99, "close": 101, "volume": 1000}],
+            })
+            self.assertEqual(invalid["quarantined"], 1)
+            self.assertEqual(read_data_lake_rows({"root": directory, "market": "US", "symbol": "AAPL", "interval": "1d"})["rows"], 1)
+
+    def test_data_lake_panel_reuses_complete_history_and_keeps_exchange_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            panel = upsert_data_lake_panel({
+                "root": directory,
+                "market": "ASX",
+                "interval": "1d",
+                "items": [
+                    {"symbol": "BHP.AX", "source": "unit-asx", "candles": candles(90)},
+                    {"symbol": "CBA.AX", "source": "unit-asx", "candles": candles(75)},
+                ],
+            })
+            self.assertTrue(panel["available"])
+            self.assertEqual(panel["partitions"], 2)
+            reused = read_data_lake_panel({
+                "root": directory,
+                "market": "ASX",
+                "symbols": ["BHP.AX", "CBA.AX"],
+                "interval": "1d",
+                "min_rows": 80,
+            })
+            self.assertEqual(reused["availableCount"], 1)
+            self.assertEqual(reused["items"][0]["symbol"], "BHP")
+            self.assertEqual(reused["items"][0]["exchange"], "ASX")
+
+    def test_data_lake_scales_ohlc_to_adjusted_close_without_losing_provenance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_data_lake({
+                "root": directory, "market": "US", "symbol": "AAPL", "source": "unit-adjusted", "interval": "1d",
+                "candles": [{"date": "2020-08-28", "open": 100, "high": 104, "low": 98, "close": 102, "adjClose": 51, "volume": 1000}],
+            })
+            result = read_data_lake_rows({"root": directory, "market": "US", "symbol": "AAPL"})
+            self.assertEqual(result["adjustment"], "split-dividend-adjusted")
+            self.assertAlmostEqual(result["candles"][0]["close"], 51)
+            self.assertAlmostEqual(result["candles"][0]["open"], 50)
+            self.assertAlmostEqual(result["candles"][0]["high"], 52)
+
+    def test_data_lake_audit_quarantines_cross_market_new_partitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_data_lake({
+                "root": directory, "market": "ASX", "symbol": "AAPL", "source": "alpaca-us-iex", "interval": "1d",
+                "candles": [{"date": "2026-07-01", "open": 100, "high": 102, "low": 99, "close": 101, "volume": 1000}],
+            })
+            result = audit_data_lake({"root": directory, "allowed_symbols": {"ASX": ["BHP"], "US": ["AAPL"], "CN": []}})
+            self.assertEqual(result["quarantined"], 1)
+            self.assertFalse(read_data_lake_rows({"root": directory, "market": "ASX", "symbol": "AAPL"})["available"])
+
+    def test_data_lake_audit_reports_verified_partitions_without_false_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_data_lake({
+                "root": directory, "market": "ASX", "symbol": "BHP", "source": "unit-asx", "interval": "1d",
+                "candles": [{"date": "2026-07-01", "open": 40, "high": 42, "low": 39, "close": 41, "volume": 1000}],
+            })
+            result = audit_data_lake({"root": directory, "allowed_symbols": {"ASX": ["BHP"], "US": [], "CN": []}})
+            self.assertEqual(result["verified"], 1)
+            self.assertEqual(result["migrated"], 0)
+            self.assertEqual(result["quarantined"], 0)
+            self.assertEqual(result["verifiedItems"][0]["symbol"], "BHP")
+
+    def test_data_lake_audit_accepts_multiple_real_sources_for_one_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = {
+                "root": directory, "market": "ASX", "symbol": "BHP", "interval": "1d",
+                "candles": [{"date": "2026-07-01", "open": 40, "high": 42, "low": 39, "close": 41, "volume": 1000}],
+            }
+            upsert_data_lake({**base, "source": "yahoo-finance-asx-single-source"})
+            upsert_data_lake({**base, "source": "stockanalysis-asx-daily-single-source"})
+            result = audit_data_lake({"root": directory, "allowed_symbols": {"ASX": ["BHP"], "US": [], "CN": []}})
+            self.assertEqual(result["verified"], 1)
+            self.assertEqual(result["quarantined"], 0)
+
+    def test_data_lake_audit_recovers_verified_multi_source_quarantine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            saved = upsert_data_lake({
+                "root": directory, "market": "ASX", "symbol": "BHP", "source": "yahoo-finance-asx-single-source", "interval": "1d",
+                "candles": [{"date": "2026-07-01", "open": 40, "high": 42, "low": 39, "close": 41, "volume": 1000}],
+            })
+            current = Path(saved["parquet"])
+            root = Path(directory).resolve()
+            quarantine = root / "quarantine" / "audit=old" / current.relative_to(root)
+            quarantine.parent.mkdir(parents=True, exist_ok=True)
+            current.rename(quarantine)
+            result = audit_data_lake({"root": directory, "allowed_symbols": {"ASX": ["BHP"], "US": [], "CN": []}})
+            self.assertEqual(result["recovered"], 1)
+            self.assertTrue(read_data_lake_rows({"root": directory, "market": "ASX", "symbol": "BHP"})["available"])
+
+    def test_data_lake_pit_records_require_availability_time_and_exchange_partition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = upsert_pit_records({
+                "root": directory,
+                "dataset": "fundamentals",
+                "market": "CN",
+                "symbol": "SH000001",
+                "exchange": "SSE",
+                "source": "unit-exchange-filing",
+                "records": [
+                    {"id": "valid", "event_time": "2026-07-01", "available_at": "2026-07-02T01:00:00Z", "value": 1},
+                    {"id": "future-unknown", "event_time": "2026-07-03", "value": 2},
+                ],
+            })
+            self.assertEqual(result["rows"], 1)
+            self.assertIn("exchange=SSE", result["parquet"])
+            self.assertIn("symbol=000001", result["parquet"])
+            lake = data_lake_summary({"root": directory})
+            self.assertEqual(lake["pitRows"], 1)
+            self.assertEqual(lake["pitDatasets"]["fundamentals"]["markets"]["CN"], 1)
+            self.assertEqual(lake["pitDatasets"]["news"]["rows"], 0)
+
+    def test_data_lake_accepts_valid_us_share_class_symbols_without_allowing_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = upsert_pit_records({
+                "root": directory,
+                "dataset": "fundamentals",
+                "market": "US",
+                "symbol": "CIG.C",
+                "source": "unit-share-class",
+                "records": [{
+                    "id": "filing-1",
+                    "event_time": "2025-03-31",
+                    "available_at": "2025-05-01T00:00:00Z",
+                    "values": {"profitMargin": 0.1},
+                }],
+            })
+            self.assertEqual(result["rows"], 1)
+            self.assertIn("symbol=CIG.C", result["parquet"])
+            with self.assertRaisesRegex(ValueError, "Invalid US symbol"):
+                upsert_pit_records({
+                    "root": directory,
+                    "dataset": "fundamentals",
+                    "market": "US",
+                    "symbol": "..",
+                    "source": "unit-invalid",
+                    "records": [],
+                })
+
+    def test_data_lake_bulk_pit_upsert_deduplicates_without_row_by_row_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            records = [
+                {
+                    "id": f"filing-{index}",
+                    "event_time": f"2024-{index % 12 + 1:02d}-{index % 27 + 1:02d}",
+                    "available_at": f"2025-{index % 12 + 1:02d}-{index % 27 + 1:02d}T01:00:00Z",
+                    "historicalAvailabilityVerified": True,
+                    "values": {"profitMargin": (index % 30) / 100},
+                }
+                for index in range(2_000)
+            ]
+            first = upsert_pit_batches({
+                "root": directory,
+                "batches": [
+                    {"dataset": "fundamentals", "market": "US", "symbol": "AAPL", "source": "unit-sec", "records": records[:1_000]},
+                    {"dataset": "fundamentals", "market": "US", "symbol": "AAPL", "source": "unit-sec", "records": records[1_000:]},
+                ],
+            })
+            second = upsert_pit_records({
+                "root": directory,
+                "dataset": "fundamentals",
+                "market": "US",
+                "symbol": "AAPL",
+                "source": "unit-sec",
+                "records": records,
+            })
+            self.assertEqual(first["batches"], 1)
+            self.assertEqual(first["inserted"], 2_000)
+            self.assertEqual(second["rows"], 2_000)
+
+    def test_data_lake_pit_panel_returns_point_in_time_model_features(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_pit_records({
+                "root": directory,
+                "dataset": "news",
+                "market": "US",
+                "symbol": "AAPL",
+                "source": "unit-news",
+                "records": [{
+                    "id": "earnings",
+                    "event_time": "2026-06-01T10:00:00Z",
+                    "available_at": "2026-06-01T10:05:00Z",
+                    "title": "AAPL earnings guidance raised",
+                    "sentiment": "positive",
+                    "relevance": 90,
+                    "truthScore": 80,
+                }],
+            })
+            panel = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "US",
+                "symbols": ["AAPL"],
+            })
+            self.assertEqual(panel["rows"], 1)
+            feature = panel["items"][0]["pointInTimeFeatures"][0]
+            self.assertEqual(feature["values"]["eventSentiment"], 1.0)
+            self.assertEqual(feature["values"]["announcementScore"], 1.0)
+
+    def test_market_wide_macro_pit_is_batched_and_replicated_without_future_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = upsert_pit_batches({
+                "root": directory,
+                "batches": [{
+                    "dataset": "macro", "market": "US", "symbol": "MARKET", "source": "unit-alfred",
+                    "records": [{
+                        "id": "CPI:2026-01", "event_time": "2026-01-01T23:59:59Z",
+                        "available_at": "2026-01-15T13:30:00Z", "historicalAvailabilityVerified": True,
+                        "values": {"macroRisk": -0.7, "eventSentiment": -0.6, "sourceQuality": 1.0},
+                    }],
+                }],
+            })
+            self.assertEqual(result["batches"], 1)
+            panel = read_data_lake_pit_panel({
+                "root": directory, "market": "US", "symbols": ["AAPL", "MSFT"], "datasets": ["macro"],
+            })
+            by_symbol = {row["symbol"]: row for row in panel["items"]}
+            self.assertEqual(by_symbol["AAPL"]["pointInTimeFeatures"][0]["values"]["macroRisk"], -0.7)
+            self.assertEqual(by_symbol["MSFT"]["pointInTimeFeatures"][0]["values"]["sourceQuality"], 1.0)
+
+            compact = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "US",
+                "symbols": ["AAPL", "MSFT"],
+                "datasets": ["macro"],
+                "broadcast_market_wide": False,
+            })
+            self.assertEqual(len(compact["marketPointInTimeFeatures"]), 1)
+            self.assertTrue(all(not row["pointInTimeFeatures"] for row in compact["items"]))
+            joined = point_in_time_features(
+                {},
+                "2026-02-01",
+                "US",
+                compact["marketPointInTimeFeatures"],
+            )
+            self.assertEqual(joined["sourceRows"], 1)
+            self.assertLess(joined["values"]["macroRisk"], 0)
+
+    def test_market_wide_universe_pit_routes_to_symbols_and_unverified_rows_do_not_backfill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_pit_records({
+                "root": directory, "dataset": "universe", "market": "US", "source": "unit-universe",
+                "records": [
+                    {"id": "AAPL", "symbol": "AAPL", "event_time": "2020-01-02", "available_at": "2020-01-02T20:00:00Z", "historicalAvailabilityVerified": True},
+                    {"id": "MSFT", "symbol": "MSFT", "event_time": "2026-07-01", "available_at": "2026-07-01T20:00:00Z", "historicalAvailabilityUnverified": True},
+                ],
+            })
+            panel = read_data_lake_pit_panel({"root": directory, "market": "US", "symbols": ["AAPL", "MSFT"], "datasets": ["universe"]})
+            by_symbol = {row["symbol"]: row for row in panel["items"]}
+            self.assertEqual(by_symbol["AAPL"]["coverage"]["verifiedUniverse"], 1)
+            self.assertEqual(by_symbol["MSFT"]["coverage"]["verifiedUniverse"], 0)
+            self.assertTrue(verified_pit_coverage(by_symbol["AAPL"]["universeHistory"], "2020-01-03", "US")["covered"])
+            self.assertFalse(verified_pit_coverage(by_symbol["MSFT"]["universeHistory"], "2020-01-03", "US")["covered"])
+
+    def test_orphaned_oof_artifact_is_recovered_as_research_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "asx-5d-test-oof.jsonl.gz"
+            with gzip.open(target, "wt", encoding="utf-8") as handle:
+                for index in range(180):
+                    day = f"2025-{index // 28 + 1:02d}-{index % 28 + 1:02d}"
+                    for symbol_index, symbol in enumerate(("BHP.AX", "CBA.AX")):
+                        actual = 1.0 if (index + symbol_index) % 3 else 0.0
+                        probability = 0.64 if actual else 0.36
+                        handle.write(json.dumps({
+                            "market": "ASX", "symbol": symbol, "date": day, "horizon": 5,
+                            "fold": index % 5 + 1, "actualTarget": actual, "actualStop": 1.0 - actual,
+                            "actualTimeout": 0.0, "actualReturn": 2.0 if actual else -1.0,
+                            "ridgePrediction": probability, "elasticPrediction": probability * 0.98,
+                            "pathSafetyPrediction": probability, "quantilePrediction": probability * 0.96,
+                            "rankerPrediction": probability, "dataQuality": 100,
+                        }) + "\n")
+            recovered = recover_oof_artifacts({"market": "ASX", "artifact_dir": directory})
+            self.assertTrue(recovered["available"])
+            self.assertTrue(recovered["horizonModels"][0]["available"])
+            self.assertFalse(recovered["productionEligibility"]["eligible"])
+            self.assertTrue(recovered["horizonModels"][0]["oofArtifact"]["recovered"])
+
+    def test_paper_agents_default_to_no_trade_without_strict_oof_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            result = step_paper_agents({
+                "db_path": db_path,
+                "market": "US",
+                "marketOpen": True,
+                "items": [{
+                    "market": "US", "symbol": "AAPL", "price": 200,
+                    "barTs": "2026-07-13T14:35:00Z", "source": "alpaca-us-real-bars", "fresh": True,
+                    "analysis": {"action": "WATCH_BUY", "confidence": 99, "projectedFinalReturn": 12},
+                    "technicals": {"close": 200, "trendScore": 90, "volumeRatio": 2.0},
+                }],
+            })
+            self.assertEqual(result["events"], [])
+            self.assertTrue(result["noTrade"])
+
+    def test_paper_agent_legacy_constraint_violation_freezes_buys_and_gradually_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            state = load_paper_agent_state("US", db_path)
+            state["config"]["requireStrictOof"] = False
+            agent = state["ledger"]["agents"][0]
+            symbols = [f"S{index}" for index in range(7)]
+            agent["cash"] = 9300.0
+            agent["positions"] = {
+                symbol: {"qty": 1, "avgPrice": 100, "lastPrice": 100, "costBasis": 100, "sector": f"Sector{index}", "entryScore": 40 + index}
+                for index, symbol in enumerate(symbols)
+            }
+            agent["equity"] = 10000.0
+            save_paper_agent_state(state, db_path)
+            items = [{
+                "market": "US", "symbol": symbol, "price": 100,
+                "barTs": "2026-07-13T14:40:00Z", "source": "alpaca-us-real-bars", "fresh": True,
+                "analysis": {"confidence": 0, "projectedFinalReturn": -1},
+                "technicals": {"close": 100, "trendScore": 20, "volumeRatio": 1.0},
+            } for symbol in symbols]
+            result = step_paper_agents({"db_path": db_path, "market": "US", "marketOpen": True, "items": items})
+            self.assertTrue(result["events"])
+            self.assertTrue(all(event["side"] == "SELL" for event in result["events"]))
+            self.assertTrue(any(event["reason"] == "constraint-migration-gradual-exit" for event in result["events"]))
+            self.assertTrue(all("behaviorProbability" in event["policyContext"] for event in result["events"]))
+            generations = list_paper_agent_generations({"db_path": db_path, "market": "US"})
+            self.assertIn("constraintCompliance", generations["current"])
+
+    def test_paper_agent_generation_archives_v1_and_blocks_non_oof_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            legacy = load_paper_agent_state("ASX", db_path)
+            legacy["config"]["generationId"] = "generation_v1"
+            for agent in legacy["ledger"]["agents"]:
+                agent["generationId"] = "generation_v1"
+            save_paper_agent_state(legacy, db_path)
+            upgraded = upgrade_paper_agent_generation({"db_path": db_path, "market": "ASX"})
+            self.assertTrue(upgraded["upgraded"])
+            self.assertEqual(upgraded["config"]["generationId"], "generation_v2")
+            generations = list_paper_agent_generations({"db_path": db_path, "market": "ASX"})
+            self.assertEqual(generations["archives"][0]["generationId"], "generation_v1")
+            replay = replay_paper_agents({
+                "db_path": db_path,
+                "market": "ASX",
+                "samples": [{"predictionId": str(index), "signalAt": "2026-07-01", "outcome": {"resolved": True}} for index in range(150)],
+            })
+            self.assertFalse(replay["updated"])
+            self.assertEqual(replay["strictOofRows"], 0)
+
+    def test_paper_agent_replay_learns_strict_oof_contextual_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            samples = []
+            for day in range(400):
+                for symbol_index in range(10):
+                    win = symbol_index % 2 == 0
+                    probability = 0.82 if win else 0.18
+                    samples.append({
+                        "predictionId": f"{day}:{symbol_index}",
+                        "strictOof": True,
+                        "market": "US",
+                        "symbol": f"S{symbol_index}",
+                        "signalAt": (date(2024, 1, 1) + timedelta(days=day)).isoformat(),
+                        "horizon": 5,
+                        "actualReturn": 2.0 if win else -1.0,
+                        "directionProbability": probability,
+                        "ridgeDirectionPrediction": probability,
+                        "elasticDirectionPrediction": probability,
+                        "treeDirectionPrediction": probability,
+                        "targetProbability": probability,
+                        "stopProbability": 1 - probability,
+                        "eventPrediction": probability,
+                        "dataQuality": 100,
+                        "regime": "trend_up" if day % 2 == 0 else "risk_off",
+                    })
+            replay = replay_paper_agents({"db_path": db_path, "market": "US", "samples": samples})
+            self.assertTrue(replay["updated"])
+            self.assertEqual(replay["strictOofRows"], 4000)
+            self.assertTrue(replay["strategySelector"]["all"]["selectedStyle"])
+            self.assertEqual(replay["strategySelector"]["all"]["method"], "context-conditioned-beta-posterior")
+
+    def test_paper_agent_policy_cannot_pass_by_overfitting_selection_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "agents.sqlite3")
+            samples = []
+            for day in range(400):
+                evaluation_period = day >= 272
+                for symbol_index in range(10):
+                    high_signal = symbol_index < 5
+                    win = (not evaluation_period and high_signal) or (evaluation_period and not high_signal)
+                    probability = 0.82 if high_signal else 0.18
+                    samples.append({
+                        "predictionId": f"holdout:{day}:{symbol_index}",
+                        "strictOof": True,
+                        "market": "US",
+                        "symbol": f"Q{symbol_index}",
+                        "signalAt": (date(2024, 1, 1) + timedelta(days=day)).isoformat(),
+                        "horizon": 5,
+                        "actualReturn": 2.0 if win else -2.0,
+                        "directionProbability": probability,
+                        "ridgeDirectionPrediction": probability,
+                        "elasticDirectionPrediction": probability,
+                        "treeDirectionPrediction": probability,
+                        "targetProbability": probability,
+                        "stopProbability": 1 - probability,
+                        "dataQuality": 100,
+                    })
+            replay = replay_paper_agents({"db_path": db_path, "market": "US", "samples": samples})
+            self.assertIsNone(replay["strategySelector"]["all"]["selectedStyle"])
+            self.assertFalse(replay["policies"]["momentum"]["productionEligible"])
+            self.assertIn("selectionEvidence", replay["policies"]["momentum"])
+
+    def test_resume_skips_feature_matrix_created_before_pit_join(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale_path = root / "datasets" / "cn-5d-stale.json.gz"
+            fresh_path = root / "datasets" / "cn-5d-fresh.json.gz"
+            base_summary = {
+                "symbolCount": 50,
+                "dateCount": 600,
+                "pointInTimeCoveragePct": 0.0,
+            }
+            rows = [{"symbol": "000001", "date": "2024-01-02", "horizon": 5}]
+            _save_dataset_cache(stale_path, {"rows": rows, "summary": dict(base_summary)}, market="CN", horizon=5)
+            dataset, path = _load_latest_eligible_dataset_cache(
+                root,
+                market="CN",
+                horizon=5,
+                min_symbols=50,
+                min_dates=500,
+                require_pit_version=True,
+            )
+            self.assertIsNone(dataset)
+            self.assertIsNone(path)
+
+            _save_dataset_cache(fresh_path, {
+                "rows": rows,
+                "summary": {**base_summary, "pitDataVersion": "pit-version-1"},
+            }, market="CN", horizon=5)
+            dataset, path = _load_latest_eligible_dataset_cache(
+                root,
+                market="CN",
+                horizon=5,
+                min_symbols=50,
+                min_dates=500,
+                require_pit_version=True,
+            )
+            self.assertIsNotNone(dataset)
+            self.assertEqual(path, fresh_path.resolve())
 
     def test_python_client_request_encodes_json_and_query(self):
         captured = {}

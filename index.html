@@ -13,7 +13,7 @@
     <link rel="stylesheet" href="/frontend/styles/simulation-layout.css?v=20260714-simulation-boundary-1">
     <link rel="stylesheet" href="/frontend/styles/performance.css?v=20260717-stable-load-2">
     <link rel="stylesheet" href="/frontend/styles/training-supervisor.css?v=20260714-training-supervisor-2">
-    <link rel="stylesheet" href="/frontend/styles/strategy-workspace.css?v=20260729-strategy-layout-3">
+    <link rel="stylesheet" href="/frontend/styles/strategy-workspace.css?v=20260810-evidence-runtime-v85">
   </head>
   <body>
     <div class="app-shell">
@@ -621,6 +621,40 @@ CBA,20,118.50</textarea>
               <button id="generateModelReport" class="primary icon-text-button" type="button"><i data-lucide="file-chart-column"></i><span>生成新报告</span></button>
             </div>
           </div>
+          <section class="continuous-learning-board" aria-labelledby="continuousLearningTitle">
+            <div class="continuous-learning-head">
+              <div>
+                <p class="section-kicker">Champion / Challenger</p>
+                <h3 id="continuousLearningTitle">持续学习与精度进步</h3>
+                <p>固定样本外曲线与滚动观察分开显示；训练完成不等于晋级。</p>
+              </div>
+              <div class="continuous-learning-actions">
+                <button id="evaluateLearning" class="secondary icon-text-button" type="button"><i data-lucide="scan-line"></i><span>只评估</span></button>
+                <button id="runWeeklyLearning" class="secondary icon-text-button" type="button"><i data-lucide="flask-conical"></i><span>周度 Challenger</span></button>
+                <button id="runFullLearning" class="secondary icon-text-button" type="button"><i data-lucide="layers-3"></i><span>全量训练</span></button>
+              </div>
+            </div>
+            <div id="learningProgressSummary" class="continuous-learning-summary" aria-live="polite">
+              <div><span>Champion</span><strong>读取中</strong></div>
+              <div><span>5日准确率</span><strong>--</strong></div>
+              <div><span>独立日期</span><strong>--</strong></div>
+              <div><span>本地数据湖</span><strong>--</strong></div>
+              <div><span>训练成功率</span><strong>--</strong></div>
+            </div>
+            <div class="continuous-learning-visual">
+              <div class="learning-chart-shell">
+                <div class="learning-chart-title"><strong>固定 OOF / 滚动观察</strong><span>Accuracy · Brier · ECE</span></div>
+                <canvas id="learningProgressChart" width="960" height="260" aria-label="模型精度进步曲线"></canvas>
+              </div>
+              <div id="learningPromotionPanel" class="learning-promotion-panel">
+                <p class="muted">正在读取晋级门槛和阻断项。</p>
+              </div>
+            </div>
+            <div id="agentGenerationPanel" class="agent-generation-strip">
+              <span>Agent generation_v2</span><strong>读取中</strong><small>旧账本保留为只读基准</small>
+            </div>
+            <div id="learningEvidenceFamilies" class="learning-evidence-families" aria-live="polite"></div>
+          </section>
           <div class="model-report-filters" aria-label="模型报告筛选">
             <label>模型族
               <select id="modelReportFamily">
@@ -767,6 +801,6 @@ CBA,20,118.50</textarea>
     <script src="/frontend/runtime/ui-runtime.js?v=20260717-stable-load-2"></script>
     <script src="/frontend/runtime/home-motion.js?v=20260712-home-motion"></script>
     <script src="/frontend/runtime/flow-navigation.js?v=20260713-flow-navigation-2"></script>
-    <script src="/frontend/runtime/shell-bootstrap.js?v=20260729-factor-lab-robust-v76"></script>
+    <script src="/frontend/runtime/shell-bootstrap.js?v=20260810-evidence-runtime-v85"></script>
   </body>
 </html>

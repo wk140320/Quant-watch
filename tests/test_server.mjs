@@ -33,6 +33,7 @@ const {
   backendMonitorBudgetLimits,
   computeServerTechnicals,
   compactWorkspaceSnapshot,
+  candleLimitForRange,
   marketAnalysisEventFromMonitorResult,
   marketOverlayFromHistoryPayload,
   mergeServerSnapshots,
@@ -55,12 +56,50 @@ const {
   intradaySampleRows,
   sanitizeBackendMonitorConfig,
   trainIntradayLinearModel,
+  stockAnalysisAsxFundamentalsFromHtml,
   stockAnalysisHistoryRows,
+  stratifiedUniverseSymbols,
   tradeFootprintRows,
+  trainingEligibleUniverseRow,
   tencentCnQuoteFromEncoded,
   tushareRows,
   universePayload,
 } = await import("../server.mjs");
+
+test("Long research ranges retain multi-year candle capacity", () => {
+  assert.equal(candleLimitForRange("8y"), 2080);
+  assert.equal(candleLimitForRange("10y"), 2600);
+  assert.equal(candleLimitForRange("15y"), 3900);
+});
+
+test("Training universe sampling spans the market instead of taking one alphabetical block", () => {
+  const symbols = Array.from({ length: 260 }, (_, index) => `${String.fromCharCode(65 + Math.floor(index / 10))}${index}`);
+  const first = stratifiedUniverseSymbols(symbols, 26, "US");
+  const second = stratifiedUniverseSymbols(symbols, 26, "US");
+  assert.deepEqual(first, second);
+  assert.equal(first.length, 26);
+  assert.ok(new Set(first.map((symbol) => symbol[0])).size >= 20);
+});
+
+test("US training universe excludes warrants, units, rights, preferred shares, and SPAC shells", () => {
+  assert.equal(trainingEligibleUniverseRow({ symbol: "AAPL", name: "Apple Inc. Common Stock", type: "stock" }, "US"), true);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "AACIW", name: "Example Acquisition Inc. - Warrants", type: "stock" }, "US"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "AAC.U", name: "Example Units, each consisting of one share and one warrant", type: "stock" }, "US"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "PREF", name: "Example 7% Preferred Stock", type: "stock" }, "US"), false);
+});
+
+test("StockAnalysis ASX fundamentals parser preserves numeric scale and ratios", () => {
+  const html = `<script>marketCap:"306.42B",revenue:"80.94B",netIncome:"15.36B",revenueGrowth:.72,netIncomeGrowth:-10.039,eps:"3.02",peRatio:"19.98",forwardPE:"16.68",dividendYield:"3.14%",beta:"0.84","legalName":"BHP Group Limited"</script><span>Industry</span><a>Other Industrial Metals &amp; Mining</a><span>Sector</span><a>Materials</a>`;
+  const result = stockAnalysisAsxFundamentalsFromHtml(html, "BHP");
+  assert.equal(result.name, "BHP Group Limited");
+  assert.equal(result.marketCap, 306_420_000_000);
+  assert.equal(result.revenue, 80_940_000_000);
+  assert.equal(result.peRatio, 19.98);
+  assert.ok(Math.abs(result.dividendYield - 0.0314) < 1e-10);
+  assert.equal(result.revenueGrowth, 0.0072);
+  assert.ok(result.profitMargin > 0.18 && result.profitMargin < 0.2);
+  assert.equal(result.sector, "Materials");
+});
 
 const {
   cacheControlFor,
@@ -491,6 +530,9 @@ test("Local batch analysis handles pools beyond the old forty symbol cap", () =>
   assert.ok(analysisBatchLimit() >= items.length);
   assert.equal(result.results.length, items.length);
   assert.ok(result.results.every((row) => row.symbol && row.analysis?.action));
+  assert.ok(result.results.every((row) => row.analysis?.qualityGate?.productionModelGate?.eligible === false));
+  assert.ok(result.results.every((row) => row.analysis?.ensemble?.optimizedWeighting?.applied === false));
+  assert.ok(result.results.every((row) => !["STRONG_BUY", "WATCH_BUY", "LIGHT_BUY"].includes(row.analysis?.action)));
 });
 
 test("Horizon-isolated local models override market-wide fallback only with enough samples", () => {
@@ -533,7 +575,7 @@ test("Node service can call the Python portfolio risk engine", async () => {
   assert.ok(risk.warnings.some((row) => row.code === "POSITION_CONCENTRATION"));
 });
 
-test("Saved factor configuration changes the decision factor signal", () => {
+test("Manual factor configuration stays research-only until strict OOF approval", () => {
   const factors = {
     macro: { available: true, score: 2, thesis: ["macro"] },
     sector: { available: true, score: -3, thesis: ["sector"] },
@@ -556,7 +598,10 @@ test("Saved factor configuration changes the decision factor signal", () => {
   }, technicals);
   assert.equal(momentum.configApplied, true);
   assert.deepEqual(momentum.disabledFactors, ["reversal_5"]);
-  assert.ok(momentum.score > reversal.score);
+  assert.equal(momentum.score, reversal.score);
+  assert.ok(momentum.researchScore > reversal.researchScore);
+  assert.equal(momentum.learnedConfigScore, 0);
+  assert.ok(momentum.factorContributions.every((row) => row.source !== "saved-research-config-display-only" || row.contribution === 0));
   assert.ok(momentum.enabledFactors.includes("momentum_5"));
   assert.ok(!momentum.enabledFactors.includes("reversal_5"));
 });

@@ -5,7 +5,9 @@ import hashlib
 import html
 import json
 import math
+import os
 import random
+import re
 import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -17,13 +19,16 @@ from paper_agents import load_state as load_paper_agent_state
 
 MARKETS = ("ASX", "US", "CN")
 MODEL_OUTPUTS = (
-    ("ridgePrediction", "Ridge cross-sectional baseline"),
-    ("elasticPrediction", "ElasticNet probability baseline"),
-    ("lightgbmPrediction", "LightGBM challenger"),
-    ("pathSafetyPrediction", "Target-before-stop path model"),
-    ("eventPrediction", "Point-in-time event model"),
-    ("ensembleProbability", "Constrained OOF ensemble"),
-    ("targetProbability", "Calibrated target probability"),
+    ("directionProbability", "Calibrated final-direction ensemble", "actualDirection"),
+    ("ridgeDirectionPrediction", "Logistic direction baseline", "actualDirection"),
+    ("treeDirectionPrediction", "Shallow-tree direction challenger", "actualDirection"),
+    ("ridgePrediction", "Ridge cross-sectional baseline", "actualTarget"),
+    ("elasticPrediction", "ElasticNet probability baseline", "actualTarget"),
+    ("lightgbmPrediction", "Shallow-tree path challenger (CatBoost/LightGBM)", "actualTarget"),
+    ("pathSafetyPrediction", "Target-before-stop path model", "actualTarget"),
+    ("eventPrediction", "Point-in-time event model", "actualTarget"),
+    ("ensembleProbability", "Constrained OOF path ensemble", "actualTarget"),
+    ("targetProbability", "Calibrated target probability", "actualTarget"),
 )
 PRODUCTION_THRESHOLDS = {
     "minRowsPerHorizon": 50_000,
@@ -136,15 +141,21 @@ def _classification_counts(actuals: list[int], predictions: list[int]) -> tuple[
 
 
 def _auc(actuals: list[int], scores: list[float]) -> float | None:
-    positives = [score for actual, score in zip(actuals, scores) if actual == 1]
-    negatives = [score for actual, score in zip(actuals, scores) if actual == 0]
-    if not positives or not negatives:
+    positive_count = sum(1 for actual in actuals if actual == 1)
+    negative_count = len(actuals) - positive_count
+    if not positive_count or not negative_count:
         return None
-    wins = 0.0
-    for positive in positives:
-        for negative in negatives:
-            wins += 1.0 if positive > negative else 0.5 if positive == negative else 0.0
-    return wins / (len(positives) * len(negatives))
+    ordered = sorted(zip(scores, actuals), key=lambda row: row[0])
+    positive_rank_sum = 0.0
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and ordered[end][0] == ordered[index][0]:
+            end += 1
+        average_rank = ((index + 1) + end) / 2.0
+        positive_rank_sum += average_rank * sum(actual for _, actual in ordered[index:end])
+        index = end
+    return (positive_rank_sum - positive_count * (positive_count + 1) / 2.0) / (positive_count * negative_count)
 
 
 def _average_precision(actuals: list[int], scores: list[float]) -> float | None:
@@ -167,28 +178,42 @@ def _platt_slope(actuals: list[int], scores: list[float]) -> tuple[float | None,
     intercept = 0.0
     slope = 1.0
     logits = [math.log(clamp(score, 0.001, 0.999) / (1 - clamp(score, 0.001, 0.999))) for score in scores]
-    for _ in range(400):
+    for _ in range(30):
         grad_i = 0.0
         grad_s = 0.0
+        hessian_ii = 1e-8
+        hessian_is = 0.0
+        hessian_ss = 1e-8
         for logit, actual in zip(logits, actuals):
             prediction = 1 / (1 + math.exp(-clamp(intercept + slope * logit, -24, 24)))
             error = prediction - actual
+            curvature = max(1e-8, prediction * (1 - prediction))
             grad_i += error
             grad_s += error * logit
-        intercept -= 0.06 * grad_i / len(actuals)
-        slope -= 0.02 * grad_s / len(actuals)
+            hessian_ii += curvature
+            hessian_is += curvature * logit
+            hessian_ss += curvature * logit * logit
+        determinant = hessian_ii * hessian_ss - hessian_is * hessian_is
+        if abs(determinant) < 1e-12:
+            break
+        delta_i = (hessian_ss * grad_i - hessian_is * grad_s) / determinant
+        delta_s = (-hessian_is * grad_i + hessian_ii * grad_s) / determinant
+        intercept -= clamp(delta_i, -2.0, 2.0)
+        slope -= clamp(delta_s, -1.0, 1.0)
         slope = clamp(slope, 0.02, 5.0)
+        if abs(delta_i) < 1e-7 and abs(delta_s) < 1e-7:
+            break
     return slope, intercept
 
 
-def classification_metrics(rows: list[dict[str, Any]], probability_key: str) -> dict[str, Any]:
+def classification_metrics(rows: list[dict[str, Any]], probability_key: str, actual_key: str = "actualTarget") -> dict[str, Any]:
     valid = [
         row for row in rows
-        if row.get(probability_key) is not None and row.get("actualTarget") is not None
+        if row.get(probability_key) is not None and row.get(actual_key) is not None
     ]
     if not valid:
         return {"available": False, "reason": "No strict OOF probability rows.", "samples": 0}
-    actuals = [1 if number(row.get("actualTarget")) >= 0.5 else 0 for row in valid]
+    actuals = [1 if number(row.get(actual_key)) >= 0.5 else 0 for row in valid]
     scores = [clamp(row.get(probability_key), 0.001, 0.999) for row in valid]
     predicted = [1 if score >= 0.5 else 0 for score in scores]
     tp, tn, fp, fn = _classification_counts(actuals, predicted)
@@ -226,6 +251,9 @@ def classification_metrics(rows: list[dict[str, Any]], probability_key: str) -> 
             "actualPct": round(actual_rate * 100, 4),
         })
     slope, intercept = _platt_slope(actuals, scores)
+    probability_std = statistics.pstdev(scores) if len(scores) > 1 else 0.0
+    occupied_buckets = sum(1 for row in reliability if int(row.get("count") or 0) >= 30)
+    probability_resolution_passed = probability_std >= 0.035 and occupied_buckets >= 4
     return {
         "available": True,
         "samples": len(valid),
@@ -246,6 +274,9 @@ def classification_metrics(rows: list[dict[str, Any]], probability_key: str) -> 
         "ecePct": round(ece * 100, 5),
         "calibrationSlope": None if slope is None else round(slope, 5),
         "calibrationIntercept": None if intercept is None else round(intercept, 5),
+        "probabilityStd": round(probability_std, 6),
+        "occupiedProbabilityBuckets": occupied_buckets,
+        "probabilityResolutionPassed": probability_resolution_passed,
         "confusionMatrix": {"tp": tp, "tn": tn, "fp": fp, "fn": fn},
         "reliabilityCurve": reliability,
     }
@@ -325,7 +356,11 @@ def rank_metrics(rows: list[dict[str, Any]], prediction_key: str = "rankerPredic
     top_returns: list[float] = []
     universe_returns: list[float] = []
     precision_hits: list[float] = []
-    for group in groups.values():
+    ndcg_values: list[float] = []
+    top_target_rates: list[float] = []
+    top_direction_rates: list[float] = []
+    dated_top_returns: list[tuple[str, float]] = []
+    for group_date, group in groups.items():
         if len(group) < 5:
             continue
         predicted_order = sorted(range(len(group)), key=lambda index: number(group[index].get(prediction_key)))
@@ -341,11 +376,32 @@ def rank_metrics(rows: list[dict[str, Any]], prediction_key: str = "rankerPredic
         actual_top = set(actual_order[-top_count:])
         precision_hits.append(len(selected & actual_top) / top_count)
         top_returns.append(statistics.fmean(number(group[index].get("actualReturn")) for index in selected))
+        dated_top_returns.append((group_date, top_returns[-1]))
         universe_returns.append(statistics.fmean(number(row.get("actualReturn")) for row in group))
+        top_target_rates.append(statistics.fmean(number(group[index].get("actualTarget")) >= 0.5 for index in selected))
+        top_direction_rates.append(statistics.fmean(number(group[index].get("actualReturn")) > 0 for index in selected))
+        relevance = [
+            3 if number(row.get("actualTarget")) >= 0.5 and number(row.get("actualStop")) < 0.5
+            else 0 if number(row.get("actualStop")) >= 0.5
+            else 2 if number(row.get("actualReturn")) > 0
+            else 1
+            for row in group
+        ]
+        ranked_relevance = [relevance[index] for index in predicted_order[-top_count:][::-1]]
+        ideal_relevance = sorted(relevance, reverse=True)[:top_count]
+        dcg = sum((2 ** value - 1) / math.log2(position + 2) for position, value in enumerate(ranked_relevance))
+        ideal_dcg = sum((2 ** value - 1) / math.log2(position + 2) for position, value in enumerate(ideal_relevance))
+        ndcg_values.append(dcg / ideal_dcg if ideal_dcg > 0 else 0.0)
     if not correlations:
         return {"available": False, "reason": "Fewer than five symbols per OOF date.", "samples": 0}
     rank_ic = statistics.fmean(correlations)
     std = statistics.stdev(correlations) if len(correlations) > 1 else 0.0
+    equity = peak = 1.0
+    max_drawdown = 0.0
+    for _, value in sorted(dated_top_returns):
+        equity *= max(0.01, 1 + value / 100)
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
     return {
         "available": True,
         "dateCount": len(correlations),
@@ -353,9 +409,13 @@ def rank_metrics(rows: list[dict[str, Any]], prediction_key: str = "rankerPredic
         "rankIcNeweyWest95": newey_west_mean_ci(correlations),
         "icir": round(rank_ic / std, 6) if std > 1e-12 else None,
         "precisionAt10Pct": round(statistics.fmean(precision_hits) * 100, 5),
+        "ndcgAt10Pct": round(statistics.fmean(ndcg_values), 6),
+        "top10TargetFirstRatePct": round(statistics.fmean(top_target_rates) * 100, 5),
+        "top10DirectionHitRatePct": round(statistics.fmean(top_direction_rates) * 100, 5),
         "topDecileNetReturnPct": round(statistics.fmean(top_returns), 6),
         "universeNetReturnPct": round(statistics.fmean(universe_returns), 6),
         "topDecileLiftPct": round(statistics.fmean(top_returns) - statistics.fmean(universe_returns), 6),
+        "topDecileMaxDrawdownPct": round(max_drawdown, 6),
     }
 
 
@@ -390,6 +450,48 @@ def block_bootstrap_ci(
         "samples": len(values),
         "low": round(values[int(len(values) * 0.025)], 6),
         "high": round(values[min(len(values) - 1, int(len(values) * 0.975))], 6),
+    }
+
+
+def classification_accuracy_block_ci(
+    rows: list[dict[str, Any]],
+    probability_key: str,
+    *,
+    actual_key: str = "actualTarget",
+    samples: int = 400,
+    seed: int = 20260728,
+) -> dict[str, Any]:
+    groups: dict[str, tuple[int, int]] = {}
+    for row in rows:
+        probability = row.get(probability_key)
+        if probability is None:
+            continue
+        day = str(row.get("date") or row.get("signalAt") or "unknown")
+        correct, total = groups.get(day, (0, 0))
+        predicted = 1 if number(probability) >= 0.5 else 0
+        actual = 1 if number(row.get(actual_key)) >= 0.5 else 0
+        groups[day] = (correct + int(predicted == actual), total + 1)
+    dates = sorted(groups)
+    if len(dates) < 5:
+        return {"available": False, "reason": "Fewer than five independent date blocks.", "dateBlocks": len(dates)}
+    rng = random.Random(seed)
+    values = []
+    for _ in range(samples):
+        correct = 0
+        total = 0
+        for _ in dates:
+            day_correct, day_total = groups[rng.choice(dates)]
+            correct += day_correct
+            total += day_total
+        if total:
+            values.append(correct / total * 100.0)
+    values.sort()
+    return {
+        "available": bool(values),
+        "dateBlocks": len(dates),
+        "samples": len(values),
+        "low": round(values[int(len(values) * 0.025)], 6) if values else None,
+        "high": round(values[min(len(values) - 1, int(len(values) * 0.975))], 6) if values else None,
     }
 
 
@@ -445,6 +547,7 @@ def _model_status(model: dict[str, Any]) -> str:
 
 def _hard_gate(dataset: dict[str, Any], horizon_model: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     metrics = horizon_model.get("metrics") or {}
+    direction_metrics = horizon_model.get("directionMetrics") or {}
     folds = horizon_model.get("foldMetrics") or []
     checks = [
         ("rows", number(horizon_model.get("rowCount")) >= PRODUCTION_THRESHOLDS["minRowsPerHorizon"], number(horizon_model.get("rowCount")), PRODUCTION_THRESHOLDS["minRowsPerHorizon"]),
@@ -458,10 +561,15 @@ def _hard_gate(dataset: dict[str, Any], horizon_model: dict[str, Any], audit: di
         ("cross_market", int(audit.get("crossMarketRows") or 0) == 0, int(audit.get("crossMarketRows") or 0), 0),
         ("future_leakage", int(audit.get("futureAvailabilityRows") or 0) == 0 and int(dataset.get("pointInTimeJoinViolationCount") or 0) == 0, int(audit.get("futureAvailabilityRows") or 0) + int(dataset.get("pointInTimeJoinViolationCount") or 0), 0),
         ("brier_skill", number(metrics.get("brierSkillScore"), -1) > PRODUCTION_THRESHOLDS["minBrierSkill"], number(metrics.get("brierSkillScore"), -1), f">{PRODUCTION_THRESHOLDS['minBrierSkill']}"),
+        ("direction_brier_skill", number(direction_metrics.get("brierSkillScore"), -1) > PRODUCTION_THRESHOLDS["minBrierSkill"], number(direction_metrics.get("brierSkillScore"), -1), f">{PRODUCTION_THRESHOLDS['minBrierSkill']}"),
+        ("direction_balanced_accuracy", number(direction_metrics.get("balancedAccuracyPct")) > 50.0, number(direction_metrics.get("balancedAccuracyPct")), ">50%"),
         ("ece", number(metrics.get("ecePct"), 100) <= PRODUCTION_THRESHOLDS["maxEcePct"], number(metrics.get("ecePct"), 100), PRODUCTION_THRESHOLDS["maxEcePct"]),
         ("calibration_slope", PRODUCTION_THRESHOLDS["minCalibrationSlope"] <= number(metrics.get("calibrationSlope"), -1) <= PRODUCTION_THRESHOLDS["maxCalibrationSlope"], number(metrics.get("calibrationSlope"), -1), "0.8-1.2"),
         ("probability_bucket", number(metrics.get("probabilityBucketMinCount")) >= PRODUCTION_THRESHOLDS["minProbabilityBucketEvents"], number(metrics.get("probabilityBucketMinCount")), PRODUCTION_THRESHOLDS["minProbabilityBucketEvents"]),
+        ("target_probability_resolution", metrics.get("probabilityResolutionPassed") is True, {"std": metrics.get("probabilityStd"), "buckets": metrics.get("occupiedProbabilityBuckets")}, "std>=0.035 and >=4 buckets"),
+        ("direction_probability_resolution", direction_metrics.get("probabilityResolutionPassed") is True, {"std": direction_metrics.get("probabilityStd"), "buckets": direction_metrics.get("occupiedProbabilityBuckets")}, "std>=0.035 and >=4 buckets"),
         ("top_k_lift", number(horizon_model.get("rankingMetrics", {}).get("topDecileLift")) > 0, number(horizon_model.get("rankingMetrics", {}).get("topDecileLift")), ">0"),
+        ("top_k_absolute_return", number(horizon_model.get("rankingMetrics", {}).get("topDecileNetReturn")) > 0, number(horizon_model.get("rankingMetrics", {}).get("topDecileNetReturn")), ">0"),
         ("net_ev", number(horizon_model.get("expectedValue", {}).get("expectedValuePct")) > 0, number(horizon_model.get("expectedValue", {}).get("expectedValuePct")), ">0"),
         ("feature_drift", max([number(fold.get("featureDrift", {}).get("maxPsi")) for fold in folds] or [0]) <= PRODUCTION_THRESHOLDS["maxFeaturePsi"], max([number(fold.get("featureDrift", {}).get("maxPsi")) for fold in folds] or [0]), PRODUCTION_THRESHOLDS["maxFeaturePsi"]),
     ]
@@ -487,14 +595,11 @@ def horizon_report(
     if artifact.get("filename") and artifact_path.exists():
         rows, audit = read_oof_rows(artifact_path, manifest, market)
     classifiers = []
-    for key, label in MODEL_OUTPUTS:
-        result = classification_metrics(rows, key)
+    for key, label, actual_key in MODEL_OUTPUTS:
+        result = classification_metrics(rows, key, actual_key)
         if result.get("available"):
-            result["accuracyCi95"] = block_bootstrap_ci(
-                rows,
-                lambda sample, output=key: number(classification_metrics(sample, output).get("accuracyPct"), math.nan),
-            )
-        classifiers.append({"id": key, "name": label, "task": "classification", "metrics": result})
+            result["accuracyCi95"] = classification_accuracy_block_ci(rows, key, actual_key=actual_key)
+        classifiers.append({"id": key, "name": label, "task": "classification", "target": actual_key, "metrics": result})
     quantiles = quantile_metrics(rows)
     regression = regression_metrics(rows, "quantileP50")
     ranking = rank_metrics(rows)
@@ -517,6 +622,9 @@ def horizon_report(
         "prunedModels": model.get("prunedModels") or [],
         "foldMetrics": model.get("foldMetrics") or model.get("folds") or [],
         "featureImportance": model.get("featureImportance") or [],
+        "featureAblation": model.get("featureAblation") or {},
+        "diagnosticBuckets": model.get("diagnosticBuckets") or {},
+        "modelComparison": model.get("modelComparison") or [],
         "calibrator": model.get("calibrator"),
         "expectedValue": model.get("expectedValue"),
         "hardGate": hard_gate,
@@ -529,24 +637,57 @@ def factor_model_reports(root: Path, market: str) -> list[dict[str, Any]]:
         payload = read_json(path, {})
         if str(payload.get("market") or "").upper() != market:
             continue
+        scope = str(payload.get("scope") or ("market" if path.stem.startswith("cross-sectional-") else "stock"))
+        if scope == "market":
+            horizon_rows = payload.get("horizonResults") or []
+            tests = [row.get("mlBacktest", {}).get("test", {}) for row in horizon_rows if isinstance(row, dict)]
+            tests = [row for row in tests if row]
+            sample_count = sum(int(number(row.get("rowCount"))) for row in horizon_rows)
+            local_gate_passed = bool(payload.get("eligibleForLiveWeight") is True and any(row.get("mlBacktest", {}).get("active") is True for row in horizon_rows))
+            rows.append({
+                "modelId": path.stem,
+                "modelVersion": payload.get("evidenceId") or payload.get("savedAt"),
+                "market": market,
+                "scope": "market",
+                "horizon": payload.get("horizons"),
+                "family": "factor_research",
+                "status": "shadow" if local_gate_passed else "research",
+                "available": bool(horizon_rows),
+                "sampleCount": sample_count,
+                "symbolCount": payload.get("symbolCount"),
+                "eligibleForLiveWeight": False,
+                "localOosGatePassed": local_gate_passed,
+                "metrics": {
+                    "rankIc": metric(sum(number(row.get("rank_ic")) for row in tests) / len(tests) if tests else None, reason="No market-level untouched Rank IC."),
+                    "directionAccuracyPct": metric(sum(number(row.get("direction_hit_rate_pct")) for row in tests) / len(tests) if tests else None, reason="No market-level untouched direction result."),
+                    "netSignalReturnPct": metric(sum(number(row.get("avg_net_signal_return_pct")) for row in tests) / len(tests) if tests else None, reason="No market-level cost-adjusted factor result."),
+                },
+                "hardGate": {"passed": False, "failedChecks": [*([] if local_gate_passed else ["market_factor_oos_gate_failed"]), "prediction_champion_required"]},
+            })
+            continue
         backtest = payload.get("mlBacktest") or {}
         policy_version = int(number(payload.get("admissionPolicyVersion")))
-        live_eligible = bool(
+        local_gate_passed = bool(
             policy_version >= 2
             and payload.get("eligibleForLiveWeight") is True
             and backtest.get("active") is True
         )
+        # A per-symbol factor experiment is research evidence, not a production
+        # market model. It remains zero-weight until strict market-level OOF is
+        # independently eligible.
+        live_eligible = False
         legacy_quarantined = policy_version < 2
         failed_checks = ["market_level_oof_required"]
         if legacy_quarantined:
             failed_checks.insert(0, "legacy_admission_policy_quarantined")
-        elif not live_eligible:
+        elif not local_gate_passed:
             failed_checks.insert(0, "strict_factor_oos_gate_failed")
         rows.append({
             "modelId": path.stem,
             "modelVersion": payload.get("savedAt"),
             "market": market,
             "symbol": payload.get("symbol"),
+            "scope": "stock",
             "horizon": payload.get("horizonDays"),
             "family": "factor_research",
             "status": "quarantined" if legacy_quarantined else ("research" if payload.get("sampleCount") else "evidence_insufficient"),
@@ -556,6 +697,7 @@ def factor_model_reports(root: Path, market: str) -> list[dict[str, Any]]:
             "admissionPolicyVersion": policy_version,
             "legacyQuarantined": legacy_quarantined,
             "eligibleForLiveWeight": live_eligible,
+            "localOosGatePassed": local_gate_passed,
             "reportedAdmittedCount": payload.get("admittedCount"),
             "admittedCount": payload.get("admittedCount") if live_eligible else 0,
             "metrics": {
@@ -730,24 +872,71 @@ def market_report(root: Path, market: str) -> dict[str, Any]:
     }
 
 
+def _job_header(path: Path) -> dict[str, Any]:
+    """Read bounded top-level job metadata without loading multi-megabyte results."""
+    try:
+        with path.open("rb") as handle:
+            text = handle.read(8_192).decode("utf-8", errors="ignore")
+    except OSError:
+        return {}
+
+    def string_value(key: str) -> str | None:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', text)
+        if not match:
+            return None
+        try:
+            return json.loads(f'"{match.group(1)}"')
+        except (ValueError, TypeError):
+            return match.group(1)
+
+    def integer_value(key: str) -> int:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*(-?\d+)', text)
+        return int(match.group(1)) if match else 0
+
+    return {
+        "id": string_value("id") or path.stem,
+        "type": string_value("type") or "unknown",
+        "runtimeVersion": integer_value("runtimeVersion"),
+        "market": string_value("market"),
+        "status": string_value("status") or "unknown",
+        "failureCategory": string_value("failureCategory"),
+        "createdAt": string_value("createdAt"),
+        "updatedAt": string_value("updatedAt"),
+    }
+
+
 def _job_summary(root: Path) -> dict[str, Any]:
+    current_runtime_version = 3
+    job_paths = sorted(
+        (root / ".cache" / "background-jobs").glob("backtest-*.json"),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    audit_limit = max(50, min(1_000, int(os.getenv("MODEL_REPORT_JOB_AUDIT_LIMIT", "400"))))
+    audited_paths = job_paths[:audit_limit]
     counts = Counter()
     types = Counter()
     failure_categories = Counter()
     current_counts = Counter()
     current_failures = Counter()
+    by_runtime: dict[str, Counter] = {}
     recent_rows: list[dict[str, Any]] = []
-    for path in (root / ".cache" / "background-jobs").glob("*.json"):
-        payload = read_json(path, {})
+    for path in audited_paths:
+        payload = _job_header(path)
+        if not payload:
+            continue
         status = str(payload.get("status") or "unknown")
         counts[status] += 1
         types[str(payload.get("type") or "unknown")] += 1
         recent_rows.append(payload)
-        if int(number(payload.get("runtimeVersion"))) >= 2:
+        runtime_version = int(number(payload.get("runtimeVersion")))
+        runtime_key = str(runtime_version or "legacy")
+        by_runtime.setdefault(runtime_key, Counter())[status] += 1
+        if runtime_version == current_runtime_version:
             current_counts[status] += 1
         if status == "failed":
             failure_categories[str(payload.get("failureCategory") or "unclassified")] += 1
-            if int(number(payload.get("runtimeVersion"))) >= 2:
+            if runtime_version == current_runtime_version:
                 current_failures[str(payload.get("failureCategory") or "unclassified")] += 1
     terminal = counts["complete"] + counts["failed"]
     current_terminal = current_counts["complete"] + current_counts["failed"]
@@ -756,22 +945,26 @@ def _job_summary(root: Path) -> dict[str, Any]:
     recent_failures = sum(1 for row in recent_terminal_rows if row.get("status") == "failed")
     return {
         "total": sum(counts.values()),
+        "totalArtifacts": len(job_paths),
+        "auditedJobs": len(audited_paths),
+        "auditCoveragePct": round(len(audited_paths) / len(job_paths) * 100, 5) if job_paths else 100.0,
         "status": dict(counts),
         "types": dict(types),
         "failureCategories": dict(failure_categories),
         "terminalFailureRatePct": round(counts["failed"] / terminal * 100, 5) if terminal else None,
         "currentRuntime": {
-            "version": 2,
+            "version": current_runtime_version,
             "status": dict(current_counts),
             "failureCategories": dict(current_failures),
             "terminalFailureRatePct": round(current_counts["failed"] / current_terminal * 100, 5) if current_terminal else None,
         },
+        "byRuntime": {key: dict(value) for key, value in sorted(by_runtime.items())},
         "recent50": {
             "terminalJobs": len(recent_terminal_rows),
             "failedJobs": recent_failures,
             "failureRatePct": round(recent_failures / len(recent_terminal_rows) * 100, 5) if recent_terminal_rows else None,
         },
-        "interpretation": "All-time history is retained for audit; currentRuntime isolates jobs created after the persistent worker and bounded-queue upgrade.",
+        "interpretation": "Training reliability uses the newest bounded backtest audit window so report generation never reloads every historical result blob. All artifacts remain retained; currentRuntime isolates Runtime V3 fold-checkpoint jobs.",
     }
 
 
@@ -871,7 +1064,7 @@ def render_html(evidence: dict[str, Any], target: Path) -> None:
             family = model.get("family")
             title = model.get("name") or model.get("modelId")
             if family == "market_multitask":
-                primary = next((row for row in model.get("classifiers") or [] if row["id"] == "ensembleProbability"), None)
+                primary = next((row for row in model.get("classifiers") or [] if row["id"] == "directionProbability"), None) or next((row for row in model.get("classifiers") or [] if row["id"] == "ensembleProbability"), None)
                 metrics = (primary or {}).get("metrics") or {}
                 metric_rows = [
                     ("Accuracy", _fmt(metrics.get("accuracyPct"), suffix="%")),
@@ -881,6 +1074,7 @@ def render_html(evidence: dict[str, Any], target: Path) -> None:
                     ("ROC-AUC", _fmt(metrics.get("rocAuc"), 3)),
                     ("Brier Skill", _fmt(metrics.get("brierSkillScore"), 3)),
                     ("ECE", _fmt(metrics.get("ecePct"), suffix="%")),
+                    ("概率分辨率", "通过" if metrics.get("probabilityResolutionPassed") else f"不足 · σ={_fmt(metrics.get('probabilityStd'), 3)} / {int(number(metrics.get('occupiedProbabilityBuckets')))}桶"),
                     ("独立日期", _fmt(model.get("sampleAudit", {}).get("independentDates"), 0)),
                 ]
                 visuals = _reliability_svg(metrics) + _confusion_html(metrics)
@@ -896,7 +1090,7 @@ def render_html(evidence: dict[str, Any], target: Path) -> None:
                 regression = model.get("regression") or {}
                 quantiles = model.get("quantiles") or {}
                 task_rows.extend([
-                    f"<tr><td>横截面排序</td><td>排序</td><td>{_fmt(ranking.get('dateCount'), 0)}</td><td>{_fmt(ranking.get('rankIc'), 3)}</td><td>{_fmt(ranking.get('precisionAt10Pct'), suffix='%')}</td><td>{_fmt(ranking.get('topDecileLiftPct'), 3)}</td></tr>",
+                    f"<tr><td>横截面排序</td><td>排序</td><td>{_fmt(ranking.get('dateCount'), 0)}</td><td>IC {_fmt(ranking.get('rankIc'), 3)} / NDCG {_fmt(ranking.get('ndcgAt10Pct'), 3)}</td><td>目标先到 {_fmt(ranking.get('top10TargetFirstRatePct'), suffix='%')} / 方向 {_fmt(ranking.get('top10DirectionHitRatePct'), suffix='%')}</td><td>Lift {_fmt(ranking.get('topDecileLiftPct'), 3)} / DD {_fmt(ranking.get('topDecileMaxDrawdownPct'), suffix='%')}</td></tr>",
                     f"<tr><td>收益中位数</td><td>回归</td><td>{_fmt(regression.get('samples'), 0)}</td><td>{_fmt(regression.get('directionAccuracyPct'), suffix='%')}</td><td>{_fmt(regression.get('mae'), 3)}</td><td>{_fmt(regression.get('r2'), 3)}</td></tr>",
                     f"<tr><td>收益分位数</td><td>Quantile</td><td>{_fmt(quantiles.get('samples'), 0)}</td><td>{_fmt(quantiles.get('intervalCoveragePct'), suffix='%')}</td><td>{_fmt(quantiles.get('p50Pinball'), 3)}</td><td>{_fmt(quantiles.get('meanIntervalWidthPct'), 3)}</td></tr>",
                 ])
@@ -1007,7 +1201,7 @@ familyFilter.addEventListener("change",applyFilters);
     target.write_text(document, "utf-8")
 
 
-DOCX_FONT_FAMILY = "Arial Unicode MS"
+DOCX_FONT_FAMILY = "Hiragino Sans GB"
 
 
 def _set_docx_font(target: Any, font_name: str = DOCX_FONT_FAMILY) -> None:
@@ -1039,6 +1233,18 @@ def _repeat_table_header(row: Any) -> None:
     marker = OxmlElement("w:tblHeader")
     marker.set(qn("w:val"), "true")
     properties.append(marker)
+
+
+def _set_table_widths(table: Any, widths: list[float]) -> None:
+    from docx.shared import Inches
+
+    table.autofit = False
+    for index, width in enumerate(widths):
+        if index >= len(table.columns):
+            break
+        table.columns[index].width = Inches(width)
+        for cell in table.columns[index].cells:
+            cell.width = Inches(width)
 
 
 def _render_evidence_chart(metrics: dict[str, Any], target: Path) -> bool:
@@ -1135,65 +1341,69 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
     run.font.color.rgb = RGBColor.from_string("A17E3E")
     title = doc.add_paragraph()
     title.paragraph_format.space_after = Pt(5)
-    title_run = title.add_run("Global Quant Watch\n全模型训练与生产验收报告")
+    title_run = title.add_run("Global Quant Watch\nAll-model training and production-gate report")
     title_run.bold = True
     _set_docx_font(title_run)
     title_run.font.size = Pt(25)
     title_run.font.color.rgb = RGBColor.from_string("172127")
-    meta = doc.add_paragraph(f"报告编号：{evidence['reportId']}    生成时间：{evidence['generatedAt']}")
+    meta = doc.add_paragraph(f"Report ID: {evidence['reportId']}    Generated: {evidence['generatedAt']}")
     meta.runs[0].font.color.rgb = RGBColor.from_string("66757D")
     lead = doc.add_paragraph()
     lead.paragraph_format.space_before = Pt(10)
     lead.paragraph_format.space_after = Pt(12)
     lead_text = (
-        "结论：当前证据已通过生产硬门槛，仍需遵循 Shadow / Paper / Production 的显式晋升流程。"
+        "Conclusion: deterministic production gates passed; explicit Shadow, Paper, and Production promotion is still required."
         if evidence["productionReady"]
-        else "结论：当前模型体系未达到生产就绪门槛，仅可用于 Research / Shadow。"
+        else "Conclusion: current evidence does not meet production gates; models remain Research or Shadow only."
     )
     lead_run = lead.add_run(lead_text)
     lead_run.bold = True
     lead_run.font.color.rgb = RGBColor.from_string("9B1C1C")
 
-    doc.add_heading("1. 执行摘要", level=1)
+    doc.add_heading("1. Executive summary", level=1)
     summary_table = doc.add_table(rows=2, cols=4)
     summary_table.autofit = False
     _repeat_table_header(summary_table.rows[0])
     for cell in summary_table.rows[0].cells:
         cell.width = Inches(1.56)
     values = [
-        ("生产就绪", "是" if evidence["productionReady"] else "否"),
-        ("后台任务", evidence["jobReliability"]["total"]),
-        ("升级后终态失败率", _fmt((evidence["jobReliability"].get("currentRuntime") or {}).get("terminalFailureRatePct", evidence["jobReliability"].get("terminalFailureRatePct")), suffix="%")),
-        ("阻断项", len(evidence["blockers"])),
+        ("Production ready", "Yes" if evidence["productionReady"] else "No"),
+        ("Background jobs", evidence["jobReliability"]["total"]),
+        ("Runtime failure", _fmt((evidence["jobReliability"].get("currentRuntime") or {}).get("terminalFailureRatePct", evidence["jobReliability"].get("terminalFailureRatePct")), suffix="%")),
+        ("Blockers", len(evidence["blockers"])),
     ]
     for index, (label, value) in enumerate(values):
         _set_cell_text(summary_table.cell(0, index), label, bold=True, color="715424")
         _set_cell_text(summary_table.cell(1, index), value, bold=True)
     doc.add_paragraph(evidence["honestBoundary"])
 
-    doc.add_heading("2. 市场与模型证据", level=1)
+    doc.add_heading("2. Market and model evidence", level=1)
     for market in evidence["markets"]:
         dataset = market.get("dataset") or {}
-        doc.add_heading(f"{market['market']} · {market.get('modelVersion') or '无市场级注册模型'}", level=2)
+        doc.add_heading(f"{market['market']} - {market.get('modelVersion') or 'no registered market model'}", level=2)
         doc.add_paragraph(
-            f"原始训练行 {int(number(dataset.get('rawRows')))}；股票 {int(number(dataset.get('symbolCount')))}；"
-            f"日期 {int(number(dataset.get('dateCount')))}；PIT 覆盖 {_fmt(dataset.get('pointInTimeCoveragePct'), suffix='%')}；"
-            f"公司行动覆盖 {_fmt(dataset.get('corporateActionCoveragePct'), suffix='%')}。"
+            f"Raw training rows {int(number(dataset.get('rawRows')))}; symbols {int(number(dataset.get('symbolCount')))}; "
+            f"dates {int(number(dataset.get('dateCount')))}; PIT event coverage {_fmt(dataset.get('pointInTimeCoveragePct'), suffix='%')}; "
+            f"verified corporate-action history {_fmt(dataset.get('corporateActionCoveragePct'), suffix='%')}; "
+            f"adjusted-price coverage {_fmt(dataset.get('adjustedPriceCoveragePct'), suffix='%')}."
         )
         doc.add_paragraph(
-            f"活跃特征 {int(number(dataset.get('activeFeatureCount')))} 个；"
-            f"已训练周期 {market.get('trainedHorizons') or []}；暂缓周期 {market.get('withheldHorizons') or []}。"
+            f"Active features {int(number(dataset.get('activeFeatureCount')))}; "
+            f"trained horizons {market.get('trainedHorizons') or []}; withheld horizons {market.get('withheldHorizons') or []}. "
             f"{dataset.get('featurePolicy') or ''}"
         )
         model_table = doc.add_table(rows=1, cols=7)
-        model_table.autofit = False
+        model_table.style = "Table Grid"
         _repeat_table_header(model_table.rows[0])
-        headers = ("模型", "任务", "状态", "样本", "Accuracy", "Precision", "F1")
+        headers = ("Model", "Task", "Status", "Samples", "Acc.", "Prec.", "F1")
         for index, label in enumerate(headers):
             _set_cell_text(model_table.cell(0, index), label, bold=True, color="715424")
-        for model in market["models"]:
+        factor_models = [model for model in market["models"] if model.get("family") == "factor_research"]
+        report_models = [model for model in market["models"] if model.get("family") != "factor_research"]
+        report_models.extend(factor_models[:12])
+        for model in report_models:
             row = model_table.add_row().cells
-            primary = next((item for item in model.get("classifiers") or [] if item["id"] == "ensembleProbability"), {})
+            primary = next((item for item in model.get("classifiers") or [] if item["id"] == "directionProbability"), None) or next((item for item in model.get("classifiers") or [] if item["id"] == "ensembleProbability"), {})
             metrics = primary.get("metrics") or model.get("metrics") or {}
             raw_accuracy = metrics.get("accuracyPct")
             if isinstance(raw_accuracy, dict):
@@ -1215,28 +1425,34 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
             )
             for index, value in enumerate(values):
                 _set_cell_text(row[index], str(value))
+        _set_table_widths(model_table, [1.30, 1.05, 0.80, 0.68, 0.68, 0.68, 0.50])
+        if len(factor_models) > 12:
+            doc.add_paragraph(
+                f"The Word summary lists 12 of {len(factor_models)} factor artifacts; the HTML and JSON evidence retain the complete registry."
+            )
 
         market_models = [model for model in market["models"] if model.get("family") == "market_multitask"]
         for model in market_models:
-            doc.add_heading(f"{model.get('horizon')} 日市场级模型", level=3)
+            doc.add_heading(f"{model.get('horizon')}-day market model", level=3)
             audit = model.get("sampleAudit") or {}
             doc.add_paragraph(
-                f"状态：{model.get('status')}；OOF 原始/去重 {audit.get('rawRows', 0)}/{audit.get('uniqueRows', 0)}；"
-                f"独立日期 {audit.get('independentDates', 0)}；重复 {audit.get('duplicateRows', 0)}；"
-                f"跨市场污染 {audit.get('crossMarketRows', 0)}。"
+                f"Status: {model.get('status')}; OOF raw/deduplicated {audit.get('rawRows', 0)}/{audit.get('uniqueRows', 0)}; "
+                f"independent dates {audit.get('independentDates', 0)}; duplicates {audit.get('duplicateRows', 0)}; "
+                f"cross-market contamination {audit.get('crossMarketRows', 0)}."
             )
             failures = model.get("hardGate", {}).get("failedChecks") or []
-            doc.add_paragraph("硬门槛：" + ("通过" if not failures else "未通过：" + "、".join(failures)))
+            doc.add_paragraph("Hard gate: " + ("passed" if not failures else "failed: " + ", ".join(failures)))
             task_table = doc.add_table(rows=1, cols=6)
+            task_table.style = "Table Grid"
             _repeat_table_header(task_table.rows[0])
-            for index, label in enumerate(("模型/输出", "任务", "样本", "Accuracy/IC", "F1/MAE", "Brier/Lift")):
+            for index, label in enumerate(("Model/output", "Task", "Samples", "Accuracy/IC", "F1/MAE", "Brier/Lift")):
                 _set_cell_text(task_table.cell(0, index), label, bold=True, color="715424")
             for classifier in model.get("classifiers") or []:
                 values = classifier.get("metrics") or {}
                 row = task_table.add_row().cells
                 task_values = (
                     classifier.get("name"),
-                    "分类",
+                    "Classification",
                     _fmt(values.get("samples"), 0),
                     _fmt(values.get("accuracyPct"), suffix="%"),
                     _fmt(values.get("f1Pct"), suffix="%"),
@@ -1245,38 +1461,39 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
                 for index, value in enumerate(task_values):
                     _set_cell_text(row[index], value)
             for name, task, values, columns in (
-                ("横截面排序", "排序", model.get("ranking") or {}, ("dateCount", "rankIc", "precisionAt10Pct", "topDecileLiftPct")),
-                ("收益中位数", "回归", model.get("regression") or {}, ("samples", "directionAccuracyPct", "mae", "r2")),
-                ("收益分位数", "Quantile", model.get("quantiles") or {}, ("samples", "intervalCoveragePct", "p50Pinball", "meanIntervalWidthPct")),
+                ("Cross-sectional ranking", "Ranking", model.get("ranking") or {}, ("dateCount", "rankIc", "precisionAt10Pct", "topDecileLiftPct")),
+                ("Median return", "Regression", model.get("regression") or {}, ("samples", "directionAccuracyPct", "mae", "r2")),
+                ("Return quantiles", "Quantile", model.get("quantiles") or {}, ("samples", "intervalCoveragePct", "p50Pinball", "meanIntervalWidthPct")),
             ):
                 row = task_table.add_row().cells
                 task_values = (name, task, *(_fmt(values.get(key)) for key in columns))
                 for index, value in enumerate(task_values):
                     _set_cell_text(row[index], value)
+            _set_table_widths(task_table, [1.55, 0.85, 0.75, 1.00, 0.90, 1.00])
             importance = model.get("featureImportance") or []
             if importance:
                 top_features = importance[:12]
                 doc.add_paragraph(
-                    "Top 特征重要性：" + "；".join(
+                    "Top feature importance: " + "; ".join(
                         f"{row.get('name', row.get('feature', 'unknown'))}={_fmt(row.get('importance', row.get('value')), 3)}"
                         for row in top_features
                     )
                 )
             else:
-                doc.add_paragraph("特征重要性：当前注册产物未持久化可验证的重要性数据。")
-            primary = next((row for row in model.get("classifiers") or [] if row["id"] == "ensembleProbability"), {})
+                doc.add_paragraph("Feature importance: the current registered artifact does not contain verifiable importance evidence.")
+            primary = next((row for row in model.get("classifiers") or [] if row["id"] == "directionProbability"), None) or next((row for row in model.get("classifiers") or [] if row["id"] == "ensembleProbability"), {})
             primary_metrics = primary.get("metrics") or {}
             chart_path = target.parent / "assets" / f"{evidence['reportId']}-{market['market']}-{model.get('horizon')}d.png"
             if _render_evidence_chart(primary_metrics, chart_path):
                 doc.add_picture(str(chart_path), width=Inches(6.7))
-                caption = doc.add_paragraph("图：严格 OOF 概率可靠性与混淆矩阵")
+                caption = doc.add_paragraph("Figure: strict OOF reliability curve and confusion matrix")
                 caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 caption.runs[0].italic = True
                 caption.runs[0].font.size = Pt(8.5)
             else:
-                doc.add_paragraph("OOF 图表：证据不足，未生成可靠性曲线或混淆矩阵。")
+                doc.add_paragraph("OOF chart unavailable because reliability-curve or confusion-matrix evidence is insufficient.")
 
-    doc.add_heading("3. Paper Agent 与 AI 监工", level=1)
+    doc.add_heading("3. Paper Agents and AI supervisors", level=1)
     for market in evidence["markets"]:
         agents = [model for model in market["models"] if model.get("family") == "paper_agent"]
         reviewers = [model for model in market["models"] if model.get("family") == "ai_supervisor"]
@@ -1284,39 +1501,40 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
         for agent in agents:
             values = agent.get("metrics") or {}
             doc.add_paragraph(
-                f"{agent.get('name') or agent.get('modelId')}：成本后收益 {_fmt(values.get('netReturnPct'), suffix='%')}，"
-                f"交易 {values.get('tradeCount', 0)}，胜率 {_fmt(values.get('winRatePct'), suffix='%')}。"
+                f"{agent.get('name') or agent.get('modelId')}: net return after costs {_fmt(values.get('netReturnPct'), suffix='%')}; "
+                f"trades {values.get('tradeCount', 0)}; win rate {_fmt(values.get('winRatePct'), suffix='%')}."
             )
         for reviewer in reviewers:
             doc.add_paragraph(
-                f"{reviewer.get('provider')}：{reviewer.get('verdict')}；可用={reviewer.get('available')}。"
-                f" {reviewer.get('rationale') or ''}"
+                f"{reviewer.get('provider')}: verdict={reviewer.get('verdict')}; available={reviewer.get('available')}."
             )
 
-    doc.add_heading("4. 生产硬门槛与返工", level=1)
+    doc.add_heading("4. Production gates and rework", level=1)
     gate_table = doc.add_table(rows=1, cols=3)
+    gate_table.style = "Table Grid"
     _repeat_table_header(gate_table.rows[0])
-    for index, label in enumerate(("门槛", "要求", "意义")):
+    for index, label in enumerate(("Gate", "Requirement", "Purpose")):
         _set_cell_text(gate_table.cell(0, index), label, bold=True, color="715424")
     requirements = (
-        ("样本", "每周期 50,000 行、OOF 1,000 行、120 个测试日", "防止小样本高分"),
-        ("事件", "止盈/止损各 500，5 折中至少 4 折为正", "覆盖不同市场阶段"),
-        ("概率", "Brier Skill > 0、ECE <= 5%、斜率 0.8–1.2", "概率可解释"),
-        ("质量", "污染/重复/泄漏为 0，PSI <= 0.40", "阻断未来函数和漂移"),
-        ("收益", "Top-K Lift 与成本后 EV 为正", "避免只有分类分数没有交易价值"),
-        ("监工", "至少两个可用 AI 监工通过", "只在确定性门槛通过后复核"),
+        ("Samples", "50,000 train rows, 1,000 OOF rows, 120 test dates", "Prevent small-sample inflation"),
+        ("Events", "500 target and stop events; at least 4 of 5 positive folds", "Cover distinct market regimes"),
+        ("Probability", "Brier Skill > 0, ECE <= 5%, slope 0.8-1.2", "Keep probabilities interpretable"),
+        ("Quality", "Zero contamination, duplicates, and leakage; PSI <= 0.40", "Block leakage and drift"),
+        ("Return", "Positive Top-K Lift and net EV", "Require economic value after costs"),
+        ("Supervision", "At least two available AI supervisors accept", "Review only after deterministic gates"),
     )
     for requirement in requirements:
         cells = gate_table.add_row().cells
         for index, value in enumerate(requirement):
             _set_cell_text(cells[index], value)
+    _set_table_widths(gate_table, [0.90, 3.25, 2.10])
 
-    doc.add_heading("5. 当前整改队列", level=1)
+    doc.add_heading("5. Current remediation queue", level=1)
     for action in evidence["recommendedActions"]:
         doc.add_paragraph(action, style="List Bullet")
     doc.add_paragraph(
-        "本报告不会把 Paper Agent 收益、规则头、AI 监工意见或重复预测解释为分类准确率。"
-        "所有缺失指标保持“证据不足”，直到严格 OOF 产物可验证。"
+        "Paper Agent returns, rule heads, AI reviewer opinions, and duplicate predictions are never relabeled as classification accuracy. "
+        "Missing metrics remain unavailable until a strict OOF artifact can support them."
     )
     target.parent.mkdir(parents=True, exist_ok=True)
     doc.save(target)

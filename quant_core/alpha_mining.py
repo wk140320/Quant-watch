@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import random
+import re
 from typing import Any
 
 from features import _pearson, _spearman, clamp, mean, number, pct_change, sanitize_candles, stddev
@@ -143,6 +145,7 @@ def _aligned_values(values: list[float], start_index: int, end_index: int) -> li
 
 
 def _candidate(name: str, expression: str, hypothesis: str, values: list[float], complexity: int, lineage: list[str]) -> dict[str, Any]:
+    canonical_expression = re.sub(r"\s+", "", expression.lower())
     return {
         "name": name,
         "expression": expression,
@@ -150,6 +153,7 @@ def _candidate(name: str, expression: str, hypothesis: str, values: list[float],
         "values": values,
         "complexity": complexity,
         "lineage": lineage,
+        "formula_hash": hashlib.sha256(canonical_expression.encode("utf-8")).hexdigest()[:20],
     }
 
 
@@ -222,6 +226,9 @@ def _evaluate_candidate(candidate: dict[str, Any], labels: list[float], accepted
     for row in accepted[:12]:
         overlap = abs(_pearson(values, row.get("_values", [])))
         max_overlap = max(max_overlap, overlap)
+    vif_proxy = 1.0 / max(1e-6, 1.0 - max_overlap * max_overlap)
+    losing_windows = sum(1 for value in rolling if value * full_ic <= 0)
+    pbo_proxy = losing_windows / max(1, len(rolling))
     generalization_score = max(0.0, min(100.0, 100.0 - overfit_penalty - max_overlap * 10 - candidate["complexity"] * 0.9))
     quality = _quality_gate(values, candidate["expression"], candidate["complexity"])
     direction = 1 if full_ic >= 0 else -1
@@ -254,6 +261,8 @@ def _evaluate_candidate(candidate: dict[str, Any], labels: list[float], accepted
         "stability": round(stability, 3),
         "positive_window_share_pct": round(positive_window_share * 100, 1),
         "max_overlap": round(max_overlap, 4),
+        "vif_proxy": round(vif_proxy, 4),
+        "pbo_proxy": round(pbo_proxy, 4),
         "quality_gate": quality,
     }
 
@@ -505,7 +514,7 @@ def analyze_alpha_evolution(
         for index in range(0, len(pairs) - 1, 2):
             children.append(_crossover(pairs[index], pairs[index + 1], rng, generation * 100 + index))
         evaluated = [_evaluate_candidate(child, labels, pool[:12]) for child in children]
-        combined = {row["expression"]: row for row in [*pool, *evaluated]}
+        combined = {row["formula_hash"]: row for row in [*pool, *evaluated]}
         pool = sorted(combined.values(), key=lambda row: row["fitness"], reverse=True)[:population]
         trajectory.append({
             "generation": generation,
@@ -527,17 +536,26 @@ def analyze_alpha_evolution(
         running_q = min(running_q, p_value * len(top_pool) / max(1, rank))
         q_values[index] = min(1.0, running_q)
     promoted = 0
+    tested_count = max(1, len(pool))
     for index, row in enumerate(top_pool):
         clean = {key: value for key, value in row.items() if key not in {"values", "_values"}}
         clean["latest_value"] = round(row["_values"][-1], 4)
         clean["lineage"] = row.get("lineage", [])[-8:]
         clean["fdr_q_value"] = round(q_values[index], 6)
+        rolling_count = max(1, len(_rolling_ic(row.get("_values") or [], labels)))
+        multiple_testing_penalty = math.sqrt(2.0 * math.log(tested_count) / rolling_count)
+        deflated_sharpe_proxy = number(row.get("stability")) - multiple_testing_penalty
+        clean["deflated_sharpe_proxy"] = round(deflated_sharpe_proxy, 6)
         checks = {
             "sixGateQuality": bool(row.get("quality_gate", {}).get("pass")),
             "validationDirection": number(row.get("validation_ic")) * number(row.get("direction"), 1) > 0,
             "testDirection": number(row.get("test_ic")) * number(row.get("direction"), 1) > 0,
             "rankDirection": number(row.get("rank_ic")) * number(row.get("direction"), 1) > 0,
             "fdr": q_values[index] <= 0.10,
+            "formulaHashUnique": sum(1 for candidate in pool if candidate.get("formula_hash") == row.get("formula_hash")) == 1,
+            "vif": number(row.get("vif_proxy"), 99.0) <= 5.0,
+            "deflatedSharpe": deflated_sharpe_proxy > 0,
+            "pbo": number(row.get("pbo_proxy"), 1.0) <= 0.20,
             "generalization": number(row.get("generalization_score")) >= 75,
             "rollingStability": number(row.get("positive_window_share_pct")) >= 60,
             "incrementalOos": number(row.get("incremental_oos_contribution")) >= 0.005,
@@ -570,6 +588,7 @@ def analyze_alpha_evolution(
             "testedCandidates": len(pool),
             "fdrMethod": "Benjamini-Hochberg over final candidate holdout IC p-values",
             "pboGuard": "Candidates with unstable rolling IC, sign flips, or a large train-holdout gap remain rejected.",
+            "overfitControls": ["formula hash", "correlation/VIF proxy", "Benjamini-Hochberg FDR", "Deflated-Sharpe proxy", "PBO proxy"],
             "automaticProductionActivation": False,
         },
         "advanced_models": {

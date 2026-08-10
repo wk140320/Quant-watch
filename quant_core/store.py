@@ -119,6 +119,17 @@ def _connect(path: str | Path | None = None):
         );
         CREATE INDEX IF NOT EXISTS idx_paper_agent_events_market_time
           ON paper_agent_events(market, id DESC);
+        CREATE TABLE IF NOT EXISTS paper_agent_archives (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          market TEXT NOT NULL,
+          generation_id TEXT NOT NULL,
+          archived_at TEXT NOT NULL,
+          state_json TEXT NOT NULL,
+          summary_json TEXT NOT NULL,
+          UNIQUE(market, generation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_paper_agent_archives_market_time
+          ON paper_agent_archives(market, archived_at DESC);
         CREATE TABLE IF NOT EXISTS background_jobs (
           id TEXT PRIMARY KEY,
           created_at TEXT NOT NULL,

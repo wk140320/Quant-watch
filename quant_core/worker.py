@@ -8,16 +8,29 @@ import traceback
 from typing import Any
 
 from alpha_mining import analyze_alpha_evolution
+from artifact_maintenance import cleanup_training_artifacts
+from data_lake import audit as audit_data_lake
+from data_lake import backfill_local_pit_caches
+from data_lake import read_rows as read_data_lake_rows
+from data_lake import read_panel as read_data_lake_panel
+from data_lake import read_pit_panel as read_data_lake_pit_panel
+from data_lake import summary as data_lake_summary
+from data_lake import upsert as upsert_data_lake
+from data_lake import upsert_panel as upsert_data_lake_panel
+from data_lake import upsert_pit_batches, upsert_pit_records
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features
 from historical_backtest import batch_historical_backtest, run_historical_backtest
 from local_model import train_local_model_suite
 from model_reporting import generate_model_report
 from paper_agents import configure as configure_paper_agents
 from paper_agents import list_agent_events, load_state as load_paper_agent_state
+from paper_agents import list_generations as list_paper_agent_generations
 from paper_agents import migrate as migrate_paper_agents
+from paper_agents import replay_oof as replay_paper_agents
 from paper_agents import reset as reset_paper_agents
 from paper_agents import step as step_paper_agents
-from production_training import train_market_multitask
+from paper_agents import upgrade_generation as upgrade_paper_agent_generation
+from production_training import recover_oof_artifacts, train_market_multitask
 from provider_budget import provider_plan
 from risk import assess_portfolio, build_paper_order_intent
 from store import append_event, control_plane_summary, list_events, list_market_rows, list_order_intents, market_data_summary, record_market_rows, record_order_intent
@@ -211,6 +224,7 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "alpha-evolution",
                 "local-model-suite",
                 "persistent-paper-agents",
+                "parquet-duckdb-data-lake",
             ],
             "order_execution_enabled": False,
         }
@@ -349,6 +363,28 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return qlib_readiness()
     if operation == "baostock-candles":
         return baostock_candles(payload)
+    if operation == "data-lake-upsert":
+        return upsert_data_lake(payload)
+    if operation == "data-lake-read":
+        return read_data_lake_rows(payload)
+    if operation == "data-lake-panel-read":
+        return read_data_lake_panel(payload)
+    if operation == "data-lake-pit-read":
+        return read_data_lake_pit_panel(payload)
+    if operation == "data-lake-panel-upsert":
+        return upsert_data_lake_panel(payload)
+    if operation == "data-lake-summary":
+        return data_lake_summary(payload)
+    if operation == "data-lake-audit":
+        return audit_data_lake(payload)
+    if operation == "data-lake-pit-upsert":
+        return upsert_pit_records(payload)
+    if operation == "data-lake-pit-batch-upsert":
+        return upsert_pit_batches(payload)
+    if operation == "data-lake-backfill-local-caches":
+        return backfill_local_pit_caches(payload)
+    if operation == "training-artifact-maintenance":
+        return cleanup_training_artifacts(payload)
     if operation == "risk-assessment":
         return assess_portfolio(payload)
     if operation == "event-append":
@@ -380,6 +416,14 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return step_paper_agents(payload)
     if operation == "paper-agent-events":
         return list_agent_events(payload)
+    if operation == "paper-agent-generations":
+        return list_paper_agent_generations(payload)
+    if operation == "paper-agent-upgrade-generation":
+        return upgrade_paper_agent_generation(payload)
+    if operation == "paper-agent-replay":
+        return replay_paper_agents(payload)
+    if operation == "production-model-recover-oof":
+        return recover_oof_artifacts(payload)
     raise ValueError(f"Unknown Python quant core operation: {operation}")
 
 

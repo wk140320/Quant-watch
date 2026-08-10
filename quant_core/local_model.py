@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import math
+import os
 from typing import Any
 
 # Keep enough resolved history for meaningful market/horizon diagnostics. These are
@@ -153,7 +155,8 @@ def ensemble_weight_learning_rows(samples: list[dict[str, Any]]) -> list[dict[st
         )
         rows.append(
             {
-                "date": str(outcome.get("resolvedAt") or sample.get("resolvedAt") or sample.get("createdAt") or sample.get("asOfDate") or ""),
+                "date": str(sample.get("signalAt") or sample.get("asOfDate") or sample.get("createdAt") or "")[:10],
+                "resolvedDate": str(outcome.get("resolvedAt") or sample.get("resolvedAt") or "")[:10],
                 "symbol": sample.get("symbol") or "",
                 "actual_return": actual_return,
                 "target_wins": bool(outcome.get("targetWins")),
@@ -384,7 +387,9 @@ def supervised_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         rows.append(
             {
-                "date": str(outcome.get("resolvedAt") or sample.get("resolvedAt") or sample.get("createdAt") or sample.get("asOfDate") or ""),
+                "date": str(sample.get("signalAt") or sample.get("asOfDate") or sample.get("createdAt") or "")[:10],
+                "resolvedDate": str(outcome.get("resolvedAt") or sample.get("resolvedAt") or "")[:10],
+                "symbol": str(sample.get("symbol") or ""),
                 "features": features,
                 "actual_return": actual_return,
                 "max_upside": clamp(max_upside, 0.0, 32.0),
@@ -418,25 +423,32 @@ def supervised_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def embargo_gap_for_rows(rows: list[dict[str, Any]]) -> int:
-    if len(rows) < 48:
+    date_count = len({str(row.get("date") or "")[:10] for row in rows if row.get("date")})
+    if date_count < 24:
         return 0
-    return max(2, min(20, math.ceil(len(rows) * DEFAULT_EMBARGO_FRACTION)))
+    return max(2, min(20, math.ceil(date_count * DEFAULT_EMBARGO_FRACTION)))
 
 
 def split_supervised_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    train_end = max(10, math.floor(len(rows) * 0.58))
-    validation_end = max(train_end + 5, math.floor(len(rows) * 0.78))
+    rows = sorted(rows, key=lambda row: (str(row.get("date") or "")[:10], str(row.get("symbol") or "")))
+    dates = sorted({str(row.get("date") or "")[:10] for row in rows if row.get("date")})
+    if len(dates) < 3:
+        return rows, [], []
+    train_end = max(1, min(len(dates) - 2, math.floor(len(dates) * 0.58)))
+    validation_end = max(train_end + 1, min(len(dates) - 1, math.floor(len(dates) * 0.78)))
     gap = embargo_gap_for_rows(rows)
-    train = rows[:max(0, train_end - gap)]
-    validation = rows[min(len(rows), train_end + gap):max(min(len(rows), train_end + gap), validation_end - gap)]
-    test = rows[min(len(rows), validation_end + gap):]
-    if len(train) < 10 or len(validation) < 5 or len(test) < 5:
-        reduced_gap = gap // 2
-        train = rows[:max(0, train_end - reduced_gap)]
-        validation = rows[min(len(rows), train_end + reduced_gap):max(min(len(rows), train_end + reduced_gap), validation_end - reduced_gap)]
-        test = rows[min(len(rows), validation_end + reduced_gap):]
-    if len(train) < 10 or len(validation) < 5 or len(test) < 5:
-        return rows[:train_end], rows[train_end:validation_end], rows[validation_end:]
+    def partition(current_gap: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        train_dates = set(dates[:max(0, train_end - current_gap)])
+        validation_dates = set(dates[min(len(dates), train_end + current_gap):max(min(len(dates), train_end + current_gap), validation_end - current_gap)])
+        test_dates = set(dates[min(len(dates), validation_end + current_gap):])
+        return (
+            [row for row in rows if str(row.get("date") or "")[:10] in train_dates],
+            [row for row in rows if str(row.get("date") or "")[:10] in validation_dates],
+            [row for row in rows if str(row.get("date") or "")[:10] in test_dates],
+        )
+    train, validation, test = partition(gap)
+    if not train or not validation or not test:
+        train, validation, test = partition(0)
     return train, validation, test
 
 
@@ -444,13 +456,22 @@ def split_audit(rows: list[dict[str, Any]]) -> dict[str, Any]:
     train, validation, test = split_supervised_rows(rows)
     gap = embargo_gap_for_rows(rows)
     return {
-        "method": "purged_walk_forward_embargo",
+        "method": "signal-date-grouped-purged-walk-forward-embargo",
         "sampleCount": len(rows),
         "embargoSamples": gap,
         "trainSamples": len(train),
         "validationSamples": len(validation),
         "testSamples": len(test),
-        "note": "Training, validation, and test windows are time-ordered with an embargo gap to reduce overlapping-label leakage.",
+        "trainDates": len({row.get("date") for row in train}),
+        "validationDates": len({row.get("date") for row in validation}),
+        "testDates": len({row.get("date") for row in test}),
+        "dateOverlapCount": len(
+            ({row.get("date") for row in train} & {row.get("date") for row in validation})
+            | ({row.get("date") for row in train} & {row.get("date") for row in test})
+            | ({row.get("date") for row in validation} & {row.get("date") for row in test})
+        ),
+        "legacyProvisional": True,
+        "note": "All symbols from one signal date stay in the same split; this legacy suite remains provisional until market-level strict OOF evidence passes.",
     }
 
 
@@ -1049,6 +1070,10 @@ def train_lightgbm_suite(rows: list[dict[str, Any]], market: str = "ASX") -> dic
         result = lightgbm_unavailable(rows, "collecting")
         result["reason"] = "Need at least 80 resolved point-in-time samples before training LightGBM or sklearn tree baselines."
         return result
+    if str(os.getenv("LOCAL_MODEL_TREE_ENABLED", "false")).strip().lower() != "true":
+        result = lightgbm_unavailable(rows, "resource_policy_disabled")
+        result["reason"] = "The deterministic local Champion remains active; tree challengers are opt-in and run only in a supervised resource window."
+        return result
     provider = "lightgbm"
     try:
         import lightgbm as lgb  # type: ignore
@@ -1502,6 +1527,8 @@ def lightgbm_return_candidate(
     baseline_test: list[float],
 ) -> dict[str, Any] | None:
     if len([*train, *validation, *test]) < 80:
+        return None
+    if str(os.getenv("LOCAL_MODEL_TREE_ENABLED", "false")).strip().lower() != "true":
         return None
     provider = "lightgbm"
     try:
@@ -2089,12 +2116,7 @@ def train_local_signal_heads(samples: list[dict[str, Any]], market: str = "ASX")
 
 
 def deep_learning_readiness(sample_count: int) -> dict[str, Any]:
-    try:
-        import torch  # type: ignore  # noqa: F401
-
-        torch_ready = True
-    except Exception:
-        torch_ready = False
+    torch_ready = importlib.util.find_spec("torch") is not None
     return {
         "framework": "pytorch_optional_local_heads",
         "torchReady": torch_ready,

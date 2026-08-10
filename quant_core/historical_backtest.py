@@ -328,12 +328,30 @@ def signed_flow_for_row(row: dict[str, Any]) -> float:
     return clamp(close_location * 0.55 + body_position * 0.45, -1.0, 1.0)
 
 
-def feature_dict(rows: list[dict[str, Any]], end: int) -> dict[str, float]:
+def build_feature_series(rows: list[dict[str, Any]]) -> dict[str, list[float]]:
     closes = [number(row["close"]) for row in rows]
-    opens = [number(row["open"]) for row in rows]
-    highs = [number(row["high"]) for row in rows]
-    lows = [number(row["low"]) for row in rows]
-    volumes = [number(row["volume"]) for row in rows]
+    ema12 = ema_series(closes, 12)
+    ema26 = ema_series(closes, 26)
+    macd = [ema12[index] - ema26[index] for index in range(len(closes))]
+    signal = ema_series(macd, 9)
+    return {
+        "closes": closes,
+        "opens": [number(row["open"]) for row in rows],
+        "highs": [number(row["high"]) for row in rows],
+        "lows": [number(row["low"]) for row in rows],
+        "volumes": [number(row["volume"]) for row in rows],
+        "signedFlows": [signed_flow_for_row(row) for row in rows],
+        "macdHist": [macd[index] - signal[index] for index in range(len(macd))],
+    }
+
+
+def feature_dict(rows: list[dict[str, Any]], end: int, series: dict[str, list[float]] | None = None) -> dict[str, float]:
+    prepared = series or build_feature_series(rows)
+    closes = prepared["closes"]
+    opens = prepared["opens"]
+    highs = prepared["highs"]
+    lows = prepared["lows"]
+    volumes = prepared["volumes"]
     close = closes[end]
     high = highs[end]
     low = lows[end]
@@ -352,7 +370,7 @@ def feature_dict(rows: list[dict[str, Any]], end: int) -> dict[str, float]:
     change10 = pct_change(close, closes[end - 10]) if end >= 10 else 0.0
     change20 = pct_change(close, closes[end - 20]) if end >= 20 else 0.0
     rsi_value = rsi_at(closes, end)
-    macd_hist = macd_hist_at(closes, end)
+    macd_hist = prepared["macdHist"][end]
     volume_ratio = volumes[end] / max(1.0, volume20)
     volume_accel = volume5 / max(1.0, volume20) - 1
     volume_trend = volume20 / max(1.0, volume50) - 1
@@ -364,7 +382,7 @@ def feature_dict(rows: list[dict[str, Any]], end: int) -> dict[str, float]:
     intraday_width = max(1e-9, high - low)
     body_position = (close - open_value) / intraday_width
     close_location = ((close - low) / intraday_width - 0.5) * 2
-    signed_flows = [signed_flow_for_row(row) for row in rows]
+    signed_flows = prepared["signedFlows"]
     buy_pressure = signed_flows[end]
     buy_pressure5 = weighted_mean(
         signed_flows[max(0, end - 4):end + 1],
@@ -665,8 +683,9 @@ def build_labeled_rows(
                 for index in range(len(quality_rows), len(rows))
             ],
         ]
+    feature_series = build_feature_series(rows)
     for end in range(start, len(rows) - horizon):
-        feature = feature_dict(rows, end)
+        feature = feature_dict(rows, end, feature_series)
         barriers = adaptive_barriers(rows, end, horizon, target_upside, stop_loss) if adaptive_labels else {
             "atrPct": atr_pct_at(rows, end, 14),
             "targetPct": target_upside,
@@ -1718,7 +1737,7 @@ def optimize_prediction_calibration(predictions: list[dict[str, Any]], horizon: 
 def aggregate_prediction_calibrations(results: list[dict[str, Any]], horizon: int | None = None) -> dict[str, Any] | None:
     rows = [
         row.get("predictionCalibration") for row in results
-        if row.get("available") and row.get("predictionCalibration", {}).get("available")
+        if row.get("available") and (row.get("predictionCalibration") or {}).get("available")
     ]
     if horizon is not None:
         rows = [row for row in rows if int(row.get("horizonDays") or 0) == int(horizon)]
@@ -1734,7 +1753,7 @@ def aggregate_prediction_calibrations(results: list[dict[str, Any]], horizon: in
     total_weight = sum(max(0.0, value) for value in weights.values()) or 1.0
     weights = {name: round(max(0.0, value) / total_weight, 5) for name, value in weights.items()}
     weighted = lambda key, section="test": (
-        sum(number(row.get(section, {}).get(key)) * max(1, int(number(row.get("sampleCount")))) for row in rows)
+        sum(number((row.get(section) or {}).get(key)) * max(1, int(number(row.get("sampleCount")))) for row in rows)
         / max(1, total_samples)
     )
     active_count = sum(1 for row in rows if row.get("active"))
@@ -1766,11 +1785,11 @@ def aggregate_prediction_calibrations(results: list[dict[str, Any]], horizon: in
         },
         "baselines": {
             "equalWeightDirectionHitRate": round(
-                sum(number(row.get("baselines", {}).get("equalWeight", {}).get("directionHitRate")) * max(1, int(number(row.get("sampleCount")))) for row in rows) / max(1, total_samples),
+                sum(number((((row.get("baselines") or {}).get("equalWeight") or {}).get("directionHitRate"))) * max(1, int(number(row.get("sampleCount")))) for row in rows) / max(1, total_samples),
                 4,
             ),
             "momentumOnlyDirectionHitRate": round(
-                sum(number(row.get("baselines", {}).get("momentumOnly", {}).get("directionHitRate")) * max(1, int(number(row.get("sampleCount")))) for row in rows) / max(1, total_samples),
+                sum(number((((row.get("baselines") or {}).get("momentumOnly") or {}).get("directionHitRate"))) * max(1, int(number(row.get("sampleCount")))) for row in rows) / max(1, total_samples),
                 4,
             ),
         },
@@ -2050,6 +2069,7 @@ def run_historical_backtest(
     rows = sanitize_candles(candles)
     data_quality = assess_candle_quality(rows)
     horizon = max(1, int(horizon or 15))
+    evidence_target_rows = 260 if horizon <= 5 else 500 if horizon <= 15 else 750
     target_upside = max(0.5, number(target_upside, 5.0))
     stop_loss = max(0.8, abs(number(stop_loss, 4.0)))
     step = max(1, int(step or 1))
@@ -2064,6 +2084,9 @@ def run_historical_backtest(
             "candleCount": len(rows),
             "dataQuality": data_quality,
             "minRequired": min_train + horizon + 40,
+            "evidenceTargetRows": evidence_target_rows,
+            "backfillRequired": len(rows) < evidence_target_rows,
+            "evidenceStatus": "insufficient",
             "reason": "Not enough historical candles for point-in-time walk-forward backtest.",
         }
 
@@ -2217,6 +2240,9 @@ def run_historical_backtest(
         "symbol": symbol,
         "source": "point-in-time-ohlcv-walk-forward",
         "candleCount": len(rows),
+        "evidenceTargetRows": evidence_target_rows,
+        "backfillRequired": len(rows) < evidence_target_rows,
+        "evidenceStatus": "ready" if len(rows) >= evidence_target_rows else "research_only",
         "dateRange": {"start": first["date"], "end": last["date"]},
         "dataQuality": {
             **{key: value for key, value in data_quality.items() if key != "rows"},

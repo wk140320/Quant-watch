@@ -181,6 +181,11 @@ test("Market selection and dense research views avoid cramped horizontal panels"
   assert.doesNotMatch(source, /bind\("marketCycleButton", "click", cycleMarket\)/);
   assert.match(source, /safeUiStep\("隔离并渲染目标市场视图", renderMarketSwitchShell\)/);
   assert.match(source, /function renderMarketSwitchShell\(\)[\s\S]*cards\.replaceChildren\(\)[\s\S]*renderCards\(\)/);
+  assert.match(source, /state\.learningProgressLoadToken \+= 1/);
+  assert.match(source, /state\.modelReportLoadToken \+= 1/);
+  assert.match(source, /safeUiStep\("清空旧市场训练报告", renderModelReportPanel\)/);
+  assert.match(source, /deferMarketStepAsync\(token, "加载模型训练报告"/);
+  assert.match(source, /const primaryEvidence = champion \|\| progress\.challenger \|\| latestStrict \|\| observed/);
   assert.match(source, /class="learning-tablist" role="tablist"/);
   assert.equal((source.match(/data-learning-panel=/g) || []).length, 3);
   assert.match(source, /<div class="chart-tools">[\s\S]*chart-overlay-popover[\s\S]*expandChart/);

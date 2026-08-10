@@ -256,7 +256,7 @@
         loadScript("quant-chart-math", "/frontend/charts/math.js?v=20260714-workspace-fast-1"),
         loadScript("quant-http-runtime", "/frontend/runtime/http.js?v=20260717-stable-load-2"),
       ]);
-      await loadScript("quant-full-app", "/app.js?v=20260729-factor-lab-robust-v76");
+      await loadScript("quant-full-app", "/app.js?v=20260810-evidence-runtime-v85");
       appLoaded = true;
       globalScope.__quantAppLoaded = true;
       document.documentElement.dataset.appState = "ready";

@@ -7,7 +7,7 @@ const DEFAULT_REVIEWERS = ["openai", "siliconflow", "hunyuan"];
 const DEFAULT_THRESHOLDS = Object.freeze({
   minRows: 50_000,
   minSymbols: 100,
-  minHorizonModels: 3,
+  minHorizonModels: 1,
   minOofRows: 1_000,
   minMetaTestRows: 1_000,
   minIndependentTestDates: 120,
@@ -49,6 +49,10 @@ function trainingResult(result = {}) {
   return result?.productionTraining || result?.result?.productionTraining || null;
 }
 
+function primaryDirectionMetrics(model = {}) {
+  return model?.directionMetrics || model?.metrics || {};
+}
+
 function addCheck(checks, id, label, passed, detail, options = {}) {
   checks.push({
     id,
@@ -66,7 +70,8 @@ function evaluateTrainingResult(result = {}, options = {}) {
   const training = trainingResult(result);
   const dataset = training?.dataset || {};
   const models = Array.isArray(training?.horizonModels) ? training.horizonModels : [];
-  const availableModels = models.filter((model) => model?.available);
+  const fiveDayModels = models.filter((model) => model?.available && Number(model?.horizon) === 5);
+  const availableModels = fiveDayModels.length ? fiveDayModels : models.filter((model) => model?.available);
   const checks = [];
 
   addCheck(checks, "training_output", "训练产物完整", Boolean(training?.available && training?.manifest?.model_version), training ? "已生成版本化训练产物。" : "没有返回 productionTraining。", { value: training?.manifest?.model_version || null });
@@ -81,7 +86,7 @@ function evaluateTrainingResult(result = {}, options = {}) {
     `跨市场隔离 ${number(dataset.crossMarketRowsExcluded)} 条；重复隔离 ${number(dataset.duplicateRowsExcluded)} 条。出现污染即阻断本轮晋升。`,
     { value: number(dataset.crossMarketRowsExcluded) + number(dataset.duplicateRowsExcluded), threshold: 0 },
   );
-  addCheck(checks, "horizon_models", "短中长期模型可用", availableModels.length >= thresholds.minHorizonModels, `可用周期模型 ${availableModels.length}/${models.length || 0}，要求至少 ${thresholds.minHorizonModels} 个。`, { value: availableModels.length, threshold: thresholds.minHorizonModels });
+  addCheck(checks, "horizon_models", "5日主模型可用", availableModels.length >= thresholds.minHorizonModels, `可用5日主模型 ${availableModels.length} 个；15/30日保持 Research 收集证据。`, { value: availableModels.length, threshold: thresholds.minHorizonModels });
 
   if (availableModels.length) {
     const oofPassed = availableModels.every((model) => number(model.oofRows) >= thresholds.minOofRows && number(model.metaTestRows) >= thresholds.minMetaTestRows);
@@ -90,23 +95,23 @@ function evaluateTrainingResult(result = {}, options = {}) {
     const eventPassed = availableModels.every((model) => number(model.eventCounts?.target) >= thresholds.minTargetEvents && number(model.eventCounts?.stop) >= thresholds.minStopEvents);
     addCheck(checks, "event_support", "目标/止损事件支持", eventPassed, availableModels.map((model) => `${model.horizon}d 目标 ${number(model.eventCounts?.target)} / 止损 ${number(model.eventCounts?.stop)}`).join("；"), { threshold: `${thresholds.minTargetEvents}/${thresholds.minStopEvents}` });
 
-    const datePassed = availableModels.every((model) => number(model.metrics?.testDates) >= thresholds.minIndependentTestDates);
-    addCheck(checks, "independent_dates", "独立测试日期", datePassed, availableModels.map((model) => `${model.horizon}d ${number(model.metrics?.testDates)} 日`).join("；"), { threshold: thresholds.minIndependentTestDates });
+    const datePassed = availableModels.every((model) => number(primaryDirectionMetrics(model).testDates) >= thresholds.minIndependentTestDates);
+    addCheck(checks, "independent_dates", "独立测试日期", datePassed, availableModels.map((model) => `${model.horizon}d ${number(primaryDirectionMetrics(model).testDates)} 日`).join("；"), { threshold: thresholds.minIndependentTestDates });
 
     const foldsPassed = availableModels.every((model) => (model.foldMetrics || []).length >= thresholds.minFolds && number(model.positiveFoldCount) >= thresholds.minPositiveFolds);
     addCheck(checks, "rolling_folds", "滚动窗口稳定性", foldsPassed, availableModels.map((model) => `${model.horizon}d ${(model.foldMetrics || []).length} 折 / 正向 ${number(model.positiveFoldCount)}`).join("；"), { threshold: `${thresholds.minFolds}/${thresholds.minPositiveFolds}` });
 
-    const brierPassed = availableModels.every((model) => number(model.metrics?.brierSkillScore, -1) > thresholds.minBrierSkill);
-    addCheck(checks, "brier_skill", "Brier Skill 为正", brierPassed, availableModels.map((model) => `${model.horizon}d ${number(model.metrics?.brierSkillScore, -1).toFixed(4)}`).join("；"), { threshold: `>${thresholds.minBrierSkill}` });
+    const brierPassed = availableModels.every((model) => number(primaryDirectionMetrics(model).brierSkillScore, -1) > thresholds.minBrierSkill);
+    addCheck(checks, "brier_skill", "方向 Brier Skill 为正", brierPassed, availableModels.map((model) => `${model.horizon}d ${number(primaryDirectionMetrics(model).brierSkillScore, -1).toFixed(4)}`).join("；"), { threshold: `>${thresholds.minBrierSkill}` });
 
-    const ecePassed = availableModels.every((model) => number(model.metrics?.ecePct, 100) <= thresholds.maxEcePct);
-    addCheck(checks, "calibration_ece", "概率校准 ECE", ecePassed, availableModels.map((model) => `${model.horizon}d ${number(model.metrics?.ecePct, 100).toFixed(2)}%`).join("；"), { threshold: `<=${thresholds.maxEcePct}%` });
+    const ecePassed = availableModels.every((model) => number(primaryDirectionMetrics(model).ecePct, 100) <= thresholds.maxEcePct);
+    addCheck(checks, "calibration_ece", "方向概率校准 ECE", ecePassed, availableModels.map((model) => `${model.horizon}d ${number(primaryDirectionMetrics(model).ecePct, 100).toFixed(2)}%`).join("；"), { threshold: `<=${thresholds.maxEcePct}%` });
 
-    const slopePassed = availableModels.every((model) => thresholds.minCalibrationSlope <= number(model.metrics?.calibrationSlope, -1) && number(model.metrics?.calibrationSlope, -1) <= thresholds.maxCalibrationSlope);
-    addCheck(checks, "calibration_slope", "概率校准斜率", slopePassed, availableModels.map((model) => `${model.horizon}d ${number(model.metrics?.calibrationSlope, -1).toFixed(3)}`).join("；"), { threshold: `${thresholds.minCalibrationSlope}-${thresholds.maxCalibrationSlope}` });
+    const slopePassed = availableModels.every((model) => thresholds.minCalibrationSlope <= number(primaryDirectionMetrics(model).calibrationSlope, -1) && number(primaryDirectionMetrics(model).calibrationSlope, -1) <= thresholds.maxCalibrationSlope);
+    addCheck(checks, "calibration_slope", "方向概率校准斜率", slopePassed, availableModels.map((model) => `${model.horizon}d ${number(primaryDirectionMetrics(model).calibrationSlope, -1).toFixed(3)}`).join("；"), { threshold: `${thresholds.minCalibrationSlope}-${thresholds.maxCalibrationSlope}` });
 
-    const bucketPassed = availableModels.every((model) => number(model.metrics?.probabilityBucketMinCount) >= thresholds.minProbabilityBucketEvents);
-    addCheck(checks, "probability_bucket_support", "概率桶独立事件", bucketPassed, availableModels.map((model) => `${model.horizon}d 最小桶 ${number(model.metrics?.probabilityBucketMinCount)}`).join("；"), { threshold: thresholds.minProbabilityBucketEvents });
+    const bucketPassed = availableModels.every((model) => number(primaryDirectionMetrics(model).probabilityBucketMinCount) >= thresholds.minProbabilityBucketEvents);
+    addCheck(checks, "probability_bucket_support", "方向概率桶独立事件", bucketPassed, availableModels.map((model) => `${model.horizon}d 最小桶 ${number(primaryDirectionMetrics(model).probabilityBucketMinCount)}`).join("；"), { threshold: thresholds.minProbabilityBucketEvents });
 
     const topKPassed = availableModels.every((model) => number(model.rankingMetrics?.topDecileLift) > thresholds.minTopDecileLift);
     addCheck(checks, "top_k_lift", "Top-K 超额收益", topKPassed, availableModels.map((model) => `${model.horizon}d ${number(model.rankingMetrics?.topDecileLift).toFixed(4)}`).join("；"), { threshold: `>${thresholds.minTopDecileLift}` });
@@ -117,7 +122,7 @@ function evaluateTrainingResult(result = {}, options = {}) {
     const driftPassed = availableModels.every((model) => (model.foldMetrics || []).every((fold) => number(fold.featureDrift?.maxPsi, 0) <= 0.40));
     addCheck(checks, "feature_drift", "特征漂移", driftPassed, "所有滚动窗口最大 PSI 必须不高于 0.40。", { threshold: "<=0.40" });
 
-    const leakagePassed = availableModels.every((model) => {
+    const leakagePassed = models.filter((model) => model?.available).every((model) => {
       const control = model.leakageControl || {};
       const entry = String(control.entry || "").toLowerCase();
       const nextSessionEntry = /next[-_ ]?(session|day)|t\s*\+\s*1|次日/.test(entry);
@@ -155,8 +160,8 @@ function evaluateTrainingResult(result = {}, options = {}) {
         horizon: model.horizon,
         oofRows: number(model.oofRows),
         metaTestRows: number(model.metaTestRows),
-        brierSkillScore: number(model.metrics?.brierSkillScore, -1),
-        ecePct: number(model.metrics?.ecePct, 100),
+        brierSkillScore: number(primaryDirectionMetrics(model).brierSkillScore, -1),
+        ecePct: number(primaryDirectionMetrics(model).ecePct, 100),
         topDecileLift: number(model.rankingMetrics?.topDecileLift),
         expectedValuePct: number(model.expectedValue?.expectedValuePct),
         maxPsi: Math.max(0, ...(model.foldMetrics || []).map((fold) => number(fold.featureDrift?.maxPsi))),
@@ -247,6 +252,7 @@ function createTrainingSupervisor(options = {}) {
   const reviewerIds = Array.isArray(options.reviewerIds) && options.reviewerIds.length ? options.reviewerIds : DEFAULT_REVIEWERS;
   const config = {
     enabled: options.config?.enabled !== false,
+    autoCycleEnabled: options.config?.autoCycleEnabled === true,
     maxAttempts: Math.max(1, Math.min(8, number(options.config?.maxAttempts, 3))),
     cadenceMs: Math.max(60_000, number(options.config?.cadenceMs, 24 * 60 * 60_000)),
     retryDelayMs: Math.max(1_000, number(options.config?.retryDelayMs, 60_000)),
@@ -282,7 +288,9 @@ function createTrainingSupervisor(options = {}) {
       lastCompletedAt: null,
       lastAcceptedAt: null,
       nextActionAt: null,
-      nextCycleAt: iso(Date.now() + config.startupDelayMs + index * 60_000),
+      nextCycleAt: config.autoCycleEnabled
+        ? iso(Date.now() + config.startupDelayMs + index * 60_000)
+        : null,
       history: [],
     };
   }
@@ -435,11 +443,11 @@ function createTrainingSupervisor(options = {}) {
       await record(marketState, "rework", { reason, nextPlan: marketState.currentPlan, nextActionAt: marketState.nextActionAt });
       await notify(marketState, `TRAINING_REWORK_${marketState.attempt}`, `${marketState.market} 模型训练需要返工`, `第 ${marketState.attempt}/${marketState.maxAttempts} 次未通过：${reason}。监工已自动安排下一轮。`, "warning");
     } else {
-      marketState.status = "needs_attention";
+      marketState.status = "completed_not_promoted";
       marketState.nextActionAt = null;
-      marketState.nextCycleAt = iso(Date.now() + config.attentionRetryMs);
-      await record(marketState, "attention", { reason, nextCycleAt: marketState.nextCycleAt });
-      await notify(marketState, "TRAINING_NEEDS_ATTENTION", `${marketState.market} 模型训练需要你协助`, `连续 ${marketState.maxAttempts} 次训练仍未通过：${reason}。系统会保留证据并在冷却后再试，你也可以手动推动。`, "error");
+      marketState.nextCycleAt = config.autoCycleEnabled ? iso(Date.now() + config.attentionRetryMs) : null;
+      await record(marketState, "completed-not-promoted", { reason, nextCycleAt: marketState.nextCycleAt });
+      await notify(marketState, "TRAINING_COMPLETED_NOT_PROMOTED", `${marketState.market} 训练完成但未晋级`, `连续 ${marketState.maxAttempts} 个候选均已完成训练，但没有通过固定样本外门槛：${reason}。旧 Champion 未被覆盖；等待新增数据、计划中的周训练或手动返工。`, "warning");
     }
     await saveState();
     return marketState;
@@ -453,22 +461,39 @@ function createTrainingSupervisor(options = {}) {
       checks: [{ id: context.stage || "training_job", label: "训练任务执行", passed: false, blocking: true, detail: reason }],
       summary: {},
     };
-    let reviews = [];
-    try {
-      reviews = (await options.review?.({ market: marketState.market, result: null, evaluation: marketState.evaluation, context: { ...context, reason, reviewerEnabled: state.reviewersEnabled } })) || [];
-      reviews = reviews.map((review) => normalizeReviewer(review));
-    } catch {
-      reviews = [];
-    }
-    await recordReviewerVerdicts(marketState, reviews, "training-failure");
-    return scheduleRework(state, marketState, reason, reviews);
+    // A language-model opinion cannot repair a crashed process and should not
+    // consume API quota for a run that produced no deterministic evidence.
+    return scheduleRework(state, marketState, reason, []);
   }
 
   async function handleComplete(state, marketState, job) {
     marketState.status = "reviewing";
     marketState.evaluation = evaluateTrainingResult(job.result || {}, { thresholds: config.thresholds });
+    marketState.lastCompletedAt = iso();
     await record(marketState, "review-started", { jobId: job.id, evaluation: marketState.evaluation });
     await saveState();
+    if (!marketState.evaluation.passed) {
+      // Deterministic gates have already rejected the candidate. Calling AI at
+      // this point cannot change the result and previously caused quota errors
+      // to be misreported as training failures.
+      marketState.reviewers = [];
+      marketState.consensus = reviewerConsensus([], config.minAiApprovals);
+      const failedLabels = marketState.evaluation.checks
+        .filter((check) => check.blocking && !check.passed)
+        .map((check) => check.label);
+      await record(marketState, "deterministic-review-complete", {
+        jobId: job.id,
+        evaluation: marketState.evaluation,
+        accepted: false,
+        aiReviewSkipped: true,
+      });
+      return scheduleRework(
+        state,
+        marketState,
+        failedLabels.join("；") || "固定样本外验收未通过",
+        [],
+      );
+    }
     let reviews = [];
     try {
       reviews = (await options.review?.({ market: marketState.market, result: job.result, evaluation: marketState.evaluation, context: { jobId: job.id, cycleId: marketState.cycleId, attempt: marketState.attempt, reviewerEnabled: state.reviewersEnabled } })) || [];
@@ -481,17 +506,29 @@ function createTrainingSupervisor(options = {}) {
     marketState.consensus = reviewerConsensus(reviews, config.minAiApprovals);
     const accepted = marketState.evaluation.passed && marketState.consensus.accepted;
     await record(marketState, "review-complete", { jobId: job.id, evaluation: marketState.evaluation, reviewers: reviews, consensus: marketState.consensus, accepted });
+    if (!accepted && marketState.consensus.available < config.minAiApprovals) {
+      marketState.status = "awaiting_optional_review";
+      marketState.activeJobId = null;
+      marketState.lastError = `AI 监工可用 ${marketState.consensus.available}/${config.minAiApprovals}`;
+      marketState.nextActionAt = null;
+      marketState.nextCycleAt = null;
+      await record(marketState, "awaiting-optional-review", {
+        jobId: job.id,
+        modelVersion: marketState.evaluation.modelVersion,
+        deterministicPassed: true,
+        consensus: marketState.consensus,
+      });
+      await notify(marketState, "TRAINING_COMPLETED_AWAITING_REVIEW", `${marketState.market} 训练已完成`, `固定样本外门槛已通过；AI 监工当前可用 ${marketState.consensus.available}/${config.minAiApprovals}，候选保持 Shadow，不会因额度不足被判为训练失败。`, "info");
+      await saveState();
+      return marketState;
+    }
     if (!accepted) {
-      const failedLabels = marketState.evaluation.checks.filter((check) => check.blocking && !check.passed).map((check) => check.label);
-      const reviewReason = marketState.consensus.available < config.minAiApprovals
-        ? `AI 监工可用 ${marketState.consensus.available}/${config.minAiApprovals}`
-        : `AI 验收 ${marketState.consensus.accepts} 票通过、${marketState.consensus.reworks} 票返工`;
-      return scheduleRework(state, marketState, [...failedLabels, reviewReason].filter(Boolean).join("；") || "验收未通过", reviews);
+      const reviewReason = `AI 验收 ${marketState.consensus.accepts} 票通过、${marketState.consensus.reworks} 票返工`;
+      return scheduleRework(state, marketState, reviewReason, reviews);
     }
     marketState.status = "accepted";
     marketState.activeJobId = null;
     marketState.lastError = null;
-    marketState.lastCompletedAt = iso();
     marketState.lastAcceptedAt = marketState.lastCompletedAt;
     marketState.nextActionAt = null;
     marketState.nextCycleAt = iso(Date.now() + config.cadenceMs);
@@ -508,11 +545,11 @@ function createTrainingSupervisor(options = {}) {
     return marketState;
   }
 
-  async function startCycle(state, marketState, reason = "scheduled") {
+  async function startCycle(state, marketState, reason = "scheduled", planOverrides = {}) {
     marketState.cycleId = `${marketState.market}-${Date.now()}-${randomUUID().slice(0, 6)}`;
     marketState.attempt = 1;
     marketState.maxAttempts = config.maxAttempts;
-    marketState.currentPlan = basePlan(marketState.market);
+    marketState.currentPlan = { ...basePlan(marketState.market), ...planOverrides };
     marketState.evaluation = null;
     marketState.reviewers = [];
     marketState.consensus = null;
@@ -551,7 +588,7 @@ function createTrainingSupervisor(options = {}) {
     for (const marketState of Object.values(state.markets)) {
       if (!marketState.enabled) continue;
       const nextCycle = new Date(marketState.nextCycleAt || 0).getTime();
-      if (["idle", "accepted", "needs_attention"].includes(marketState.status) && (!nextCycle || nextCycle <= now)) {
+      if (config.autoCycleEnabled && ["idle", "accepted", "completed_not_promoted"].includes(marketState.status) && (!nextCycle || nextCycle <= now)) {
         return startCycle(state, marketState, reason);
       }
     }
@@ -593,7 +630,15 @@ function createTrainingSupervisor(options = {}) {
       return { accepted: true, queued: false, rework: true, market, state: marketState };
     }
     await recordOperatorAction(marketState, "run-requested", { ...payload, outcome: "started" });
-    await startCycle(state, marketState, payload.reason || "manual");
+    const mode = ["incremental", "weekly", "full"].includes(String(payload.mode || "").toLowerCase())
+      ? String(payload.mode).toLowerCase()
+      : "weekly";
+    await startCycle(state, marketState, payload.reason || "manual", {
+      trainingMode: mode,
+      mode,
+      ...(mode === "incremental" ? { limit: Math.min(120, config.baseSymbolLimit), foldCount: 3, testDates: 60 } : {}),
+      ...(mode === "full" ? { limit: config.maxSymbols, range: config.ranges[market] || "10y", foldCount: 5, testDates: 120 } : {}),
+    });
     return { accepted: true, queued: false, market, state: marketState };
   }
 
@@ -668,6 +713,7 @@ function createTrainingSupervisor(options = {}) {
       updatedAt: state.updatedAt,
       config: {
         maxAttempts: config.maxAttempts,
+        autoCycleEnabled: config.autoCycleEnabled,
         cadenceMs: config.cadenceMs,
         retryDelayMs: config.retryDelayMs,
         attentionRetryMs: config.attentionRetryMs,
