@@ -323,6 +323,49 @@ function normalizeFmpHistoricalUniverseRecords(payload = {}) {
   });
 }
 
+function normalizeAlphaVantageListingStatusRecords(rows = []) {
+  return (Array.isArray(rows) ? rows : []).flatMap((row) => {
+    const symbol = String(row.symbol || row.ticker || "").trim().toUpperCase();
+    if (!symbol || !/^[A-Z0-9.\-]{1,12}$/.test(symbol)) return [];
+    const exchange = String(row.exchange || "US").trim().toUpperCase() || "US";
+    const name = String(row.name || row.companyName || symbol).trim() || symbol;
+    const records = [];
+    const listedAt = isoDay(row.ipoDate || row.listingDate, false);
+    if (listedAt) records.push({
+      id: `${symbol}:listed:${listedAt.slice(0, 10)}`,
+      symbol,
+      exchange,
+      name,
+      assetType: row.assetType || row.type || null,
+      listed: true,
+      status: "active",
+      event_time: listedAt,
+      available_at: listedAt,
+      revision: "alpha-vantage-listing-status",
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityMethod: "alpha-vantage-historical-listing-status",
+      sourceProvider: "alphavantage-listing-status-pit",
+    });
+    const delistedAt = isoDay(row.delistingDate || row.delistedDate, false);
+    if (delistedAt) records.push({
+      id: `${symbol}:delisted:${delistedAt.slice(0, 10)}`,
+      symbol,
+      exchange,
+      name,
+      assetType: row.assetType || row.type || null,
+      listed: false,
+      status: "delisted",
+      event_time: delistedAt,
+      available_at: delistedAt,
+      revision: "alpha-vantage-listing-status",
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityMethod: "alpha-vantage-historical-listing-status",
+      sourceProvider: "alphavantage-listing-status-pit",
+    });
+    return records;
+  });
+}
+
 function normalizeFmpSymbolChangeRecords(payload = {}) {
   const rows = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
   return rows.flatMap((row) => {
@@ -412,22 +455,60 @@ function normalizeEastmoneyPitRecords(symbol, payload = {}) {
 const MACRO_DIRECTION = Object.freeze({
   FEDFUNDS: -1,
   DGS10: -1,
+  T10Y2Y: 1,
   CPIAUCSL: -1,
   UNRATE: -1,
   VIXCLS: -1,
+  BAMLC0A0CM: -1,
   GDP: 1,
   IRSTCI01AUM156N: -1,
+  IRLTLT01AUM156N: -1,
   CPALTT01AUM657N: -1,
+  CPALTT01AUQ659N: -1,
   LRUNTTTTAUM156S: -1,
+  AUSGDPRQPSMEI: 1,
   IRSTCI01CNM156N: -1,
   CPALTT01CNM659N: -1,
   LRUNTTTTCNM156S: -1,
 });
 
-function normalizeFredVintageRecords(seriesId, observations = []) {
+const MACRO_FEATURE_BY_SERIES = Object.freeze({
+  FEDFUNDS: "macroRatesImpulse",
+  DGS10: "macroRatesImpulse",
+  IRSTCI01AUM156N: "macroRatesImpulse",
+  IRLTLT01AUM156N: "macroRatesImpulse",
+  IRSTCI01CNM156N: "macroRatesImpulse",
+  CPIAUCSL: "macroInflationImpulse",
+  CPALTT01AUM657N: "macroInflationImpulse",
+  CPALTT01AUQ659N: "macroInflationImpulse",
+  CPALTT01CNM659N: "macroInflationImpulse",
+  UNRATE: "macroLaborImpulse",
+  LRUNTTTTAUM156S: "macroLaborImpulse",
+  LRUNTTTTCNM156S: "macroLaborImpulse",
+  GDP: "macroGrowthImpulse",
+  AUSGDPRQPSMEI: "macroGrowthImpulse",
+  VIXCLS: "macroVolatilityImpulse",
+  BAMLC0A0CM: "macroCreditImpulse",
+  T10Y2Y: "macroYieldCurveImpulse",
+  DEXUSAL: "macroFxImpulse",
+  DEXCHUS: "macroFxImpulse",
+  DCOILBRENTEU: "macroCommodityImpulse",
+  PCOPPUSDM: "macroCommodityImpulse",
+  GOLDAMGBD228NLBM: "macroCommodityImpulse",
+});
+
+function nextUtcDay(day) {
+  const timestamp = Date.parse(`${String(day || "").slice(0, 10)}T00:00:00Z`);
+  return Number.isFinite(timestamp) ? new Date(timestamp + 86_400_000).toISOString() : null;
+}
+
+function normalizeFredVintageRecords(seriesId, observations = [], options = {}) {
   const rows = observations.map((row) => ({
     date: String(row.date || "").slice(0, 10),
-    availableAt: isoDay(row.realtime_start, false),
+    availableAt: [
+      nextUtcDay(row.date),
+      options.conservativeMarketClose === true ? null : isoDay(row.realtime_start, false),
+    ].filter(Boolean).sort().at(-1),
     value: finite(row.value),
   })).filter((row) => row.value !== null && row.availableAt && /^\d{4}-\d{2}-\d{2}$/.test(row.date));
   rows.sort((left, right) => left.date.localeCompare(right.date));
@@ -441,20 +522,29 @@ function normalizeFredVintageRecords(seriesId, observations = []) {
     const scale = Math.sqrt(variance) || Math.max(1e-6, Math.abs(previous) * 0.02);
     const surprise = clamp((change - mean) / scale, -3, 3) / 3;
     changes.push(change);
-    const sentiment = clamp((MACRO_DIRECTION[seriesId] || 0) * surprise);
+    const direction = MACRO_DIRECTION[seriesId];
+    const sentiment = Number.isFinite(direction) ? clamp(direction * surprise) : 0;
+    const featureName = MACRO_FEATURE_BY_SERIES[seriesId];
+    const featureValue = Number.isFinite(direction) ? sentiment : surprise;
+    const featureValues = featureName ? { [featureName]: featureValue } : {};
     return {
       id: `${seriesId}:${row.date}:${row.availableAt.slice(0, 10)}`,
       seriesId,
-      event_time: `${row.date}T23:59:59Z`,
+      event_time: `${row.date}T00:00:00Z`,
       available_at: row.availableAt,
       revision: "initial-release",
       historicalAvailabilityVerified: true,
+      historicalAvailabilityMethod: options.conservativeMarketClose === true
+        ? "conservative-next-utc-day-market-observation"
+        : "alfred-initial-release-vintage",
       rawValue: row.value,
       values: {
+        ...featureValues,
         eventSentiment: sentiment,
         eventRelevance: 0.8,
         eventNovelty: Math.abs(surprise),
         macroRisk: sentiment,
+        macroDataCoverage: 1,
         sourceQuality: 1,
       },
     };
@@ -469,23 +559,176 @@ function normalizePublishedPitRecords(items = [], options = {}) {
       ? isoDay(text, true)
       : safeIsoTimestamp(text);
     if (!availableAt) return [];
+    const title = String(item.title || "");
+    const description = String(item.description || item.summary || "");
+    const textContent = `${title} ${description}`.toLowerCase();
+    const positiveMatches = textContent.match(/\b(upgrade|record (?:revenue|profit|sales)|profit (?:up|increase)|guidance (?:raised|upgraded)|contract (?:award|win)|approval granted|buyback|share repurchase|dividend increase|special dividend|production increase|discovery|milestone achieved)\b/g) || [];
+    const negativeMatches = textContent.match(/\b(downgrade|profit warning|guidance (?:cut|lowered|withdrawn)|net loss|impairment|investigation|suspension|insolvency|default|penalty|litigation|cyber incident|production decrease|fatality)\b/g) || [];
+    const earningsEvent = /\b(annual report|half[- ]year(?:ly)? report|quarterly report|financial results|appendix 4[de]|earnings|preliminary final report)\b/.test(textContent);
+    const positiveCapital = /\b(buyback|share repurchase|return of capital|special dividend|dividend increase)\b/.test(textContent);
+    const dilution = /\b(placement|entitlement offer|rights issue|issue of (?:new )?shares|capital raising|convertible notes?)\b/.test(textContent);
+    const regulatory = /\b(regulator|regulatory notice|investigation|litigation|court proceedings?|penalty|class action|compliance breach)\b/.test(textContent);
+    const operationalPositive = /\b(contract award|production increase|guidance raised|guidance upgraded|discovery|milestone achieved)\b/.test(textContent);
+    const operationalNegative = /\b(production decrease|guidance cut|guidance lowered|guidance withdrawn|shutdown|suspension|fatality)\b/.test(textContent);
+    const existingValues = item.values && typeof item.values === "object" ? item.values : {};
+    const suppliedSentiment = finite(existingValues.eventSentiment ?? item.eventSentiment ?? item.sentiment ?? item.sentimentScore);
+    const lexicalSentiment = clamp((positiveMatches.length - negativeMatches.length) / 2, -1, 1);
+    const eventSentiment = suppliedSentiment === null ? lexicalSentiment : clamp(suppliedSentiment, -1, 1);
+    const sourceQuality = clamp(Number(existingValues.sourceQuality ?? item.sourceQuality ?? options.sourceQuality ?? 0.8), 0, 1);
+    const relevance = clamp(Number(existingValues.eventRelevance ?? item.eventRelevance ?? item.relevance ?? (item.priceSensitive ? 1 : 0.72)), 0, 1);
+    const explicitEvent = earningsEvent || positiveCapital || dilution || regulatory || operationalPositive || operationalNegative;
+    const values = {
+      ...existingValues,
+      eventSentiment,
+      eventRelevance: relevance,
+      eventNovelty: clamp(Number(existingValues.eventNovelty ?? item.eventNovelty ?? item.novelty ?? (item.priceSensitive ? 0.95 : explicitEvent ? 0.78 : 0.45)), 0, 1),
+      announcementScore: clamp(Number(existingValues.announcementScore ?? item.announcementScore ?? (item.priceSensitive ? 1 : explicitEvent ? 0.72 : 0.35)), 0, 1),
+      fundamentalQuality: clamp(Number(existingValues.fundamentalQuality ?? item.fundamentalQuality ?? (earningsEvent ? eventSentiment : 0)), -1, 1),
+      sourceQuality,
+      positiveCatalyst: clamp(Number(item.positiveCatalyst ?? (positiveMatches.length || positiveCapital || operationalPositive ? 0.8 : 0)), 0, 1),
+      negativeCatalyst: clamp(Number(item.negativeCatalyst ?? (negativeMatches.length || regulatory || operationalNegative ? 0.8 : 0)), 0, 1),
+      dilutionRisk: clamp(Number(item.dilutionRisk ?? (dilution ? 0.9 : 0)), 0, 1),
+      regulatoryRisk: clamp(Number(item.regulatoryRisk ?? (regulatory ? 0.9 : 0)), 0, 1),
+      earningsEvent: clamp(Number(item.earningsEvent ?? (earningsEvent ? 1 : 0)), 0, 1),
+      capitalAllocation: clamp(Number(item.capitalAllocation ?? (positiveCapital ? 0.8 : dilution ? -0.8 : 0)), -1, 1),
+      operationalMomentum: clamp(Number(item.operationalMomentum ?? (operationalPositive ? 0.8 : operationalNegative ? -0.8 : 0)), -1, 1),
+      eventIntensity: clamp(Number(item.eventIntensity ?? (item.priceSensitive ? 1 : explicitEvent ? 0.75 : 0.35)), 0, 1),
+    };
     return [{
       ...item,
       id: item.id || item.link || `${options.symbol || "MARKET"}:${availableAt}:${index}`,
       event_time: availableAt,
       available_at: availableAt,
       revision: "initial",
-      sourceQuality: Number(item.sourceQuality ?? options.sourceQuality ?? 0.8),
+      sourceQuality,
+      values,
       historicalAvailabilityVerified: true,
     }];
   });
 }
 
+function normalizeCorporateActionRecords(symbol, payload = [], options = {}) {
+  const rows = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload?.results)
+        ? payload.results
+        : [];
+  const provider = String(options.provider || "corporate-action-provider");
+  const defaultType = String(options.eventType || "corporate-action");
+  return rows.flatMap((row, index) => {
+    const eventDate = row.exDate || row.ex_date || row.date || row.effectiveDate || row.paymentDate || row.recordDate;
+    const eventTime = isoDay(eventDate, false) || safeIsoTimestamp(eventDate);
+    if (!eventTime) return [];
+    const announced = row.declarationDate || row.declaration_date || row.announcementDate || row.ann_date;
+    const availableAt = isoDay(announced, true) || safeIsoTimestamp(announced) || eventTime;
+    const eventType = String(row.eventType || row.type || row.actionType || defaultType).toLowerCase();
+    const ratio = row.ratio || row.split || row.splitRatio || row.split_factor || null;
+    const amount = finite(row.amount ?? row.value ?? row.dividend ?? row.cash_div_tax ?? row.cash_div);
+    return [{
+      id: `${symbol}:${eventType}:${eventTime.slice(0, 10)}:${row.id || index}`,
+      symbol,
+      eventType,
+      event_time: eventTime,
+      available_at: availableAt,
+      revision: String(row.updatedAt || row.lastUpdated || row.paymentDate || row.recordDate || eventDate).slice(0, 40),
+      historicalAvailabilityVerified: true,
+      sourceProvider: provider,
+      values: {
+        amount,
+        ratio,
+        currency: row.currency || row.currencyCode || null,
+        recordDate: row.recordDate || row.record_date || null,
+        paymentDate: row.paymentDate || row.payment_date || row.pay_date || null,
+        declarationDate: announced || null,
+        sourceQuality: Number(options.sourceQuality ?? 0.92),
+      },
+    }];
+  });
+}
+
+function normalizeEodhdCompanyUniverseRecords(symbol, payload = {}, options = {}) {
+  const general = payload?.General || payload?.general || payload || {};
+  const listedAt = isoDay(general.IPODate || general.ipoDate || general.ListingDate, false);
+  const delistedAt = isoDay(general.DelistedDate || general.delistedDate, false);
+  const exchange = general.Exchange || general.ExchangeCode || options.exchange || options.market || "";
+  const name = general.Name || general.name || symbol;
+  const records = [];
+  if (listedAt) records.push({
+    id: `${symbol}:listed:${listedAt.slice(0, 10)}`,
+    symbol,
+    exchange,
+    name,
+    listed: true,
+    status: "active",
+    event_time: listedAt,
+    available_at: listedAt,
+    revision: "listing-event",
+    historicalAvailabilityVerified: true,
+    sourceProvider: "eodhd-company-general-pit",
+  });
+  if (delistedAt) records.push({
+    id: `${symbol}:delisted:${delistedAt.slice(0, 10)}`,
+    symbol,
+    exchange,
+    name,
+    listed: false,
+    status: "delisted",
+    event_time: delistedAt,
+    available_at: delistedAt,
+    revision: "delisting-event",
+    historicalAvailabilityVerified: true,
+    sourceProvider: "eodhd-company-general-pit",
+  });
+  return records;
+}
+
+function normalizeEodhdFinancialPitRecords(symbol, payload = {}, options = {}) {
+  const financials = payload?.Financials || payload?.financials || {};
+  const provider = String(options.provider || "eodhd-financial-statements-pit");
+  const records = [];
+  for (const [statementName, statement] of Object.entries(financials)) {
+    if (!statement || typeof statement !== "object") continue;
+    for (const frequency of ["quarterly", "yearly", "annual"]) {
+      const rows = statement[frequency];
+      if (!rows || typeof rows !== "object") continue;
+      for (const [periodKey, raw] of Object.entries(rows)) {
+        const row = raw && typeof raw === "object" ? raw : {};
+        const eventTime = isoDay(row.date || row.period || periodKey, true);
+        const filed = row.filing_date || row.filingDate || row.filedDate || row.reportedDate || row.reportDate;
+        const availableAt = isoDay(filed, true) || safeIsoTimestamp(filed);
+        if (!eventTime || !availableAt || availableAt < eventTime) continue;
+        records.push({
+          id: `${symbol}:${statementName}:${frequency}:${eventTime.slice(0, 10)}:${availableAt.slice(0, 10)}`,
+          symbol,
+          statement: statementName,
+          frequency,
+          event_time: eventTime,
+          available_at: availableAt,
+          revision: String(row.updatedAt || row.filing_date || row.filingDate || filed).slice(0, 40),
+          historicalAvailabilityVerified: true,
+          sourceProvider: provider,
+          values: {
+            ...row,
+            sourceQuality: Number(options.sourceQuality ?? 0.9),
+          },
+        });
+      }
+    }
+  }
+  return records.sort((left, right) => left.available_at.localeCompare(right.available_at));
+}
+
 export {
+  normalizeCorporateActionRecords,
+  normalizeAlphaVantageListingStatusRecords,
+  normalizeEodhdFinancialPitRecords,
   normalizeFmpHistoricalUniverseRecords,
   normalizeFmpSymbolChangeRecords,
   normalizeOpenFigiMappings,
   normalizeEastmoneyPitRecords,
+  normalizeEodhdCompanyUniverseRecords,
   normalizeFredVintageRecords,
   normalizePublishedPitRecords,
   normalizeSecPitRecords,

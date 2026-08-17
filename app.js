@@ -257,6 +257,8 @@ const state = {
   modelReportJobId: null,
   learningProgress: null,
   learningTrajectories: null,
+  trainingResources: null,
+  learningDataAudit: null,
   learningProgressLoading: false,
   learningProgressLoadToken: 0,
   agentGenerations: null,
@@ -3145,6 +3147,7 @@ function setWorkspacePage(page, options = {}) {
   if (next === "sources") {
     deferWorkspaceStep(next, workspaceToken, "刷新数据源预算", () => refreshProviderBudget(false), 40, { frame: true });
     deferWorkspaceStep(next, workspaceToken, "刷新数据健康中心", () => refreshDataHealth(false), 120, { idle: true, timeout: 1200 });
+    deferWorkspaceStep(next, workspaceToken, "读取数据补齐计划", () => refreshDataReplenishment(false), 220, { idle: true, timeout: 1800 });
   }
   if (next === "regime") {
     queueMainRender(["indexes"]);
@@ -4601,6 +4604,120 @@ async function refreshDataHealth(showStatus = true) {
   } catch (error) {
     if (panel) panel.innerHTML = `<p class="quant-error">${escapeHtml(compactDisplayError(error.message))}</p>`;
     if (showStatus) setStatus(`数据健康中心读取失败：${compactDisplayError(error.message)}`);
+  }
+}
+
+function renderDataReplenishment(payload) {
+  const panel = $("dataReplenishmentPanel");
+  if (!panel) return;
+  if (!payload) {
+    panel.innerHTML = `<p class="muted">尚未读取数据补齐计划。</p>`;
+    return;
+  }
+  const history = payload.history || {};
+  const universe = payload.universe || {};
+  const pit = payload.pit || {};
+  const datasets = pit.datasets || {};
+  const target = payload.target || {};
+  const stageOne = payload.stageOne || {};
+  const stageGates = stageOne.gates || {};
+  const researchRequired = asNumber(stageGates.researchHistory?.required, Math.ceil(asNumber(universe.target, 0) * 0.8));
+  const deepRequired = asNumber(stageGates.deepHistory?.required, Math.ceil(asNumber(universe.target, 0) * 0.5));
+  const financialDatasetKey = stageGates.fundamentals?.dataset || "fundamentals";
+  const financialPitLabel = stageGates.fundamentals?.label || "历史财务PIT覆盖";
+  const percentage = (value, total) => Math.max(0, Math.min(100, asNumber(value, 0) / Math.max(1, asNumber(total, 0)) * 100));
+  const pitCard = (key, label, threshold) => {
+    const row = datasets[key] || {};
+    const value = asNumber(row.trainingUniverseCoveragePct, 0);
+    return `
+      <div class="replenishment-metric ${value >= threshold ? "ready" : "blocked"}">
+        <span>${escapeHtml(label)}</span><strong>${value.toFixed(1)}%</strong>
+        <small>${formatCompactNumber(row.verifiedSymbols || 0, 0)} / ${formatCompactNumber(row.denominator || payload?.history?.partitions || payload?.universe?.available || 0, 0)} 只训练股票已验证${row.exact ? " · 精确交集" : ""}</small>
+        <i style="--progress:${Math.min(100, value)}%"></i>
+      </div>`;
+  };
+  const recentJobs = [...(payload.jobs?.pit || []), ...(payload.jobs?.history || [])]
+    .sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")))
+    .slice(0, 6);
+  panel.innerHTML = `
+    <div class="replenishment-head">
+      <div><span>市场级数据补齐</span><strong>${escapeHtml(payload.market)} · ${escapeHtml(payload.resourceProfile || "balanced")}</strong></div>
+      <div class="stage-one-readiness ${stageOne.met ? "ready" : "blocked"}"><span>第一阶段</span><strong>${asNumber(stageOne.progressPct, 0).toFixed(1)}%</strong><small>${stageOne.met ? "数据门槛通过" : `下一步 ${escapeHtml(stageOne.nextAction || "补齐数据")}`}</small></div>
+      <p>${escapeHtml(payload.note || "")}</p>
+    </div>
+    <div class="replenishment-grid">
+      <div class="replenishment-metric ${universe.selected >= universe.target ? "ready" : "blocked"}">
+        <span>训练股票池</span><strong>${universe.selected || 0} / ${universe.target || 0}</strong>
+        <small>可用 universe ${formatCompactNumber(universe.available || 0, 0)} 只</small>
+        <i style="--progress:${percentage(universe.selected, universe.target)}%"></i>
+      </div>
+      <div class="replenishment-metric ${history.researchReadySymbols >= researchRequired ? "ready" : "blocked"}">
+        <span>研究历史达标</span><strong>${history.researchReadySymbols || 0} / ${researchRequired}</strong>
+        <small>每只至少 ${formatCompactNumber(target.researchRows || 0, 0)} 根真实日线</small>
+        <i style="--progress:${percentage(history.researchReadySymbols, researchRequired)}%"></i>
+      </div>
+      <div class="replenishment-metric ${history.deepHistorySymbols >= deepRequired ? "ready" : "blocked"}">
+        <span>深历史达标</span><strong>${history.deepHistorySymbols || 0} / ${deepRequired}</strong>
+        <small>目标 ${formatCompactNumber(target.deepHistoryRows || 0, 0)} 根 · 待补 ${history.missingOrShort || 0} 只</small>
+        <i style="--progress:${percentage(history.deepHistorySymbols, deepRequired)}%"></i>
+      </div>
+      ${pitCard("universe", "历史股票池PIT", 80)}
+      ${pitCard("corporate_actions", "公司行动PIT", 95)}
+      ${pitCard(financialDatasetKey, financialPitLabel, 80)}
+      ${pitCard("news", "新闻事件PIT", 80)}
+    </div>
+    <div class="replenishment-actions">
+      <button class="secondary" type="button" data-replenishment-scope="history">补历史行情</button>
+      <button class="secondary" type="button" data-replenishment-scope="pit">补PIT事件</button>
+      <button class="secondary" type="button" data-replenishment-scope="corporate-actions">补公司行动</button>
+      <button type="button" data-replenishment-scope="all">补齐全部</button>
+      <button class="secondary" type="button" data-replenishment-scope="all-train">补齐后训练</button>
+    </div>
+    <div class="replenishment-blockers">
+      <strong>当前阻断</strong>
+      <p>${(stageOne.blockers || []).map((row) => `<span>${escapeHtml(row.label)} ${formatCompactNumber(row.actual, 1)} / ${formatCompactNumber(row.required, 1)}</span>`).join("") || "<span class=\"ready\">当前第一阶段数据门槛已满足</span>"}</p>
+    </div>
+    <details class="health-details" ${recentJobs.some((job) => ["queued", "running"].includes(job.status)) ? "open" : ""}>
+      <summary>最近补齐任务</summary>
+      <div class="replenishment-job-list">
+        ${recentJobs.map((job) => `<div><strong>${escapeHtml(job.type || "job")}</strong><span>${escapeHtml(job.status || "unknown")} · ${Math.round(asNumber(job.progress, 0) * 100)}%</span><small>${escapeHtml(job.detail?.phase || job.error || job.updatedAt || "")}</small></div>`).join("") || "<p class=\"muted\">尚无补齐任务。</p>"}
+      </div>
+    </details>
+  `;
+  panel.querySelectorAll("[data-replenishment-scope]").forEach((button) => {
+    button.addEventListener("click", () => queueDataReplenishment(button.dataset.replenishmentScope));
+  });
+}
+
+async function refreshDataReplenishment(showStatus = true) {
+  const panel = $("dataReplenishmentPanel");
+  try {
+    if (panel) panel.innerHTML = `<p class="muted">正在核对 ${escapeHtml(activeMarketConfig().label)} 训练池与PIT缺口...</p>`;
+    const payload = await requestJson(`/api/data-replenishment?market=${encodeURIComponent(state.market)}`);
+    renderDataReplenishment(payload);
+    if (showStatus) setStatus(`${activeMarketConfig().label}数据补齐计划已更新`);
+    return payload;
+  } catch (error) {
+    if (panel) panel.innerHTML = `<p class="quant-error">${escapeHtml(compactDisplayError(error.message))}</p>`;
+    if (showStatus) setStatus(`数据补齐计划读取失败：${compactDisplayError(error.message)}`);
+    return null;
+  }
+}
+
+async function queueDataReplenishment(rawScope = "all") {
+  const retrainAfter = rawScope === "all-train";
+  const scope = retrainAfter ? "all" : rawScope;
+  setStatus(`正在为${activeMarketConfig().label}安排${scope === "history" ? "历史行情" : scope === "pit" ? "PIT事件" : scope === "corporate-actions" ? "公司行动" : "完整数据"}补齐任务...`);
+  try {
+    const result = await requestJson("/api/data-replenishment/run", {
+      method: "POST",
+      body: JSON.stringify({ market: state.market, scope, retrainAfter }),
+    });
+    const jobs = result.jobs || [];
+    setStatus(`已按${result.resourceProfile || "当前"}档位安排 ${jobs.length} 个后台任务；关闭网页后仍会继续。`);
+    await refreshDataReplenishment(false);
+  } catch (error) {
+    setStatus(`数据补齐任务安排失败：${compactDisplayError(error.message)}`);
   }
 }
 
@@ -6507,6 +6624,7 @@ function renderLearningProgressPanel() {
   const promotion = $("learningPromotionPanel");
   const generation = $("agentGenerationPanel");
   const familiesPanel = $("learningEvidenceFamilies");
+  const readinessPanel = $("learningReadinessPanel");
   if (!summary || !promotion || !generation || state.activePage !== "strategy") return;
   const progress = state.learningProgress;
   if (!progress) {
@@ -6547,15 +6665,53 @@ function renderLearningProgressPanel() {
     <small>${escapeHtml(constraint && !constraint.compliant ? `约束修复中：${constraint.violations} 项违规，已冻结新增买入并渐退` : current?.promotionBlockers?.[0] || "旧账本保留为只读基准")}</small>
   `;
   if (familiesPanel) {
-    const labels = { training: "模型训练", factor: "因子研究", alpha: "Alpha 进化", minute: "分钟学习", acceptance: "训练验收", agent: "Agent 学习" };
+    const labels = { training: "模型训练", calibration: "权重校准", factor: "因子研究", alpha: "Alpha 进化", minute: "分钟学习", acceptance: "训练验收", agent: "Agent 学习" };
     const counts = state.learningTrajectories?.counts || [];
+    const trajectoryRows = state.learningTrajectories?.rows || [];
     familiesPanel.innerHTML = Object.entries(labels).map(([family, label]) => {
       const rows = counts.filter((row) => row.family === family);
       const total = rows.reduce((sum, row) => sum + Number(row.count || 0), 0);
       const complete = rows.filter((row) => row.status === "complete").reduce((sum, row) => sum + Number(row.count || 0), 0);
       const failed = rows.filter((row) => row.status === "failed").reduce((sum, row) => sum + Number(row.count || 0), 0);
-      return `<div class="learning-evidence-family"><span>${label}</span><strong>${total ? `${formatCompactNumber(total, 0)} 次运行` : "尚未运行"}</strong><small>${total ? `完成 ${formatCompactNumber(complete, 0)} · 失败 ${formatCompactNumber(failed, 0)}` : "不是 0 分，而是没有可用运行证据"}</small></div>`;
+      const latest = trajectoryRows.find((row) => row.family === family);
+      const evidence = latest?.evidence?.result || {};
+      const sample = evidence.strictOofRows ?? evidence.sampleCount ?? evidence.oofRows ?? evidence.symbolCount ?? evidence.availableCount;
+      const sampleText = Number.isFinite(Number(sample)) ? ` · 证据 ${formatCompactNumber(sample, 0)}` : "";
+      return `<div class="learning-evidence-family"><span>${label}</span><strong>${total ? `${formatCompactNumber(total, 0)} 次运行` : "尚未运行"}</strong><small>${total ? `完成 ${formatCompactNumber(complete, 0)} · 失败 ${formatCompactNumber(failed, 0)}${sampleText}` : "尚未形成真实运行产物；可运行当前学习链"}</small></div>`;
     }).join("");
+  }
+  const resources = state.trainingResources;
+  const selectedResource = resources?.selected || "balanced";
+  document.querySelectorAll("[data-training-resource]").forEach((button) => {
+    const active = button.dataset.trainingResource === selectedResource;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  const resourceProfile = resources?.profile;
+  if ($("trainingResourceLabel")) $("trainingResourceLabel").textContent = resourceProfile?.label || "均衡";
+  if ($("trainingResourceDescription")) $("trainingResourceDescription").textContent = resourceProfile?.description || "资源档位不会降低模型晋级门槛。";
+  if (readinessPanel) {
+    const audit = state.learningDataAudit || {};
+    const marketTargets = { ASX: 350, US: 450, CN: 550 };
+    const symbolCount = Number(primaryEvidence.samples?.symbolCount || 0);
+    const targetSymbols = marketTargets[state.market] || 200;
+    const pit = audit.pitDatasets || {};
+    const verified = (name) => Number(pit[name]?.trainingUniverseCoveragePct || 0);
+    const positiveFolds = Number(primaryEvidence.folds?.filter?.((fold) => fold.positive)?.length || 0);
+    const foldCount = Number(primaryEvidence.folds?.length || 0);
+    const gates = [
+      { label: "横截面股票", value: `${formatCompactNumber(symbolCount, 0)} / ${targetSymbols}`, pass: symbolCount >= targetSymbols },
+      { label: "独立测试日期", value: `${formatCompactNumber(primaryEvidence.samples?.independentDates || 0, 0)} / 120`, pass: Number(primaryEvidence.samples?.independentDates || 0) >= 120 },
+      { label: "稳定滚动折", value: `${positiveFolds} / ${Math.max(5, foldCount)}，要求至少 4 折为正`, pass: positiveFolds >= 4 && foldCount >= 5 },
+      { label: "历史股票池 PIT", value: `${verified("universe").toFixed(1)}%`, pass: verified("universe") >= 80 },
+      { label: "公司行动 PIT", value: `${verified("corporate_actions").toFixed(1)}%`, pass: verified("corporate_actions") >= 95 },
+      { label: "公司事件 PIT", value: `${Math.max(verified("fundamentals"), verified("news")).toFixed(1)}%`, pass: Math.max(verified("fundamentals"), verified("news")) >= 80 },
+    ];
+    readinessPanel.innerHTML = `
+      <div class="learning-readiness-head"><div><span>明显提升需要什么</span><strong>不是重复训练同一批数据，而是新增独立日期、横截面和 PIT 事件</strong></div><small>5日标签至少需约一周成熟；稳定变化通常需要 20–50 个新增独立日期或一次有实质数据增量的月度训练。</small></div>
+      <div class="learning-readiness-grid">${gates.map((gate) => `<div class="${gate.pass ? "pass" : "hold"}"><span>${escapeHtml(gate.label)}</span><strong>${escapeHtml(gate.value)}</strong></div>`).join("")}</div>
+      <p>优先补充：历史成分与退市股、拆股分红公司行动、带首次发布时间的财报/公告/新闻；分钟模型还需每支重点股持续累积真实已完成分钟 K 线。门控未通过时模型仍会学习和记录，但不会冒充可用 Champion。</p>
+    `;
   }
   requestUiFrame(drawLearningProgressChart);
 }
@@ -6565,15 +6721,19 @@ async function loadLearningProgress(options = {}) {
   const requestToken = ++state.learningProgressLoadToken;
   state.learningProgressLoading = true;
   try {
-    const [progress, generations, trajectories] = await Promise.all([
+    const [progress, generations, trajectories, resources, dataAudit] = await Promise.all([
       requestJson(`/api/learning-progress?market=${encodeURIComponent(market)}`),
       requestJson(`/api/agent-generations?market=${encodeURIComponent(market)}`).catch(() => null),
       requestJson(`/api/learning-trajectories?market=${encodeURIComponent(market)}&limit=600`).catch(() => null),
+      requestJson("/api/training-resource-profile").catch(() => null),
+      requestJson(`/api/data-audit?market=${encodeURIComponent(market)}`).catch(() => null),
     ]);
     if (market !== state.market || requestToken !== state.learningProgressLoadToken) return null;
     state.learningProgress = progress;
     state.agentGenerations = generations;
     state.learningTrajectories = trajectories;
+    state.trainingResources = resources;
+    state.learningDataAudit = dataAudit;
     renderLearningProgressPanel();
     return progress;
   } catch (error) {
@@ -6582,6 +6742,36 @@ async function loadLearningProgress(options = {}) {
     return null;
   } finally {
     if (requestToken === state.learningProgressLoadToken) state.learningProgressLoading = false;
+  }
+}
+
+async function setTrainingResourceProfile(profile) {
+  try {
+    const result = await requestJson("/api/training-resource-profile", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profile }),
+    });
+    state.trainingResources = result;
+    renderLearningProgressPanel();
+    setStatus(`后台训练已切换为${result.profile?.label || profile}；正在运行的任务不会被中断`);
+  } catch (error) {
+    setStatus(`训练负载切换失败：${compactDisplayError(error.message || error)}`);
+  }
+}
+
+async function runCurrentLearningChain() {
+  try {
+    setStatus("正在提交模型、校准、因子、Alpha、分钟与 Agent 学习链");
+    const result = await requestJson("/api/learning-families/run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ market: state.market, family: "all", mode: "weekly" }),
+    });
+    setStatus(`已按${result.resourceProfile || "当前"}档提交 ${result.jobs?.length || 0} 组后台任务；失败与证据不足也会留下轨迹`);
+    setTimeout(() => loadLearningProgress({ quiet: true }), 1200);
+  } catch (error) {
+    setStatus(`学习链提交失败：${compactDisplayError(error.message || error)}`);
   }
 }
 
@@ -8505,7 +8695,7 @@ function productionTrainingSummaryHtml(training = null) {
       <div class="boost-row">
         <strong>市场级多任务 OOF 候选 · ${escapeHtml(training.manifest?.deployment_status || "research")}</strong>
         <span>${escapeHtml(training.framework || "market-level-multitask-oof-calibrated-stack")} · 版本 ${escapeHtml(training.manifest?.model_version || "待生成")}</span>
-        <p>样本 ${formatCompactNumber(dataset.rawRows || 0, 0)} 行 · 有效 ${formatCompactNumber(dataset.effectiveWeightedRows || 0, 1)} · 股票 ${dataset.symbolCount || 0}/${target.symbols || "-"} · PIT 事件覆盖 ${numberOrPending(dataset.pointInTimeCoveragePct, 1)}% · 泄漏违规 ${dataset.pointInTimeJoinViolationCount || 0}</p>
+        <p>样本 ${formatCompactNumber(dataset.rawRows || 0, 0)} 行 · 有效 ${formatCompactNumber(dataset.effectiveWeightedRows || 0, 1)} · 股票 ${dataset.symbolCount || 0}/${target.symbols || "-"} · PIT 事件覆盖 ${numberOrPending(dataset.pointInTimeCoveragePct, 1)}% · 实际泄漏 ${dataset.pointInTimeJoinViolationCount || 0} · 已隔离异常 ${dataset.pointInTimeExcludedViolationCount || 0}</p>
         <p class="muted small-text">${eligibility.eligible ? "已具备生产证据，但仍需 Paper Champion 与显式晋升。" : `当前仅允许 Research/Shadow；未通过：${failedChecks.map(escapeHtml).join("、") || "周期样本/OOF 证据不足"}。`}</p>
       </div>
       ${horizonRows.map((row) => {
@@ -15235,6 +15425,7 @@ async function switchMarket(nextMarket) {
   state.modelReportLoading = false;
   state.learningProgress = null;
   state.learningTrajectories = null;
+  state.learningDataAudit = null;
   state.agentGenerations = null;
   state.modelReports = [];
   state.activeModelReport = null;
@@ -15283,6 +15474,7 @@ async function switchMarket(nextMarket) {
   if (state.activePage === "sources") {
     deferMarketStepAsync(token, "刷新数据源预算", () => refreshProviderBudget(false), 1250, { idle: true, timeout: 4500 });
     deferMarketStepAsync(token, "刷新数据健康中心", () => refreshDataHealth(false), 1450, { idle: true, timeout: 4500 });
+    deferMarketStepAsync(token, "刷新数据补齐计划", () => refreshDataReplenishment(false), 1550, { idle: true, timeout: 5000 });
   }
   deferMarketStepAsync(token, "刷新 API 状态", () => refreshApiStatusBar(false), 1650, { idle: true, timeout: 4500 });
   deferMarketStep(token, "排队 Reddit 社媒缓存", () => scheduleRedditSocialWarmup("market-switch", 300, { maxSymbols: 60 }), 1850, { idle: true });
@@ -15460,6 +15652,7 @@ function boot() {
   bind("openModelChangeLog", "click", openModelChangeLogModal);
   bind("refreshProviderBudget", "click", () => refreshProviderBudget(true));
   bind("refreshDataHealth", "click", () => refreshDataHealth(true));
+  bind("replenishMarketData", "click", () => queueDataReplenishment("all"));
   bind("refreshNewsNow", "click", refreshNewsNow);
   bind("checkIbkrReadiness", "click", checkIbkrReadiness);
   bind("runRiskAssessment", "click", () => runRiskAssessment(true));
@@ -15540,6 +15733,10 @@ function boot() {
   bind("evaluateLearning", "click", () => runLearningMode("evaluate"));
   bind("runWeeklyLearning", "click", () => runLearningMode("weekly"));
   bind("runFullLearning", "click", () => runLearningMode("full"));
+  bind("trainingResourceLight", "click", () => setTrainingResourceProfile("light"));
+  bind("trainingResourceBalanced", "click", () => setTrainingResourceProfile("balanced"));
+  bind("trainingResourceDeep", "click", () => setTrainingResourceProfile("deep"));
+  bind("runLearningChain", "click", runCurrentLearningChain);
   ["modelReportFamily", "modelReportHorizon", "modelReportStatus"].forEach((id) => {
     bind(id, "change", renderModelReportPanel);
   });

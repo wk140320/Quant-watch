@@ -159,7 +159,16 @@ function pointFromTrainingJob(job = {}) {
       brier: Number.isFinite(Number(metrics.brier)) ? number(metrics.brier) : null,
       brierSkill: Number.isFinite(Number(metrics.brierSkillScore)) ? number(metrics.brierSkillScore) : null,
       ecePct: Number.isFinite(Number(metrics.ecePct)) ? number(metrics.ecePct) : null,
-      topDecileAccuracyPct: Number.isFinite(Number(metrics.topDecileTargetRate)) ? number(metrics.topDecileTargetRate) : null,
+      topDecileAccuracyPct: Number.isFinite(Number(model?.rankingMetrics?.top10DirectionHitRatePct))
+        ? number(model.rankingMetrics.top10DirectionHitRatePct)
+        : Number.isFinite(Number(metrics.selectiveTop10AccuracyPct))
+          ? number(metrics.selectiveTop10AccuracyPct)
+          : null,
+      topDecileTargetFirstPct: Number.isFinite(Number(model?.rankingMetrics?.top10TargetFirstRatePct))
+        ? number(model.rankingMetrics.top10TargetFirstRatePct)
+        : Number.isFinite(Number(metrics.topDecileTargetRate))
+          ? number(metrics.topDecileTargetRate)
+          : null,
     },
     folds: foldMetrics.map((fold) => ({
       id: fold.fold ?? fold.id ?? null,
@@ -298,7 +307,15 @@ function createLearningProgressService(options = {}) {
     const selected = five.length ? five : resolved;
     const dates = new Set(selected.map(sampleDate).filter(Boolean));
     const metrics = evidenceMetrics(selected);
-    const digest = createHash("sha256").update(selected.map((sample) => String(sample.predictionId || sample.id || "")).sort().join("|")).digest("hex").slice(0, 16);
+    const digestRows = selected.map((sample) => JSON.stringify({
+      id: String(sample.predictionId || sample.id || ""),
+      resolvedAt: sample.resolvedAt || sample.outcome?.resolvedAt || null,
+      entryPrice: sample.outcome?.entryPrice ?? null,
+      entryDate: sample.outcome?.entryDate ?? null,
+      outcome: sample.outcome?.firstEvent || sample.outcome?.label || null,
+      returnPct: outcomeReturn(sample),
+    })).sort();
+    const digest = createHash("sha256").update(digestRows.join("|")).digest("hex").slice(0, 16);
     return {
       id: `observed-${marketCode(market).toLowerCase()}-${digest}`,
       market: marketCode(market),

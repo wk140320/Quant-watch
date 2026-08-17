@@ -29,6 +29,7 @@ const DATA_OPERATIONS = new Set([
   "data-lake-pit-batch-upsert",
   "data-lake-pit-read",
   "data-lake-backfill-local-caches",
+  "baostock-corporate-actions",
 ]);
 const MAINTENANCE_OPERATIONS = new Set([
   "data-lake-audit",

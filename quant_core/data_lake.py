@@ -12,7 +12,9 @@ from typing import Any
 
 
 MARKETS = {"ASX", "US", "CN"}
-PIT_DATASETS = {"corporate_actions", "fundamentals", "macro", "news", "social", "universe"}
+PIT_DATASETS = {
+    "corporate_actions", "financial_disclosures", "fundamentals", "macro", "news", "social", "universe",
+}
 ROW_FIELDS = [
     "key", "market", "exchange", "symbol", "timestamp", "date", "interval",
     "open", "high", "low", "close", "volume", "amount", "turnover_rate",
@@ -491,12 +493,18 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
             ]
         finally:
             connection.close()
+    daily_symbol_counts = {
+        market: len({row["symbol"] for row in rows if row["market"] == market and row["interval"] == "1d"})
+        for market in MARKETS
+    }
     pit_summary: dict[str, dict[str, Any]] = {}
     for dataset in sorted(PIT_DATASETS):
         pit_files = list((root / dataset).glob("market=*/exchange=*/symbol=*/data.parquet"))
         dataset_rows = 0
         market_rows = {market: 0 for market in MARKETS}
         verified_market_rows = {market: 0 for market in MARKETS}
+        market_symbols = {market: 0 for market in MARKETS}
+        verified_market_symbols = {market: 0 for market in MARKETS}
         if pit_files:
             pattern = str(root / dataset / "market=*" / "exchange=*" / "symbol=*" / "data.parquet").replace("'", "''")
             connection = duckdb.connect()
@@ -505,14 +513,20 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
                     SELECT market, count(*),
                       sum(CASE WHEN try_cast(json_extract(payload_json, '$.historicalAvailabilityVerified') AS BOOLEAN) = true
                         AND coalesce(try_cast(json_extract(payload_json, '$.historicalAvailabilityUnverified') AS BOOLEAN), false) = false
-                      THEN 1 ELSE 0 END)
+                      THEN 1 ELSE 0 END),
+                      count(DISTINCT coalesce(nullif(json_extract_string(payload_json, '$.symbol'), ''), symbol)),
+                      count(DISTINCT CASE WHEN try_cast(json_extract(payload_json, '$.historicalAvailabilityVerified') AS BOOLEAN) = true
+                        AND coalesce(try_cast(json_extract(payload_json, '$.historicalAvailabilityUnverified') AS BOOLEAN), false) = false
+                      THEN coalesce(nullif(json_extract_string(payload_json, '$.symbol'), ''), symbol) ELSE NULL END)
                     FROM read_parquet('{pattern}', union_by_name=true) GROUP BY market
                 """).fetchall()
                 verified_rows = 0
-                for pit_market, count, verified in result:
+                for pit_market, count, verified, symbol_count, verified_symbol_count in result:
                     if pit_market in market_rows:
                         market_rows[pit_market] = int(count)
                         verified_market_rows[pit_market] = int(verified or 0)
+                        market_symbols[pit_market] = int(symbol_count or 0)
+                        verified_market_symbols[pit_market] = int(verified_symbol_count or 0)
                         dataset_rows += int(count)
                         verified_rows += int(verified or 0)
             finally:
@@ -528,6 +542,16 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
                 market: round(verified_market_rows[market] / max(1, market_rows[market]) * 100.0, 4)
                 for market in MARKETS
             },
+            "symbols": market_symbols,
+            "verifiedSymbols": verified_market_symbols,
+            "verifiedSymbolPct": {
+                market: round(verified_market_symbols[market] / max(1, market_symbols[market]) * 100.0, 4)
+                for market in MARKETS
+            },
+            "trainingUniverseCoveragePct": {
+                market: round(min(1.0, verified_market_symbols[market] / max(1, daily_symbol_counts[market])) * 100.0, 4)
+                for market in MARKETS
+            },
             "pointInTime": True,
             "requiredTimestamp": "available_at",
         }
@@ -537,6 +561,7 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
         "partitions": len(rows),
         "rows": sum(int(row["rows"]) for row in rows),
         "markets": {market: sum(int(row["rows"]) for row in rows if row["market"] == market) for market in MARKETS},
+        "dailySymbols": daily_symbol_counts,
         "items": rows[:2_000],
         "pitDatasets": pit_summary,
         "pitRows": sum(int(item["rows"]) for item in pit_summary.values()),
@@ -897,6 +922,98 @@ def upsert_pit_batches(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+ASX_FINANCIAL_DISCLOSURE_PATTERN = re.compile(
+    r"\b(annual report|annual financial report|half[- ]year(?:ly)? report|half[- ]year results|"
+    r"preliminary final report|appendix 4[de]|quarterly (?:activities|cash flow|report)|"
+    r"financial statements?|financial results?|full year results?|earnings release)\b",
+    re.IGNORECASE,
+)
+
+
+def migrate_asx_financial_disclosures(payload: dict[str, Any]) -> dict[str, Any]:
+    """Classify dated ASX exchange filings without pretending they contain numeric statements."""
+    try:
+        import duckdb  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("duckdb is required for the Parquet data lake") from exc
+    root = _root(payload)
+    source_root = root / "news" / "market=ASX"
+    limit = max(1, min(100_000, int(payload.get("limit") or 5_000)))
+    batches: list[dict[str, Any]] = []
+    scanned = 0
+    matched = 0
+    symbols: set[str] = set()
+    connection = duckdb.connect()
+    try:
+        for path in sorted(source_root.glob("exchange=*/symbol=*/data.parquet")):
+            if matched >= limit:
+                break
+            escaped_path = str(path).replace("'", "''")
+            rows = connection.execute(
+                f"SELECT symbol, source, payload_json FROM read_parquet('{escaped_path}') ORDER BY available_at"
+            ).fetchall()
+            records: list[dict[str, Any]] = []
+            source = "asx-official-financial-disclosures"
+            symbol = ""
+            for raw_symbol, raw_source, payload_json in rows:
+                scanned += 1
+                try:
+                    record = json.loads(payload_json or "{}")
+                except json.JSONDecodeError:
+                    continue
+                title = str(record.get("title") or record.get("headline") or "").strip()
+                source_text = str(raw_source or record.get("source") or "").lower()
+                if (
+                    record.get("historicalAvailabilityVerified") is not True
+                    or record.get("historicalAvailabilityUnverified") is True
+                    or "asx" not in source_text
+                    or not ASX_FINANCIAL_DISCLOSURE_PATTERN.search(title)
+                ):
+                    continue
+                symbol = _symbol(raw_symbol, "ASX")
+                values = record.get("values") if isinstance(record.get("values"), dict) else {}
+                records.append({
+                    **record,
+                    "id": str(record.get("id") or record.get("link") or _stable_hash(record, 32)),
+                    "disclosureType": "exchange-filed-financial-report",
+                    "historicalAvailabilityVerified": True,
+                    "historicalAvailabilityVerificationMethod": "asx-official-announcement-published-time",
+                    "values": {
+                        **values,
+                        "earningsEvent": 1.0,
+                        "sourceQuality": 1.0,
+                        "eventRelevance": max(0.9, _normalized_score(values.get("eventRelevance"), 0.0)),
+                    },
+                })
+                matched += 1
+                symbols.add(symbol)
+                if matched >= limit:
+                    break
+            if records and symbol:
+                batches.append({
+                    "dataset": "financial_disclosures",
+                    "market": "ASX",
+                    "symbol": symbol,
+                    "source": source,
+                    "records": records,
+                })
+    finally:
+        connection.close()
+    saved = upsert_pit_batches({"root": str(root), "batches": batches}) if batches else {
+        "batches": 0, "inserted": 0,
+    }
+    return {
+        "available": bool(batches),
+        "market": "ASX",
+        "scanned": scanned,
+        "matched": matched,
+        "symbols": len(symbols),
+        "batches": int(saved.get("batches") or 0),
+        "inserted": int(saved.get("inserted") or 0),
+        "note": "Official dated disclosures are event evidence, not a substitute for structured numeric statements.",
+    }
+
+
 def _sentiment_value(raw: Any) -> float:
     if isinstance(raw, (int, float)):
         return max(-1.0, min(1.0, float(raw) / (100.0 if abs(float(raw)) > 1.0 else 1.0)))
@@ -918,23 +1035,114 @@ def _normalized_score(raw: Any, fallback: float = 0.0) -> float:
     return max(-1.0, min(1.0, value))
 
 
-def _pit_feature_values(dataset: str, raw: dict[str, Any]) -> dict[str, float]:
+def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+MACRO_FEATURE_NAMES = (
+    "macroRatesImpulse",
+    "macroInflationImpulse",
+    "macroLaborImpulse",
+    "macroGrowthImpulse",
+    "macroVolatilityImpulse",
+    "macroCreditImpulse",
+    "macroYieldCurveImpulse",
+    "macroFxImpulse",
+    "macroCommodityImpulse",
+    "macroDataCoverage",
+)
+
+
+def _pit_feature_values(dataset: str, raw: dict[str, Any], source: Any = None) -> dict[str, Any]:
     values = raw.get("values") if isinstance(raw.get("values"), dict) else raw
     title = str(raw.get("title") or raw.get("headline") or raw.get("summary") or "").lower()
-    macro_terms = ("rate", "inflation", "war", "tariff", "sanction", "central bank", "利率", "通胀", "战争", "制裁")
-    if dataset == "fundamentals":
+    source_text = str(source or raw.get("source") or raw.get("provider") or "").lower()
+    official_exchange = dataset in {"news", "financial_disclosures"} and _contains_any(source_text, ("asx", "exchange-announcement"))
+    macro_terms = (
+        "rate hike", "inflation", "war", "tariff", "sanction", "central bank",
+        "geopolitical", "recession", "利率", "通胀", "战争", "制裁", "衰退",
+    )
+    positive_terms = (
+        "guidance raised", "guidance upgrade", "upgraded", "record revenue", "record profit",
+        "profit rises", "earnings beat", "strong growth", "contract awarded", "contract win",
+        "approved", "approval granted", "grant awarded", "buy-back", "buyback", "dividend increase",
+        "high-grade", "commences production", "production commenced", "successful", "milestone achieved",
+        "上调指引", "业绩增长", "中标", "获批", "回购", "增派股息",
+    )
+    negative_terms = (
+        "guidance lowered", "guidance downgrade", "downgraded", "profit warning", "earnings miss",
+        "impairment", "default", "insolvency", "administration", "delay", "cancelled", "canceled",
+        "investigation", "litigation", "class action", "trading suspension", "trading halt",
+        "production halt", "weak trading", "revenue decline", "loss widens", "breach",
+        "下调指引", "业绩预警", "亏损扩大", "调查", "诉讼", "停牌", "违约",
+    )
+    dilution_terms = (
+        "placement", "entitlement offer", "rights issue", "capital raising", "capital raise",
+        "issue of shares", "application for quotation of securities", "unquoted securities",
+        "convertible note", "share purchase plan", "securities issued", "配股", "增发", "可转债",
+    )
+    regulatory_terms = (
+        "regulatory", "asic", "accc", "court", "legal proceedings", "investigation", "litigation",
+        "class action", "compliance breach", "show cause", "penalty", "fine", "监管", "调查", "诉讼", "处罚",
+    )
+    earnings_terms = (
+        "earnings", "results", "statutory accounts", "annual report", "half year report",
+        "quarterly activities", "cash flow report", "trading update", "guidance", "revenue", "profit",
+        "业绩", "财报", "年报", "季报", "营收", "利润", "指引",
+    )
+    capital_allocation_positive_terms = (
+        "buy-back", "buyback", "dividend", "distribution", "special dividend", "capital return", "回购", "股息", "分红",
+    )
+    capital_allocation_negative_terms = dilution_terms
+    operational_terms = (
+        "contract", "order", "project", "production", "drilling", "resource", "reserve", "study",
+        "approval", "licence", "license", "customer", "patent", "trial", "development", "acquisition",
+        "divestment", "disposal", "合作", "项目", "订单", "产量", "资源量", "获批", "收购", "出售",
+    )
+    administrative_terms = (
+        "director's interest", "directors interest", "substantial holding", "substantial holder",
+        "unquoted securities", "application for quotation", "cessation of securities", "securities on issue",
+        "notice of meeting", "proxy form", "change of address", "notification regarding", "appendix 3",
+        "董事权益", "股东大会通知",
+    )
+    positive = _contains_any(title, positive_terms)
+    negative = _contains_any(title, negative_terms)
+    dilution = _contains_any(title, dilution_terms)
+    regulatory = _contains_any(title, regulatory_terms)
+    earnings = _contains_any(title, earnings_terms)
+    capital_positive = _contains_any(title, capital_allocation_positive_terms)
+    capital_negative = _contains_any(title, capital_allocation_negative_terms)
+    operational = _contains_any(title, operational_terms)
+    administrative = _contains_any(title, administrative_terms)
+    if dataset in {"fundamentals", "financial_disclosures"}:
         margin = _normalized_score(values.get("profitMargin"), 0.0)
         growth = _normalized_score(values.get("earningsGrowth", values.get("revenueGrowth")), 0.0)
         quality = max(-1.0, min(1.0, margin * 0.55 + growth * 0.45))
     else:
         quality = 0.0
-    truth = _normalized_score(raw.get("truthScore", raw.get("sourceQuality", raw.get("credibility"))), 0.5)
-    relevance = _normalized_score(raw.get("relevance", raw.get("relevanceScore")), 0.5)
-    novelty = _normalized_score(raw.get("novelty", raw.get("noveltyScore")), 0.5)
-    announcement = 1.0 if dataset == "news" and any(term in title for term in ("earnings", "guidance", "filing", "announcement", "财报", "公告")) else 0.0
+    source_default = 1.0 if official_exchange or dataset in {"fundamentals", "financial_disclosures", "macro"} else 0.55 if dataset == "news" else 0.45
+    truth = _normalized_score(raw.get("truthScore", raw.get("sourceQuality", raw.get("credibility"))), source_default)
+    relevance_default = 1.0 if official_exchange else 0.35 if dataset == "news" else 0.75
+    if administrative:
+        relevance_default = min(relevance_default, 0.30)
+    relevance = _normalized_score(raw.get("relevance", raw.get("relevanceScore")), relevance_default)
+    novelty_default = 0.80 if official_exchange and not administrative else 0.15 if administrative else 0.35
+    novelty = _normalized_score(raw.get("novelty", raw.get("noveltyScore")), novelty_default)
+    announcement = 1.0 if (official_exchange and not administrative) or earnings or operational else 0.15 if administrative else 0.0
     macro_risk = -1.0 if any(term in title for term in macro_terms) else 0.0
+    inferred_sentiment = 1.0 if positive and not negative else -1.0 if negative and not positive else 0.0
+    explicit_sentiment = _sentiment_value(raw.get("sentiment", raw.get("sentimentScore")))
+    event_sentiment = explicit_sentiment if abs(explicit_sentiment) > 1e-12 else inferred_sentiment
+    event_intensity = 0.0
+    if dataset == "macro":
+        event_intensity = 0.35
+    elif official_exchange:
+        event_intensity = 0.20 if administrative else min(1.0, 0.45 + 0.15 * sum((earnings, operational, dilution, regulatory)))
+    elif title:
+        event_intensity = 0.30 + 0.15 * sum((earnings, operational, dilution, regulatory))
     output = {
-        "eventSentiment": _sentiment_value(raw.get("sentiment", raw.get("sentimentScore"))),
+        "__eventId": str(raw.get("id") or raw.get("link") or raw.get("url") or ""),
+        "eventSentiment": event_sentiment,
         "eventRelevance": relevance,
         "eventNovelty": novelty,
         "announcementScore": announcement,
@@ -942,9 +1150,21 @@ def _pit_feature_values(dataset: str, raw: dict[str, Any]) -> dict[str, float]:
         "macroRisk": macro_risk,
         "sourceQuality": truth,
         "freshnessScore": 1.0,
+        "positiveCatalyst": 1.0 if positive else 0.0,
+        "negativeCatalyst": 1.0 if negative else 0.0,
+        "dilutionRisk": 1.0 if dilution else 0.0,
+        "regulatoryRisk": 1.0 if regulatory else 0.0,
+        "earningsEvent": 1.0 if earnings else 0.0,
+        "capitalAllocation": 1.0 if capital_positive and not capital_negative else -1.0 if capital_negative and not capital_positive else 0.0,
+        "operationalMomentum": inferred_sentiment if operational else 0.0,
+        "eventIntensity": event_intensity,
     }
+    if dataset == "macro":
+        output["__seriesId"] = str(raw.get("seriesId") or values.get("seriesId") or "UNKNOWN")
+        for name in MACRO_FEATURE_NAMES:
+            output[name] = _normalized_score(values.get(name), 0.0)
     for name in output:
-        if name in values:
+        if name in values and not name.startswith("__"):
             output[name] = _normalized_score(values.get(name), output[name])
     return output
 
@@ -957,9 +1177,10 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
     root = _root(payload)
     market = _market(payload.get("market"))
     symbols = {_symbol(symbol, market) for symbol in payload.get("symbols") or [] if str(symbol or "").strip()}
-    datasets = [str(value).lower() for value in payload.get("datasets") or ("news", "social", "fundamentals", "macro", "corporate_actions", "universe") if str(value).lower() in PIT_DATASETS]
+    datasets = [str(value).lower() for value in payload.get("datasets") or ("financial_disclosures", "news", "social", "fundamentals", "macro", "corporate_actions", "universe") if str(value).lower() in PIT_DATASETS]
     limit_per_symbol = max(1, min(2_000, int(payload.get("limit_per_symbol", payload.get("limitPerSymbol", 400)) or 400)))
     broadcast_market_wide = payload.get("broadcast_market_wide", payload.get("broadcastMarketWide", True)) is not False
+    verified_only = payload.get("verified_only", payload.get("verifiedOnly", False)) is True
     items: dict[str, dict[str, list[dict[str, Any]]]] = {
         symbol: {"features": [], "universe": [], "actions": []} for symbol in symbols
     }
@@ -976,7 +1197,11 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                     continue
                 query_limit = limit_per_symbol * max(1, len(symbols)) if market_wide_partition else limit_per_symbol
                 escaped_path = str(path).replace("'", "''")
-                query = f"SELECT symbol,event_time,available_at,revision,source,payload_json FROM read_parquet('{escaped_path}') ORDER BY available_at DESC LIMIT {query_limit}"
+                verified_filter = """
+                    WHERE json_extract_string(payload_json, '$.historicalAvailabilityVerified') = 'true'
+                      AND coalesce(json_extract_string(payload_json, '$.historicalAvailabilityUnverified'), 'false') != 'true'
+                """ if verified_only else ""
+                query = f"SELECT symbol,event_time,available_at,revision,source,payload_json FROM read_parquet('{escaped_path}') {verified_filter} ORDER BY available_at DESC LIMIT {query_limit}"
                 for symbol, event_time, available_at, revision, source, payload_json in connection.execute(query).fetchall():
                     try:
                         raw = json.loads(payload_json or "{}")
@@ -991,6 +1216,7 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                         except ValueError:
                             continue
                     common = {
+                        "id": str(raw.get("id") or raw.get("link") or raw.get("url") or ""),
                         "dataset": dataset,
                         "event_time": event_time,
                         "available_at": available_at,
@@ -1000,20 +1226,25 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                             and not bool(raw.get("historicalAvailabilityUnverified")),
                     }
                     if dataset == "macro" and market_wide_partition and not broadcast_market_wide:
-                        market_features.append({**common, "values": _pit_feature_values(dataset, raw)})
+                        market_features.append({**common, "values": _pit_feature_values(dataset, raw, source)})
                         source_counts[dataset] = source_counts.get(dataset, 0) + 1
                         continue
                     for target_symbol in target_symbols:
                         if symbols and target_symbol not in symbols:
                             continue
                         bucket = items.setdefault(target_symbol, {"features": [], "universe": [], "actions": []})
-                        if dataset in {"news", "social", "fundamentals", "macro"}:
-                            bucket["features"].append({**common, "values": _pit_feature_values(dataset, raw)})
+                        if dataset in {"news", "social", "fundamentals", "financial_disclosures", "macro"}:
+                            bucket["features"].append({**common, "values": _pit_feature_values(dataset, raw, source)})
                         elif dataset == "universe":
+                            event_type = raw.get("eventType") or raw.get("type")
                             bucket["universe"].append({
                                 **common,
-                                "listed": raw.get("listed", raw.get("status", "active") not in {"delisted", "inactive"}),
+                                "listed": None if str(event_type or "").lower() == "coverage" else raw.get("listed", raw.get("status", "active") not in {"delisted", "inactive"}),
                                 "exchange": raw.get("exchange"),
+                                "eventType": event_type,
+                                "coverageKind": raw.get("coverageKind"),
+                                "coverageStart": raw.get("coverageStart"),
+                                "coverageEnd": raw.get("coverageEnd"),
                             })
                         elif dataset == "corporate_actions":
                             bucket["actions"].append({
@@ -1022,13 +1253,17 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                                 "amount": raw.get("amount"),
                                 "numerator": raw.get("numerator"),
                                 "denominator": raw.get("denominator"),
+                                "coverageStart": raw.get("coverageStart"),
+                                "coverageEnd": raw.get("coverageEnd"),
                             })
                         source_counts[dataset] = source_counts.get(dataset, 0) + 1
     finally:
         connection.close()
+    market_feature_limit = max(limit_per_symbol, min(100_000, limit_per_symbol * max(1, len(symbols))))
     return {
         "available": True,
         "market": market,
+        "verifiedOnly": verified_only,
         "items": [
             {
                 "symbol": symbol,
@@ -1048,7 +1283,7 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
         "marketPointInTimeFeatures": sorted(
             market_features,
             key=lambda row: str(row.get("available_at") or ""),
-        )[-limit_per_symbol:],
+        )[-market_feature_limit:],
         "sourceCounts": source_counts,
         "rows": len(market_features) + sum(sum(len(values) for values in rows.values()) for rows in items.values()),
         "dataVersion": _stable_hash({

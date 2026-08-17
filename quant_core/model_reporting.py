@@ -548,6 +548,8 @@ def _model_status(model: dict[str, Any]) -> str:
 def _hard_gate(dataset: dict[str, Any], horizon_model: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     metrics = horizon_model.get("metrics") or {}
     direction_metrics = horizon_model.get("directionMetrics") or {}
+    long_gate = horizon_model.get("longTradeGate") or {}
+    long_evidence = long_gate.get("testEvidence") or {}
     folds = horizon_model.get("foldMetrics") or []
     checks = [
         ("rows", number(horizon_model.get("rowCount")) >= PRODUCTION_THRESHOLDS["minRowsPerHorizon"], number(horizon_model.get("rowCount")), PRODUCTION_THRESHOLDS["minRowsPerHorizon"]),
@@ -563,6 +565,8 @@ def _hard_gate(dataset: dict[str, Any], horizon_model: dict[str, Any], audit: di
         ("brier_skill", number(metrics.get("brierSkillScore"), -1) > PRODUCTION_THRESHOLDS["minBrierSkill"], number(metrics.get("brierSkillScore"), -1), f">{PRODUCTION_THRESHOLDS['minBrierSkill']}"),
         ("direction_brier_skill", number(direction_metrics.get("brierSkillScore"), -1) > PRODUCTION_THRESHOLDS["minBrierSkill"], number(direction_metrics.get("brierSkillScore"), -1), f">{PRODUCTION_THRESHOLDS['minBrierSkill']}"),
         ("direction_balanced_accuracy", number(direction_metrics.get("balancedAccuracyPct")) > 50.0, number(direction_metrics.get("balancedAccuracyPct")), ">50%"),
+        ("eligible_long_accuracy", long_gate.get("active") is True and number(long_evidence.get("directionHitRatePct")) >= 57.0 and number(long_evidence.get("directionHitRate95LowerPct")) > 50.0, {"hitRatePct": long_evidence.get("directionHitRatePct"), "ci95LowerPct": long_evidence.get("directionHitRate95LowerPct")}, "hit>=57% and block-CI lower>50%"),
+        ("eligible_long_support", number(long_evidence.get("signalCount")) >= 200 and number(long_evidence.get("signalDates")) >= 80, {"signals": long_evidence.get("signalCount"), "dates": long_evidence.get("signalDates")}, "200 signals / 80 dates"),
         ("ece", number(metrics.get("ecePct"), 100) <= PRODUCTION_THRESHOLDS["maxEcePct"], number(metrics.get("ecePct"), 100), PRODUCTION_THRESHOLDS["maxEcePct"]),
         ("calibration_slope", PRODUCTION_THRESHOLDS["minCalibrationSlope"] <= number(metrics.get("calibrationSlope"), -1) <= PRODUCTION_THRESHOLDS["maxCalibrationSlope"], number(metrics.get("calibrationSlope"), -1), "0.8-1.2"),
         ("probability_bucket", number(metrics.get("probabilityBucketMinCount")) >= PRODUCTION_THRESHOLDS["minProbabilityBucketEvents"], number(metrics.get("probabilityBucketMinCount")), PRODUCTION_THRESHOLDS["minProbabilityBucketEvents"]),
@@ -570,7 +574,7 @@ def _hard_gate(dataset: dict[str, Any], horizon_model: dict[str, Any], audit: di
         ("direction_probability_resolution", direction_metrics.get("probabilityResolutionPassed") is True, {"std": direction_metrics.get("probabilityStd"), "buckets": direction_metrics.get("occupiedProbabilityBuckets")}, "std>=0.035 and >=4 buckets"),
         ("top_k_lift", number(horizon_model.get("rankingMetrics", {}).get("topDecileLift")) > 0, number(horizon_model.get("rankingMetrics", {}).get("topDecileLift")), ">0"),
         ("top_k_absolute_return", number(horizon_model.get("rankingMetrics", {}).get("topDecileNetReturn")) > 0, number(horizon_model.get("rankingMetrics", {}).get("topDecileNetReturn")), ">0"),
-        ("net_ev", number(horizon_model.get("expectedValue", {}).get("expectedValuePct")) > 0, number(horizon_model.get("expectedValue", {}).get("expectedValuePct")), ">0"),
+        ("net_ev", number(horizon_model.get("longTradeExpectedValue", {}).get("expectedValuePct")) > 0, number(horizon_model.get("longTradeExpectedValue", {}).get("expectedValuePct")), ">0 on eligible long signals"),
         ("feature_drift", max([number(fold.get("featureDrift", {}).get("maxPsi")) for fold in folds] or [0]) <= PRODUCTION_THRESHOLDS["maxFeaturePsi"], max([number(fold.get("featureDrift", {}).get("maxPsi")) for fold in folds] or [0]), PRODUCTION_THRESHOLDS["maxFeaturePsi"]),
     ]
     rows = [{"id": key, "passed": passed, "value": value, "threshold": threshold} for key, passed, value, threshold in checks]
@@ -602,7 +606,9 @@ def horizon_report(
         classifiers.append({"id": key, "name": label, "task": "classification", "target": actual_key, "metrics": result})
     quantiles = quantile_metrics(rows)
     regression = regression_metrics(rows, "quantileP50")
-    ranking = rank_metrics(rows)
+    ranking_key = "selectionScore" if any(row.get("selectionScore") is not None for row in rows) else "rankerPrediction"
+    ranking = rank_metrics(rows, ranking_key)
+    ranking["scoreKey"] = ranking_key
     hard_gate = _hard_gate(registry.get("dataset") or {}, model, audit)
     return {
         "modelId": model.get("modelVersion") or f"{manifest.get('model_version', market.lower())}-{model.get('horizon', 'unknown')}d",
@@ -625,8 +631,11 @@ def horizon_report(
         "featureAblation": model.get("featureAblation") or {},
         "diagnosticBuckets": model.get("diagnosticBuckets") or {},
         "modelComparison": model.get("modelComparison") or [],
+        "selectiveRankingHead": model.get("selectiveRankingHead") or {},
+        "longTradeGate": model.get("longTradeGate") or {},
         "calibrator": model.get("calibrator"),
         "expectedValue": model.get("expectedValue"),
+        "longTradeExpectedValue": model.get("longTradeExpectedValue"),
         "hardGate": hard_gate,
     }
 

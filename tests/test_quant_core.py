@@ -15,6 +15,7 @@ from alpha_mining import analyze_alpha_evolution  # noqa: E402
 from data_quality import assess_candle_quality  # noqa: E402
 from data_lake import (  # noqa: E402
     audit as audit_data_lake,
+    migrate_asx_financial_disclosures,
     read_panel as read_data_lake_panel,
     read_pit_panel as read_data_lake_pit_panel,
     read_rows as read_data_lake_rows,
@@ -40,8 +41,9 @@ from model_reporting import (  # noqa: E402
     read_oof_rows,
 )
 from paper_agents import configure as configure_paper_agents, list_agent_events, list_generations as list_paper_agent_generations, load_state as load_paper_agent_state, migrate as migrate_paper_agents, replay_oof as replay_paper_agents, save_state as save_paper_agent_state, step as step_paper_agents, upgrade_generation as upgrade_paper_agent_generation  # noqa: E402
+from pit_ingest import normalize_baostock_adjust_factors  # noqa: E402
 from provider_budget import provider_plan  # noqa: E402
-from production_training import _date_level_regime_predictions, _event_fold_predictions, _fallback_baseline_predictions, _fold_checkpoint_context, _load_latest_eligible_dataset_cache, _save_dataset_cache, brier_skilled_models, build_market_dataset, calibration_metrics, fit_constrained_stack, fit_probability_calibrator, point_in_time_features, purged_walk_forward_folds, recover_oof_artifacts, verified_pit_coverage  # noqa: E402
+from production_training import _combine_company_market_point_in_time, _date_level_regime_predictions, _event_fold_predictions, _fallback_baseline_predictions, _fold_checkpoint_context, _load_latest_eligible_dataset_cache, _point_in_time_features_from_prepared, _prepare_point_in_time_candidates, _rank_cross_section, _save_dataset_cache, _training_feature_family_gate, _training_feature_profile_gate, _training_stable_feature_panel, brier_skilled_models, build_market_dataset, calibration_metrics, diagnostic_bucket_summary, fit_constrained_stack, fit_false_positive_risk_head, fit_long_trade_gate, fit_probability_calibrator, fit_selective_ranking_head, hydrate_verified_pit_from_data_lake, point_in_time_features, purged_walk_forward_folds, recover_oof_artifacts, select_robust_direction_models, verified_pit_coverage  # noqa: E402
 from risk import assess_portfolio, build_paper_order_intent  # noqa: E402
 from store import append_event, control_plane_summary, list_events, list_market_rows, market_data_summary, record_market_rows, record_order_intent  # noqa: E402
 from trades import analyze_trades  # noqa: E402
@@ -169,6 +171,35 @@ def prediction_samples(count=48):
 
 
 class QuantCoreTests(unittest.TestCase):
+    def test_baostock_adjust_factors_include_verified_non_feature_coverage_receipt(self):
+        records = normalize_baostock_adjust_factors(
+            "600000",
+            ["code", "dividOperateDate", "foreAdjustFactor", "backAdjustFactor", "adjustFactor"],
+            [["sh.600000", "2020-06-01", "1.2", "0.8", "1.0"]],
+            start_date="2010-01-01",
+            end_date="2026-08-11",
+        )
+        self.assertEqual(records[0]["eventType"], "adjustment-factor")
+        self.assertEqual(records[0]["available_at"], "2020-06-01")
+        self.assertTrue(records[0]["historicalAvailabilityVerified"])
+        self.assertEqual(records[-1]["eventType"], "coverage")
+        self.assertEqual(records[-1]["coverageStart"], "2010-01-01")
+        self.assertEqual(records[-1]["coverageEnd"], "2026-08-11")
+
+    def test_corporate_action_coverage_receipt_covers_range_without_future_event(self):
+        receipt = {
+            "eventType": "coverage",
+            "event_time": "2000-01-01",
+            "available_at": "2000-01-01",
+            "coverageStart": "2000-01-01",
+            "coverageEnd": "2026-08-11",
+            "historicalAvailabilityVerified": True,
+        }
+        covered = verified_pit_coverage([receipt], "2019-06-03", "CN")
+        outside = verified_pit_coverage([receipt], "1999-06-03", "CN")
+        self.assertTrue(covered["covered"])
+        self.assertFalse(outside["covered"])
+
     def test_feature_analysis_uses_real_rows(self):
         result = analyze_features(candles(), market="US", symbol="TEST", source="unit", interval="1d")
         self.assertEqual(result["row_count"], 140)
@@ -512,6 +543,44 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(joined["joinViolationCount"], 0)
         self.assertGreater(joined["values"]["eventSentiment"], 0)
 
+    def test_point_in_time_join_aggregates_event_sequence_instead_of_overwriting(self):
+        joined = point_in_time_features({
+            "pointInTimeFeatures": [
+                {
+                    "dataset": "news",
+                    "event_time": "2025-02-20T08:00:00Z",
+                    "available_at": "2025-02-20T08:00:00Z",
+                    "historicalAvailabilityVerified": True,
+                    "values": {
+                        "eventSentiment": 0.8,
+                        "eventRelevance": 1.0,
+                        "sourceQuality": 1.0,
+                        "positiveCatalyst": 1.0,
+                        "eventIntensity": 0.8,
+                    },
+                },
+                {
+                    "dataset": "news",
+                    "event_time": "2025-02-25T08:00:00Z",
+                    "available_at": "2025-02-25T08:00:00Z",
+                    "historicalAvailabilityVerified": True,
+                    "values": {
+                        "eventSentiment": -0.6,
+                        "eventRelevance": 1.0,
+                        "sourceQuality": 1.0,
+                        "negativeCatalyst": 1.0,
+                        "eventIntensity": 0.8,
+                    },
+                },
+            ],
+        }, "2025-03-01", "US")
+        self.assertEqual(joined["sourceRows"], 2)
+        self.assertGreater(joined["values"]["positiveCatalyst"], 0.0)
+        self.assertGreater(joined["values"]["negativeCatalyst"], 0.0)
+        self.assertGreater(joined["values"]["eventIntensity"], 0.0)
+        self.assertEqual(joined["aggregationSchema"], "pit-event-aggregation-v8-date-cached-market-company-split")
+        self.assertEqual(joined["companySourceRows"], 2)
+
     def test_unverified_point_in_time_rows_are_blocked_and_audited(self):
         joined = point_in_time_features({
             "pointInTimeFeatures": [{
@@ -523,8 +592,58 @@ class QuantCoreTests(unittest.TestCase):
         }, "2025-03-01", "US")
         self.assertEqual(joined["sourceRows"], 0)
         self.assertEqual(joined["unverifiedRowsExcluded"], 1)
-        self.assertEqual(joined["joinViolationCount"], 1)
+        self.assertEqual(joined["joinViolationCount"], 0)
+        self.assertEqual(joined["excludedViolationCount"], 1)
         self.assertEqual(joined["values"]["eventSentiment"], 0.0)
+
+    def test_company_and_market_pit_can_be_aggregated_separately_without_changing_time_boundary(self):
+        company_bundle = _prepare_point_in_time_candidates({
+            "pointInTimeFeatures": [{
+                "dataset": "news",
+                "event_time": "2025-02-01T08:00:00Z",
+                "available_at": "2025-02-01T08:00:00Z",
+                "historicalAvailabilityVerified": True,
+                "values": {"eventSentiment": 0.8, "eventRelevance": 1.0, "sourceQuality": 1.0},
+            }],
+        })
+        market_bundle = _prepare_point_in_time_candidates({}, [{
+            "dataset": "macro",
+            "event_time": "2025-02-01T00:00:00Z",
+            "available_at": "2025-02-02T00:00:00Z",
+            "historicalAvailabilityVerified": True,
+            "values": {
+                "macroRisk": -0.6,
+                "macroVolatilityImpulse": -0.7,
+                "macroDataCoverage": 1.0,
+                "sourceQuality": 1.0,
+                "__seriesId": "VIXCLS",
+            },
+        }])
+        company = _point_in_time_features_from_prepared(company_bundle, "2025-03-01", "US")
+        market = _point_in_time_features_from_prepared(market_bundle, "2025-03-01", "US")
+        joined = _combine_company_market_point_in_time(company, market)
+        self.assertGreater(joined["values"]["eventSentiment"], 0.0)
+        self.assertLess(joined["values"]["macroRisk"], 0.0)
+        self.assertLess(joined["values"]["macroVolatilityImpulse"], 0.0)
+        self.assertEqual(joined["values"]["macroDataCoverage"], 1.0)
+        self.assertEqual(joined["companySourceRows"], 1)
+        self.assertEqual(joined["marketSourceRows"], 1)
+        self.assertEqual(joined["sourceRows"], 2)
+        self.assertEqual(joined["joinViolationCount"], 0)
+
+    def test_cross_sectional_rank_label_prioritizes_path_then_return_tiebreak(self):
+        rows = [
+            {"date": "2025-01-02", "horizon": 5, "symbol": "LOSS", "actualReturn": -4.0, "actualTarget": 0.0, "actualStop": 1.0, "actualDirection": 0.0, "feature": {}, "crossSectionRaw": {}, "x": []},
+            {"date": "2025-01-02", "horizon": 5, "symbol": "FLAT", "actualReturn": 0.2, "actualTarget": 0.0, "actualStop": 0.0, "actualDirection": 1.0, "feature": {}, "crossSectionRaw": {}, "x": []},
+            {"date": "2025-01-02", "horizon": 5, "symbol": "WIN", "actualReturn": 6.0, "actualTarget": 1.0, "actualStop": 0.0, "actualDirection": 1.0, "feature": {}, "crossSectionRaw": {}, "x": []},
+        ]
+        _rank_cross_section(rows)
+        by_symbol = {row["symbol"]: row for row in rows}
+        self.assertEqual(by_symbol["LOSS"]["rankRelevance"], 0.0)
+        self.assertEqual(by_symbol["WIN"]["rankRelevance"], 11.0)
+        self.assertGreater(by_symbol["WIN"]["rankRelevance"], by_symbol["FLAT"]["rankRelevance"])
+        self.assertGreater(by_symbol["FLAT"]["rankRelevance"], by_symbol["LOSS"]["rankRelevance"])
+        self.assertEqual(by_symbol["WIN"]["returnRank"], 1.0)
 
     def test_local_model_split_keeps_each_signal_date_in_one_partition(self):
         rows = [
@@ -583,11 +702,11 @@ class QuantCoreTests(unittest.TestCase):
         train = [
             {
                 "eventCoverage": 1.0,
-                "eventX": [1.0, index / 700.0, (index % 7) / 7.0],
+                "eventX": [1.0, index / 2_100.0, (index % 7) / 7.0],
                 "actualTarget": 1.0 if index % 3 else 0.0,
                 "trainingWeight": 1.0,
             }
-            for index in range(700)
+            for index in range(2_100)
         ]
         test = [
             {"eventCoverage": 1.0, "eventX": [1.0, index / 20.0, (index % 5) / 5.0]}
@@ -596,6 +715,9 @@ class QuantCoreTests(unittest.TestCase):
         predictions = _event_fold_predictions(train, test)
         self.assertEqual(len(predictions), len(test))
         self.assertTrue(all(0.0 <= value <= 1.0 for value in predictions))
+
+        insufficient = _event_fold_predictions(train[:700], test)
+        self.assertIsNone(insufficient)
 
     def test_market_dataset_quarantines_cross_market_and_duplicate_rows(self):
         items = panel_items(120)
@@ -880,6 +1002,289 @@ class QuantCoreTests(unittest.TestCase):
         self.assertEqual(metrics["selectiveTop10AccuracyPct"], 100.0)
         self.assertGreater(metrics["selectiveTop10Accuracy95LowerPct"], 90.0)
 
+    def test_false_positive_risk_head_uses_inner_validation_and_never_raises_scores(self):
+        train_rows = []
+        train_probabilities = []
+        for index in range(720):
+            high = index % 4 == 0
+            false_positive = high and index % 8 == 0
+            actual = 0.0 if false_positive else 1.0 if high else float(index % 2)
+            train_rows.append({
+                "date": (date(2018, 1, 1) + timedelta(days=index)).isoformat(),
+                "x": [1.0 if false_positive else 0.0, index % 7 / 7],
+                "actualDirection": actual,
+                "actualReturn": 1.0 if actual else -1.0,
+                "liquidityWeight": 1.0,
+                "dataQuality": 0.9,
+                "evaluationWeight": 1.0,
+            })
+            train_probabilities.append(0.9 if high else 0.45)
+        test_rows = []
+        test_probabilities = []
+        for index in range(160):
+            high = index % 4 == 0
+            false_positive = high and index % 8 == 0
+            actual = 0.0 if false_positive else 1.0 if high else float(index % 2)
+            test_rows.append({
+                "date": (date(2024, 1, 1) + timedelta(days=index)).isoformat(),
+                "x": [1.0 if false_positive else 0.0, index % 7 / 7],
+                "actualDirection": actual,
+                "actualReturn": 1.0 if actual else -1.0,
+                "liquidityWeight": 1.0,
+                "dataQuality": 0.9,
+                "evaluationWeight": 1.0,
+            })
+            test_probabilities.append(0.9 if high else 0.45)
+        result = fit_false_positive_risk_head(train_rows, test_rows, train_probabilities, test_probabilities)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["innerPurgeDates"], 12)
+        self.assertTrue(all(adjusted <= original + 1e-12 for adjusted, original in zip(result["probabilities"], test_probabilities)))
+        self.assertIn("inner validation", result["reason"].lower())
+
+    def test_false_positive_diagnostics_use_the_persisted_compact_feature_vector(self):
+        rows = []
+        probabilities = []
+        for index in range(100):
+            high = index >= 90
+            actual = 0.0 if index % 2 == 0 else 1.0
+            rows.append({
+                "date": (date(2025, 1, 1) + timedelta(days=index // 5)).isoformat(),
+                "symbol": f"S{index}",
+                "actualDirection": actual,
+                "actualReturn": 1.0 if actual else -1.0,
+                "liquidityWeight": 1.0,
+                "dataQuality": 100.0,
+                "regime": "range",
+                "sector": "general",
+                "falsePositiveFeatures": [2.0 if high and not actual else 0.25, 0.0],
+            })
+            probabilities.append(0.9 + index / 10_000 if high else 0.2 + index / 1_000)
+        result = diagnostic_bucket_summary(rows, probabilities)
+        library = result["highConfidenceFalsePositiveLibrary"]
+        self.assertGreater(library["falsePositiveCount"], 0)
+        self.assertTrue(library["featureDeltas"])
+        self.assertEqual(library["featureDeltas"][0]["feature"], "change5")
+
+    def test_selective_ranking_head_uses_inner_dates_and_leaves_final_test_untouched(self):
+        def make_rows(start: date, days: int):
+            rows = []
+            direction = []
+            target = []
+            for day in range(days):
+                current = (start + timedelta(days=day)).isoformat()
+                for symbol in range(20):
+                    positive = symbol < 6
+                    probability = 0.90 if positive else 0.10
+                    rows.append({
+                        "date": current,
+                        "symbol": f"S{symbol:02d}",
+                        "rankerPrediction": (symbol + 1) / 20,
+                        "pathSafetyPrediction": probability,
+                        "stopProbability": 1.0 - probability,
+                        "quantileP50": 2.0 if positive else -1.0,
+                        "baselineReturn": 1.5 if positive else -0.8,
+                        "liquidityWeight": 1.0,
+                        "actualDirection": 1.0 if positive else 0.0,
+                        "actualTarget": 1.0 if positive else 0.0,
+                        "actualStop": 0.0 if positive else 1.0,
+                        "actualReturn": 2.0 if positive else -1.0,
+                        "evaluationWeight": 1.0,
+                    })
+                    direction.append(probability)
+                    target.append(probability)
+            return rows, direction, target
+
+        train_rows, train_direction, train_target = make_rows(date(2023, 1, 1), 120)
+        test_rows, test_direction, test_target = make_rows(date(2025, 1, 1), 40)
+        result = fit_selective_ranking_head(
+            train_rows,
+            test_rows,
+            train_direction,
+            test_direction,
+            train_target,
+            test_target,
+        )
+        self.assertTrue(result["available"])
+        self.assertTrue(result["active"])
+        self.assertNotEqual(result["selected"], "rank-only")
+        self.assertEqual(result["innerPurgeDates"], 12)
+        self.assertEqual(len(result["scores"]), len(test_rows))
+        first_day_scores = result["scores"][:20]
+        self.assertGreater(min(first_day_scores[:6]), max(first_day_scores[6:]))
+
+    def test_long_trade_gate_learns_threshold_without_reading_test_labels(self):
+        def make_rows(start: date, days: int):
+            rows = []
+            direction = []
+            target = []
+            for day in range(days):
+                current = (start + timedelta(days=day)).isoformat()
+                for symbol in range(4):
+                    eligible = symbol < 2
+                    success = not eligible or (day + symbol) % 5 < 3
+                    rows.append({
+                        "date": current,
+                        "fold": day // 40 + 1,
+                        "actualDirection": 1.0 if success else 0.0,
+                        "actualTarget": 1.0 if eligible and success else 0.0,
+                        "actualStop": 1.0 if eligible and not success else 0.0,
+                        "actualTimeout": 0.0,
+                        "actualReturn": 1.5 if success else -0.5,
+                        "actualGrossReturn": 1.5 if success else -0.5,
+                        "targetBarrierPct": 5.0,
+                        "stopBarrierPct": 4.0,
+                        "stopProbability": 0.25,
+                        "timeoutProbability": 0.15,
+                        "transactionCostBps": 18.0,
+                    })
+                    direction.append(0.57 if eligible else 0.45)
+                    target.append(0.60 if eligible else 0.30)
+            return rows, direction, target
+
+        train, train_direction, train_target = make_rows(date(2022, 1, 1), 160)
+        test, test_direction, test_target = make_rows(date(2025, 1, 1), 100)
+        result = fit_long_trade_gate(train, test, train_direction, test_direction, train_target, test_target)
+        self.assertTrue(result["active"])
+        self.assertGreaterEqual(result["testEvidence"]["directionHitRatePct"], 57.0)
+        self.assertGreater(result["testEvidence"]["meanNetReturnPct"], 0)
+
+        inverted_test = [{**row, "actualDirection": 1.0 - row["actualDirection"]} for row in test]
+        inverted = fit_long_trade_gate(train, inverted_test, train_direction, test_direction, train_target, test_target)
+        self.assertEqual(result["threshold"], inverted["threshold"])
+        self.assertNotEqual(result["testEvidence"]["directionHitRatePct"], inverted["testEvidence"]["directionHitRatePct"])
+        self.assertFalse(inverted["active"])
+        self.assertEqual(inverted["eligibleIndexes"], [])
+        self.assertIn("failed untouched holdout", inverted["reason"])
+
+    def test_training_feature_family_gate_uses_inner_dates_not_heldout_labels(self):
+        names = [
+            "bias", "change5", "change20", "volumeRatio", "volatility", "gap", "closeLocation", "buyPressure5",
+            "macroRatesImpulse", "macroVolatilityImpulse",
+        ]
+        train = []
+        for day_index in range(300):
+            signal_day = (date(2022, 1, 1) + timedelta(days=day_index)).isoformat()
+            for symbol_index in range(6):
+                actual = 1.0 if (day_index + symbol_index) % 2 == 0 else 0.0
+                signal = 1.0 if actual else -1.0
+                macro = signal if day_index < 240 else -signal
+                train.append({
+                    "date": signal_day,
+                    "symbol": f"S{symbol_index}",
+                    "featureNames": names,
+                    "x": [signal, signal * 0.8, signal * 0.6, 0.2, 0.1, 0.0, signal * 0.3, signal * 0.4, macro, macro],
+                    "actualDirection": actual,
+                    "actualReturn": 1.0 if actual else -1.0,
+                })
+        test = [
+            {**row, "date": (date(2025, 1, 1) + timedelta(days=index // 6)).isoformat()}
+            for index, row in enumerate(train[:120])
+        ]
+        projected_train, projected_test, audit = _training_feature_family_gate(train, test)
+        self.assertTrue(audit["available"])
+        self.assertIn("macro_regime", audit["excludedFamilies"])
+        self.assertNotIn("macroRatesImpulse", projected_train[0]["featureNames"])
+        self.assertIn("specialist", audit["macroPolicy"].lower())
+
+        inverted_test = [{**row, "actualDirection": 1.0 - row["actualDirection"]} for row in test]
+        _, inverted_projection, inverted_audit = _training_feature_family_gate(train, inverted_test)
+        self.assertEqual(audit["excludedFamilies"], inverted_audit["excludedFamilies"])
+        self.assertEqual(projected_test[0]["featureNames"], inverted_projection[0]["featureNames"])
+
+    def test_stability_gate_uses_worst_adjacent_training_window(self):
+        names = ["bias", "change1", "change3", "change5", "change10", "change20", "rsi", "macroFxImpulse", "volumeRatio"]
+        train = []
+        for day_index in range(240):
+            block = day_index // 60
+            for symbol_index in range(5):
+                stable = (symbol_index - 2) / 3
+                drifting = stable + block * 8.0
+                train.append({
+                    "date": (date(2021, 1, 1) + timedelta(days=day_index)).isoformat(),
+                    "symbol": f"S{symbol_index}",
+                    "featureNames": names,
+                    "x": [1.0, stable, stable, stable, stable, stable, stable, drifting, stable],
+                    "actualDirection": float((day_index + symbol_index) % 2 == 0),
+                    "actualReturn": stable,
+                })
+        test = [{**row, "date": (date(2025, 1, 1) + timedelta(days=index // 5)).isoformat()} for index, row in enumerate(train[:100])]
+        projected_train, projected_test, audit = _training_stable_feature_panel(train, test)
+        self.assertTrue(audit["available"])
+        self.assertFalse(audit["selectionUsesHeldOutFold"])
+        self.assertIn("macroFxImpulse", audit["excludedFeatures"])
+        self.assertNotIn("macroFxImpulse", projected_train[0]["featureNames"])
+        self.assertEqual(projected_train[0]["featureNames"], projected_test[0]["featureNames"])
+        self.assertGreaterEqual(len(audit["trainingStabilityWindows"]), 3)
+
+    def test_feature_profile_gate_uses_nested_training_windows_only(self):
+        names = [
+            "bias", "change1", "change3", "change5", "change10", "change20", "volumeRatio", "rsi",
+            "macdHist", "smaGap", "volatility", "rangePosition", "gap", "bodyPosition", "closeLocation",
+            "trueRange", "buyPressure5", "pressureChange", "volumeAccel", "volumeTrend", "profileDistance",
+            "profileSkew", "profilePocDistance", "profileImbalance", "liquidityShock", "trendQuality",
+            "reversalPressure", "eventSentiment", "eventRelevance", "eventNovelty", "announcementScore",
+            "fundamentalQuality", "sourceQuality", "freshnessScore", "positiveCatalyst", "negativeCatalyst",
+            "dilutionRisk", "regulatoryRisk", "earningsEvent", "capitalAllocation", "operationalMomentum",
+            "eventIntensity", "companyEventCoverage", "companyEventFreshness", "xsMomentum5Rank",
+            "xsMomentum20Rank", "xsVolumeRatioRank", "xsLowVolatilityRank", "xsLiquidityRank",
+            "xsTrendQualityRank", "xsPressureChangeRank", "xsVwapDistanceRank", "marketBreadth5",
+        ]
+        train = []
+        for day_index in range(540):
+            for symbol_index in range(5):
+                actual = float((day_index + symbol_index) % 3 != 0)
+                signal = 1.0 if actual else -1.0
+                values = []
+                for feature_index, name in enumerate(names):
+                    if name in {"change5", "change20", "buyPressure5", "xsMomentum5Rank"}:
+                        values.append(signal * (0.8 + feature_index / 1000))
+                    elif name.startswith("event") or name in {"positiveCatalyst", "negativeCatalyst"}:
+                        values.append(-signal if day_index > 420 else signal)
+                    else:
+                        values.append(((day_index + symbol_index + feature_index) % 11 - 5) / 10)
+                train.append({
+                    "date": (date(2020, 1, 1) + timedelta(days=day_index)).isoformat(),
+                    "symbol": f"S{symbol_index}",
+                    "featureNames": names,
+                    "x": values,
+                    "actualDirection": actual,
+                    "actualReturn": signal,
+                    "evaluationWeight": 1.0,
+                })
+        test = [{**row, "date": (date(2025, 1, 1) + timedelta(days=index // 5)).isoformat()} for index, row in enumerate(train[:200])]
+        projected_train, projected_test, audit = _training_feature_profile_gate(train, test)
+        self.assertTrue(audit["available"])
+        self.assertFalse(audit["selectionUsesHeldOutFold"])
+        self.assertGreaterEqual(len(audit["windows"]), 2)
+        self.assertIn(audit["selectedProfile"], {row["profile"] for row in audit["comparisons"]})
+        self.assertEqual(projected_train[0]["featureNames"], projected_test[0]["featureNames"])
+
+        inverted_test = [{**row, "actualDirection": 1.0 - row["actualDirection"]} for row in test]
+        _, inverted_projection, inverted_audit = _training_feature_profile_gate(train, inverted_test)
+        self.assertEqual(audit["selectedProfile"], inverted_audit["selectedProfile"])
+        self.assertEqual(projected_test[0]["featureNames"], inverted_projection[0]["featureNames"])
+
+    def test_direction_model_selection_does_not_force_two_model_equal_weights(self):
+        rows = []
+        for day_index in range(360):
+            for symbol_index in range(5):
+                actual = float((day_index + symbol_index) % 2 == 0)
+                rows.append({
+                    "date": (date(2021, 1, 1) + timedelta(days=day_index)).isoformat(),
+                    "actualDirection": actual,
+                    "evaluationWeight": 1.0,
+                    "stableDirection": 0.74 if actual else 0.26,
+                    "flatDirection": 0.5,
+                })
+        selected, rejected, audit = select_robust_direction_models(
+            rows,
+            ["stableDirection", "flatDirection"],
+        )
+        self.assertTrue(audit["available"])
+        self.assertFalse(audit["selectionUsesHeldOutMetaTest"])
+        self.assertEqual(selected, ["stableDirection"])
+        self.assertEqual(rejected[0]["model"], "flatDirection")
+
     def test_date_level_regime_model_uses_current_cross_section_only(self):
         names = [
             "change5", "change20", "volatility", "volumeRatio",
@@ -942,8 +1347,17 @@ class QuantCoreTests(unittest.TestCase):
             changed_rows = [{**rows[0], "x": [0.1, 0.25]}]
             changed = _fold_checkpoint_context(changed_rows, folds, market="US", horizon=5, config=config)
             changed_config = _fold_checkpoint_context(rows, folds, market="US", horizon=5, config={**config, "embargoDays": 10})
+            changed_class_balance = _fold_checkpoint_context(
+                rows,
+                folds,
+                market="US",
+                horizon=5,
+                config={**config, "treeClassBalance": "Balanced"},
+            )
         self.assertNotEqual(original["signature"], changed["signature"])
         self.assertNotEqual(original["signature"], changed_config["signature"])
+        self.assertNotEqual(original["signature"], changed_class_balance["signature"])
+        self.assertEqual(changed_class_balance["payload"]["modelConfiguration"]["treeClassBalance"], "Balanced")
         self.assertIn("trainingSourceHash", original["payload"])
         self.assertIn("dependencyVersions", original["payload"])
 
@@ -1585,7 +1999,7 @@ class QuantCoreTests(unittest.TestCase):
                 "exchange": "SSE",
                 "source": "unit-exchange-filing",
                 "records": [
-                    {"id": "valid", "event_time": "2026-07-01", "available_at": "2026-07-02T01:00:00Z", "value": 1},
+                    {"id": "valid", "event_time": "2026-07-01", "available_at": "2026-07-02T01:00:00Z", "historicalAvailabilityVerified": True, "value": 1},
                     {"id": "future-unknown", "event_time": "2026-07-03", "value": 2},
                 ],
             })
@@ -1595,7 +2009,49 @@ class QuantCoreTests(unittest.TestCase):
             lake = data_lake_summary({"root": directory})
             self.assertEqual(lake["pitRows"], 1)
             self.assertEqual(lake["pitDatasets"]["fundamentals"]["markets"]["CN"], 1)
+            self.assertEqual(lake["pitDatasets"]["fundamentals"]["verifiedSymbols"]["CN"], 1)
+            self.assertEqual(lake["pitDatasets"]["fundamentals"]["trainingUniverseCoveragePct"]["CN"], 100.0)
             self.assertEqual(lake["pitDatasets"]["news"]["rows"], 0)
+
+    def test_asx_official_financial_disclosures_are_classified_without_fabricating_numeric_statements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_data_lake({
+                "root": directory,
+                "market": "ASX",
+                "symbol": "BHP",
+                "source": "yahoo-finance-asx-single-source",
+                "interval": "1d",
+                "candles": [{"date": "2025-08-21", "open": 40, "high": 42, "low": 39, "close": 41, "volume": 1000}],
+            })
+            upsert_pit_records({
+                "root": directory,
+                "dataset": "news",
+                "market": "ASX",
+                "symbol": "BHP",
+                "source": "asx-official-historical-announcements",
+                "records": [{
+                    "id": "bhp-annual-report-2025",
+                    "title": "Annual Report 2025",
+                    "event_time": "2025-08-20T06:00:00Z",
+                    "available_at": "2025-08-20T06:00:00Z",
+                    "historicalAvailabilityVerified": True,
+                    "values": {"earningsEvent": 1, "sourceQuality": 1},
+                }],
+            })
+            result = migrate_asx_financial_disclosures({"root": directory})
+            self.assertEqual(result["symbols"], 1)
+            lake = data_lake_summary({"root": directory})
+            self.assertEqual(lake["pitDatasets"]["financial_disclosures"]["verifiedSymbols"]["ASX"], 1)
+            panel = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "ASX",
+                "symbols": ["BHP"],
+                "datasets": ["financial_disclosures"],
+                "verified_only": True,
+            })
+            feature = panel["items"][0]["pointInTimeFeatures"][0]
+            self.assertEqual(feature["dataset"], "financial_disclosures")
+            self.assertNotIn("revenue", feature["values"])
 
     def test_data_lake_accepts_valid_us_share_class_symbols_without_allowing_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1671,6 +2127,7 @@ class QuantCoreTests(unittest.TestCase):
                     "sentiment": "positive",
                     "relevance": 90,
                     "truthScore": 80,
+                    "historicalAvailabilityVerified": True,
                 }],
             })
             panel = read_data_lake_pit_panel({
@@ -1682,6 +2139,90 @@ class QuantCoreTests(unittest.TestCase):
             feature = panel["items"][0]["pointInTimeFeatures"][0]
             self.assertEqual(feature["values"]["eventSentiment"], 1.0)
             self.assertEqual(feature["values"]["announcementScore"], 1.0)
+            self.assertEqual(feature["values"]["positiveCatalyst"], 1.0)
+            verified_panel = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "US",
+                "symbols": ["AAPL"],
+                "datasets": ["news"],
+                "verified_only": True,
+            })
+            self.assertTrue(verified_panel["verifiedOnly"])
+            self.assertEqual(len(verified_panel["items"][0]["pointInTimeFeatures"]), 1)
+            self.assertTrue(verified_panel["items"][0]["pointInTimeFeatures"][0]["historicalAvailabilityVerified"])
+
+            hydrated, market_features, audit = hydrate_verified_pit_from_data_lake(
+                [{"market": "US", "symbol": "AAPL", "candles": candles(80)}],
+                market="US",
+                root=directory,
+                limit_per_symbol=20,
+            )
+            self.assertEqual(market_features, [])
+            self.assertEqual(audit["transport"], "python-local-parquet")
+            self.assertEqual(audit["coveredSymbols"], 1)
+            self.assertTrue(hydrated[0]["pointInTimeFeatures"])
+            self.assertEqual(hydrated[0]["pitDataVersion"], audit["dataVersion"])
+
+    def test_universe_coverage_receipt_preserves_range_without_claiming_listing_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_pit_records({
+                "root": directory,
+                "dataset": "universe",
+                "market": "ASX",
+                "symbol": "ABC",
+                "source": "asx-official-historical-announcements",
+                "records": [{
+                    "id": "coverage",
+                    "symbol": "ABC.AX",
+                    "event_time": "2012-01-01",
+                    "available_at": "2012-01-01",
+                    "eventType": "coverage",
+                    "coverageKind": "official-announcement-range-plus-observed-trading-history",
+                    "coverageStart": "2012-01-01",
+                    "coverageEnd": "2026-08-11",
+                    "historicalAvailabilityVerified": True,
+                }],
+            })
+            panel = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "ASX",
+                "symbols": ["ABC"],
+                "datasets": ["universe"],
+                "verified_only": True,
+            })
+            record = panel["items"][0]["universeHistory"][0]
+            self.assertIsNone(record["listed"])
+            self.assertEqual(record["eventType"], "coverage")
+            self.assertTrue(verified_pit_coverage([record], "2019-01-02", "ASX")["covered"])
+
+    def test_data_lake_classifies_official_dilution_and_regulatory_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upsert_pit_records({
+                "root": directory,
+                "dataset": "news",
+                "market": "ASX",
+                "symbol": "ABC",
+                "source": "asx-announcements-historical",
+                "records": [{
+                    "id": "placement",
+                    "event_time": "2026-05-01T00:00:00Z",
+                    "available_at": "2026-05-01T00:05:00Z",
+                    "title": "Trading Halt - Capital Raising Placement and ASIC Investigation",
+                    "historicalAvailabilityVerified": True,
+                }],
+            })
+            panel = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "ASX",
+                "symbols": ["ABC"],
+                "datasets": ["news"],
+                "verified_only": True,
+            })
+            feature = panel["items"][0]["pointInTimeFeatures"][0]["values"]
+            self.assertEqual(feature["dilutionRisk"], 1.0)
+            self.assertEqual(feature["regulatoryRisk"], 1.0)
+            self.assertEqual(feature["negativeCatalyst"], 1.0)
+            self.assertEqual(feature["sourceQuality"], 1.0)
 
     def test_market_wide_macro_pit_is_batched_and_replicated_without_future_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1690,9 +2231,15 @@ class QuantCoreTests(unittest.TestCase):
                 "batches": [{
                     "dataset": "macro", "market": "US", "symbol": "MARKET", "source": "unit-alfred",
                     "records": [{
-                        "id": "CPI:2026-01", "event_time": "2026-01-01T23:59:59Z",
+                        "id": "CPI:2026-01", "seriesId": "CPIAUCSL", "event_time": "2026-01-01T23:59:59Z",
                         "available_at": "2026-01-15T13:30:00Z", "historicalAvailabilityVerified": True,
-                        "values": {"macroRisk": -0.7, "eventSentiment": -0.6, "sourceQuality": 1.0},
+                        "values": {
+                            "macroRisk": -0.7,
+                            "macroInflationImpulse": -0.65,
+                            "macroDataCoverage": 1.0,
+                            "eventSentiment": -0.6,
+                            "sourceQuality": 1.0,
+                        },
                     }],
                 }],
             })
@@ -1702,6 +2249,8 @@ class QuantCoreTests(unittest.TestCase):
             })
             by_symbol = {row["symbol"]: row for row in panel["items"]}
             self.assertEqual(by_symbol["AAPL"]["pointInTimeFeatures"][0]["values"]["macroRisk"], -0.7)
+            self.assertEqual(by_symbol["AAPL"]["pointInTimeFeatures"][0]["values"]["macroInflationImpulse"], -0.65)
+            self.assertEqual(by_symbol["AAPL"]["pointInTimeFeatures"][0]["values"]["__seriesId"], "CPIAUCSL")
             self.assertEqual(by_symbol["MSFT"]["pointInTimeFeatures"][0]["values"]["sourceQuality"], 1.0)
 
             compact = read_data_lake_pit_panel({
@@ -1720,7 +2269,57 @@ class QuantCoreTests(unittest.TestCase):
                 compact["marketPointInTimeFeatures"],
             )
             self.assertEqual(joined["sourceRows"], 1)
+            self.assertEqual(joined["companySourceRows"], 0)
+            self.assertEqual(joined["marketSourceRows"], 1)
             self.assertLess(joined["values"]["macroRisk"], 0)
+            self.assertLess(joined["values"]["macroInflationImpulse"], 0)
+            self.assertEqual(joined["values"]["macroDataCoverage"], 1.0)
+            dataset = build_market_dataset(
+                [
+                    {"market": "US", "symbol": "AAPL", "candles": panel_candles(90, phase=1)},
+                    {"market": "US", "symbol": "MSFT", "candles": panel_candles(90, phase=2)},
+                ],
+                market="US",
+                horizons=[5],
+                market_point_in_time_features=compact["marketPointInTimeFeatures"],
+            )
+            self.assertTrue(dataset["summary"]["eventFeaturesEnabled"])
+            self.assertTrue(dataset["summary"]["marketPointInTimeFeaturesAvailable"])
+            self.assertEqual(dataset["summary"]["eventItemCoveragePct"], 0)
+            self.assertTrue(all(row["eventCoverage"] == 0.0 for row in dataset["rows"]))
+            self.assertTrue(all(row.get("marketEventCoverage", 0.0) == 0.0 for row in dataset["rows"]))
+
+    def test_market_wide_pit_limit_scales_with_training_cross_section(self):
+        with tempfile.TemporaryDirectory() as directory:
+            records = []
+            for index in range(6):
+                records.append({
+                    "id": f"VIX:{index}",
+                    "seriesId": "VIXCLS",
+                    "event_time": f"2025-01-{index + 1:02d}T00:00:00Z",
+                    "available_at": f"2025-01-{index + 2:02d}T00:00:00Z",
+                    "historicalAvailabilityVerified": True,
+                    "values": {"macroVolatilityImpulse": -0.1 * index, "macroDataCoverage": 1.0},
+                })
+            upsert_pit_records({
+                "root": directory,
+                "dataset": "macro",
+                "market": "ASX",
+                "symbol": "MARKET",
+                "source": "unit-alfred",
+                "records": records,
+            })
+            panel = read_data_lake_pit_panel({
+                "root": directory,
+                "market": "ASX",
+                "symbols": ["AAA", "BBB"],
+                "datasets": ["macro"],
+                "broadcast_market_wide": False,
+                "verified_only": True,
+                "limit_per_symbol": 2,
+            })
+            self.assertEqual(len(panel["marketPointInTimeFeatures"]), 4)
+            self.assertEqual(panel["marketPointInTimeFeatures"][-1]["values"]["__seriesId"], "VIXCLS")
 
     def test_market_wide_universe_pit_routes_to_symbols_and_unverified_rows_do_not_backfill(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1927,6 +2526,32 @@ class QuantCoreTests(unittest.TestCase):
             )
             self.assertIsNotNone(dataset)
             self.assertEqual(path, fresh_path.resolve())
+
+    def test_resume_skips_feature_matrix_from_old_event_aggregation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "datasets" / "asx-5d-old-events.json.gz"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(path, "wt", encoding="utf-8") as handle:
+                json.dump({
+                    "schema": "market-feature-matrix-v9",
+                    "eventAggregationSchema": "pit-event-aggregation-v2",
+                    "market": "ASX",
+                    "horizon": 5,
+                    "dataset": {
+                        "rows": [{"symbol": "BHP", "date": "2024-01-02", "horizon": 5}],
+                        "summary": {"symbolCount": 200, "dateCount": 600, "pitDataVersion": "pit-1"},
+                    },
+                }, handle)
+            dataset, selected = _load_latest_eligible_dataset_cache(
+                directory,
+                market="ASX",
+                horizon=5,
+                min_symbols=100,
+                min_dates=500,
+                require_pit_version=True,
+            )
+            self.assertIsNone(dataset)
+            self.assertIsNone(selected)
 
     def test_python_client_request_encodes_json_and_query(self):
         captured = {}

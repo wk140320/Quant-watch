@@ -35,6 +35,19 @@ from historical_backtest import (
 )
 
 
+MACRO_FEATURE_NAMES = [
+    "macroRatesImpulse",
+    "macroInflationImpulse",
+    "macroLaborImpulse",
+    "macroGrowthImpulse",
+    "macroVolatilityImpulse",
+    "macroCreditImpulse",
+    "macroYieldCurveImpulse",
+    "macroFxImpulse",
+    "macroCommodityImpulse",
+    "macroDataCoverage",
+]
+
 EVENT_FEATURE_NAMES = [
     "eventSentiment",
     "eventRelevance",
@@ -44,9 +57,53 @@ EVENT_FEATURE_NAMES = [
     "macroRisk",
     "sourceQuality",
     "freshnessScore",
+    "positiveCatalyst",
+    "negativeCatalyst",
+    "dilutionRisk",
+    "regulatoryRisk",
+    "earningsEvent",
+    "capitalAllocation",
+    "operationalMomentum",
+    "eventIntensity",
+    "companyEventCoverage",
+    "companyEventFreshness",
+    *MACRO_FEATURE_NAMES,
 ]
 
+EVENT_AGGREGATION_SCHEMA = "pit-event-aggregation-v8-date-cached-market-company-split"
+FEATURE_MATRIX_SCHEMA = "market-feature-matrix-v17-orthogonal-price-flow-features"
+
 CORE_TECHNICAL_FEATURE_NAMES = [
+    "bias",
+    "change1",
+    "change3",
+    "change5",
+    "change10",
+    "change20",
+    "volumeRatio",
+    "rsi",
+    "macdHist",
+    "smaGap",
+    "volatility",
+    "rangePosition",
+    "gap",
+    "bodyPosition",
+    "closeLocation",
+    "trueRange",
+    "buyPressure5",
+    "pressureChange",
+    "volumeAccel",
+    "volumeTrend",
+    "profileDistance",
+    "profileSkew",
+    "profilePocDistance",
+    "profileImbalance",
+    "liquidityShock",
+    "trendQuality",
+    "reversalPressure",
+]
+
+COMPACT_TECHNICAL_FEATURE_NAMES = [
     "bias",
     "change5",
     "change20",
@@ -70,17 +127,101 @@ CROSS_SECTIONAL_FEATURE_NAMES = [
     "xsVolumeRatioRank",
     "xsLowVolatilityRank",
     "xsLiquidityRank",
+    "xsTrendQualityRank",
+    "xsPressureChangeRank",
+    "xsVwapDistanceRank",
     "marketBreadth5",
 ]
 
+COMPACT_CROSS_SECTIONAL_FEATURE_NAMES = [
+    "xsMomentum5Rank",
+    "xsMomentum20Rank",
+    "xsVolumeRatioRank",
+    "xsLowVolatilityRank",
+    "xsLiquidityRank",
+    "marketBreadth5",
+]
+
+FALSE_POSITIVE_FEATURE_NAMES = [
+    "change5",
+    "change20",
+    "volumeRatio",
+    "volatility",
+    "gap",
+    "closeLocation",
+    "buyPressure5",
+    "liquidityShock",
+    "reversalPressure",
+    "profilePocDistance",
+    "xsMomentum5Rank",
+    "xsMomentum20Rank",
+    "xsLiquidityRank",
+    "marketBreadth5",
+    "eventSentiment",
+    "macroRisk",
+    *MACRO_FEATURE_NAMES,
+    "positiveCatalyst",
+    "negativeCatalyst",
+    "dilutionRisk",
+    "regulatoryRisk",
+    "earningsEvent",
+    "capitalAllocation",
+    "operationalMomentum",
+    "eventIntensity",
+    "companyEventCoverage",
+    "companyEventFreshness",
+    # Append-only schema: existing persisted OOF vectors keep their original
+    # column meaning while new diagnostics gain the richer price-flow context.
+    "change1",
+    "change3",
+    "change10",
+    "rsi",
+    "smaGap",
+    "bodyPosition",
+    "pressureChange",
+    "volumeTrend",
+    "profileDistance",
+    "profileSkew",
+    "profileImbalance",
+    "trendQuality",
+    "xsTrendQualityRank",
+    "xsPressureChangeRank",
+    "xsVwapDistanceRank",
+]
+
 FEATURE_FAMILIES = {
-    "momentum_trend": {"bias", "change5", "change20", "macdHist"},
-    "volume_flow": {"volumeRatio", "buyPressure5", "volumeAccel", "liquidityShock"},
-    "volatility_risk": {"volatility", "trueRange", "gap", "rangePosition", "closeLocation", "reversalPressure"},
-    "volume_profile": {"profilePocDistance"},
-    "event_fundamental": set(EVENT_FEATURE_NAMES),
+    "momentum_trend": {"bias", "change1", "change3", "change5", "change10", "change20", "rsi", "macdHist", "smaGap", "trendQuality"},
+    "volume_flow": {"volumeRatio", "buyPressure5", "pressureChange", "volumeAccel", "volumeTrend", "liquidityShock"},
+    "volatility_risk": {"volatility", "trueRange", "gap", "bodyPosition", "rangePosition", "closeLocation", "reversalPressure"},
+    "volume_profile": {"profileDistance", "profileSkew", "profilePocDistance", "profileImbalance"},
+    "event_fundamental": set(EVENT_FEATURE_NAMES) - set(MACRO_FEATURE_NAMES) - {"macroRisk"},
+    "macro_regime": {*MACRO_FEATURE_NAMES, "macroRisk"},
     "market_cross_section": set(CROSS_SECTIONAL_FEATURE_NAMES),
 }
+
+
+def _feature_names_for_row(row: dict[str, Any]) -> list[str]:
+    explicit = list(row.get("featureNames") or [])
+    if explicit:
+        return explicit
+    width = len(row.get("x") or [])
+    technical_only = [*CORE_TECHNICAL_FEATURE_NAMES, *CROSS_SECTIONAL_FEATURE_NAMES]
+    with_events = [*CORE_TECHNICAL_FEATURE_NAMES, *EVENT_FEATURE_NAMES, *CROSS_SECTIONAL_FEATURE_NAMES]
+    if width == len(technical_only):
+        return technical_only
+    if width == len(with_events):
+        return with_events
+    return with_events[:width]
+
+
+def _event_feature_vector(row: dict[str, Any]) -> list[float]:
+    explicit = row.get("eventX")
+    if isinstance(explicit, list) and len(explicit) == len(EVENT_FEATURE_NAMES):
+        return [number(value) for value in explicit]
+    names = _feature_names_for_row(row)
+    values = list(row.get("x") or [])
+    lookup = {name: number(values[index]) for index, name in enumerate(names) if index < len(values)}
+    return [lookup.get(name, 0.0) for name in EVENT_FEATURE_NAMES]
 
 MODEL_OUTPUT_KEYS = [
     "ridgePrediction",
@@ -166,20 +307,27 @@ def _fold_checkpoint_context(
         return None
     dates = sorted({str(row.get("date") or "") for row in rows if row.get("date")})
     symbols = sorted({str(row.get("symbol") or "") for row in rows if row.get("symbol")})
-    row_digest = hashlib.sha256()
-    for row in sorted(rows, key=lambda value: (str(value.get("date") or ""), str(value.get("symbol") or ""))):
-        row_digest.update(json.dumps({
-            "date": row.get("date"),
-            "symbol": row.get("symbol"),
-            "x": row.get("x"),
-            "actualTarget": row.get("actualTarget"),
-            "actualStop": row.get("actualStop"),
-            "actualTimeout": row.get("actualTimeout"),
-            "actualDirection": row.get("actualDirection"),
-            "actualReturn": row.get("actualReturn"),
-            "trainingWeight": row.get("trainingWeight"),
-            "entrySource": row.get("entrySource"),
-        }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+    dataset_content_hash = str(config.get("datasetContentHash") or "").strip()
+    if dataset_content_hash:
+        row_content_hash = dataset_content_hash
+        row_hash_method = "immutable-feature-matrix-content-hash"
+    else:
+        row_digest = hashlib.sha256()
+        for row in sorted(rows, key=lambda value: (str(value.get("date") or ""), str(value.get("symbol") or ""))):
+            row_digest.update(json.dumps({
+                "date": row.get("date"),
+                "symbol": row.get("symbol"),
+                "x": row.get("x"),
+                "actualTarget": row.get("actualTarget"),
+                "actualStop": row.get("actualStop"),
+                "actualTimeout": row.get("actualTimeout"),
+                "actualDirection": row.get("actualDirection"),
+                "actualReturn": row.get("actualReturn"),
+                "trainingWeight": row.get("trainingWeight"),
+                "entrySource": row.get("entrySource"),
+            }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+        row_content_hash = row_digest.hexdigest()
+        row_hash_method = "full-row-content-hash"
     dependency_versions = {}
     for package in ("numpy", "scikit-learn", "catboost", "lightgbm"):
         try:
@@ -188,13 +336,14 @@ def _fold_checkpoint_context(
             dependency_versions[package] = None
     training_source_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     model_configuration = {
-        "treeBackend": os.getenv("PRODUCTION_TREE_BACKEND", "catboost"),
-        "treeMaxRows": int(os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000")),
-        "treeIterations": int(os.getenv("PRODUCTION_TREE_ITERATIONS", "72")),
+        "treeBackend": str(config.get("treeBackend") or os.getenv("PRODUCTION_TREE_BACKEND", "catboost")),
+        "treeMaxRows": int(config.get("treeMaxRows", os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000"))),
+        "treeIterations": int(config.get("treeIterations", os.getenv("PRODUCTION_TREE_ITERATIONS", "72"))),
         "treeEarlyStoppingRounds": int(os.getenv("PRODUCTION_TREE_EARLY_STOPPING_ROUNDS", "12")),
-        "treeThreads": int(os.getenv("PRODUCTION_TREE_THREADS", "2")),
-        "baselineMaxRows": int(os.getenv("PRODUCTION_BASELINE_MAX_ROWS", "6000")),
-        "quantileMaxRows": int(os.getenv("PRODUCTION_QUANTILE_MAX_ROWS", "6000")),
+        "treeThreads": int(config.get("treeThreads", os.getenv("PRODUCTION_TREE_THREADS", "2"))),
+        "treeClassBalance": str(config.get("treeClassBalance") or os.getenv("PRODUCTION_TREE_CLASS_BALANCE", "SqrtBalanced")),
+        "baselineMaxRows": int(config.get("baselineMaxRows", os.getenv("PRODUCTION_BASELINE_MAX_ROWS", "6000"))),
+        "quantileMaxRows": int(config.get("quantileMaxRows", os.getenv("PRODUCTION_QUANTILE_MAX_ROWS", "6000"))),
         "maxModelWeight": number(config.get("maxModelWeight"), 0.35),
         "embargoDays": int(config.get("embargoDays", 7)),
         "foldCount": int(config.get("foldCount", 5)),
@@ -202,7 +351,7 @@ def _fold_checkpoint_context(
         "testDates": int(config.get("testDates", 120)),
     }
     signature_payload = {
-        "schema": "oof-fold-checkpoint-v6-content-code-config",
+        "schema": "oof-fold-checkpoint-v7-matrix-code-config",
         "market": market,
         "horizon": horizon,
         "rows": len(rows),
@@ -223,8 +372,9 @@ def _fold_checkpoint_context(
         ],
         "treeModels": bool(config.get("enableTreeModels", False)),
         "sklearnModels": bool(config.get("enableSklearnModels", False)),
-        "featureSchema": list(rows[0].get("featureNames") or CORE_TECHNICAL_FEATURE_NAMES) if rows else [],
-        "rowContentHash": row_digest.hexdigest(),
+        "featureSchema": _feature_names_for_row(rows[0]) if rows else [],
+        "rowContentHash": row_content_hash,
+        "rowHashMethod": row_hash_method,
         "trainingSourceHash": training_source_hash,
         "dependencyVersions": dependency_versions,
         "modelConfiguration": model_configuration,
@@ -289,7 +439,7 @@ def _dataset_cache_path(
     if not directory_text:
         return None
     digest = hashlib.sha256()
-    digest.update(f"dataset-v6-verified-pit-content-version|{market}|{horizon}|{target_upside}|{stop_loss}|{transaction_cost_bps}".encode("utf-8"))
+    digest.update(f"{FEATURE_MATRIX_SCHEMA}|{EVENT_AGGREGATION_SCHEMA}|{market}|{horizon}|{target_upside}|{stop_loss}|{transaction_cost_bps}".encode("utf-8"))
     for item in sorted((row for row in items if isinstance(row, dict)), key=lambda row: str(row.get("symbol") or "")):
         # Provider labels can change when the same real rows are served from local cache.
         # Cache identity follows market data and PIT content, not the delivery route.
@@ -317,7 +467,11 @@ def _load_dataset_cache(path: Path | None, *, market: str, horizon: int) -> dict
     if path is None or not path.exists():
         return None
     payload = _read_gzip_json(path)
-    if not isinstance(payload, dict) or payload.get("schema") != "market-feature-matrix-v6":
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != FEATURE_MATRIX_SCHEMA
+        or payload.get("eventAggregationSchema") != EVENT_AGGREGATION_SCHEMA
+    ):
         return None
     dataset = payload.get("dataset")
     if payload.get("market") != market or int(payload.get("horizon") or 0) != int(horizon):
@@ -364,7 +518,8 @@ def _save_dataset_cache(path: Path | None, dataset: dict[str, Any], *, market: s
     if path is None:
         return
     _atomic_gzip_json(path, {
-        "schema": "market-feature-matrix-v6",
+        "schema": FEATURE_MATRIX_SCHEMA,
+        "eventAggregationSchema": EVENT_AGGREGATION_SCHEMA,
         "market": market,
         "horizon": horizon,
         "savedAt": datetime.now(timezone.utc).isoformat(),
@@ -417,9 +572,18 @@ def _prepare_point_in_time_candidates(
     market_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     item_candidates = item.get("pointInTimeFeatures") or item.get("point_in_time_features") or item.get("events") or []
-    prepared: list[tuple[datetime, str, dict[str, Any]]] = []
-    audit = {"unverifiedRowsExcluded": 0, "invalidTimestampRowsExcluded": 0, "temporalOrderViolations": 0}
-    for candidates in (market_candidates or [], item_candidates if isinstance(item_candidates, list) else []):
+    candidates_prepared: list[tuple[datetime, str, dict[str, Any], str, int]] = []
+    audit = {
+        "unverifiedRowsExcluded": 0,
+        "invalidTimestampRowsExcluded": 0,
+        "temporalOrderViolations": 0,
+        "duplicateEventRowsExcluded": 0,
+    }
+    candidate_sets = (
+        (market_candidates or [], True),
+        (item_candidates if isinstance(item_candidates, list) else [], False),
+    )
+    for candidates, market_wide in candidate_sets:
         for raw in candidates:
             if not isinstance(raw, dict):
                 continue
@@ -439,7 +603,31 @@ def _prepare_point_in_time_candidates(
                 raw.get("effectiveDate", raw.get("event_time", raw.get("eventTime", raw.get("date", "")))),
             ))[:10]
             values = raw.get("values") if isinstance(raw.get("values"), dict) else raw
-            prepared.append((available_at, effective_day, values))
+            prepared_values = {
+                **values,
+                "__dataset": str(raw.get("dataset") or values.get("__dataset") or "news").lower(),
+                "__source": str(raw.get("source") or values.get("__source") or "unknown"),
+                "__marketWide": market_wide,
+            }
+            event_id = str(raw.get("id") or values.get("__eventId") or "").strip()
+            priority = 2 if prepared_values["__dataset"] == "financial_disclosures" else 1
+            candidates_prepared.append((available_at, effective_day, prepared_values, event_id, priority))
+    selected_by_identity: dict[tuple[bool, str], tuple[datetime, str, dict[str, Any], str, int]] = {}
+    anonymous: list[tuple[datetime, str, dict[str, Any], str, int]] = []
+    for row in candidates_prepared:
+        identity = row[3]
+        if not identity:
+            anonymous.append(row)
+            continue
+        key = (bool(row[2].get("__marketWide")), identity)
+        previous = selected_by_identity.get(key)
+        if previous is None or row[4] > previous[4]:
+            if previous is not None:
+                audit["duplicateEventRowsExcluded"] += 1
+            selected_by_identity[key] = row
+        else:
+            audit["duplicateEventRowsExcluded"] += 1
+    prepared = [(row[0], row[1], row[2]) for row in [*selected_by_identity.values(), *anonymous]]
     prepared.sort(key=lambda row: row[0])
     return {"rows": prepared, "audit": audit}
 
@@ -467,37 +655,137 @@ def _point_in_time_features_from_prepared(
             "latestAvailableAt": None,
             "sourceRows": 0,
             "futureRowsExcluded": len(prepared),
-            "joinViolationCount": structural_violations,
+            "joinViolationCount": 0,
+            "excludedViolationCount": structural_violations,
             **audit,
         }
     upper = bisect_right(prepared, signal_at, key=lambda row: row[0])
     excluded_future = len(prepared) - upper
     selected: list[tuple[datetime, dict[str, Any]]] = []
+    dataset_counts: dict[str, int] = defaultdict(int)
+    dataset_limits = {"news": 40, "social": 16, "fundamentals": 12, "financial_disclosures": 16, "macro": 24}
+    max_age_days = {"news": 180.0, "social": 21.0, "fundamentals": 400.0, "financial_disclosures": 400.0, "macro": 120.0}
+    macro_series_counts: dict[str, int] = defaultdict(int)
     cursor = upper - 1
-    while cursor >= 0 and len(selected) < 24:
+    while cursor >= 0:
         available_at, effective_day, values = prepared[cursor]
         cursor -= 1
         if effective_day and effective_day > str(signal_day)[:10]:
             excluded_future += 1
             continue
-        selected.append((available_at, values))
-    selected.reverse()
-    latest_at = None
-    for available_at, values in selected:
-        latest_at = available_at
         age_days = max(0.0, (signal_at - available_at).total_seconds() / 86400.0)
-        decay = math.exp(-age_days / 20.0)
-        for name in EVENT_FEATURE_NAMES:
-            if name in values:
-                output[name] = clamp(number(values.get(name)) * decay, -5.0, 5.0)
+        if age_days > 400.0:
+            break
+        dataset = str(values.get("__dataset") or "news").lower()
+        if age_days > max_age_days.get(dataset, 180.0):
+            continue
+        if dataset == "macro":
+            series_id = str(values.get("__seriesId") or "UNKNOWN")
+            if macro_series_counts[series_id] >= 2:
+                continue
+        if dataset_counts[dataset] >= dataset_limits.get(dataset, 24):
+            continue
+        selected.append((available_at, values))
+        dataset_counts[dataset] += 1
+        if dataset == "macro":
+            macro_series_counts[str(values.get("__seriesId") or "UNKNOWN")] += 1
+    selected.reverse()
+    latest_at = max((row[0] for row in selected), default=None)
+    weighted_sums = {name: 0.0 for name in EVENT_FEATURE_NAMES}
+    weighted_denominators = {name: 0.0 for name in EVENT_FEATURE_NAMES}
+    decayed_max = {name: 0.0 for name in EVENT_FEATURE_NAMES}
+    saturating_products = {name: 1.0 for name in ("positiveCatalyst", "negativeCatalyst", "dilutionRisk", "regulatoryRisk")}
+    signed_names = {
+        "eventSentiment", "fundamentalQuality", "macroRisk", "capitalAllocation", "operationalMomentum",
+        *[name for name in MACRO_FEATURE_NAMES if name != "macroDataCoverage"],
+    }
+    average_names = {"eventRelevance", "sourceQuality", "macroDataCoverage"}
+    max_names = {"eventNovelty", "announcementScore", "earningsEvent"}
+    intensity_sum = 0.0
+    company_source_rows = 0
+    market_source_rows = 0
+    company_freshness = 0.0
+    for available_at, values in selected:
+        age_days = max(0.0, (signal_at - available_at).total_seconds() / 86400.0)
+        dataset = str(values.get("__dataset") or "news").lower()
+        half_life = 45.0 if dataset in {"fundamentals", "financial_disclosures"} else 30.0 if dataset == "macro" else 24.0 if dataset == "news" else 7.0
+        decay = math.exp(-math.log(2.0) * age_days / half_life)
+        relevance = clamp(number(values.get("eventRelevance"), 0.5), 0.05, 1.0)
+        source_quality = clamp(number(values.get("sourceQuality"), 0.5), 0.20, 1.0)
+        evidence_weight = decay * relevance * source_quality
+        if values.get("__marketWide") is True:
+            market_source_rows += 1
+        else:
+            company_source_rows += 1
+            company_freshness = max(company_freshness, decay)
+        for name in signed_names:
+            value = clamp(number(values.get(name)), -1.0, 1.0)
+            if abs(value) > 1e-12:
+                weighted_sums[name] += value * evidence_weight
+                weighted_denominators[name] += evidence_weight
+        for name in average_names:
+            if name == "macroDataCoverage" and dataset != "macro":
+                continue
+            value = clamp(number(values.get(name)), 0.0, 1.0)
+            weighted_sums[name] += value * decay
+            weighted_denominators[name] += decay
+        for name in max_names:
+            decayed_max[name] = max(decayed_max[name], clamp(number(values.get(name)), 0.0, 1.0) * decay)
+        for name in saturating_products:
+            contribution = clamp(number(values.get(name)), 0.0, 1.0) * evidence_weight
+            saturating_products[name] *= 1.0 - clamp(contribution, 0.0, 0.95)
+        intensity_sum += clamp(number(values.get("eventIntensity")), 0.0, 1.0) * evidence_weight
+        output["freshnessScore"] = max(output["freshnessScore"], decay)
+    for name in signed_names | average_names:
+        if weighted_denominators[name] > 1e-12:
+            output[name] = clamp(weighted_sums[name] / weighted_denominators[name], -1.0, 1.0)
+    for name in max_names:
+        output[name] = clamp(decayed_max[name], 0.0, 1.0)
+    for name in saturating_products:
+        output[name] = clamp(1.0 - saturating_products[name], 0.0, 1.0)
+    output["eventIntensity"] = clamp(math.tanh(intensity_sum / 2.5), 0.0, 1.0)
+    output["companyEventCoverage"] = 1.0 if company_source_rows else 0.0
+    output["companyEventFreshness"] = clamp(company_freshness, 0.0, 1.0)
     return {
         "values": output,
         "signalAt": signal_at.isoformat() if signal_at else None,
         "latestAvailableAt": latest_at.isoformat() if latest_at else None,
         "sourceRows": len(selected),
+        "companySourceRows": company_source_rows,
+        "marketSourceRows": market_source_rows,
+        "sourceRowsByDataset": dict(dataset_counts),
+        "aggregationSchema": EVENT_AGGREGATION_SCHEMA,
         "futureRowsExcluded": excluded_future,
-        "joinViolationCount": structural_violations,
+        "joinViolationCount": 0,
+        "excludedViolationCount": structural_violations,
         **audit,
+    }
+
+
+def _combine_company_market_point_in_time(
+    company: dict[str, Any],
+    market: dict[str, Any],
+) -> dict[str, Any]:
+    values = {name: number((company.get("values") or {}).get(name)) for name in EVENT_FEATURE_NAMES}
+    for name in ["macroRisk", *MACRO_FEATURE_NAMES]:
+        values[name] = number((market.get("values") or {}).get(name))
+    dataset_counts: dict[str, int] = defaultdict(int)
+    for source in (company.get("sourceRowsByDataset") or {}, market.get("sourceRowsByDataset") or {}):
+        for name, count in source.items():
+            dataset_counts[str(name)] += int(count or 0)
+    latest_values = [value for value in (company.get("latestAvailableAt"), market.get("latestAvailableAt")) if value]
+    return {
+        "values": values,
+        "signalAt": company.get("signalAt") or market.get("signalAt"),
+        "latestAvailableAt": max(latest_values) if latest_values else None,
+        "sourceRows": int(company.get("sourceRows") or 0) + int(market.get("sourceRows") or 0),
+        "companySourceRows": int(company.get("companySourceRows") or company.get("sourceRows") or 0),
+        "marketSourceRows": int(market.get("marketSourceRows") or market.get("sourceRows") or 0),
+        "sourceRowsByDataset": dict(dataset_counts),
+        "aggregationSchema": EVENT_AGGREGATION_SCHEMA,
+        "futureRowsExcluded": int(company.get("futureRowsExcluded") or 0) + int(market.get("futureRowsExcluded") or 0),
+        "joinViolationCount": 0,
+        "excludedViolationCount": int(company.get("excludedViolationCount") or 0) + int(market.get("excludedViolationCount") or 0),
     }
 
 
@@ -520,6 +808,12 @@ def verified_pit_coverage(records: Any, signal_day: str, market: str) -> dict[st
     excluded_future = 0
     for raw in records if isinstance(records, list) else []:
         if not isinstance(raw, dict) or raw.get("historicalAvailabilityVerified") is not True:
+            continue
+        if str(raw.get("eventType") or "").lower() == "coverage":
+            coverage_start = str(raw.get("coverageStart") or "")[:10]
+            coverage_end = str(raw.get("coverageEnd") or "")[:10]
+            if coverage_start and coverage_end and coverage_start <= str(signal_day)[:10] <= coverage_end:
+                available.append(raw)
             continue
         available_at = parse_timestamp(raw.get("available_at", raw.get("availableAt")))
         event_at = parse_timestamp(raw.get("event_time", raw.get("eventTime", raw.get("date"))))
@@ -553,12 +847,15 @@ def _rank_cross_section(rows: list[dict[str, Any]]) -> None:
         for index, row in enumerate(ordered):
             rank = index / denominator if len(ordered) > 1 else 0.5
             row["returnRank"] = rank
-            row["rankRelevance"] = (
-                3 if number(row.get("actualTarget")) >= 0.5
-                else 0 if number(row.get("actualStop")) >= 0.5
-                else 2 if number(row.get("actualReturn")) > 0
-                else 1
-            )
+            # Path class is the primary ranking target. The within-day return
+            # percentile is only a tie-breaker, so a large but unstable move
+            # cannot outrank a target-first or positive-expiry path merely by
+            # magnitude. This ordering matches the production Top-K objective.
+            target_first = number(row.get("actualTarget")) >= 0.5
+            stop_first = number(row.get("actualStop")) >= 0.5
+            positive_expiry = number(row.get("actualDirection")) >= 0.5
+            path_grade = 3.0 if target_first else 0.0 if stop_first else 2.0 if positive_expiry else 1.0
+            row["rankRelevance"] = path_grade * 3.0 + rank * 2.0
             row["crossSectionSize"] = len(ordered)
         breadth = sum(1 for row in group if number((row.get("feature") or {}).get("change5")) > 0) / max(1, len(group))
 
@@ -580,6 +877,9 @@ def _rank_cross_section(rows: list[dict[str, Any]]) -> None:
             ranked("volumeRatio"),
             ranked("volatility", reverse=True),
             ranked("dollarLiquidity"),
+            ranked("trendQuality"),
+            ranked("pressureChange"),
+            ranked("profileDistance"),
         ]
         for index, row in enumerate(group):
             row["x"].extend([
@@ -588,6 +888,9 @@ def _rank_cross_section(rows: list[dict[str, Any]]) -> None:
                 feature_ranks[2][index],
                 feature_ranks[3][index],
                 feature_ranks[4][index],
+                feature_ranks[5][index],
+                feature_ranks[6][index],
+                feature_ranks[7][index],
                 breadth * 2.0 - 1.0,
             ])
 
@@ -608,6 +911,12 @@ def build_market_dataset(
     source_rows = 0
     excluded_future_rows = 0
     join_violation_count = 0
+    prepared_market_pit = _prepare_point_in_time_candidates({}, market_point_in_time_features)
+    market_pit_by_day: dict[str, dict[str, Any]] = {}
+    market_pit_audit = prepared_market_pit.get("audit") or {}
+    excluded_violation_count = sum(int(market_pit_audit.get(name) or 0) for name in (
+        "unverifiedRowsExcluded", "invalidTimestampRowsExcluded", "temporalOrderViolations"
+    ))
     cross_market_rows_excluded = 0
     source_names: set[str] = set()
     def has_verified_features(candidates: Any) -> bool:
@@ -651,8 +960,11 @@ def build_market_dataset(
         volumes = sorted(max(0.0, number(row.get("volume"))) for row in candles if number(row.get("volume")) > 0)
         median_volume = median(volumes) if volumes else 1.0
         feature_series = build_feature_series(candles)
-        prepared_pit = _prepare_point_in_time_candidates(item, market_point_in_time_features)
-        join_violation_count += sum(int((prepared_pit.get("audit") or {}).get(name) or 0) for name in (
+        prepared_item_pit = _prepare_point_in_time_candidates(item)
+        item_pit_audit = prepared_item_pit.get("audit") or {}
+        prepared_pit = prepared_item_pit
+        prepared_audit = prepared_pit.get("audit") or {}
+        excluded_violation_count += sum(int(prepared_audit.get(name) or 0) for name in (
             "unverifiedRowsExcluded", "invalidTimestampRowsExcluded", "temporalOrderViolations"
         ))
         feature_cache = {
@@ -684,11 +996,17 @@ def build_market_dataset(
                     barriers["targetPct"],
                     barriers["stopPct"],
                 )
-                pit = _point_in_time_features_from_prepared(
+                signal_day = str(candles[index].get("date") or "")
+                company_pit = _point_in_time_features_from_prepared(
                     prepared_pit,
-                    str(candles[index].get("date") or ""),
+                    signal_day,
                     key,
                 )
+                market_pit = market_pit_by_day.get(signal_day)
+                if market_pit is None:
+                    market_pit = _point_in_time_features_from_prepared(prepared_market_pit, signal_day, key)
+                    market_pit_by_day[signal_day] = market_pit
+                pit = _combine_company_market_point_in_time(company_pit, market_pit)
                 universe_coverage = verified_pit_coverage(item.get("universeHistory"), str(candles[index].get("date") or ""), key)
                 action_coverage = verified_pit_coverage(item.get("corporateActions"), str(candles[index].get("date") or ""), key)
                 source_rows += int(pit["sourceRows"])
@@ -742,7 +1060,9 @@ def build_market_dataset(
                     "labelConfidence": number(label_quality.get("labelConfidence"), 1.0),
                     "dataQualityScore": number(row_quality.get("score"), 100.0),
                     "liquidityWeight": liquidity_weight,
-                    "eventCoverage": 1.0 if pit["sourceRows"] else 0.0,
+                    "eventCoverage": 1.0 if int(pit.get("companySourceRows") or 0) > 0 else 0.0,
+                    "marketEventCoverage": 1.0 if int(pit.get("marketSourceRows") or 0) > 0 else 0.0,
+                    "companyEventSourceRows": int(pit.get("companySourceRows") or 0),
                     "historicalUniverseCoverage": 1.0 if universe_coverage["covered"] else 0.0,
                     "corporateActionCoverage": 1.0 if action_coverage["covered"] else 0.0,
                     "adjustedPriceCoverage": 1.0 if item_adjusted else 0.0,
@@ -757,6 +1077,9 @@ def build_market_dataset(
                         "volumeRatio": number(feature.get("volumeRatio")),
                         "volatility": number(feature.get("volatility")),
                         "dollarLiquidity": math.log1p(max(0.0, number(candles[index].get("close"))) * max(0.0, number(candles[index].get("volume")))),
+                        "trendQuality": number(feature.get("trendQuality")),
+                        "pressureChange": number(feature.get("pressureChange")),
+                        "profileDistance": number(feature.get("profileDistance")),
                     },
                 })
     unique_dataset: list[dict[str, Any]] = []
@@ -810,6 +1133,7 @@ def build_market_dataset(
         source_rows=source_rows,
         excluded_future_rows=excluded_future_rows,
         join_violation_count=join_violation_count,
+        excluded_violation_count=excluded_violation_count,
         historical_universe_rows=sum(number(row.get("historicalUniverseCoverage")) for row in dataset),
         corporate_action_rows=sum(number(row.get("corporateActionCoverage")) for row in dataset),
         action_adjusted_rows=sum(number(row.get("adjustedPriceCoverage")) for row in dataset),
@@ -820,9 +1144,23 @@ def build_market_dataset(
     summary["activeFeatureCount"] = len(active_feature_names)
     summary["eventFeaturesEnabled"] = event_features_enabled
     summary["eventItemCoveragePct"] = round(
-        (1.0 if verified_market_features else event_item_count / max(1, len(items or []))) * 100.0,
+        event_item_count / max(1, len(items or [])) * 100.0,
         3,
     )
+    summary["marketPointInTimeFeaturesAvailable"] = verified_market_features
+    summary["eventFeatureActivationReason"] = (
+        "verified-market-and-company-pit" if verified_market_features and event_item_count
+        else "verified-market-pit" if verified_market_features
+        else "verified-company-pit" if event_item_count
+        else "insufficient-verified-pit"
+    )
+    summary["rankingLabel"] = {
+        "schema": "daily-net-return-decile-plus-target-stop-v3",
+        "formula": "return_decile + 2*target_first + positive_expiry - 2*stop_first",
+        "range": [0, 12],
+        "pointInTimeSafe": True,
+        "note": "This is a future outcome label used only during training; it is never included in the prediction feature vector.",
+    }
     pit_versions = sorted({
         str(item.get("pitDataVersion") or "").strip()
         for item in items or []
@@ -835,11 +1173,36 @@ def build_market_dataset(
         "method": "equal-aggregate-weight-per-market-date",
         "reason": "Overlapping cross-sectional rows remain usable without pretending that dates with more symbols are more independent.",
     }
+    technical_count = len(CORE_TECHNICAL_FEATURE_NAMES) + len(CROSS_SECTIONAL_FEATURE_NAMES)
     summary["featurePolicy"] = (
-        "Core 15 low-redundancy technical features plus point-in-time event features."
+        f"Core {technical_count} normalized technical/cross-sectional features plus verified point-in-time event features."
         if event_features_enabled
-        else "Core 15 low-redundancy technical features; event features withheld because point-in-time coverage is below 60%."
+        else f"Core {technical_count} normalized technical/cross-sectional features; event features withheld because verified point-in-time coverage is insufficient."
     )
+    # These fields have already been reduced into the immutable summary or the
+    # final feature vector. Dropping them prevents each cached row from
+    # repeating another full technical dictionary and PIT audit payload.
+    compact_only_fields = {
+        "feature",
+        "featureNames",
+        "eventX",
+        "crossSectionRaw",
+        "sampleWeight",
+        "pitFutureRowsExcluded",
+        "pitJoinViolationCount",
+        "corporateActionAdjusted",
+        "pitDataVersion",
+        "historicalUniverseCoverage",
+        "corporateActionCoverage",
+        "adjustedPriceCoverage",
+        "companyEventSourceRows",
+        "marketEventCoverage",
+        "crossSectionSize",
+        "dateBalanceScale",
+    }
+    for row in dataset:
+        for name in compact_only_fields:
+            row.pop(name, None)
     return {"rows": dataset, "summary": summary}
 
 
@@ -871,6 +1234,7 @@ def dataset_profile(
     source_rows: int,
     excluded_future_rows: int,
     join_violation_count: int,
+    excluded_violation_count: int = 0,
     historical_universe_rows: int,
     corporate_action_rows: int,
     action_adjusted_rows: int,
@@ -902,6 +1266,7 @@ def dataset_profile(
         "pointInTimeCoveragePct": round(sum(number(row.get("eventCoverage")) for row in rows) / max(1, len(rows)) * 100.0, 4),
         "futureFeatureRowsExcluded": excluded_future_rows,
         "pointInTimeJoinViolationCount": join_violation_count,
+        "pointInTimeExcludedViolationCount": excluded_violation_count,
         "historicalUniverseCoveragePct": round(historical_universe_rows / max(1, len(rows)) * 100.0, 3),
         "corporateActionCoveragePct": round(corporate_action_rows / max(1, len(rows)) * 100.0, 3),
         "adjustedPriceCoveragePct": round(action_adjusted_rows / max(1, len(rows)) * 100.0, 3),
@@ -1030,6 +1395,7 @@ def _sklearn_baseline_predictions(
     test: list[dict[str, Any]],
     *,
     enabled: bool = False,
+    max_rows: int = 50_000,
 ) -> dict[str, Any] | None:
     if not enabled or not model_library_status()["sklearn"]:
         return None
@@ -1038,7 +1404,7 @@ def _sklearn_baseline_predictions(
         from sklearn.linear_model import BayesianRidge, LogisticRegression, Ridge, SGDClassifier  # type: ignore
         from sklearn.preprocessing import StandardScaler  # type: ignore
 
-        model_train = _evenly_spaced_rows(train, 50_000)
+        model_train = _evenly_spaced_rows(train, max(2_000, int(max_rows)))
         x_train = np.asarray([row["x"] for row in model_train], dtype=float)
         x_test = np.asarray([row["x"] for row in test], dtype=float)
         sample_weight = np.asarray([number(row.get("trainingWeight"), 1.0) for row in model_train], dtype=float)
@@ -1130,8 +1496,8 @@ def _sklearn_baseline_predictions(
         return None
 
 
-def _fallback_baseline_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]]) -> dict[str, Any]:
-    baseline_max_rows = max(2_000, min(20_000, int(os.getenv("PRODUCTION_BASELINE_MAX_ROWS", "6000"))))
+def _fallback_baseline_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]], *, max_rows: int | None = None) -> dict[str, Any]:
+    baseline_max_rows = max(2_000, min(50_000, int(max_rows or os.getenv("PRODUCTION_BASELINE_MAX_ROWS", "6000"))))
     bounded_train = _evenly_spaced_rows(train, baseline_max_rows)
     ridge_return = fit_ridge(bounded_train, "actualReturn", 0.12, epochs=32)
     ridge_target = fit_logistic(bounded_train, "actualTarget", 0.12, epochs=32)
@@ -1156,13 +1522,18 @@ def _fallback_baseline_predictions(train: list[dict[str, Any]], test: list[dict[
     }
 
 
-def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]], *, enabled: bool) -> dict[str, Any] | None:
+def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]], *, enabled: bool, config: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    config = config or {}
     status = model_library_status()
-    preferred_backend = str(os.getenv("PRODUCTION_TREE_BACKEND", "catboost")).strip().lower()
-    tree_max_rows = max(20_000, int(os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000")))
-    tree_iterations = max(40, min(160, int(os.getenv("PRODUCTION_TREE_ITERATIONS", "72"))))
+    preferred_backend = str(config.get("treeBackend") or os.getenv("PRODUCTION_TREE_BACKEND", "catboost")).strip().lower()
+    tree_max_rows = max(20_000, int(config.get("treeMaxRows", os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000"))))
+    tree_iterations = max(40, min(200, int(config.get("treeIterations", os.getenv("PRODUCTION_TREE_ITERATIONS", "72")))))
     early_stopping_rounds = max(8, min(30, int(os.getenv("PRODUCTION_TREE_EARLY_STOPPING_ROUNDS", "12"))))
-    tree_threads = max(1, min(4, int(os.getenv("PRODUCTION_TREE_THREADS", "2"))))
+    tree_threads = max(1, min(4, int(config.get("treeThreads", os.getenv("PRODUCTION_TREE_THREADS", "2")))))
+    requested_class_balance = str(
+        config.get("treeClassBalance") or os.getenv("PRODUCTION_TREE_CLASS_BALANCE", "SqrtBalanced")
+    ).strip()
+    tree_class_balance = requested_class_balance if requested_class_balance in {"Balanced", "SqrtBalanced"} else None
     full_train = train
     train_dates = sorted({str(row.get("date")) for row in full_train})
     cross_sections = defaultdict(set)
@@ -1172,7 +1543,7 @@ def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any
     if not enabled or len(full_train) < 5_000 or len(train_dates) < 250 or median_cross_section < 30:
         return None
     if preferred_backend == "lightgbm" and status["lightgbm"]:
-        preferred = _lightgbm_fold_predictions(full_train, test)
+        preferred = _lightgbm_fold_predictions(full_train, test, config=config)
         if preferred and not preferred.get("error"):
             preferred["preferredBackend"] = True
             return preferred
@@ -1210,6 +1581,7 @@ def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any
                 verbose=False,
                 random_seed=17,
                 thread_count=tree_threads,
+                auto_class_weights=tree_class_balance,
             )
             path.fit(
                 [x_train[index] for index in fit_indexes],
@@ -1242,6 +1614,7 @@ def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any
                     verbose=False,
                     random_seed=31,
                     thread_count=tree_threads,
+                    auto_class_weights=tree_class_balance,
                 )
                 direction.fit(
                     [x_train[index] for index in fit_indexes],
@@ -1361,14 +1734,16 @@ def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any
                     "validationRows": len(validation_indexes),
                     "jointPathModel": True,
                     "rankerWithheld": rank_scores is None,
+            "rankLabelSchema": "daily-path-priority-plus-return-tiebreak-v4",
                     "directionSingleClass": len(direction_classes) < 2,
+                    "classBalance": tree_class_balance or "None",
                 },
             }
         if status["lightgbm"]:
-            return _lightgbm_fold_predictions(train, test)
+            return _lightgbm_fold_predictions(train, test, config=config)
     except Exception as exc:  # noqa: BLE001 - optional challenger failure must not block baselines.
         if status["lightgbm"]:
-            fallback = _lightgbm_fold_predictions(train, test)
+            fallback = _lightgbm_fold_predictions(train, test, config=config)
             if fallback and not fallback.get("error"):
                 fallback["fallbackFrom"] = f"catboost: {exc}"
                 return fallback
@@ -1376,12 +1751,13 @@ def _tree_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any
     return None
 
 
-def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]]) -> dict[str, Any]:
+def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]], *, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or {}
     try:
         import lightgbm as lgb  # type: ignore
 
         full_train_rows = len(train)
-        tree_max_rows = max(20_000, int(os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000")))
+        tree_max_rows = max(20_000, int(config.get("treeMaxRows", os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000"))))
         train = _evenly_spaced_rows(train, tree_max_rows)
         x_train = [row["x"] for row in train]
         x_test = [row["x"] for row in test]
@@ -1399,7 +1775,7 @@ def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str,
         ]
         if len(fit_indexes) < 2_000 or len(validation_indexes) < 300:
             return {"error": "LightGBM fold lacks a separate chronological validation block.", "family": "lightgbm_error"}
-        tree_iterations = max(40, min(200, int(os.getenv("PRODUCTION_TREE_ITERATIONS", "72"))))
+        tree_iterations = max(40, min(200, int(config.get("treeIterations", os.getenv("PRODUCTION_TREE_ITERATIONS", "72")))))
         early_stopping_rounds = max(8, min(30, int(os.getenv("PRODUCTION_TREE_EARLY_STOPPING_ROUNDS", "12"))))
         common = {
             "n_estimators": tree_iterations,
@@ -1412,7 +1788,7 @@ def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str,
             "reg_lambda": 8.0,
             "reg_alpha": 0.2,
             "verbosity": -1,
-            "n_jobs": 2,
+            "n_jobs": max(1, min(4, int(config.get("treeThreads", os.getenv("PRODUCTION_TREE_THREADS", "2"))))),
         }
         path = lgb.LGBMClassifier(objective="multiclass", num_class=3, **common)
         path.fit(
@@ -1506,10 +1882,10 @@ def _lightgbm_fold_predictions(train: list[dict[str, Any]], test: list[dict[str,
 def _event_fold_predictions(train: list[dict[str, Any]], test: list[dict[str, Any]]) -> list[float | None] | None:
     event_train = [row for row in train if number(row.get("eventCoverage")) > 0]
     coverage = len(event_train) / max(1, len(train))
-    if coverage < 0.60 or len(event_train) < 500 or sum(row["actualTarget"] for row in event_train) < 50:
+    if coverage < 0.10 or len(event_train) < 2_000 or sum(row["actualTarget"] for row in event_train) < 200:
         return None
-    mapped_train = [{**row, "x": row["eventX"]} for row in event_train]
-    mapped_test = [{**row, "x": row["eventX"]} for row in test]
+    mapped_train = [{**row, "x": _event_feature_vector(row)} for row in event_train]
+    mapped_test = [{**row, "x": _event_feature_vector(row)} for row in test]
     model = fit_logistic(mapped_train, "actualTarget", 0.14)
     predictions = [predict_logistic(model, row["x"]) for row in mapped_test]
     return [predictions[index] if number(row.get("eventCoverage")) > 0 else None for index, row in enumerate(test)]
@@ -1519,7 +1895,7 @@ def _date_level_regime_predictions(train: list[dict[str, Any]], test: list[dict[
     """Predict broad market direction once per date, then broadcast it to that date's stocks."""
     if not train or not test:
         return None
-    feature_names = list(train[0].get("featureNames") or [])
+    feature_names = _feature_names_for_row(train[0])
     selected_names = [
         "change5",
         "change20",
@@ -1589,7 +1965,7 @@ def feature_drift_summary(train: list[dict[str, Any]], test: list[dict[str, Any]
 
     train_sample = sampled(train)
     test_sample = sampled(test)
-    feature_names = list(train_sample[0].get("featureNames") or CORE_TECHNICAL_FEATURE_NAMES)
+    feature_names = _feature_names_for_row(train_sample[0])
     feature_names = feature_names[: len(train_sample[0].get("x") or [])]
     drift_rows = []
     for feature_index, name in enumerate(feature_names):
@@ -1658,14 +2034,40 @@ def _training_stable_feature_panel(
     early = [row for row in train if str(row.get("date") or "") in early_dates]
     late = [row for row in train if str(row.get("date") or "") in late_dates]
     stability = feature_drift_summary(early, late)
-    names = list(train[0].get("featureNames") or CORE_TECHNICAL_FEATURE_NAMES)
+    stability_windows = [{
+        "start": dates[0],
+        "split": dates[split],
+        "end": dates[-1],
+        "summary": stability,
+    }]
+    # A single early/late comparison can miss a feature that repeatedly changes
+    # distribution inside the training history. Compare adjacent chronological
+    # blocks too, and use the worst training-only PSI. The held-out fold remains
+    # completely untouched by feature selection.
+    block_count = 4
+    block_edges = [round(index * len(dates) / block_count) for index in range(block_count + 1)]
+    for block in range(block_count - 1):
+        left_dates = set(dates[block_edges[block]:block_edges[block + 1]])
+        right_dates = set(dates[block_edges[block + 1]:block_edges[block + 2]])
+        if len(left_dates) < 40 or len(right_dates) < 40:
+            continue
+        left = [row for row in train if str(row.get("date") or "") in left_dates]
+        right = [row for row in train if str(row.get("date") or "") in right_dates]
+        summary = feature_drift_summary(left, right)
+        stability_windows.append({
+            "start": dates[block_edges[block]],
+            "split": dates[block_edges[block + 1]],
+            "end": dates[min(len(dates) - 1, block_edges[block + 2] - 1)],
+            "summary": summary,
+        })
+    names = _feature_names_for_row(train[0])
     names = names[: len(train[0].get("x") or [])]
-    psi_by_name = {
-        str(row.get("feature")): number(row.get("psi"))
-        for row in stability.get("features") or stability.get("topFeatures") or []
-    }
-    # feature_drift_summary only returns the highest rows. Missing rows are
-    # below the displayed tail and therefore remain eligible.
+    psi_by_name: dict[str, float] = {}
+    for window in stability_windows:
+        summary = window.get("summary") or {}
+        for row in summary.get("features") or summary.get("topFeatures") or []:
+            name = str(row.get("feature"))
+            psi_by_name[name] = max(psi_by_name.get(name, 0.0), number(row.get("psi")))
     excluded = {name for name, psi in psi_by_name.items() if psi >= max_psi}
     keep_indexes = [index for index, name in enumerate(names) if name not in excluded]
     if len(keep_indexes) < minimum_features:
@@ -1678,6 +2080,8 @@ def _training_stable_feature_panel(
             "excludedFeatures": [],
             "retainedFeatures": names,
             "trainingStability": stability,
+            "trainingStabilityWindows": stability_windows,
+            "worstTrainingPsi": psi_by_name,
         }
     retained = [names[index] for index in keep_indexes]
 
@@ -1699,7 +2103,242 @@ def _training_stable_feature_panel(
         "excludedFeatures": [name for name in names if name not in retained],
         "retainedFeatures": retained,
         "trainingStability": stability,
+        "trainingStabilityWindows": stability_windows,
+        "worstTrainingPsi": psi_by_name,
     }
+
+
+def _training_feature_family_gate(
+    train: list[dict[str, Any]],
+    test: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Remove clearly harmful event families using only an inner training split."""
+    if not train or not test:
+        return train, test, {"available": False, "reason": "empty-fold"}
+    names = _feature_names_for_row(train[0])[: len(train[0].get("x") or [])]
+    dates = sorted({str(row.get("date") or "") for row in train if row.get("date")})
+    if len(dates) < 240:
+        return train, test, {"available": False, "reason": "insufficient-inner-training-dates"}
+    validation_size = min(120, max(60, len(dates) // 5))
+    validation_dates = set(dates[-validation_size:])
+    inner_dates = set(dates[: max(0, len(dates) - validation_size - 7)])
+    inner = _evenly_spaced_rows([row for row in train if str(row.get("date")) in inner_dates], 4_000)
+    validation = _evenly_spaced_rows([row for row in train if str(row.get("date")) in validation_dates], 4_000)
+    if len(inner) < 1_000 or len(validation) < 300:
+        return train, test, {"available": False, "reason": "insufficient-inner-training-rows"}
+
+    def mapped(source: list[dict[str, Any]], indexes: list[int]) -> list[dict[str, Any]]:
+        retained = [names[index] for index in indexes]
+        return [
+            {
+                **row,
+                "x": [number(row.get("x", [])[index]) for index in indexes],
+                "featureNames": retained,
+            }
+            for row in source
+        ]
+
+    def evaluate(indexes: list[int]) -> dict[str, Any]:
+        fit_rows = mapped(inner, indexes)
+        validation_rows = mapped(validation, indexes)
+        model = fit_logistic(fit_rows, "actualDirection", 0.24, epochs=24)
+        probabilities = [predict_logistic(model, row["x"]) for row in validation_rows]
+        return calibration_metrics(validation_rows, probabilities, bins=6, actual_key="actualDirection")
+
+    all_indexes = list(range(len(names)))
+    # Macro releases are consumed by the dedicated event/regime experts. Raw
+    # macro states must not enter every price/path model: doing so makes all
+    # base learners share the same revision and regime-shift error. This is an
+    # architecture rule decided before any held-out fold is observed.
+    excluded_families: list[str] = ["macro_regime"]
+    macro_names = FEATURE_FAMILIES["macro_regime"]
+    specialist_indexes = [index for index, name in enumerate(names) if name not in macro_names]
+    baseline = evaluate(specialist_indexes)
+    comparisons: list[dict[str, Any]] = [{
+        "family": "macro_regime",
+        "removedFeatureCount": sum(1 for name in names if name in FEATURE_FAMILIES["macro_regime"]),
+        "excluded": True,
+        "reason": "specialist-only-regime-input",
+    }]
+    for family in ("event_fundamental",):
+        family_names = FEATURE_FAMILIES[family]
+        removed = [index for index, name in enumerate(names) if name in family_names]
+        retained = [index for index in specialist_indexes if index not in removed]
+        if not removed or len(retained) < 8:
+            continue
+        reduced = evaluate(retained)
+        brier_penalty = number(baseline.get("brier"), 1.0) - number(reduced.get("brier"), 1.0)
+        accuracy_penalty = number(reduced.get("balancedAccuracyPct")) - number(baseline.get("balancedAccuracyPct"))
+        harmful = brier_penalty > 0.0005 and accuracy_penalty > -0.10
+        if harmful:
+            excluded_families.append(family)
+        comparisons.append({
+            "family": family,
+            "removedFeatureCount": len(removed),
+            "fullBrier": baseline.get("brier"),
+            "withoutFamilyBrier": reduced.get("brier"),
+            "fullBalancedAccuracyPct": baseline.get("balancedAccuracyPct"),
+            "withoutFamilyBalancedAccuracyPct": reduced.get("balancedAccuracyPct"),
+            "excluded": harmful,
+        })
+    excluded_names = set().union(*(FEATURE_FAMILIES[name] for name in excluded_families)) if excluded_families else set()
+    keep_indexes = [index for index, name in enumerate(names) if name not in excluded_names]
+    return mapped(train, keep_indexes), mapped(test, keep_indexes), {
+        "available": True,
+        "method": "inner-chronological-direction-family-gate",
+        "macroPolicy": "Macro PIT features are reserved for event/regime specialists and cannot directly drive every base model.",
+        "selectionUsesHeldOutFold": False,
+        "innerTrainRows": len(inner),
+        "innerValidationRows": len(validation),
+        "innerValidationDates": len(validation_dates),
+        "excludedFamilies": excluded_families,
+        "comparisons": comparisons,
+        "retainedFeatures": [names[index] for index in keep_indexes],
+    }
+
+
+def _training_feature_profile_gate(
+    train: list[dict[str, Any]],
+    test: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Select a compact or enriched feature profile on inner training windows.
+
+    Each candidate is fitted only on dates preceding its validation block. The
+    outer fold remains untouched, so changing feature breadth cannot tune to
+    the reported OOF period.
+    """
+    if not train or not test:
+        return train, test, {"available": False, "reason": "empty-fold"}
+    names = _feature_names_for_row(train[0])[: len(train[0].get("x") or [])]
+    dates = sorted({str(row.get("date") or "") for row in train if row.get("date")})
+    if len(dates) < 480:
+        return train, test, {"available": False, "reason": "insufficient-inner-training-dates"}
+
+    compact_names = set(COMPACT_TECHNICAL_FEATURE_NAMES) | set(COMPACT_CROSS_SECTIONAL_FEATURE_NAMES)
+    technical_names = set(CORE_TECHNICAL_FEATURE_NAMES) | set(CROSS_SECTIONAL_FEATURE_NAMES)
+    event_names = set(EVENT_FEATURE_NAMES) - set(MACRO_FEATURE_NAMES) - {"macroRisk"}
+    profile_names = {
+        "compact-price-flow": compact_names,
+        "enriched-price-flow": technical_names,
+        "enriched-with-events": technical_names | event_names,
+    }
+    candidates: dict[str, list[int]] = {}
+    for profile, allowed in profile_names.items():
+        indexes = [index for index, name in enumerate(names) if name in allowed]
+        if len(indexes) >= 8:
+            candidates[profile] = indexes
+    if len(candidates) < 2:
+        return train, test, {"available": False, "reason": "insufficient-distinct-profiles"}
+
+    def mapped(source: list[dict[str, Any]], indexes: list[int]) -> list[dict[str, Any]]:
+        retained = [names[index] for index in indexes]
+        return [
+            {
+                **row,
+                "x": [number(row.get("x", [])[index]) for index in indexes],
+                "featureNames": retained,
+            }
+            for row in source
+        ]
+
+    validation_size = min(100, max(60, len(dates) // 10))
+    validation_ends = [
+        len(dates) - validation_size * 2,
+        len(dates) - validation_size,
+        len(dates),
+    ]
+    windows: list[dict[str, Any]] = []
+    candidate_metrics: dict[str, list[dict[str, Any]]] = {name: [] for name in candidates}
+    for end in validation_ends:
+        start = max(0, end - validation_size)
+        train_end = max(0, start - 7)
+        if train_end < 300:
+            continue
+        inner_dates = set(dates[:train_end])
+        validation_dates = set(dates[start:end])
+        inner = _evenly_spaced_rows(
+            [row for row in train if str(row.get("date") or "") in inner_dates],
+            4_000,
+        )
+        validation = _evenly_spaced_rows(
+            [row for row in train if str(row.get("date") or "") in validation_dates],
+            4_000,
+        )
+        if len(inner) < 1_000 or len(validation) < 300:
+            continue
+        weights = [max(0.05, number(row.get("evaluationWeight"), 1.0)) for row in validation]
+        total_weight = sum(weights) or 1.0
+        prevalence = sum(number(row.get("actualDirection")) * weights[index] for index, row in enumerate(validation)) / total_weight
+        baseline_brier = sum(
+            (prevalence - number(row.get("actualDirection"))) ** 2 * weights[index]
+            for index, row in enumerate(validation)
+        ) / total_weight
+        window = {
+            "trainEnd": dates[train_end - 1],
+            "validationStart": dates[start],
+            "validationEnd": dates[end - 1],
+            "trainRows": len(inner),
+            "validationRows": len(validation),
+        }
+        windows.append(window)
+        for profile, indexes in candidates.items():
+            fit_rows = mapped(inner, indexes)
+            validation_rows = mapped(validation, indexes)
+            model = fit_logistic(fit_rows, "actualDirection", 0.28, epochs=28)
+            probabilities = [predict_logistic(model, row["x"]) for row in validation_rows]
+            metrics = calibration_metrics(validation_rows, probabilities, bins=6, actual_key="actualDirection")
+            model_brier = number(metrics.get("brier"), 1.0)
+            candidate_metrics[profile].append({
+                "brier": model_brier,
+                "brierSkill": (baseline_brier - model_brier) / baseline_brier if baseline_brier > 0 else 0.0,
+                "balancedAccuracyPct": number(metrics.get("balancedAccuracyPct")),
+                "f1Pct": number(metrics.get("f1Pct")),
+            })
+    if len(windows) < 2:
+        return train, test, {"available": False, "reason": "insufficient-inner-validation-windows"}
+
+    comparisons = []
+    for profile, rows in candidate_metrics.items():
+        mean_brier = sum(number(row.get("brier"), 1.0) for row in rows) / max(1, len(rows))
+        mean_skill = sum(number(row.get("brierSkill")) for row in rows) / max(1, len(rows))
+        mean_balanced = sum(number(row.get("balancedAccuracyPct")) for row in rows) / max(1, len(rows))
+        mean_f1 = sum(number(row.get("f1Pct")) for row in rows) / max(1, len(rows))
+        negative_windows = sum(1 for row in rows if number(row.get("brierSkill")) <= 0)
+        score = mean_brier + negative_windows * 0.00075 + max(0.0, 50.0 - mean_balanced) / 1_000.0
+        comparisons.append({
+            "profile": profile,
+            "featureCount": len(candidates[profile]),
+            "meanBrier": round(mean_brier, 7),
+            "meanBrierSkill": round(mean_skill, 7),
+            "meanBalancedAccuracyPct": round(mean_balanced, 5),
+            "meanF1Pct": round(mean_f1, 5),
+            "negativeSkillWindows": negative_windows,
+            "selectionScore": round(score, 7),
+            "windows": rows,
+        })
+    comparisons.sort(key=lambda row: (number(row.get("selectionScore"), 1.0), -number(row.get("meanF1Pct"))))
+    selected_profile = str(comparisons[0]["profile"])
+    selected_indexes = candidates[selected_profile]
+    return mapped(train, selected_indexes), mapped(test, selected_indexes), {
+        "available": True,
+        "method": "nested-multi-window-feature-profile-selection",
+        "selectionUsesHeldOutFold": False,
+        "selectedProfile": selected_profile,
+        "retainedFeatures": [names[index] for index in selected_indexes],
+        "windows": windows,
+        "comparisons": comparisons,
+    }
+
+
+def _false_positive_feature_vector(row: dict[str, Any]) -> list[float]:
+    names = _feature_names_for_row(row)
+    values = list(row.get("x") or [])
+    lookup = {
+        str(name): number(values[index])
+        for index, name in enumerate(names)
+        if index < len(values)
+    }
+    return [lookup.get(name, 0.0) for name in FALSE_POSITIVE_FEATURE_NAMES]
 
 
 def _fold_oof_predictions(
@@ -1707,12 +2346,22 @@ def _fold_oof_predictions(
     *,
     enable_tree_models: bool,
     enable_sklearn_models: bool,
+    config: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    config = config or {}
     original_train = fold["train"]
     original_test = fold["test"]
     pre_control_drift = feature_drift_summary(original_train, original_test)
     train, test, feature_stability = _training_stable_feature_panel(original_train, original_test)
-    baseline = _sklearn_baseline_predictions(train, test, enabled=enable_sklearn_models) or _fallback_baseline_predictions(train, test)
+    train, test, feature_family_gate = _training_feature_family_gate(train, test)
+    train, test, feature_profile_gate = _training_feature_profile_gate(train, test)
+    baseline_rows = int(config.get("baselineMaxRows", os.getenv("PRODUCTION_BASELINE_MAX_ROWS", "6000")))
+    baseline = _sklearn_baseline_predictions(
+        train,
+        test,
+        enabled=enable_sklearn_models,
+        max_rows=max(2_000, baseline_rows),
+    ) or _fallback_baseline_predictions(train, test, max_rows=baseline_rows)
     baseline_return = baseline["baselineReturn"]
     stable_direction_probability = baseline["direction"]
     elastic_direction_probability = baseline["elasticDirection"]
@@ -1723,7 +2372,7 @@ def _fold_oof_predictions(
     stop_probability = baseline["stop"]
     timeout_probability = baseline["timeout"]
     rank_scores = baseline["rank"]
-    tree = _tree_fold_predictions(train, test, enabled=enable_tree_models)
+    tree = _tree_fold_predictions(train, test, enabled=enable_tree_models, config=config)
     family = baseline["family"]
     if tree and not tree.get("error"):
         family = f"{family}+{tree.get('family')}"
@@ -1736,7 +2385,7 @@ def _fold_oof_predictions(
         if tree.get("direction") is not None:
             direction_probability_rows = tree["direction"]
     else:
-        quantile_max_rows = max(2_000, min(20_000, int(os.getenv("PRODUCTION_QUANTILE_MAX_ROWS", "6000"))))
+        quantile_max_rows = max(2_000, min(50_000, int(config.get("quantileMaxRows", os.getenv("PRODUCTION_QUANTILE_MAX_ROWS", "6000")))))
         quantile_train = _evenly_spaced_rows(train, quantile_max_rows)
         quantile_epochs = 32 if len(quantile_train) >= 5_000 else 50
         q_models = [fit_quantile_linear(quantile_train, alpha, epochs=quantile_epochs) for alpha in (0.1, 0.5, 0.9)]
@@ -1813,6 +2462,7 @@ def _fold_oof_predictions(
             "evaluationWeight": row["evaluationWeight"],
             "transactionCostBps": row["transactionCostBps"],
             "entrySource": row["entrySource"],
+            "falsePositiveFeatures": _false_positive_feature_vector(row),
             "fold": fold["fold"],
         })
     return output, {
@@ -1832,6 +2482,7 @@ def _fold_oof_predictions(
         "treeSampledTrainingRows": int((tree.get("trainingPolicy") or {}).get("sampledTrainingRows") or 0) if tree and not tree.get("error") else 0,
         "treeFitRows": int((tree.get("trainingPolicy") or {}).get("fitRows") or 0) if tree and not tree.get("error") else 0,
         "treeValidationRows": int((tree.get("trainingPolicy") or {}).get("validationRows") or 0) if tree and not tree.get("error") else 0,
+        "treeTrainingPolicy": dict(tree.get("trainingPolicy") or {}) if tree and not tree.get("error") else {},
         "quantileTrainingRows": len(train) if tree and not tree.get("error") else len(quantile_train),
         "trainRows": len(train),
         "testRows": len(test),
@@ -1845,10 +2496,12 @@ def _fold_oof_predictions(
         "featureDrift": drift,
         "preControlFeatureDrift": pre_control_drift,
         "featureStabilityControl": feature_stability,
+        "featureFamilyGate": feature_family_gate,
+        "featureProfileGate": feature_profile_gate,
         "directionFeatureImportance": (
             [
                 {"feature": name, "importance": number(value)}
-                for name, value in zip(test[0].get("featureNames") or [], tree.get("directionFeatureImportance") or [])
+                for name, value in zip(_feature_names_for_row(test[0]), tree.get("directionFeatureImportance") or [])
             ]
             if tree and not tree.get("error") and test
             else []
@@ -2243,6 +2896,126 @@ def apply_probability_calibrator(model: dict[str, Any], probabilities: list[floa
     return output
 
 
+def select_robust_direction_models(
+    rows: list[dict[str, Any]],
+    names: list[str],
+    *,
+    purge_days: int = 7,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    """Keep direction models that retain calibrated skill across inner windows.
+
+    A capped simplex cannot honour a 35% per-model limit when only two models
+    survive. In that case, forcing an equal-weight ensemble can dilute the
+    stronger model. We therefore select a single Champion from nested OOF
+    windows until at least three genuinely distinct skilled models exist.
+    """
+    if not rows or not names:
+        return names, [], {"available": False, "reason": "empty-meta-training-set"}
+    dates = sorted({str(row.get("date") or "") for row in rows if row.get("date")})
+    if len(dates) < 240:
+        return names, [], {"available": False, "reason": "insufficient-meta-training-dates"}
+    window_size = min(80, max(60, len(dates) // 6))
+    validation_ends = [len(dates) - window_size * 2, len(dates) - window_size, len(dates)]
+    model_windows: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+    windows = []
+    for end in validation_ends:
+        start = max(0, end - window_size)
+        train_end = max(0, start - max(1, purge_days))
+        if train_end < 120:
+            continue
+        train_dates = set(dates[:train_end])
+        validation_dates = set(dates[start:end])
+        fit_rows = [row for row in rows if str(row.get("date") or "") in train_dates]
+        validation_rows = [row for row in rows if str(row.get("date") or "") in validation_dates]
+        if len(fit_rows) < 1_000 or len(validation_rows) < 300:
+            continue
+        validation_weights = [max(0.05, number(row.get("evaluationWeight"), 1.0)) for row in validation_rows]
+        weight_total = sum(validation_weights) or 1.0
+        prevalence = sum(
+            number(row.get("actualDirection")) * validation_weights[index]
+            for index, row in enumerate(validation_rows)
+        ) / weight_total
+        baseline_brier = brier(
+            validation_rows,
+            probabilities=[prevalence] * len(validation_rows),
+            actual_key="actualDirection",
+        )
+        windows.append({
+            "trainEnd": dates[train_end - 1],
+            "validationStart": dates[start],
+            "validationEnd": dates[end - 1],
+            "trainRows": len(fit_rows),
+            "validationRows": len(validation_rows),
+        })
+        for name in names:
+            train_probabilities = [_model_value(row, name) for row in fit_rows]
+            calibrator = fit_probability_calibrator(
+                train_probabilities,
+                [number(row.get("actualDirection")) for row in fit_rows],
+                independent_dates=len(train_dates),
+                dates=[str(row.get("date") or "") for row in fit_rows],
+            )
+            probabilities = apply_probability_calibrator(
+                calibrator,
+                [_model_value(row, name) for row in validation_rows],
+            )
+            model_brier = brier(
+                validation_rows,
+                probabilities=probabilities,
+                actual_key="actualDirection",
+            )
+            model_windows[name].append({
+                "brier": round(model_brier, 7),
+                "baselineBrier": round(baseline_brier, 7),
+                "brierSkill": round((baseline_brier - model_brier) / baseline_brier, 7) if baseline_brier > 0 else 0.0,
+                "calibrator": calibrator.get("method"),
+            })
+    if len(windows) < 2:
+        return names, [], {"available": False, "reason": "insufficient-inner-validation-windows"}
+
+    comparisons = []
+    for name in names:
+        values = model_windows[name]
+        mean_skill = sum(number(value.get("brierSkill")) for value in values) / max(1, len(values))
+        positive_windows = sum(1 for value in values if number(value.get("brierSkill")) > 0)
+        comparisons.append({
+            "model": name,
+            "meanBrierSkill": round(mean_skill, 7),
+            "positiveWindows": positive_windows,
+            "windowCount": len(values),
+            "windows": values,
+        })
+    comparisons.sort(key=lambda row: (-number(row.get("meanBrierSkill")), -number(row.get("positiveWindows"))))
+    minimum_positive = max(2, math.ceil(len(windows) * 2 / 3))
+    eligible = [
+        str(row["model"])
+        for row in comparisons
+        if number(row.get("meanBrierSkill")) > 0 and int(row.get("positiveWindows") or 0) >= minimum_positive
+    ]
+    if not eligible:
+        eligible = [str(comparisons[0]["model"])]
+    selected = eligible if len(eligible) >= 3 else [eligible[0]]
+    rejected = [
+        {
+            "model": str(row["model"]),
+            "because": "nested-direction-champion-selection",
+            "meanBrierSkill": row.get("meanBrierSkill"),
+            "positiveWindows": row.get("positiveWindows"),
+        }
+        for row in comparisons
+        if str(row["model"]) not in selected
+    ]
+    return selected, rejected, {
+        "available": True,
+        "method": "nested-calibrated-brier-champion-selection",
+        "selectionUsesHeldOutMetaTest": False,
+        "ensembleMinimumDistinctModels": 3,
+        "selectedModels": selected,
+        "windows": windows,
+        "comparisons": comparisons,
+    }
+
+
 def conformalize_quantiles(train_rows: list[dict[str, Any]], test_rows: list[dict[str, Any]], alpha: float = 0.20) -> dict[str, Any]:
     scores = sorted(
         max(number(row.get("quantileP10")) - number(row.get("actualReturn")), number(row.get("actualReturn")) - number(row.get("quantileP90")), 0.0)
@@ -2281,7 +3054,7 @@ def _rank_values(values: list[float]) -> list[float]:
     return ranks
 
 
-def rank_ic_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def rank_ic_summary(rows: list[dict[str, Any]], *, score_key: str = "rankerPrediction") -> dict[str, Any]:
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[str(row.get("date"))].append(row)
@@ -2294,7 +3067,7 @@ def rank_ic_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for group in groups.values():
         if len(group) < 5:
             continue
-        predicted = _rank_values([_model_value(row, "rankerPrediction") for row in group])
+        predicted = _rank_values([_model_value(row, score_key) for row in group])
         actual = _rank_values([number(row.get("actualReturn")) for row in group])
         pred_mean = sum(predicted) / len(predicted)
         actual_mean = sum(actual) / len(actual)
@@ -2305,7 +3078,7 @@ def rank_ic_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
         correlations.append(numerator / denominator if denominator > 1e-12 else 0.0)
         top_count = max(1, math.ceil(len(group) * 0.10))
-        selected = sorted(group, key=lambda row: _model_value(row, "rankerPrediction"), reverse=True)[:top_count]
+        selected = sorted(group, key=lambda row: _model_value(row, score_key), reverse=True)[:top_count]
         top_returns.append(sum(number(row.get("actualReturn")) for row in selected) / len(selected))
         universe_returns.append(sum(number(row.get("actualReturn")) for row in group) / len(group))
         relevance = lambda row: 3.0 if number(row.get("actualTarget")) >= 0.5 else 0.0 if number(row.get("actualStop")) >= 0.5 else 2.0 if number(row.get("actualReturn")) > 0 else 1.0
@@ -2326,6 +3099,7 @@ def rank_ic_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         max_drawdown = max(max_drawdown, (peak - cumulative) / max(1e-12, peak) * 100.0)
     return {
         "available": bool(correlations),
+        "scoreKey": score_key,
         "dateCount": len(correlations),
         "rankIc": round(sum(correlations) / max(1, len(correlations)), 6),
         "topDecileNetReturn": round(sum(top_returns) / max(1, len(top_returns)), 6),
@@ -2335,6 +3109,163 @@ def rank_ic_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "top10TargetFirstRatePct": round(sum(precision_values) / max(1, len(precision_values)) * 100.0, 5),
         "top10DirectionHitRatePct": round(sum(direction_values) / max(1, len(direction_values)) * 100.0, 5),
         "maxDrawdownPct": round(max_drawdown, 6),
+    }
+
+
+def fit_selective_ranking_head(
+    train_rows: list[dict[str, Any]],
+    test_rows: list[dict[str, Any]],
+    train_direction_probabilities: list[float],
+    test_direction_probabilities: list[float],
+    train_target_probabilities: list[float],
+    test_target_probabilities: list[float],
+) -> dict[str, Any]:
+    """Select a conservative Top-K blend on a purged inner OOF block.
+
+    Every component is already an out-of-fold prediction. The final untouched
+    meta-test labels are never read while choosing the blend.
+    """
+    if len(train_rows) < 500 or len(test_rows) < 100:
+        return {
+            "available": False,
+            "active": False,
+            "reason": "Selective ranking requires at least 500 meta-train and 100 untouched meta-test rows.",
+            "scores": [_model_value(row, "rankerPrediction") for row in test_rows],
+        }
+
+    component_names = [
+        "rank",
+        "direction",
+        "target",
+        "pathSafety",
+        "stopSafety",
+        "quantileMedian",
+        "baselineReturn",
+        "liquidity",
+    ]
+
+    def components(
+        rows: list[dict[str, Any]],
+        direction_probabilities: list[float],
+        target_probabilities: list[float],
+    ) -> list[dict[str, float]]:
+        raw = {
+            "rank": [_model_value(row, "rankerPrediction") for row in rows],
+            "direction": [clamp(number(value), 0.001, 0.999) for value in direction_probabilities],
+            "target": [clamp(number(value), 0.001, 0.999) for value in target_probabilities],
+            "pathSafety": [_model_value(row, "pathSafetyPrediction") for row in rows],
+            "stopSafety": [1.0 - _model_value(row, "stopProbability") for row in rows],
+            "quantileMedian": [number(row.get("quantileP50")) for row in rows],
+            "baselineReturn": [number(row.get("baselineReturn")) for row in rows],
+            "liquidity": [number(row.get("liquidityWeight"), 0.5) for row in rows],
+        }
+        ranked = {name: _percentile_by_date(rows, values) for name, values in raw.items()}
+        return [
+            {name: clamp(number(ranked[name][index]), 0.0, 1.0) for name in component_names}
+            for index in range(len(rows))
+        ]
+
+    train_components = components(train_rows, train_direction_probabilities, train_target_probabilities)
+    test_components = components(test_rows, test_direction_probabilities, test_target_probabilities)
+    ordered_dates = sorted({str(row.get("date") or "") for row in train_rows})
+    validation_start = max(1, int(len(ordered_dates) * 0.75))
+    inner_purge_start = max(0, validation_start - 12)
+    inner_training_dates = set(ordered_dates[:inner_purge_start])
+    validation_dates = set(ordered_dates[validation_start:])
+    inner_train_indexes = [index for index, row in enumerate(train_rows) if str(row.get("date") or "") in inner_training_dates]
+    validation_indexes = [index for index, row in enumerate(train_rows) if str(row.get("date") or "") in validation_dates]
+    if len(inner_train_indexes) < 300 or len(validation_indexes) < 100 or len(validation_dates) < 30:
+        return {
+            "available": False,
+            "active": False,
+            "reason": "Selective ranking lacks a sufficiently deep independent inner validation date block.",
+            "scores": [_model_value(row, "rankerPrediction") for row in test_rows],
+        }
+
+    candidates: dict[str, dict[str, float]] = {
+        "rank-only": {"rank": 1.0},
+        "rank-direction": {"rank": 0.55, "direction": 0.45},
+        "rank-direction-path": {"rank": 0.45, "direction": 0.35, "target": 0.10, "pathSafety": 0.10},
+        "risk-adjusted": {"rank": 0.40, "direction": 0.30, "target": 0.10, "stopSafety": 0.15, "liquidity": 0.05},
+        "return-aware": {"rank": 0.35, "direction": 0.30, "pathSafety": 0.10, "quantileMedian": 0.15, "baselineReturn": 0.10},
+    }
+    stack_rows = []
+    stack_keys = [f"selection_{name}" for name in component_names]
+    for index in inner_train_indexes:
+        stack_rows.append({
+            **train_rows[index],
+            **{stack_keys[position]: train_components[index][name] for position, name in enumerate(component_names)},
+        })
+    learned_weights = fit_constrained_stack(
+        stack_rows,
+        stack_keys,
+        cap=0.45,
+        actual_key="actualDirection",
+    )
+    if learned_weights:
+        candidates["learned-direction-stack"] = {
+            name: learned_weights[index]
+            for index, name in enumerate(component_names)
+            if learned_weights[index] > 1e-8
+        }
+
+    def blended_scores(matrix: list[dict[str, float]], weights: dict[str, float]) -> list[float]:
+        total = sum(max(0.0, number(value)) for value in weights.values()) or 1.0
+        return [
+            clamp(sum(max(0.0, number(weight)) * row.get(name, 0.5) for name, weight in weights.items()) / total, 0.0, 1.0)
+            for row in matrix
+        ]
+
+    validation_rows = [train_rows[index] for index in validation_indexes]
+    validation_matrix = [train_components[index] for index in validation_indexes]
+    comparisons = []
+    for name, weights in candidates.items():
+        scores = blended_scores(validation_matrix, weights)
+        scored_rows = [{**row, "selectionScore": scores[index]} for index, row in enumerate(validation_rows)]
+        metrics = rank_ic_summary(scored_rows, score_key="selectionScore")
+        objective = (
+            (number(metrics.get("top10DirectionHitRatePct")) - 50.0) * 0.20
+            + number(metrics.get("topDecileLift")) * 1.5
+            + number(metrics.get("topDecileNetReturn")) * 0.5
+            + number(metrics.get("rankIc")) * 3.0
+            - number(metrics.get("maxDrawdownPct")) * 0.01
+        )
+        comparisons.append({"name": name, "weights": weights, "metrics": metrics, "objective": round(objective, 7)})
+    baseline = next(row for row in comparisons if row["name"] == "rank-only")
+
+    def admissible(candidate: dict[str, Any]) -> bool:
+        if candidate["name"] == "rank-only":
+            return True
+        current = candidate["metrics"]
+        base = baseline["metrics"]
+        direction_gain = number(current.get("top10DirectionHitRatePct")) - number(base.get("top10DirectionHitRatePct"))
+        return_gain = number(current.get("topDecileNetReturn")) - number(base.get("topDecileNetReturn"))
+        lift_gain = number(current.get("topDecileLift")) - number(base.get("topDecileLift"))
+        drawdown_change = number(current.get("maxDrawdownPct")) - number(base.get("maxDrawdownPct"))
+        direction_case = direction_gain >= 0.50 and return_gain >= -0.02 and lift_gain >= -0.02 and drawdown_change <= 2.0
+        return_case = return_gain >= 0.05 and direction_gain >= 0.0 and lift_gain >= 0.03 and drawdown_change <= 1.0
+        return direction_case or return_case
+
+    eligible = [row for row in comparisons if admissible(row)]
+    selected = max(eligible, key=lambda row: number(row.get("objective"))) if eligible else baseline
+    active = selected["name"] != "rank-only"
+    test_scores = blended_scores(test_components, selected["weights"])
+    return {
+        "available": True,
+        "active": active,
+        "selected": selected["name"],
+        "weights": {name: round(number(value), 6) for name, value in selected["weights"].items()},
+        "reason": (
+            "Activated only after improving the purged inner Top-K validation block without violating return, lift, or drawdown non-degradation gates."
+            if active else
+            "Rank-only remained the safest candidate on the purged inner validation block."
+        ),
+        "innerTrainDates": len(inner_training_dates),
+        "innerValidationDates": len(validation_dates),
+        "innerPurgeDates": validation_start - inner_purge_start,
+        "comparisons": comparisons,
+        "scores": test_scores,
+        "policy": "Selection weights are chosen before the untouched meta-test and cannot create a probability; they only rank already eligible candidates.",
     }
 
 
@@ -2359,7 +3290,7 @@ def persist_oof_artifact(rows: list[dict[str, Any]], artifact_dir: str | None, m
         "sha256": digest.hexdigest(),
         "schema": [
             "date", "symbol", "market", "horizon", "actualTarget", "actualStop", "actualTimeout", "actualDirection", "actualReturn",
-            *MODEL_OUTPUT_KEYS, *DIRECTION_OUTPUT_KEYS, "ensembleProbability", "directionProbability", "targetProbability", "stopProbability", "timeoutProbability",
+            *MODEL_OUTPUT_KEYS, *DIRECTION_OUTPUT_KEYS, "ensembleProbability", "directionProbability", "selectionScore", "targetProbability", "stopProbability", "timeoutProbability",
             "quantileP10", "quantileP50", "quantileP90", "conformalP10", "conformalP90", "regime", "sector", "liquidityWeight", "fold",
         ],
     }
@@ -2520,6 +3451,335 @@ def expected_value_summary(rows: list[dict[str, Any]], probabilities: list[float
     }
 
 
+def _long_signal_metrics(
+    rows: list[dict[str, Any]],
+    direction_probabilities: list[float],
+    target_probabilities: list[float],
+    threshold: float,
+) -> dict[str, Any]:
+    indexes = [
+        index for index, probability in enumerate(direction_probabilities)
+        if number(probability) >= threshold
+    ]
+    selected = [rows[index] for index in indexes]
+    selected_target_probabilities = [target_probabilities[index] for index in indexes]
+    if not selected:
+        return {
+            "available": False,
+            "threshold": round(threshold, 4),
+            "signalCount": 0,
+            "signalDates": 0,
+            "selectedIndexes": [],
+        }
+    hits = [float(number(row.get("actualDirection")) >= 0.5) for row in selected]
+    grouped: dict[str, list[float]] = defaultdict(list)
+    daily_returns: dict[str, list[float]] = defaultdict(list)
+    fold_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row, hit in zip(selected, hits):
+        day = str(row.get("date") or "unknown")
+        grouped[day].append(hit)
+        daily_returns[day].append(number(row.get("actualReturn")))
+        fold_rows[int(row.get("fold") or 0)].append(row)
+    week_blocks: dict[str, list[float]] = defaultdict(list)
+    for day, values in sorted(grouped.items()):
+        score = sum(values) / len(values)
+        try:
+            parsed_day = date.fromisoformat(day[:10])
+            iso = parsed_day.isocalendar()
+            block = f"{iso.year}-W{iso.week:02d}"
+        except ValueError:
+            block = day
+        week_blocks[block].append(score)
+    blocks = [sum(values) / len(values) for _, values in sorted(week_blocks.items())]
+    if len(blocks) < 8:
+        blocks = [sum(values) / len(values) for _, values in sorted(grouped.items())]
+    bootstrap = []
+    if blocks:
+        generator = random.Random(20260811)
+        for _ in range(600):
+            sample = [blocks[generator.randrange(len(blocks))] for _ in blocks]
+            bootstrap.append(sum(sample) / len(sample))
+    bootstrap.sort()
+    lower = bootstrap[max(0, int(len(bootstrap) * 0.025) - 1)] if bootstrap else 0.0
+    fold_evidence = []
+    for fold, fold_items in sorted(fold_rows.items()):
+        fold_hit = sum(float(number(row.get("actualDirection")) >= 0.5) for row in fold_items) / len(fold_items)
+        fold_return = sum(number(row.get("actualReturn")) for row in fold_items) / len(fold_items)
+        fold_evidence.append({
+            "fold": fold,
+            "signals": len(fold_items),
+            "directionHitRatePct": round(fold_hit * 100.0, 5),
+            "meanNetReturnPct": round(fold_return, 5),
+            "positive": len(fold_items) >= 20 and fold_hit > 0.50 and fold_return > 0,
+        })
+    cumulative = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
+    for day in sorted(daily_returns):
+        daily_return = sum(daily_returns[day]) / len(daily_returns[day])
+        cumulative *= 1.0 + daily_return / 100.0
+        peak = max(peak, cumulative)
+        max_drawdown = max(max_drawdown, (peak - cumulative) / max(1e-12, peak) * 100.0)
+    expected = expected_value_summary(selected, selected_target_probabilities)
+    return {
+        "available": True,
+        "threshold": round(threshold, 4),
+        "signalCount": len(selected),
+        "signalDates": len(grouped),
+        "coveragePct": round(len(selected) / max(1, len(rows)) * 100.0, 5),
+        "directionHitRatePct": round(sum(hits) / len(hits) * 100.0, 5),
+        "directionHitRate95LowerPct": round(lower * 100.0, 5),
+        "ciMethod": "date/week-block-bootstrap-600",
+        "targetFirstRatePct": round(sum(number(row.get("actualTarget")) for row in selected) / len(selected) * 100.0, 5),
+        "meanNetReturnPct": round(sum(number(row.get("actualReturn")) for row in selected) / len(selected), 5),
+        "maxDrawdownPct": round(max_drawdown, 5),
+        "positiveFoldCount": sum(1 for row in fold_evidence if row["positive"]),
+        "foldCount": len(fold_evidence),
+        "foldEvidence": fold_evidence,
+        "expectedValue": expected,
+        "selectedIndexes": indexes,
+    }
+
+
+def fit_long_trade_gate(
+    train_rows: list[dict[str, Any]],
+    test_rows: list[dict[str, Any]],
+    train_direction_probabilities: list[float],
+    test_direction_probabilities: list[float],
+    train_target_probabilities: list[float],
+    test_target_probabilities: list[float],
+) -> dict[str, Any]:
+    """Learn a long-only rejection threshold before reading test outcomes."""
+    candidates = []
+    for step in range(50, 81):
+        threshold = step / 100.0
+        metrics = _long_signal_metrics(
+            train_rows,
+            train_direction_probabilities,
+            train_target_probabilities,
+            threshold,
+        )
+        expected_value = number((metrics.get("expectedValue") or {}).get("expectedValuePct"), -1.0)
+        stable_folds = int(metrics.get("positiveFoldCount") or 0)
+        qualified = (
+            metrics.get("available") is True
+            and int(metrics.get("signalCount") or 0) >= 200
+            and int(metrics.get("signalDates") or 0) >= 120
+            and number(metrics.get("directionHitRatePct")) >= 55.0
+            and number(metrics.get("directionHitRate95LowerPct")) > 50.0
+            and number(metrics.get("meanNetReturnPct")) > 0
+            and expected_value > 0
+            and stable_folds >= 3
+        )
+        objective = (
+            number(metrics.get("directionHitRatePct"))
+            + number(metrics.get("directionHitRate95LowerPct")) * 0.20
+            + min(2.0, max(-2.0, number(metrics.get("meanNetReturnPct")))) * 0.50
+            + stable_folds * 0.10
+        )
+        candidates.append({
+            "threshold": round(threshold, 4),
+            "qualified": qualified,
+            "objective": round(objective, 6),
+            "metrics": {key: value for key, value in metrics.items() if key != "selectedIndexes"},
+        })
+    eligible = [row for row in candidates if row["qualified"]]
+    if not eligible:
+        return {
+            "available": True,
+            "active": False,
+            "reason": "No long-only threshold met the minimum train-only sample, stability, calibration, and net-return gates.",
+            "candidates": candidates,
+            "eligibleIndexes": [],
+        }
+    selected = max(eligible, key=lambda row: (number(row["objective"]), -number(row["threshold"])))
+    test_metrics = _long_signal_metrics(
+        test_rows,
+        test_direction_probabilities,
+        test_target_probabilities,
+        number(selected["threshold"]),
+    )
+    test_expected_value = number((test_metrics.get("expectedValue") or {}).get("expectedValuePct"), -1.0)
+    holdout_passed = (
+        test_metrics.get("available") is True
+        and int(test_metrics.get("signalCount") or 0) >= 200
+        and int(test_metrics.get("signalDates") or 0) >= 80
+        and number(test_metrics.get("directionHitRatePct")) >= 57.0
+        and number(test_metrics.get("directionHitRate95LowerPct")) > 50.0
+        and number(test_metrics.get("meanNetReturnPct")) > 0
+        and test_expected_value > 0
+        and int(test_metrics.get("positiveFoldCount") or 0) >= 2
+    )
+    return {
+        "available": True,
+        "active": holdout_passed,
+        "threshold": selected["threshold"],
+        "reason": (
+            "Threshold passed the earlier OOF selection window and the untouched holdout activation gates."
+            if holdout_passed
+            else "Threshold passed the earlier OOF selection window but failed untouched holdout activation; all long signals remain No Trade."
+        ),
+        "trainingEvidence": selected["metrics"],
+        "testEvidence": {key: value for key, value in test_metrics.items() if key != "selectedIndexes"},
+        "candidateCount": len(candidates),
+        "qualifiedCandidateCount": len(eligible),
+        "eligibleIndexes": list(test_metrics.get("selectedIndexes") or []) if holdout_passed else [],
+        "policy": "The train window chooses a threshold; only an untouched holdout pass can activate it. The gate can reject a buy signal but cannot raise its probability or create a trade.",
+    }
+
+
+def fit_false_positive_risk_head(
+    train_rows: list[dict[str, Any]],
+    test_rows: list[dict[str, Any]],
+    train_probabilities: list[float],
+    test_probabilities: list[float],
+) -> dict[str, Any]:
+    """Fit a strictly nested gate that may only reduce high-confidence direction scores."""
+    if len(train_rows) < 300 or len(test_rows) < 100:
+        return {
+            "available": False,
+            "active": False,
+            "reason": "False-positive risk head requires at least 300 meta-train and 100 untouched meta-test rows.",
+            "probabilities": test_probabilities,
+        }
+    ordered_dates = sorted({str(row.get("date") or "") for row in train_rows})
+    validation_start = max(1, int(len(ordered_dates) * 0.75))
+    inner_purge_start = max(0, validation_start - 12)
+    inner_training_dates = set(ordered_dates[:inner_purge_start])
+    validation_dates = set(ordered_dates[validation_start:])
+    inner_train_indexes = [index for index, row in enumerate(train_rows) if str(row.get("date") or "") in inner_training_dates]
+    inner_validation_indexes = [index for index, row in enumerate(train_rows) if str(row.get("date") or "") in validation_dates]
+    if len(inner_train_indexes) < 200 or len(inner_validation_indexes) < 60:
+        return {
+            "available": False,
+            "active": False,
+            "reason": "False-positive risk head lacks an independent inner validation date block.",
+            "probabilities": test_probabilities,
+        }
+    ordered = sorted(clamp(train_probabilities[index], 0.001, 0.999) for index in inner_train_indexes)
+    threshold = ordered[min(len(ordered) - 1, max(0, int(len(ordered) * 0.75)))]
+    candidate_indexes = [index for index in inner_train_indexes if train_probabilities[index] >= threshold]
+    false_count = sum(1 for index in candidate_indexes if number(train_rows[index].get("actualDirection")) < 0.5)
+    true_count = len(candidate_indexes) - false_count
+    if len(candidate_indexes) < 80 or min(false_count, true_count) < 20:
+        return {
+            "available": False,
+            "active": False,
+            "reason": "High-confidence OOF candidates do not yet contain enough true and false outcomes for a stable risk head.",
+            "candidateRows": len(candidate_indexes),
+            "falsePositiveRows": false_count,
+            "truePositiveRows": true_count,
+            "threshold": round(threshold, 6),
+            "probabilities": test_probabilities,
+        }
+
+    def mapped(row: dict[str, Any], probability: float, target: float | None = None) -> dict[str, Any]:
+        features = list(row.get("falsePositiveFeatures") or row.get("x") or [])
+        direction_outputs = [
+            _model_value(row, name)
+            for name in DIRECTION_OUTPUT_KEYS
+            if row.get(name) is not None
+        ]
+        direction_mean = sum(direction_outputs) / max(1, len(direction_outputs))
+        direction_disagreement = math.sqrt(
+            sum((value - direction_mean) ** 2 for value in direction_outputs) / max(1, len(direction_outputs))
+        ) if direction_outputs else 0.0
+        features.extend([
+            clamp(probability, 0.001, 0.999),
+            number(row.get("liquidityWeight"), 1.0),
+            number(row.get("dataQuality"), 0.0),
+            _model_value(row, "rankerPrediction"),
+            _model_value(row, "targetProbability"),
+            _model_value(row, "stopProbability"),
+            number(row.get("quantileP50")),
+            max(0.0, number(row.get("quantileP90")) - number(row.get("quantileP10"))),
+            direction_disagreement,
+        ])
+        value = {**row, "x": features}
+        if target is not None:
+            value["falsePositiveTarget"] = target
+        return value
+
+    training = [
+        mapped(
+            train_rows[index],
+            train_probabilities[index],
+            1.0 if number(train_rows[index].get("actualDirection")) < 0.5 else 0.0,
+        )
+        for index in candidate_indexes
+    ]
+    model = fit_logistic(training, "falsePositiveTarget", 0.28, epochs=70)
+    validation_rows = [train_rows[index] for index in inner_validation_indexes]
+    validation_probabilities = [train_probabilities[index] for index in inner_validation_indexes]
+    risk_validation = [
+        predict_logistic(model, mapped(train_rows[index], train_probabilities[index])["x"])
+        for index in inner_validation_indexes
+    ]
+    adjusted_validation = [
+        clamp(
+            probability * (1.0 - max(0.0, risk_validation[index] - 0.5) * 0.70)
+            if probability >= threshold else probability,
+            0.001,
+            0.999,
+        )
+        for index, probability in enumerate(validation_probabilities)
+    ]
+    base_metrics = calibration_metrics(validation_rows, validation_probabilities, actual_key="actualDirection")
+    adjusted_metrics = calibration_metrics(validation_rows, adjusted_validation, actual_key="actualDirection")
+    top_gain = number(adjusted_metrics.get("selectiveTop10AccuracyPct")) - number(base_metrics.get("selectiveTop10AccuracyPct"))
+    brier_gain = number(adjusted_metrics.get("brierSkillScore"), -1.0) - number(base_metrics.get("brierSkillScore"), -1.0)
+    balanced_change = number(adjusted_metrics.get("balancedAccuracyPct")) - number(base_metrics.get("balancedAccuracyPct"))
+    active = top_gain >= 1.0 and brier_gain >= -0.005 and balanced_change >= -1.0
+    final_probabilities = list(test_probabilities)
+    if active:
+        all_candidates = [index for index, value in enumerate(train_probabilities) if value >= threshold]
+        final_training = [
+            mapped(
+                train_rows[index],
+                train_probabilities[index],
+                1.0 if number(train_rows[index].get("actualDirection")) < 0.5 else 0.0,
+            )
+            for index in all_candidates
+        ]
+        final_model = fit_logistic(final_training, "falsePositiveTarget", 0.28, epochs=70)
+        final_risk = [
+            predict_logistic(final_model, mapped(row, test_probabilities[index])["x"])
+            for index, row in enumerate(test_rows)
+        ]
+        final_probabilities = [
+            clamp(
+                probability * (1.0 - max(0.0, final_risk[index] - 0.5) * 0.70)
+                if probability >= threshold else probability,
+                0.001,
+                0.999,
+            )
+            for index, probability in enumerate(test_probabilities)
+        ]
+    return {
+        "available": True,
+        "active": active,
+        "reason": (
+            "Activated because the purged inner validation block improved Top-10 accuracy without material Brier or balanced-accuracy degradation; the final meta-test remained untouched."
+            if active else
+            "Retained as a dormant Challenger because it did not improve the purged inner validation block under the non-degradation gates; the final meta-test remained untouched."
+        ),
+        "candidateRows": len(candidate_indexes),
+        "falsePositiveRows": false_count,
+        "truePositiveRows": true_count,
+        "threshold": round(threshold, 6),
+        "innerTrainDates": len({str(train_rows[index].get("date")) for index in inner_train_indexes}),
+        "innerValidationDates": len(validation_dates),
+        "innerPurgeDates": validation_start - inner_purge_start,
+        "top10AccuracyGainPct": round(top_gain, 6),
+        "brierSkillGain": round(brier_gain, 7),
+        "balancedAccuracyChangePct": round(balanced_change, 6),
+        "baseMetrics": base_metrics,
+        "adjustedMetrics": adjusted_metrics,
+        "probabilities": final_probabilities,
+        "policy": "The risk head may only lower a high-confidence score or trigger No Trade; it can never raise a buy probability.",
+    }
+
+
 def diagnostic_bucket_summary(rows: list[dict[str, Any]], probabilities: list[float]) -> dict[str, Any]:
     if not rows:
         return {"available": False}
@@ -2563,11 +3823,13 @@ def diagnostic_bucket_summary(rows: list[dict[str, Any]], probabilities: list[fl
     top_indexes = sorted(range(len(rows)), key=lambda index: probabilities[index], reverse=True)[:top_count]
     false_positive_indexes = [index for index in top_indexes if number(rows[index].get("actualDirection")) < 0.5]
     true_positive_indexes = [index for index in top_indexes if number(rows[index].get("actualDirection")) >= 0.5]
-    feature_names = list(rows[0].get("featureNames") or [])
+    uses_false_positive_vector = any(row.get("falsePositiveFeatures") for row in rows)
+    feature_names = FALSE_POSITIVE_FEATURE_NAMES if uses_false_positive_vector else _feature_names_for_row(rows[0])
+    vector_key = "falsePositiveFeatures" if uses_false_positive_vector else "x"
     feature_deltas = []
     for feature_index, feature_name in enumerate(feature_names):
-        false_values = [number(rows[index].get("x", [])[feature_index]) for index in false_positive_indexes if feature_index < len(rows[index].get("x") or [])]
-        comparison_values = [number(rows[index].get("x", [])[feature_index]) for index in true_positive_indexes if feature_index < len(rows[index].get("x") or [])]
+        false_values = [number(rows[index].get(vector_key, [])[feature_index]) for index in false_positive_indexes if feature_index < len(rows[index].get(vector_key) or [])]
+        comparison_values = [number(rows[index].get(vector_key, [])[feature_index]) for index in true_positive_indexes if feature_index < len(rows[index].get(vector_key) or [])]
         if not false_values or not comparison_values:
             continue
         feature_deltas.append({
@@ -2610,7 +3872,7 @@ def diagnostic_bucket_summary(rows: list[dict[str, Any]], probabilities: list[fl
 def feature_family_ablation(rows: list[dict[str, Any]], test_dates: set[str], *, horizon: int, embargo_days: int) -> dict[str, Any]:
     if not rows or not test_dates:
         return {"available": False, "reason": "No untouched test dates."}
-    feature_names = list(rows[0].get("featureNames") or [])
+    feature_names = _feature_names_for_row(rows[0])
     all_dates = sorted({str(row.get("date") or "") for row in rows})
     first_test = min(test_dates)
     try:
@@ -2730,6 +3992,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
                 fold,
                 enable_tree_models=bool(config.get("enableTreeModels", False)),
                 enable_sklearn_models=bool(config.get("enableSklearnModels", False)),
+                config=config,
             )
             _save_fold_checkpoint(checkpoint_context, fold_index, predictions, metadata)
         fold_probability = [number(row["pathSafetyPrediction"]) for row in predictions]
@@ -2769,6 +4032,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         independent_dates=len(meta_train_dates),
         dates=[str(row["date"]) for row in meta_train],
     )
+    calibrated_train = apply_probability_calibrator(calibrator, raw_train)
     calibrated_test = apply_probability_calibrator(calibrator, raw_test)
     direction_names = [name for name in DIRECTION_OUTPUT_KEYS if any(row.get(name) is not None for row in meta_train)]
     direction_names, direction_skill_pruned = brier_skilled_models(
@@ -2782,7 +4046,12 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         float(config.get("maxResidualCorrelation", PRODUCTION_THRESHOLDS["maxResidualCorrelation"])),
         actual_key="actualDirection",
     )
-    direction_pruned = [*direction_skill_pruned, *direction_correlation_pruned]
+    direction_names, direction_robust_pruned, direction_model_selection = select_robust_direction_models(
+        meta_train,
+        direction_names,
+        purge_days=horizon + int(config.get("embargoDays", 7)),
+    )
+    direction_pruned = [*direction_skill_pruned, *direction_correlation_pruned, *direction_robust_pruned]
     direction_weights = fit_constrained_stack(
         meta_train,
         direction_names,
@@ -2798,10 +4067,38 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         dates=[str(row["date"]) for row in meta_train],
     )
     calibrated_direction_test = apply_probability_calibrator(direction_calibrator, raw_direction_test)
+    calibrated_direction_train = apply_probability_calibrator(direction_calibrator, raw_direction_train)
+    false_positive_risk_head = fit_false_positive_risk_head(
+        meta_train,
+        meta_test,
+        calibrated_direction_train,
+        calibrated_direction_test,
+    )
+    calibrated_direction_test = list(false_positive_risk_head.get("probabilities") or calibrated_direction_test)
+    long_trade_gate = fit_long_trade_gate(
+        meta_train,
+        meta_test,
+        calibrated_direction_train,
+        calibrated_direction_test,
+        calibrated_train,
+        calibrated_test,
+    )
+    long_trade_indexes = set(long_trade_gate.get("eligibleIndexes") or [])
+    selective_ranking_head = fit_selective_ranking_head(
+        meta_train,
+        meta_test,
+        calibrated_direction_train,
+        calibrated_direction_test,
+        calibrated_train,
+        calibrated_test,
+    )
+    selection_scores = list(selective_ranking_head.get("scores") or [_model_value(row, "rankerPrediction") for row in meta_test])
     conformal_quantiles = conformalize_quantiles(meta_train, meta_test)
     for index, row in enumerate(meta_test):
         row["ensembleProbability"] = calibrated_test[index]
         row["directionProbability"] = calibrated_direction_test[index]
+        row["selectionScore"] = selection_scores[index]
+        row["longTradeEligible"] = index in long_trade_indexes
     metrics = calibration_metrics(meta_test, calibrated_test)
     direction_metrics = calibration_metrics(meta_test, calibrated_direction_test, actual_key="actualDirection")
     model_comparison = []
@@ -2830,6 +4127,13 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         })
     model_comparison.sort(key=lambda row: (-number(row.get("brierSkillScore"), -10), -number(row.get("balancedAccuracyPct"), -1)))
     diagnostic_buckets = diagnostic_bucket_summary(meta_test, calibrated_direction_test)
+    diagnostic_buckets["highConfidenceFalsePositiveRiskHead"] = {
+        key: value for key, value in false_positive_risk_head.items() if key != "probabilities"
+    }
+    false_positive_library = diagnostic_buckets.get("highConfidenceFalsePositiveLibrary") or {}
+    false_positive_library["activeRiskHead"] = false_positive_risk_head.get("active") is True
+    false_positive_library["riskHeadReason"] = false_positive_risk_head.get("reason")
+    diagnostic_buckets["highConfidenceFalsePositiveLibrary"] = false_positive_library
     ablation = (
         feature_family_ablation(
             rows,
@@ -2840,7 +4144,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         if horizon == 5 and config.get("enableFeatureAblation", True)
         else {"available": False, "reason": "Feature-family ablation is reserved for the active 5-day production horizon."}
     )
-    ranking = rank_ic_summary(meta_test)
+    ranking = rank_ic_summary(meta_test, score_key="selectionScore")
     regime_diagnostics = {}
     for regime in sorted({str(row.get("regime") or "unknown") for row in meta_test}):
         indexes = [index for index, row in enumerate(meta_test) if str(row.get("regime") or "unknown") == regime]
@@ -2850,6 +4154,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
             bins=5,
         )
     expected_value = expected_value_summary(meta_test, calibrated_test)
+    long_trade_expected_value = ((long_trade_gate.get("testEvidence") or {}).get("expectedValue") or {"available": False})
     marginal = []
     full_brier = brier(meta_test, probabilities=calibrated_test)
     for index, name in enumerate(names):
@@ -2885,16 +4190,22 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         "directionBrierSkill": number(direction_metrics.get("brierSkillScore"), -1.0) > float(thresholds["minBrierSkill"]),
         "directionBalancedAccuracy": number(direction_metrics.get("balancedAccuracyPct"), 0.0) > 50.0,
         "directionSelectiveHighConfidence": (
-            number(direction_metrics.get("selectiveTop10AccuracyPct"), 0.0) >= 57.0
-            and number(direction_metrics.get("selectiveTop10Accuracy95LowerPct"), 0.0) > 50.0
+            long_trade_gate.get("active") is True
+            and number((long_trade_gate.get("testEvidence") or {}).get("directionHitRatePct"), 0.0) >= 57.0
+            and number((long_trade_gate.get("testEvidence") or {}).get("directionHitRate95LowerPct"), 0.0) > 50.0
         ),
+        "longTradeSampleSupport": (
+            int((long_trade_gate.get("testEvidence") or {}).get("signalCount") or 0) >= 200
+            and int((long_trade_gate.get("testEvidence") or {}).get("signalDates") or 0) >= 80
+        ),
+        "longTradeNetReturn": number((long_trade_gate.get("testEvidence") or {}).get("meanNetReturnPct"), -1.0) > 0,
         "targetProbabilityResolution": metrics.get("probabilityResolutionPassed") is True,
         "directionProbabilityResolution": direction_metrics.get("probabilityResolutionPassed") is True,
         "ece": number(metrics.get("ecePct"), 100.0) <= float(thresholds["maxEcePct"]),
         "calibrationSlope": float(thresholds["minCalibrationSlope"]) <= number(metrics.get("calibrationSlope")) <= float(thresholds["maxCalibrationSlope"]),
         "topDecileLift": number(metrics.get("topDecileLift")) > 0,
         "topDecileAbsoluteReturn": number(metrics.get("topDecileNetReturn")) > 0,
-        "expectedValuePositive": number(expected_value.get("expectedValuePct"), -1.0) > 0,
+        "expectedValuePositive": number(long_trade_expected_value.get("expectedValuePct"), -1.0) > 0,
         "rankIc": number(ranking.get("rankIc"), -1.0) > float(thresholds["minRankIc"]),
         "rankTopDecileLift": number(ranking.get("topDecileLift")) > 0,
         "rankTopDecileAbsoluteReturn": number(ranking.get("topDecileNetReturn")) > 0,
@@ -2908,7 +4219,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
     production_evidence = all(production_checks.values())
     research_eligible = len(rows) >= int(thresholds["researchMinRows"]) and len(meta_test) >= 20
     deployment_status = "shadow" if research_eligible else "research"
-    active_feature_names = list(rows[0].get("featureNames") or CORE_TECHNICAL_FEATURE_NAMES) if rows else list(CORE_TECHNICAL_FEATURE_NAMES)
+    active_feature_names = _feature_names_for_row(rows[0]) if rows else list(CORE_TECHNICAL_FEATURE_NAMES)
     feature_importance = direction_feature_importance_summary(meta_train, fold_metrics, active_feature_names)
     version_basis = {
         "market": market,
@@ -2919,6 +4230,19 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         "weights": [round(value, 8) for value in weights],
         "directionWeights": [round(value, 8) for value in direction_weights],
         "calibrator": calibrator,
+        "falsePositiveRiskHead": {
+            key: value for key, value in false_positive_risk_head.items()
+            if key not in {"probabilities", "baseMetrics", "adjustedMetrics"}
+        },
+        "longTradeGate": {
+            "active": long_trade_gate.get("active") is True,
+            "threshold": long_trade_gate.get("threshold"),
+            "trainingEvidence": long_trade_gate.get("trainingEvidence"),
+        },
+        "selectiveRankingHead": {
+            key: value for key, value in selective_ranking_head.items()
+            if key not in {"scores", "comparisons"}
+        },
     }
     model_version = f"{market.lower()}-{horizon}d-{stable_hash(version_basis, 12)}"
     for row in oof:
@@ -2932,6 +4256,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
             "featureSchemaHash": stable_hash(active_feature_names),
             "modelVersion": model_version,
         }, 32)
+        row.pop("falsePositiveFeatures", None)
     oof_artifact = persist_oof_artifact(oof, config.get("artifactDir"), model_version)
     return {
         "available": True,
@@ -2952,6 +4277,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         "directionModels": direction_names,
         "directionWeights": {name: round(direction_weights[index], 6) for index, name in enumerate(direction_names)},
         "directionPrunedModels": direction_pruned,
+        "directionModelSelection": direction_model_selection,
         "prunedModels": pruned,
         "residualCorrelations": [
             {"left": names[left], "right": names[right], "correlation": round(residual_correlation(meta_train, names[left], names[right]), 5)}
@@ -2964,12 +4290,23 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         "directionMetrics": direction_metrics,
         "modelComparison": model_comparison,
         "diagnosticBuckets": diagnostic_buckets,
+        "highConfidenceFalsePositiveRiskHead": {
+            key: value for key, value in false_positive_risk_head.items() if key != "probabilities"
+        },
+        "longTradeGate": {
+            key: value for key, value in long_trade_gate.items()
+            if key not in {"eligibleIndexes", "candidates"}
+        },
+        "selectiveRankingHead": {
+            key: value for key, value in selective_ranking_head.items() if key != "scores"
+        },
         "featureAblation": ablation,
         "featureImportance": feature_importance,
         "rankingMetrics": ranking,
         "conformalQuantiles": conformal_quantiles,
         "regimeDiagnostics": regime_diagnostics,
         "expectedValue": expected_value,
+        "longTradeExpectedValue": long_trade_expected_value,
         "foldMetrics": fold_metrics,
         "foldCheckpoint": {
             "enabled": checkpoint_context is not None,
@@ -2983,7 +4320,7 @@ def train_horizon_model(rows: list[dict[str, Any]], *, market: str, horizon: int
         "oofSchema": [
             "date", "symbol", "market", "horizon", "actualTarget", "actualStop", "actualDirection", "actualReturn",
             *MODEL_OUTPUT_KEYS, *DIRECTION_OUTPUT_KEYS, "ensembleProbability", "directionProbability", "targetProbability", "stopProbability", "timeoutProbability", "quantileP10", "quantileP50", "quantileP90",
-            "regime", "sector", "liquidityWeight", "dataQuality", "fold",
+            "selectionScore", "longTradeEligible", "regime", "sector", "liquidityWeight", "dataQuality", "fold",
         ],
         "oofPreview": oof[-40:],
         "oofArtifact": oof_artifact,
@@ -3047,6 +4384,7 @@ def aggregate_dataset_profiles(profiles: list[dict[str, Any]], market: str) -> d
         "pointInTimeCoveragePct": round(weighted_coverage, 4),
         "futureFeatureRowsExcluded": sum(int(row.get("futureFeatureRowsExcluded") or 0) for row in profiles),
         "pointInTimeJoinViolationCount": sum(int(row.get("pointInTimeJoinViolationCount") or 0) for row in profiles),
+        "pointInTimeExcludedViolationCount": sum(int(row.get("pointInTimeExcludedViolationCount") or 0) for row in profiles),
         "pitDataVersion": pit_versions[0] if len(pit_versions) == 1 else stable_hash(pit_versions, 24) if pit_versions else None,
         "pitDataVersionCount": len(pit_versions),
         "duplicateRowsExcluded": sum(int(row.get("duplicateRowsExcluded") or 0) for row in profiles),
@@ -3059,11 +4397,76 @@ def aggregate_dataset_profiles(profiles: list[dict[str, Any]], market: str) -> d
         "activeFeatureCount": int(profiles[0].get("activeFeatureCount") or len(CORE_TECHNICAL_FEATURE_NAMES)),
         "eventFeaturesEnabled": all(bool(row.get("eventFeaturesEnabled")) for row in profiles),
         "eventItemCoveragePct": min((number(row.get("eventItemCoveragePct")) for row in profiles), default=0.0),
+        "marketPointInTimeFeaturesAvailable": all(bool(row.get("marketPointInTimeFeaturesAvailable")) for row in profiles),
+        "eventFeatureActivationReason": profiles[0].get("eventFeatureActivationReason") or "insufficient-verified-pit",
         "featurePolicy": profiles[0].get("featurePolicy") or "Core low-redundancy feature set.",
         "firstStageTarget": target,
         "coverageVsTargetPct": round(min(100.0, minimum_horizon_rows / max(1, target["rows"]) * 100.0), 4),
         "sampleMeaning": profiles[0].get("sampleMeaning") or {},
         "memoryPolicy": "Each horizon is built, trained, and released separately so 5d/15d/30d rows are not retained in memory together.",
+    }
+
+
+def hydrate_verified_pit_from_data_lake(
+    items: list[dict[str, Any]],
+    *,
+    market: str,
+    root: Any,
+    limit_per_symbol: int = 600,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Join verified PIT records inside Python so large event panels never cross IPC twice."""
+    try:
+        from .data_lake import read_pit_panel
+    except ImportError:  # Direct script/test imports keep quant_core on sys.path.
+        from data_lake import read_pit_panel
+
+    key = str(market or "ASX").upper()
+
+    def identity(value: Any) -> str:
+        text = str(value or "").strip().upper()
+        if key == "ASX" and text.endswith(".AX"):
+            return text[:-3]
+        if key == "CN" and text.endswith((".SS", ".SH", ".SZ")):
+            return text.rsplit(".", 1)[0]
+        return text
+
+    symbols = [str(item.get("symbol") or "") for item in items if isinstance(item, dict) and item.get("symbol")]
+    panel = read_pit_panel({
+        "root": root,
+        "market": key,
+        "symbols": symbols,
+        "datasets": ["financial_disclosures", "news", "social", "fundamentals", "macro", "corporate_actions", "universe"],
+        "limit_per_symbol": max(1, min(2_000, int(limit_per_symbol or 600))),
+        "broadcast_market_wide": False,
+        "verified_only": True,
+    })
+    by_symbol = {identity(row.get("symbol")): row for row in panel.get("items") or [] if isinstance(row, dict)}
+    hydrated = []
+    covered_symbols = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        pit = by_symbol.get(identity(item.get("symbol"))) or {}
+        features = list(pit.get("pointInTimeFeatures") or [])
+        if features:
+            covered_symbols += 1
+        hydrated.append({
+            **item,
+            "pointInTimeFeatures": features,
+            "universeHistory": list(pit.get("universeHistory") or []),
+            "corporateActions": list(pit.get("corporateActions") or []),
+            "pitCoverage": pit.get("coverage") or {},
+            "pitDataVersion": panel.get("dataVersion"),
+        })
+    return hydrated, list(panel.get("marketPointInTimeFeatures") or []), {
+        "available": panel.get("available") is True,
+        "rows": int(panel.get("rows") or 0),
+        "coveredSymbols": covered_symbols,
+        "requestedSymbols": len(symbols),
+        "marketFeatureRows": len(panel.get("marketPointInTimeFeatures") or []),
+        "dataVersion": panel.get("dataVersion"),
+        "verifiedOnly": panel.get("verifiedOnly") is True,
+        "transport": "python-local-parquet",
     }
 
 
@@ -3073,6 +4476,14 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
     requested_horizons = sorted({max(1, int(number(value, 15))) for value in (raw_horizons if isinstance(raw_horizons, list) else [raw_horizons])})
     items = payload.get("items") or []
     market_point_in_time_features = payload.get("market_point_in_time_features", payload.get("marketPointInTimeFeatures")) or []
+    pit_load = None
+    if payload.get("load_pit_from_data_lake", payload.get("loadPitFromDataLake", False)) is True:
+        items, market_point_in_time_features, pit_load = hydrate_verified_pit_from_data_lake(
+            items,
+            market=market,
+            root=payload.get("data_lake_root", payload.get("dataLakeRoot")),
+            limit_per_symbol=int(payload.get("pit_rows_per_symbol", payload.get("pitRowsPerSymbol", 600)) or 600),
+        )
     panel_dates: dict[str, set[str]] = defaultdict(set)
     panel_symbols: set[str] = set()
     for item in items:
@@ -3115,6 +4526,13 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
         "resumeMinDates": int(payload.get("resume_min_dates", payload.get("resumeMinDates", 500)) or 500),
         "resumeRequirePitVersion": payload.get("resume_require_pit_version", payload.get("resumeRequirePitVersion", False)) is True,
         "thresholds": payload.get("productionThresholds") or {},
+        "treeBackend": payload.get("tree_backend", payload.get("treeBackend")),
+        "treeMaxRows": int(payload.get("tree_max_rows", payload.get("treeMaxRows", os.getenv("PRODUCTION_TREE_MAX_ROWS", "40000"))) or 40000),
+        "treeIterations": int(payload.get("tree_iterations", payload.get("treeIterations", os.getenv("PRODUCTION_TREE_ITERATIONS", "72"))) or 72),
+        "treeThreads": int(payload.get("tree_threads", payload.get("treeThreads", os.getenv("PRODUCTION_TREE_THREADS", "2"))) or 2),
+        "treeClassBalance": str(payload.get("tree_class_balance", payload.get("treeClassBalance", os.getenv("PRODUCTION_TREE_CLASS_BALANCE", "SqrtBalanced"))) or "SqrtBalanced"),
+        "baselineMaxRows": int(payload.get("baseline_max_rows", payload.get("baselineMaxRows", os.getenv("PRODUCTION_BASELINE_MAX_ROWS", "6000"))) or 6000),
+        "quantileMaxRows": int(payload.get("quantile_max_rows", payload.get("quantileMaxRows", os.getenv("PRODUCTION_QUANTILE_MAX_ROWS", "6000"))) or 6000),
     }
     horizon_models = []
     dataset_profiles = []
@@ -3157,11 +4575,20 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
             _save_dataset_cache(dataset_cache_path, dataset, market=market, horizon=horizon)
         dataset["summary"]["featureMatrixCache"] = {
             "hit": dataset_cache_hit,
-            "schema": "market-feature-matrix-v6",
+            "schema": FEATURE_MATRIX_SCHEMA,
+            "eventAggregationSchema": EVENT_AGGREGATION_SCHEMA,
             "path": str(dataset_cache_path) if dataset_cache_path else None,
         }
         dataset_profiles.append(dataset["summary"])
-        horizon_models.append(train_horizon_model(dataset["rows"], market=market, horizon=horizon, config=config))
+        horizon_config = {
+            **config,
+            "datasetContentHash": (
+                dataset_cache_path.name
+                if dataset_cache_path is not None
+                else stable_hash(dataset.get("summary") or {}, 24)
+            ),
+        }
+        horizon_models.append(train_horizon_model(dataset["rows"], market=market, horizon=horizon, config=horizon_config))
     for horizon in withheld_horizons:
         horizon_models.append({
             "available": False,
@@ -3177,13 +4604,21 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
         })
     horizon_models.sort(key=lambda row: int(row.get("horizon") or 0))
     summary = aggregate_dataset_profiles(dataset_profiles, market)
+    if pit_load is not None:
+        summary["pitLoad"] = pit_load
+        summary["eventItemCoveragePct"] = round(
+            number(pit_load.get("coveredSymbols")) / max(1, number(pit_load.get("requestedSymbols"), 1.0)) * 100.0,
+            3,
+        )
+        summary["companyEventItemCoveragePct"] = summary["eventItemCoveragePct"]
+        summary["marketPointInTimeFeaturesAvailable"] = number(pit_load.get("marketFeatureRows")) > 0
     historical_universe_ok = number(summary.get("historicalUniverseCoveragePct")) >= 95.0
     corporate_actions_ok = number(summary.get("corporateActionCoveragePct")) >= 95.0
     adjusted_prices_ok = number(summary.get("adjustedPriceCoveragePct")) >= 95.0
     pit_ok = int(summary.get("pointInTimeJoinViolationCount") or 0) == 0
     sample_isolation_ok = int(summary.get("duplicateRowsExcluded") or 0) == 0 and int(summary.get("crossMarketRowsExcluded") or 0) == 0
     available_models = [model for model in horizon_models if model.get("available")]
-    event_history_ok = number(summary.get("pointInTimeCoveragePct")) >= 20.0
+    event_history_ok = number(summary.get("eventItemCoveragePct")) >= 20.0
     universe_breadth_ok = int(summary.get("symbolCount") or 0) >= int(MARKET_DATA_TARGETS.get(market, MARKET_DATA_TARGETS["ASX"])["symbols"])
     primary_five_day = next((model for model in horizon_models if int(model.get("horizon") or 0) == 5), None)
     evidence_passed = bool(primary_five_day and primary_five_day.get("available") and primary_five_day.get("productionEvidencePassed"))
@@ -3196,14 +4631,24 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
     for model in available_models:
         metrics = model.get("metrics") or {}
         ranking = model.get("rankingMetrics") or {}
+        long_gate = model.get("longTradeGate") or {}
+        long_gate_evidence = long_gate.get("testEvidence") or {}
         if number(metrics.get("brierSkillScore"), -1.0) <= 0:
             downgrade_reasons.append(f"{model.get('horizon')}d Brier Skill Score <= 0")
         if number(metrics.get("ecePct"), 100.0) > PRODUCTION_THRESHOLDS["maxDegradedEcePct"]:
             downgrade_reasons.append(f"{model.get('horizon')}d ECE > 10%")
-        if number(ranking.get("topDecileLift")) <= 0:
-            downgrade_reasons.append(f"{model.get('horizon')}d Top-K no longer beats universe")
-        if number((model.get("expectedValue") or {}).get("expectedValuePct")) <= 0:
-            downgrade_reasons.append(f"{model.get('horizon')}d net expected value <= 0")
+        if long_gate.get("active") is True:
+            if number(long_gate_evidence.get("directionHitRatePct")) < 57.0:
+                downgrade_reasons.append(f"{model.get('horizon')}d eligible-long direction hit rate < 57%")
+            if number(long_gate_evidence.get("meanNetReturnPct")) <= 0:
+                downgrade_reasons.append(f"{model.get('horizon')}d eligible-long net return <= 0")
+            if number((model.get("longTradeExpectedValue") or {}).get("expectedValuePct")) <= 0:
+                downgrade_reasons.append(f"{model.get('horizon')}d eligible-long expected value <= 0")
+        else:
+            if number(ranking.get("topDecileLift")) <= 0:
+                downgrade_reasons.append(f"{model.get('horizon')}d Top-K no longer beats universe")
+            if number((model.get("expectedValue") or {}).get("expectedValuePct")) <= 0:
+                downgrade_reasons.append(f"{model.get('horizon')}d net expected value <= 0")
         if any(number((fold.get("featureDrift") or {}).get("maxPsi")) > 0.40 for fold in model.get("foldMetrics") or []):
             downgrade_reasons.append(f"{model.get('horizon')}d feature PSI > 0.40")
     candidate_status = (
@@ -3280,6 +4725,11 @@ def train_market_multitask(payload: dict[str, Any]) -> dict[str, Any]:
         "rejectTradePolicy": {
             "enabled": True,
             "cashPriorWeight": 0.15,
+            "learnedLongThresholds": {
+                f"{model.get('horizon')}d": (model.get("longTradeGate") or {}).get("threshold")
+                for model in available_models
+                if (model.get("longTradeGate") or {}).get("active") is True
+            },
             "rejectWhen": [
                 "calibrated probability is below the strategy threshold",
                 "Brier Skill Score <= 0 or ECE > 10%",

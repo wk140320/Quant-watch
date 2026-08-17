@@ -34,6 +34,8 @@ const OBVIOUS_ASX_ONLY_SYMBOLS = new Set([
   "PLS", "LYC", "SEK", "PME", "STW", "VAS", "IOZ",
 ]);
 
+const NON_US_EXCHANGE_SUFFIX = /\.(?:AX|AU|L|OL|ST|HE|CO|TO|V|HK|SS|SZ|T|KS|KQ|NS|BO|PA|DE|F|AS|BR|MI|MC|SW|SI|JK|BK)$/;
+
 const TRAINING_UNIVERSES = Object.freeze({
   ASX: [
     "BHP", "CBA", "RIO", "CSL", "NAB", "WBC", "ANZ", "MQG", "WES", "WOW",
@@ -90,7 +92,7 @@ function isValidMarketCode(symbol, market = "ASX") {
   if (!code) return false;
   if (key === "CN") return /^\d{6}$/.test(code) || /^(SH000|SZ399)\d{3}$/.test(code);
   if (key === "US") {
-    if (/\.A[UX]$/.test(code) || OBVIOUS_ASX_ONLY_SYMBOLS.has(code)) return false;
+    if (NON_US_EXCHANGE_SUFFIX.test(code) || OBVIOUS_ASX_ONLY_SYMBOLS.has(code)) return false;
     if (/^\^[A-Z0-9.]{2,12}$/.test(code)) return true;
     return /^[A-Z][A-Z0-9.-]{0,9}$/.test(code);
   }

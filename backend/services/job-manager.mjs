@@ -28,9 +28,9 @@ function createJobManager(options = {}) {
   const running = new Map();
   const controllers = new Map();
   const pending = [];
-  const maxConcurrent = Math.max(1, Math.min(8, Number(options.maxConcurrent || process.env.BACKGROUND_JOB_CONCURRENCY || 2)));
-  const heavyTypes = new Set(["backtest", "historical-backtest-symbol", "factor-lab", "factor-evolution", "model-report"]);
-  const maxHeavyConcurrent = Math.max(1, Math.min(2, Number(process.env.BACKGROUND_HEAVY_JOB_CONCURRENCY || 1)));
+  let maxConcurrent = Math.max(1, Math.min(8, Number(options.maxConcurrent || process.env.BACKGROUND_JOB_CONCURRENCY || 2)));
+  const heavyTypes = new Set(["backtest", "historical-backtest-symbol", "history-backfill", "pit-enrichment", "corporate-action-backfill", "cn-corporate-action-backfill", "factor-lab", "factor-research", "factor-evolution", "model-report"]);
+  let maxHeavyConcurrent = Math.max(1, Math.min(3, Number(process.env.BACKGROUND_HEAVY_JOB_CONCURRENCY || 1)));
   const maxQueue = Math.max(maxConcurrent, Math.min(500, Number(options.maxQueue || process.env.BACKGROUND_JOB_QUEUE_LIMIT || 48)));
   let activeCount = 0;
   let activeHeavyCount = 0;
@@ -158,13 +158,28 @@ function createJobManager(options = {}) {
     } catch {
       return { scanned: 0, repaired: 0 };
     }
+    const timestampFromFilename = (filename) => Number(filename.match(/-(\d{13})-[a-zA-Z0-9]{8}\.json$/)?.[1] || 0);
+    const recoveryPriority = (filename) => (
+      /^(?:history-backfill|pit-enrichment|corporate-action-backfill|cn-corporate-action-backfill)-/.test(filename) ? 0
+        : /^backtest-/.test(filename) ? 1 : 2
+    );
+    files.sort((left, right) => recoveryPriority(left) - recoveryPriority(right)
+      || timestampFromFilename(right) - timestampFromFilename(left)
+      || right.localeCompare(left));
     let repaired = 0;
     let resumed = 0;
     for (const filename of files) {
       try {
         const job = JSON.parse(await readFile(join(basePath, filename), "utf8"));
         if (!["running", "queued"].includes(job.status)) continue;
-        const maxAttempts = Math.max(Number(job.maxAttempts || 1), job.type === "backtest" ? 3 : 2);
+        const restartBudgetFloor = [
+          "backtest",
+          "history-backfill",
+          "pit-enrichment",
+          "corporate-action-backfill",
+          "cn-corporate-action-backfill",
+        ].includes(String(job.type)) ? 3 : 2;
+        const maxAttempts = Math.max(Number(job.maxAttempts || 1), restartBudgetFloor);
         const restartBudgetExhausted = job.resumedAfterRestart === true
           && Number(job.attempt || 1) >= maxAttempts;
         const resumable = !restartBudgetExhausted
@@ -172,11 +187,14 @@ function createJobManager(options = {}) {
           && [
             "backtest",
             "historical-backtest-symbol",
+            "history-backfill",
             "factor-lab",
             "factor-evolution",
             "model-report",
             "agent-replay",
             "pit-enrichment",
+            "corporate-action-backfill",
+            "cn-corporate-action-backfill",
           ].includes(String(job.type))
           && handlers.has(String(job.type));
         if (resumable) {
@@ -196,6 +214,7 @@ function createJobManager(options = {}) {
           running.set(job.id, job);
           pending.push(job);
           await saveBestEffort(job, "startup-resume");
+          pump();
           resumed += 1;
         } else {
           job.status = "failed";
@@ -213,7 +232,12 @@ function createJobManager(options = {}) {
         // A damaged task file is isolated and cannot block startup.
       }
     }
-    if (resumed) pump();
+    if (resumed) {
+      pump();
+      // Startup reconciliation can finish before the persisted resource profile
+      // has reapplied its capacity. Wake the queue once more after that turn.
+      setTimeout(pump, 25).unref?.();
+    }
     if (repaired) publish("job.reconciled", { scanned: files.length, repaired, resumed });
     return { scanned: files.length, repaired, resumed };
   }
@@ -477,7 +501,18 @@ function createJobManager(options = {}) {
     };
   }
 
-  return { cancel, create, get, isRunning, list, reconcile, register, status };
+  function configurePolicy(policy = {}) {
+    if (policy.maxConcurrent != null) {
+      maxConcurrent = Math.max(1, Math.min(8, Number(policy.maxConcurrent) || 1));
+    }
+    if (policy.maxHeavyConcurrent != null) {
+      maxHeavyConcurrent = Math.max(1, Math.min(3, Number(policy.maxHeavyConcurrent) || 1));
+    }
+    pump();
+    return status();
+  }
+
+  return { cancel, configurePolicy, create, get, isRunning, list, reconcile, register, status };
 }
 
 export { createJobManager };

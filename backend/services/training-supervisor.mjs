@@ -156,6 +156,7 @@ function evaluateTrainingResult(result = {}, options = {}) {
       symbolCount: number(dataset.symbolCount),
       pointInTimeCoveragePct: number(dataset.pointInTimeCoveragePct),
       pointInTimeJoinViolationCount: number(dataset.pointInTimeJoinViolationCount),
+      pointInTimeExcludedViolationCount: number(dataset.pointInTimeExcludedViolationCount),
       horizons: availableModels.map((model) => ({
         horizon: model.horizon,
         oofRows: number(model.oofRows),
@@ -287,6 +288,8 @@ function createTrainingSupervisor(options = {}) {
       lastStartedAt: null,
       lastCompletedAt: null,
       lastAcceptedAt: null,
+      lastDataVersion: null,
+      lastCompletedPlanSignature: null,
       nextActionAt: null,
       nextCycleAt: config.autoCycleEnabled
         ? iso(Date.now() + config.startupDelayMs + index * 60_000)
@@ -468,10 +471,40 @@ function createTrainingSupervisor(options = {}) {
 
   async function handleComplete(state, marketState, job) {
     marketState.status = "reviewing";
+    const training = trainingResult(job.result || {});
+    const dataVersion = training?.manifest?.data_version || null;
+    const planSignature = JSON.stringify(marketState.currentPlan || {});
+    const repeatedEvidence = Boolean(
+      dataVersion
+      && marketState.lastDataVersion === dataVersion
+      && marketState.lastCompletedPlanSignature === planSignature
+    );
     marketState.evaluation = evaluateTrainingResult(job.result || {}, { thresholds: config.thresholds });
     marketState.lastCompletedAt = iso();
-    await record(marketState, "review-started", { jobId: job.id, evaluation: marketState.evaluation });
+    await record(marketState, "review-started", {
+      jobId: job.id,
+      evaluation: marketState.evaluation,
+      dataVersion,
+      repeatedEvidence,
+    });
+    marketState.lastDataVersion = dataVersion || marketState.lastDataVersion;
+    marketState.lastCompletedPlanSignature = planSignature;
     await saveState();
+    if (repeatedEvidence) {
+      marketState.status = "completed_not_promoted";
+      marketState.activeJobId = null;
+      marketState.lastError = "训练数据版本与参数均未变化；已停止重复拟合。";
+      marketState.nextActionAt = null;
+      marketState.nextCycleAt = config.autoCycleEnabled ? iso(Date.now() + config.attentionRetryMs) : null;
+      await record(marketState, "unchanged-data", {
+        jobId: job.id,
+        dataVersion,
+        reason: marketState.lastError,
+      });
+      await notify(marketState, "TRAINING_UNCHANGED_DATA", `${marketState.market} 未重复训练`, "本轮数据版本与训练方案均未变化，候选未晋级，也不会安排相同返工。等待新增已解析标签或新的 PIT 数据。", "info");
+      await saveState();
+      return marketState;
+    }
     if (!marketState.evaluation.passed) {
       // Deterministic gates have already rejected the candidate. Calling AI at
       // this point cannot change the result and previously caused quota errors
@@ -571,7 +604,14 @@ function createTrainingSupervisor(options = {}) {
       if (!job || !Number.isFinite(jobAge) || jobAge > config.maxJobAgeMs) {
         return handleFailure(state, marketState, `训练 Job 丢失或超过 ${Math.round(config.maxJobAgeMs / 60000)} 分钟无进展。`, { stage: "job-stale", jobId: marketState.activeJobId });
       }
-      if (job.status === "failed") return handleFailure(state, marketState, job.error || "Training job failed.", { stage: "job-failed", jobId: job.id });
+      if (["failed", "cancelled"].includes(job.status)) {
+        return handleFailure(
+          state,
+          marketState,
+          job.error || (job.status === "cancelled" ? "Training job was cancelled." : "Training job failed."),
+          { stage: job.status === "cancelled" ? "job-cancelled" : "job-failed", jobId: job.id },
+        );
+      }
       if (job.status === "complete") return handleComplete(state, marketState, job);
       return { ok: true, active: true, market: marketState.market, jobId: job.id, status: job.status, progress: job.progress };
     }

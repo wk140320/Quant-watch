@@ -1355,6 +1355,172 @@ html[data-active-workspace="regime"] .main {
   padding-left: 28px;
 }
 
+.quant-lab-page[data-quant-page="sources"] > #dataReplenishmentPanel {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  padding: 22px;
+  border: 1px solid color-mix(in srgb, var(--qw-amber) 22%, var(--qw-line-soft));
+  background: color-mix(in srgb, var(--qw-surface-2) 94%, var(--qw-amber) 6%);
+}
+
+.replenishment-head,
+.replenishment-actions,
+.replenishment-blockers p,
+.replenishment-job-list > div {
+  display: flex;
+  align-items: center;
+}
+
+.replenishment-head {
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+}
+
+.replenishment-head > div {
+  display: grid;
+  gap: 5px;
+}
+
+.replenishment-head .stage-one-readiness {
+  min-width: 138px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--qw-amber) 35%, var(--qw-line-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--qw-surface-3) 90%, var(--qw-amber) 10%);
+}
+
+.replenishment-head .stage-one-readiness.ready {
+  border-color: color-mix(in srgb, var(--qw-green) 40%, var(--qw-line-soft));
+  background: color-mix(in srgb, var(--qw-surface-3) 91%, var(--qw-green) 9%);
+}
+
+.stage-one-readiness strong {
+  color: var(--qw-amber);
+  font-variant-numeric: tabular-nums;
+}
+
+.stage-one-readiness.ready strong {
+  color: var(--qw-green);
+}
+
+.stage-one-readiness small {
+  color: var(--qw-muted);
+  font-size: 11px;
+}
+
+.replenishment-head span,
+.replenishment-metric span,
+.replenishment-blockers > strong {
+  color: var(--qw-muted);
+  font-size: 12px;
+}
+
+.replenishment-head strong {
+  font-size: 18px;
+}
+
+.replenishment-head p {
+  max-width: 680px;
+  margin: 0;
+  color: var(--qw-muted);
+  font-size: 12px;
+  line-height: 1.65;
+  text-align: right;
+}
+
+.replenishment-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.replenishment-metric {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 104px;
+  gap: 6px;
+  padding: 14px 14px 18px;
+  overflow: hidden;
+  border: 1px solid var(--qw-line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--qw-surface-3) 88%, transparent);
+}
+
+.replenishment-metric strong {
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.replenishment-metric small {
+  color: var(--qw-muted);
+  line-height: 1.35;
+}
+
+.replenishment-metric i {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--qw-green) var(--progress), color-mix(in srgb, var(--qw-line-soft) 70%, transparent) var(--progress));
+}
+
+.replenishment-metric.blocked i {
+  background: linear-gradient(90deg, var(--qw-amber) var(--progress), color-mix(in srgb, var(--qw-line-soft) 70%, transparent) var(--progress));
+}
+
+.replenishment-actions {
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.replenishment-blockers {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--qw-line-soft);
+}
+
+.replenishment-blockers p {
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 8px 0 0;
+}
+
+.replenishment-blockers p span {
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--qw-amber) 30%, var(--qw-line-soft));
+  border-radius: 999px;
+  color: var(--qw-amber);
+  font-size: 11px;
+}
+
+.replenishment-blockers p span.ready {
+  border-color: color-mix(in srgb, var(--qw-green) 32%, var(--qw-line-soft));
+  color: var(--qw-green);
+}
+
+.replenishment-job-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.replenishment-job-list > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.4fr) minmax(110px, 0.25fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--qw-line-soft);
+}
+
+.replenishment-job-list span,
+.replenishment-job-list small {
+  color: var(--qw-muted);
+}
+
 html[data-active-workspace="dashboard"] .main {
   grid-template-areas:
     "topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar"
@@ -1620,7 +1786,8 @@ html[data-active-workspace="dashboard"] .stock-picker-board {
 
   .quant-lab-page[data-quant-page="sources"] > .section-head,
   .quant-lab-page[data-quant-page="sources"] > #providerBudgetPanel,
-  .quant-lab-page[data-quant-page="sources"] > #dataHealthPanel {
+  .quant-lab-page[data-quant-page="sources"] > #dataHealthPanel,
+  .quant-lab-page[data-quant-page="sources"] > #dataReplenishmentPanel {
     grid-column: 1;
   }
 
@@ -1635,6 +1802,29 @@ html[data-active-workspace="dashboard"] .stock-picker-board {
   .quant-lab-page[data-quant-page="sources"] > #dataHealthPanel {
     border-left: 0;
     padding-left: 0;
+  }
+
+  .replenishment-head {
+    display: grid;
+  }
+
+  .replenishment-head p {
+    text-align: left;
+  }
+
+  .replenishment-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .replenishment-job-list > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+}
+
+@media (max-width: 560px) {
+  .replenishment-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

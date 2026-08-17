@@ -34,8 +34,13 @@ import { createTrainingSupervisor } from "./backend/services/training-supervisor
 import { createModelReportService } from "./backend/services/model-reports.mjs";
 import { createLearningProgressService } from "./backend/services/learning-progress.mjs";
 import { createEvidenceRegistry } from "./backend/services/evidence-registry.mjs";
+import { createTrainingResourceService } from "./backend/services/training-resources.mjs";
 import {
+  normalizeAlphaVantageListingStatusRecords,
+  normalizeCorporateActionRecords,
   normalizeEastmoneyPitRecords,
+  normalizeEodhdCompanyUniverseRecords,
+  normalizeEodhdFinancialPitRecords,
   normalizeFmpHistoricalUniverseRecords,
   normalizeFmpSymbolChangeRecords,
   normalizeFredVintageRecords,
@@ -45,6 +50,7 @@ import {
   normalizeSimfinPitRecords,
   normalizeTusharePitRecords,
   normalizeTushareUniverseRecords,
+  tableRows,
 } from "./backend/services/pit-sources.mjs";
 
 const root = new URL(".", import.meta.url).pathname;
@@ -59,7 +65,7 @@ const { tushareRows } = createTushareAdapter({ sanitizeCandleRows });
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-08-10-evidence-runtime-v86";
+const APP_VERSION = "2026-08-12-exact-stage-one-v91";
 const SERVER_STARTED_AT = new Date().toISOString();
 const SERVER_RUNTIME_ENABLED = process.env.SERVER_DISABLE_LISTEN !== "true";
 const providerBackoff = new Map();
@@ -100,6 +106,10 @@ const backgroundJobs = createJobManager({
   publish: (type, payload) => runtimeEvents.publish(type, payload),
   onTerminal: (job) => learningProgress?.recordJob(job),
   onPersist: (job, options) => evidenceRegistry.persistJob(job, options),
+});
+const trainingResources = createTrainingResourceService({
+  configPath: join(snapshotBasePath, "training-resource-profile.json"),
+  applyPolicy: (profile) => backgroundJobs.configurePolicy(profile.jobs),
 });
 learningProgress = createLearningProgressService({
   basePath: join(snapshotBasePath, "learning-progress"),
@@ -2414,6 +2424,10 @@ async function writeProductionModelVersionSnapshot(market, training = {}) {
       metrics: row.metrics,
       directionMetrics: row.directionMetrics,
       expectedValue: row.expectedValue,
+      longTradeExpectedValue: row.longTradeExpectedValue,
+      longTradeGate: row.longTradeGate,
+      selectiveRankingHead: row.selectiveRankingHead,
+      highConfidenceFalsePositiveRiskHead: row.highConfidenceFalsePositiveRiskHead,
       foldMetrics: row.foldMetrics,
       rankingMetrics: row.rankingMetrics,
       conformalQuantiles: row.conformalQuantiles,
@@ -2756,12 +2770,17 @@ function normalizeUniverseEventDate(value) {
 
 function universeRow(symbol, name = "", market = "ASX", extra = {}) {
   const key = safeMarket(market);
+  const rawSymbol = String(symbol || "").trim();
+  const rawName = String(name || "").trim();
+  const headerToken = rawSymbol.replace(/[^A-Za-z]/g, "").toUpperCase();
+  if (["SYMBOL", "ACTSYMBOL", "NASDAQTRADED", "FILECREATIONTIME"].includes(headerToken)) return null;
+  if (/^(?:security name|company name|issuer name|description)$/i.test(rawName)) return null;
   const code = cleanCode(symbol, key);
   if (!isValidMarketCode(code, key)) return null;
   return {
     symbol: normalizeMarketSymbol(code, key),
     code,
-    name: String(name || code).trim().slice(0, 160),
+    name: String(rawName || code).trim().slice(0, 160),
     market: key,
     exchange: String(extra.exchange || key).slice(0, 40),
     sector: String(extra.sector || "").slice(0, 120),
@@ -2821,20 +2840,27 @@ function sanitizeUniverseRows(rows = [], market = "ASX") {
   const byCode = new Map();
   for (const raw of Array.isArray(rows) ? rows : []) {
     const row = universeRow(raw?.symbol || raw?.code, raw?.name || raw?.description, key, raw);
-    if (row && !row.code.startsWith("^") && row.type !== "fund" && !byCode.has(row.code)) byCode.set(row.code, row);
+    if (row && !row.code.startsWith("^") && String(row.type || "").toLowerCase() !== "fund" && !byCode.has(row.code)) byCode.set(row.code, row);
   }
   return [...byCode.values()].sort((a, b) => a.code.localeCompare(b.code));
 }
 
 function trainingEligibleUniverseRow(row = {}, market = "ASX") {
   const key = safeMarket(market);
-  if (!row?.symbol || row.type === "fund") return false;
-  if (key !== "US") return true;
+  if (!row?.symbol) return false;
+  const code = cleanCode(row.symbol, key);
   const name = String(row.name || "").toLowerCase();
   const type = String(row.type || "stock").toLowerCase();
-  if (!new Set(["stock", "common stock", "ordinary share", "adr"]).has(type)) return false;
-  if (/\b(warrant|warrants|right|rights|unit|units|preferred|preference|debenture|bond|note due|notes due)\b/.test(name)) return false;
-  if (/\b(acquisition corp|acquisition corporation|acquisition inc|blank check)\b/.test(name)) return false;
+  const eligibleTypes = key === "CN"
+    ? new Set(["stock", "common stock", "ordinary share", "a share"])
+    : new Set(["stock", "common stock", "ordinary share", "adr"]);
+  if (!eligibleTypes.has(type)) return false;
+  if (/\b(warrant|warrants|right|rights|unit|units|preferred|preference|debenture|bond|note due|notes due|deferred settlement)\b/.test(name)) return false;
+  // ASX ordinary-company codes are three characters. Longer codes commonly
+  // identify deferred-settlement, options, rights, warrants or other temporary
+  // securities even when a vendor labels them as Common Stock.
+  if (key === "ASX" && !/^[A-Z0-9]{3}$/.test(code)) return false;
+  if (key === "US" && /\b(acquisition corp|acquisition corporation|acquisition inc|blank check)\b/.test(name)) return false;
   return true;
 }
 
@@ -2846,7 +2872,8 @@ async function readUniverseCache(market = "ASX", maxAgeMs = Number(process.env.U
     const payload = JSON.parse(await readFile(universePathForMarket(key), "utf8"));
     const fetchedAt = new Date(payload.fetchedAt || 0).getTime();
     if (fetchedAt && Date.now() - fetchedAt < maxAgeMs && Array.isArray(payload.rows) && payload.rows.length) {
-      const value = { ...payload, cache: "disk" };
+      const rows = sanitizeUniverseRows(payload.rows, key);
+      const value = { ...payload, rows, count: rows.length, cache: "disk" };
       universeResponseCache.set(key, { time: Date.now(), value });
       return value;
     }
@@ -2882,7 +2909,7 @@ async function writeUniverseCache(payload) {
 
 function parseNasdaqTraderRows(text = "", market = "US") {
   return String(text).split(/\r?\n/)
-    .filter((line) => line && !/^Symbol\||^File Creation Time|^Nasdaq Traded\|/i.test(line))
+    .filter((line) => line && !/^(?:Symbol|ACT Symbol|Nasdaq Traded)\||^File Creation Time/i.test(line))
     .map((line) => {
       const cells = line.split("|");
       const symbol = cells[0];
@@ -3178,7 +3205,7 @@ async function expandTrainingSymbolsForMarket({ market = "ASX", symbols = [], li
   const requestedSymbols = normalizeSymbolListForMarket(symbols, key);
   const desiredTarget = Number(
     process.env[`HISTORICAL_BACKTEST_TARGET_SYMBOLS_${key}`]
-    || ({ US: 350, ASX: 220, CN: 550 }[key] || 220)
+    || ({ US: 450, ASX: 350, CN: 550 }[key] || 350)
   );
   const defaultLimit = Number(
     process.env[`HISTORICAL_BACKTEST_SYMBOL_LIMIT_${key}`] ||
@@ -3189,7 +3216,7 @@ async function expandTrainingSymbolsForMarket({ market = "ASX", symbols = [], li
   const executionCap = Math.max(3, Number(
     process.env[`HISTORICAL_BACKTEST_FETCH_CAP_${key}`]
     || process.env.HISTORICAL_BACKTEST_FETCH_CAP
-    || ({ US: 350, ASX: 220, CN: 550 }[key] || 220)
+    || ({ US: 450, ASX: 350, CN: 550 }[key] || 350)
   ));
   const hardLimit = Number(process.env.HISTORICAL_BACKTEST_BATCH_MAX_SYMBOLS || 1500);
   const requestedTarget = Math.max(3, Math.min(Math.max(3, hardLimit), Number(limit || defaultLimit || desiredTarget)));
@@ -3884,9 +3911,11 @@ function normalizedCandles(candles = []) {
   return sanitizeCandleRows(candles)
     .map((row) => ({
       date: candleDate(row),
+      open: Number(row.open ?? row.close),
       close: Number(row.close),
       high: Number(row.high ?? row.close),
       low: Number(row.low ?? row.close),
+      volume: Math.max(0, Number(row.volume || 0)),
     }))
     .filter((row) => row.date && Number.isFinite(row.close) && row.close > 0)
     .sort((a, b) => a.date.localeCompare(b.date));
@@ -4851,12 +4880,13 @@ function persistIntradayTrainingEvidence(summary = {}) {
   }
 }
 
-async function runBackendIntradayTraining(config = {}, runtime = {}, { recordEvidence = true } = {}) {
+async function runBackendIntradayTraining(config = {}, runtime = {}, { recordEvidence = true, force = false } = {}) {
   if (config.training?.enabled === false) return null;
+  const minuteResources = trainingResources.current().profile.minute;
   const now = Date.now();
   const last = Number(runtime.lastTrainingAt || 0);
-  if (now - last < Number(config.refresh?.trainingMs || 5 * 60_000)) return null;
-  const allowOffHours = envBool("BACKEND_MONITOR_ALLOW_OFF_HOURS_FETCH", false);
+  if (!force && now - last < Number(config.refresh?.trainingMs || 5 * 60_000)) return null;
+  const allowOffHours = force || envBool("BACKEND_MONITOR_ALLOW_OFF_HOURS_FETCH", false);
   const results = [];
   for (const market of Object.keys(MARKET_CONFIG)) {
     const session = backendMarketSession(market);
@@ -4866,7 +4896,7 @@ async function runBackendIntradayTraining(config = {}, runtime = {}, { recordEvi
     const symbols = [...new Set([
       ...portfolio.map((holding) => holding.symbol),
       ...watchlist,
-    ])].slice(0, Number(config.training?.symbolLimit || 3));
+    ])].slice(0, Math.min(Number(config.training?.symbolLimit || 3), minuteResources.symbolLimit));
     if (!symbols.length) continue;
     const collected = [];
     for (const symbol of symbols) {
@@ -4908,7 +4938,7 @@ async function runBackendIntradayTraining(config = {}, runtime = {}, { recordEvi
       results.push({ market, reusedModel: true, sampleCount: samples.length, reason: "no newly completed minute-bar sample" });
       continue;
     }
-    const minimumNewRows = Math.max(20, Number(process.env.BACKEND_MONITOR_INCREMENTAL_MIN_NEW_ROWS || 200));
+    const minimumNewRows = Math.max(20, Number(process.env.BACKEND_MONITOR_INCREMENTAL_MIN_NEW_ROWS || minuteResources.minimumNewRows));
     const trainingDataAsOf = String(existingModel?.trainingDataAsOf || "");
     const newRowsSinceModel = trainingDataAsOf
       ? samples.filter((sample) => String(sample.timestamp || "") > trainingDataAsOf).length
@@ -5916,6 +5946,11 @@ function normalizePredictionSample(sample, market = "ASX") {
 }
 
 function evaluatePredictionOutcome(sample, candles = [], live = {}) {
+  const rawOpenByDate = new Map((Array.isArray(candles) ? candles : []).flatMap((row) => {
+    const day = candleDate(row);
+    const open = Number(row?.open);
+    return day && Number.isFinite(open) && open > 0 ? [[day, open]] : [];
+  }));
   const rows = normalizedCandles(candles);
   if (!rows.length || sample?.outcome?.resolved) return sample;
   const startIndex = rows.findIndex((row) => row.date === sample.asOfDate);
@@ -5923,11 +5958,12 @@ function evaluatePredictionOutcome(sample, candles = [], live = {}) {
   if (anchorIndex < 0) return sample;
   const horizonDays = Number(sample.horizonDays || 15);
   let future = rows.slice(anchorIndex + 1, anchorIndex + 1 + horizonDays);
-  const entry = Number(sample.close || rows[anchorIndex].close);
   const livePrice = Number(live?.currentPrice ?? live?.close ?? sample?.currentPrice);
   const liveDate = String(live?.currentDate || live?.date || sample?.currentDate || "").slice(0, 10);
   let sameDayLiveOnly = false;
-  if (Number.isFinite(livePrice) && livePrice > 0 && liveDate && liveDate >= sample.asOfDate) {
+  // A quote is useful for an interim display, but it is not a completed OHLC
+  // path. Only an explicitly completed bar may resolve a training label.
+  if (live?.completedBar === true && Number.isFinite(livePrice) && livePrice > 0 && liveDate && liveDate >= sample.asOfDate) {
     const liveRow = { date: liveDate, open: livePrice, high: livePrice, low: livePrice, close: livePrice };
     const sameDateIndex = future.findIndex((row) => row.date === liveDate);
     if (sameDateIndex >= 0) {
@@ -5944,6 +5980,20 @@ function evaluatePredictionOutcome(sample, candles = [], live = {}) {
     }
   }
   if (!future.length) return sample;
+  const nextSessionEntry = /next[-_ ]?(session|day)|t\s*\+\s*1|次日/i.test(String(sample.labelDefinition || ""));
+  const entryRow = future[0];
+  const nextOpen = nextSessionEntry ? Number(rawOpenByDate.get(entryRow?.date)) : Number(entryRow?.open);
+  if (nextSessionEntry && (!Number.isFinite(nextOpen) || nextOpen <= 0)) {
+    return {
+      ...sample,
+      labelDataStatus: "waiting_for_next_session_open",
+      lastEvaluatedAt: new Date().toISOString(),
+    };
+  }
+  const entry = nextSessionEntry && Number.isFinite(nextOpen) && nextOpen > 0
+    ? nextOpen
+    : Number(sample.close || rows[anchorIndex].close);
+  if (!Number.isFinite(entry) || entry <= 0) return sample;
   const targetPrice = entry * (1 + Number(sample.targetUpside || 5) / 100);
   const stopPrice = entry * (1 - Math.abs(Number(sample.stopLoss || 4)) / 100);
   let hitTarget = false;
@@ -5992,6 +6042,9 @@ function evaluatePredictionOutcome(sample, candles = [], live = {}) {
   const outcome = {
     resolved: true,
     resolvedAt: new Date().toISOString(),
+    entryDate: entryRow?.date || null,
+    entryPrice: entry,
+    entryMethod: nextSessionEntry ? "next-session-open" : "signal-close",
     observedDays: future.length,
     hitTarget,
     hitStop,
@@ -7423,19 +7476,101 @@ async function updatePredictionSamples(market, incoming = [], options = {}) {
   for (const raw of incoming) {
     const sample = normalizePredictionSample(raw, key);
     if (!sample) continue;
+    const completedCandles = completedDailyCandleRows(raw.candles || [], key);
     const evaluatedExisting = [...byId.values()].map((item) => (
       item.market === sample.market && item.symbol === sample.symbol
-        ? evaluatePredictionOutcome(item, raw.candles || [], sample)
+        ? evaluatePredictionOutcome(item, completedCandles, sample)
         : item
     ));
     byId.clear();
     evaluatedExisting.forEach((item) => byId.set(item.predictionId || item.id, item));
     const predictionId = sample.predictionId || sample.id;
-    byId.set(predictionId, evaluatePredictionOutcome({ ...byId.get(predictionId), ...sample }, raw.candles || [], sample));
+    byId.set(predictionId, evaluatePredictionOutcome({ ...byId.get(predictionId), ...sample }, completedCandles, sample));
   }
   const samples = dedupePredictionSamples([...byId.values()], key);
   await writePredictionSamples(key, samples);
   return await summarizePredictionSamplesWithLocalModel(samples, key);
+}
+
+function previousWeekday(day) {
+  const parsed = new Date(`${String(day || "").slice(0, 10)}T12:00:00Z`);
+  if (!Number.isFinite(parsed.getTime())) return null;
+  do parsed.setUTCDate(parsed.getUTCDate() - 1);
+  while ([0, 6].includes(parsed.getUTCDay()));
+  return parsed.toISOString().slice(0, 10);
+}
+
+function completedDailyCandleCutoff(market = "ASX", now = new Date()) {
+  const session = backendMarketSession(market, now);
+  const local = zonedDateParts(now, session.timeZone);
+  const closeMinute = Math.max(...session.ranges.map((range) => range[1]));
+  const minute = local.hour * 60 + local.minute;
+  if (session.weekend || minute < closeMinute + 15) return previousWeekday(local.date);
+  return local.date;
+}
+
+function completedDailyCandleRows(candles = [], market = "ASX", now = new Date()) {
+  const cutoff = completedDailyCandleCutoff(market, now);
+  if (!cutoff) return [];
+  return normalizedCandles(candles).filter((row) => String(row.date || "").slice(0, 10) <= cutoff);
+}
+
+async function resolvePredictionSamplesFromDataLake(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const all = await readPredictionSamples(key);
+  const unresolved = all.filter((sample) => !isResolvedPredictionSample(sample));
+  const symbols = [...new Set(unresolved.map((sample) => normalizeMarketSymbol(sample.symbol, key)).filter(Boolean))];
+  const cutoff = completedDailyCandleCutoff(key, options.now ? new Date(options.now) : new Date());
+  if (!symbols.length || !cutoff) {
+    return { market: key, cutoff, scanned: all.length, pending: unresolved.length, resolved: 0, updated: 0, symbols: symbols.length };
+  }
+  const candlesBySymbol = new Map();
+  const batchSize = Math.max(5, Math.min(40, Number(process.env.PREDICTION_RESOLUTION_SYMBOL_BATCH || 20)));
+  let panelRows = 0;
+  for (let offset = 0; offset < symbols.length; offset += batchSize) {
+    const batchSymbols = symbols.slice(offset, offset + batchSize);
+    const panel = await runPythonQuantCore("data-lake-panel-read", {
+      market: key,
+      symbols: batchSymbols,
+      interval: "1d",
+      min_rows: 1,
+      limit: Math.max(260, Math.min(5_000, Number(options.limit || 1_500))),
+    }, Number(process.env.PREDICTION_RESOLUTION_TIMEOUT_MS || 120_000), { signal: options.signal });
+    for (const item of panel.items || []) {
+      const candles = completedDailyCandleRows(item.candles || [], key, options.now ? new Date(options.now) : new Date());
+      candlesBySymbol.set(cleanCode(item.symbol, key), candles);
+      panelRows += candles.length;
+    }
+  }
+  let resolved = 0;
+  let updated = 0;
+  let missingHistory = 0;
+  const next = all.map((sample) => {
+    if (isResolvedPredictionSample(sample)) return sample;
+    const candles = candlesBySymbol.get(cleanCode(sample.symbol, key)) || [];
+    if (!candles.length) {
+      missingHistory += 1;
+      return sample;
+    }
+    const evaluated = evaluatePredictionOutcome(sample, candles, {});
+    if (evaluated !== sample) updated += 1;
+    if (!isResolvedPredictionSample(sample) && isResolvedPredictionSample(evaluated)) resolved += 1;
+    return evaluated;
+  });
+  if (updated) await writePredictionSamples(key, next);
+  return {
+    market: key,
+    cutoff,
+    scanned: all.length,
+    pending: unresolved.length,
+    resolved,
+    updated,
+    missingHistory,
+    symbols: symbols.length,
+    panelRows,
+    symbolBatchSize: batchSize,
+    policy: "Only completed daily candles can resolve labels; next-session open is the entry for v2 labels.",
+  };
 }
 
 function backoffProvider(key, ms, reason) {
@@ -11226,11 +11361,16 @@ function newsProviderStatus() {
 function pitProviderStatus() {
   const rows = [
     { name: "sec", env: null, scope: "US filings and XBRL", historical: true },
+    { name: "alpha-vantage-listing-status", env: "ALPHAVANTAGE_API_KEY", scope: "US active/delisted listing history", historical: true },
     { name: "simfin", env: "SIMFIN_API_KEY", scope: "US as-reported statements", historical: true },
     { name: "fmp", env: "FMP_API_KEY", scope: "US delisted and symbol-change history", historical: true },
+    { name: "tiingo", env: "TIINGO_API_KEY", scope: "US historical dividends, splits and adjusted-price coverage", historical: true },
     { name: "openfigi", env: "OPENFIGI_API_KEY", scope: "current identifier validation", historical: false },
     { name: "tushare", env: "TUSHARE_TOKEN", scope: "CN filings, listing status and corporate actions", historical: true },
     { name: "eastmoney", env: null, scope: "CN publication-dated fundamentals fallback", historical: true },
+    { name: "baostock", env: null, scope: "CN historical adjustment factors and corporate-action coverage", historical: true },
+    { name: "asx-official-announcements", env: null, scope: "ASX listing, delisting and corporate-action announcements", historical: true },
+    { name: "asx-official-financial-disclosures", env: null, scope: "ASX dated annual, half-year and quarterly financial-report disclosures (event evidence, not reconstructed numeric statements)", historical: true },
     { name: "fred-alfred", env: "FRED_API_KEY", scope: "macro initial-release vintages", historical: true },
   ];
   return rows.map((row) => ({
@@ -11900,6 +12040,7 @@ async function fetchFundamentals(symbol, market = "ASX") {
     const valuation = payload?.Valuation || {};
     const value = {
       source: "eodhd-fundamentals",
+      historicalRecords: normalizeEodhdFinancialPitRecords(code, payload),
       fundamentals: {
         name: payload?.General?.Name,
         sector: payload?.General?.Sector,
@@ -11938,7 +12079,7 @@ async function fetchFundamentals(symbol, market = "ASX") {
   }
 }
 
-function asxAnnouncementRows(html) {
+function asxAnnouncementRows(html, limit = 12) {
   return [...String(html || "").matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/g)].map((match) => {
     const block = match[1];
     const cells = [...block.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)].map((cell) => cell[1]);
@@ -11954,7 +12095,225 @@ function asxAnnouncementRows(html) {
       title,
       link: href.startsWith("http") ? href : `https://www.asx.com.au${href.replace(/&amp;/g, "&")}`,
     };
-  }).filter(Boolean).slice(0, 12);
+  }).filter(Boolean).slice(0, Math.max(1, Number(limit || 12)));
+}
+
+function asxDelistedEntityRows(html) {
+  const text = String(html || "").trim();
+  let apiRows = [];
+  const jsonp = text.match(/^processDelistedCompanies\((\[[\s\S]*\])\);?$/);
+  if (jsonp) {
+    try {
+      apiRows = JSON.parse(jsonp[1]).map((row) => [row.name_full, row.code, row.delisting_date, row.reason_delisted]);
+    } catch {
+      apiRows = [];
+    }
+  }
+  const tableRows = [...text.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].map((match) => (
+    [...match[1].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((cell) => stripHtml(cell[1]))
+  ));
+  return [...apiRows, ...tableRows].flatMap((cells) => {
+    if (cells.length < 4) return [];
+    const [name, rawCode, rawDate, reason] = cells;
+    const code = String(rawCode || "").trim().toUpperCase();
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(String(rawDate || "")) ? String(rawDate) : parseAuDate(rawDate);
+    if (!/^[A-Z0-9]{2,6}$/.test(code) || !date || /^null$/i.test(name || "")) return [];
+    const availableAt = `${date}T10:00:00+10:00`;
+    return [{
+      id: `${code}:delisted:${date}`,
+      symbol: normalizeMarketSymbol(code, "ASX"),
+      exchange: "ASX",
+      name,
+      listed: false,
+      status: "delisted",
+      event_time: availableAt,
+      available_at: availableAt,
+      revision: "official-delisting-effective-date",
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityMethod: "asx-official-list-effective-date-conservative",
+      sourceProvider: "asx-official-delisted-entities",
+      reason,
+    }];
+  });
+}
+
+async function fetchAsxOfficialRecentDelistings({ force = false } = {}) {
+  const cacheName = "asx-official-recent-delistings";
+  if (!force) {
+    const cached = await readPitProviderCache(cacheName, Math.max(6 * 60 * 60_000, Number(process.env.ASX_DELISTED_CACHE_MS || 24 * 60 * 60_000)));
+    if (cached?.records?.length) return { records: cached.records, cached: true };
+  }
+  const url = "https://www.asx.com.au/asx/1/delisted-companies?callback=processDelistedCompanies";
+  const html = await fetchText(url, 20_000, { "user-agent": "GlobalQuantWatch/1.0", referer: "https://www.asx.com.au/" });
+  const records = asxDelistedEntityRows(html);
+  if (!records.length) throw new Error("ASX official delisted-entities page returned no dated rows.");
+  await writePitProviderCache(cacheName, { records, url });
+  return { records, cached: false };
+}
+
+let asxAnnouncementRequestChain = Promise.resolve();
+let asxAnnouncementNextRequestAt = 0;
+
+async function fetchAsxAnnouncementHistoryText(endpoint) {
+  const gapMs = Math.max(100, Number(process.env.ASX_PIT_ANNOUNCEMENT_INTERVAL_MS || 140));
+  const task = asxAnnouncementRequestChain.then(async () => {
+    const delay = Math.max(0, asxAnnouncementNextRequestAt - Date.now());
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    asxAnnouncementNextRequestAt = Date.now() + gapMs;
+    return fetchText(endpoint, 8_000);
+  });
+  asxAnnouncementRequestChain = task.catch(() => null);
+  return task;
+}
+
+function asxHistoricalUniverseRecords(items = [], symbol = "") {
+  const code = cleanAsxCode(symbol);
+  return (Array.isArray(items) ? items : []).flatMap((item) => {
+    const title = String(item.title || "");
+    const delisted = /removal from (?:the )?official list|removed from (?:the )?official list|delist(?:ing|ed)/i.test(title);
+    const listed = /admission to (?:the )?official list|admission and commencement of official quotation/i.test(title);
+    if (!delisted && !listed) return [];
+    const availableAt = item.available_at || item.publishedAt || item.date;
+    const parsedAt = new Date(availableAt || "");
+    const timestamp = Number.isFinite(parsedAt.getTime()) ? parsedAt.toISOString() : null;
+    if (!timestamp) return [];
+    return [{
+      id: `${code}:${delisted ? "delisted" : "listed"}:${timestamp.slice(0, 10)}`,
+      symbol: normalizeMarketSymbol(code, "ASX"),
+      exchange: "ASX",
+      listed: !delisted,
+      status: delisted ? "delisted" : "active",
+      event_time: item.event_time || timestamp,
+      available_at: timestamp,
+      revision: "asx-official-announcement",
+      historicalAvailabilityVerified: true,
+      sourceProvider: "asx-official-historical-announcements",
+      title,
+      link: item.link || null,
+    }];
+  });
+}
+
+function asxHistoricalCorporateActionRecords(items = [], symbol = "", { coverageStart, coverageEnd, complete = false } = {}) {
+  const code = cleanAsxCode(symbol);
+  const records = (Array.isArray(items) ? items : []).flatMap((item) => {
+    const title = String(item.title || "");
+    let eventType = null;
+    if (/dividend|distribution|return of capital/i.test(title)) eventType = "distribution-announcement";
+    else if (/share split|consolidation of capital|capital consolidation|bonus issue/i.test(title)) eventType = "capital-adjustment-announcement";
+    else if (/scheme of arrangement|merger implementation|change of company name|change of asx code/i.test(title)) eventType = "corporate-identity-announcement";
+    if (!eventType) return [];
+    const availableAt = item.available_at || item.publishedAt || item.date;
+    const parsedAt = new Date(availableAt || "");
+    const timestamp = Number.isFinite(parsedAt.getTime()) ? parsedAt.toISOString() : null;
+    if (!timestamp) return [];
+    return [{
+      id: `${code}:${eventType}:${timestamp.slice(0, 10)}:${String(item.id || item.link || title).slice(-80)}`,
+      event_time: item.event_time || timestamp,
+      available_at: timestamp,
+      first_seen_at: timestamp,
+      revision: "asx-official-announcement",
+      eventType,
+      title,
+      link: item.link || null,
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerificationMethod: "asx-official-announcement-published-time",
+      sourceProvider: "asx-official-historical-announcements",
+    }];
+  });
+  if (complete && coverageStart && coverageEnd) records.push({
+    id: `${code}:asx-announcement-coverage:${coverageStart}:${coverageEnd}`,
+    event_time: coverageStart,
+    available_at: coverageStart,
+    first_seen_at: new Date().toISOString(),
+    revision: "coverage-v1",
+    eventType: "coverage",
+    coverageStart,
+    coverageEnd,
+    historicalAvailabilityVerified: true,
+    historicalAvailabilityVerificationMethod: "asx-official-historical-announcement-range-query",
+    sourceProvider: "asx-official-historical-announcements",
+  });
+  return records;
+}
+
+async function fetchAsxHistoricalAnnouncementsPit(symbol, options = {}) {
+  const code = cleanAsxCode(symbol);
+  const yearCount = Math.max(1, Math.min(15, Number(options.years || process.env.ASX_PIT_ANNOUNCEMENT_YEARS || 8)));
+  const currentYear = new Date().getUTCFullYear();
+  const warnings = [];
+  const items = [];
+  for (let year = currentYear; year > currentYear - yearCount; year -= 1) {
+    const cacheName = `asx-announcements-${code}-${year}`;
+    const cached = options.force !== true
+      ? await readPitProviderCache(cacheName, Math.max(30 * 24 * 60 * 60_000, Number(process.env.ASX_PIT_ANNOUNCEMENT_CACHE_MS || 180 * 24 * 60 * 60_000)))
+      : null;
+    if (Array.isArray(cached?.records)) {
+      items.push(...cached.records);
+      continue;
+    }
+    try {
+      const endpoint = new URL("https://www.asx.com.au/asx/v2/statistics/announcements.do");
+      endpoint.searchParams.set("by", "asxCode");
+      endpoint.searchParams.set("asxCode", code);
+      endpoint.searchParams.set("timeframe", "Y");
+      endpoint.searchParams.set("year", String(year));
+      const html = await fetchAsxAnnouncementHistoryText(endpoint);
+      const records = asxAnnouncementRows(html, 250).map((item, index) => ({
+        ...item,
+        id: item.link || `${code}:${year}:${index}:${item.date}`,
+        publishedAt: item.date,
+        sourceQuality: 1,
+        relevance: 1,
+        issuerCode: code,
+      }));
+      await writePitProviderCache(cacheName, { records });
+      items.push(...records);
+    } catch (error) {
+      warnings.push(`${year}: ${error.message || String(error)}`);
+    }
+  }
+  const news = normalizePublishedPitRecords(items, { symbol: code, sourceQuality: 1 });
+  const universe = asxHistoricalUniverseRecords(news, code);
+  const coverageStart = `${currentYear - yearCount + 1}-01-01`;
+  const coverageEnd = new Date().toISOString().slice(0, 10);
+  if (warnings.length === 0) universe.push({
+    id: `${code}:asx-universe-coverage:${coverageStart}:${coverageEnd}`,
+    symbol: normalizeMarketSymbol(code, "ASX"),
+    exchange: "ASX",
+    event_time: coverageStart,
+    available_at: coverageStart,
+    first_seen_at: new Date().toISOString(),
+    revision: "coverage-v1",
+    eventType: "coverage",
+    coverageKind: "official-announcement-range-plus-observed-trading-history",
+    coverageStart,
+    coverageEnd,
+    historicalAvailabilityVerified: true,
+    historicalAvailabilityVerificationMethod: "asx-official-historical-announcement-range-query",
+    sourceProvider: "asx-official-historical-announcements",
+  });
+  const corporateActions = asxHistoricalCorporateActionRecords(news, code, {
+    coverageStart,
+    coverageEnd,
+    complete: warnings.length === 0,
+  });
+  const financialDisclosures = news.filter((record) => (
+    Number(record?.values?.earningsEvent || 0) >= 0.5
+    || /\b(annual report|half[- ]year(?:ly)? report|preliminary final report|appendix 4[de]|financial (?:statements?|results?))\b/i.test(String(record?.title || ""))
+  )).map((record) => ({
+    ...record,
+    disclosureType: "exchange-filed-financial-report",
+    historicalAvailabilityVerified: true,
+    historicalAvailabilityVerificationMethod: "asx-official-announcement-published-time",
+    values: {
+      ...(record.values || {}),
+      earningsEvent: 1,
+      sourceQuality: 1,
+      eventRelevance: Math.max(0.9, Number(record?.values?.eventRelevance || 0)),
+    },
+  }));
+  return { news, universe, corporateActions, financialDisclosures, warnings };
 }
 
 async function fetchAsxAnnouncementsFactor(symbol, market = "ASX") {
@@ -12567,7 +12926,7 @@ async function historicalBacktestForCandles({ market, symbol, candles, strategy 
     knn_window: Number(process.env.HISTORICAL_BACKTEST_KNN_WINDOW || 260),
     adaptive_labels: true,
     transaction_cost_bps: Number(process.env[`TRANSACTION_COST_BPS_${key}`] || process.env.TRANSACTION_COST_BPS || ({ US: 12, ASX: 18, CN: 20 }[key] || 18)),
-  }, Number(process.env.HISTORICAL_BACKTEST_TIMEOUT_MS || 18000));
+  }, Number(process.env.HISTORICAL_BACKTEST_TIMEOUT_MS || 60_000));
   const value = {
     ...result,
     market: key,
@@ -12890,6 +13249,12 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
       enable_sklearn_models: process.env.PRODUCTION_SKLEARN_ENABLED !== "false",
       max_model_weight: Number(trainingOptions.maxModelWeight ?? process.env.PRODUCTION_MODEL_MAX_WEIGHT ?? 0.35),
       max_residual_correlation: Number(trainingOptions.maxResidualCorrelation ?? process.env.PRODUCTION_MODEL_MAX_RESIDUAL_CORRELATION ?? 0.8),
+      tree_max_rows: Number(trainingOptions.treeMaxRows ?? process.env.PRODUCTION_TREE_MAX_ROWS ?? 40_000),
+      tree_iterations: Number(trainingOptions.treeIterations ?? process.env.PRODUCTION_TREE_ITERATIONS ?? 72),
+      tree_threads: Number(trainingOptions.treeThreads ?? process.env.PRODUCTION_TREE_THREADS ?? 2),
+      tree_class_balance: String(trainingOptions.treeClassBalance ?? process.env.PRODUCTION_TREE_CLASS_BALANCE ?? "SqrtBalanced"),
+      baseline_max_rows: Number(trainingOptions.baselineMaxRows ?? process.env.PRODUCTION_BASELINE_MAX_ROWS ?? 6_000),
+      quantile_max_rows: Number(trainingOptions.quantileMaxRows ?? process.env.PRODUCTION_QUANTILE_MAX_ROWS ?? 6_000),
       artifact_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
       checkpoint_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
       training_run_id: trainingRunId,
@@ -13002,13 +13367,19 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
   }
   const universeMetadata = await readUniverseCache(key, Number(process.env.TRAINING_UNIVERSE_CACHE_MAX_AGE_MS || 30 * 24 * 60 * 60 * 1000)).catch(() => null);
   const metadataByCode = new Map((universeMetadata?.rows || []).map((row) => [cleanCode(row.symbol || row.code, key), row]));
-  const pitPanel = await runPythonQuantCore("data-lake-pit-read", {
+  const pitPanel = productionTraining === true ? {
+    items: [],
+    rows: 0,
+    marketPointInTimeFeatures: [],
+    dataVersion: null,
+  } : await runPythonQuantCore("data-lake-pit-read", {
     market: key,
     symbols: items.map((item) => item.symbol),
     datasets: ["news", "social", "fundamentals", "macro", "corporate_actions", "universe"],
-    limit_per_symbol: Number(process.env.PRODUCTION_MODEL_PIT_ROWS_PER_SYMBOL || 2_000),
+    limit_per_symbol: Number(process.env.PRODUCTION_MODEL_PIT_ROWS_PER_SYMBOL || 600),
     broadcast_market_wide: false,
-  }, Number(process.env.DATA_LAKE_PANEL_READ_TIMEOUT_MS || 120_000), { signal }).catch(() => ({ items: [], rows: 0 }));
+    verified_only: true,
+  }, Number(process.env.DATA_LAKE_PANEL_READ_TIMEOUT_MS || 120_000), { signal });
   const pitByCode = new Map((pitPanel.items || []).map((row) => [cleanCode(row.symbol, key), row]));
   for (const item of items) {
     const code = cleanCode(item.symbol, key);
@@ -13061,9 +13432,18 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     enable_sklearn_models: process.env.PRODUCTION_SKLEARN_ENABLED !== "false",
     max_model_weight: Number(trainingOptions.maxModelWeight ?? process.env.PRODUCTION_MODEL_MAX_WEIGHT ?? 0.35),
     max_residual_correlation: Number(trainingOptions.maxResidualCorrelation ?? process.env.PRODUCTION_MODEL_MAX_RESIDUAL_CORRELATION ?? 0.8),
+    tree_max_rows: Number(trainingOptions.treeMaxRows ?? process.env.PRODUCTION_TREE_MAX_ROWS ?? 40_000),
+    tree_iterations: Number(trainingOptions.treeIterations ?? process.env.PRODUCTION_TREE_ITERATIONS ?? 72),
+    tree_threads: Number(trainingOptions.treeThreads ?? process.env.PRODUCTION_TREE_THREADS ?? 2),
+    tree_class_balance: String(trainingOptions.treeClassBalance ?? process.env.PRODUCTION_TREE_CLASS_BALANCE ?? "SqrtBalanced"),
+    baseline_max_rows: Number(trainingOptions.baselineMaxRows ?? process.env.PRODUCTION_BASELINE_MAX_ROWS ?? 6_000),
+    quantile_max_rows: Number(trainingOptions.quantileMaxRows ?? process.env.PRODUCTION_QUANTILE_MAX_ROWS ?? 6_000),
     artifact_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
     checkpoint_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
     market_point_in_time_features: pitPanel.marketPointInTimeFeatures || [],
+    load_pit_from_data_lake: productionTraining === true,
+    data_lake_root: join(snapshotBasePath, "data-lake"),
+    pit_rows_per_symbol: Number(process.env.PRODUCTION_MODEL_PIT_ROWS_PER_SYMBOL || 600),
     training_run_id: trainingRunId,
   };
   let productionModel = null;
@@ -13209,22 +13589,25 @@ const factorEvolutionScheduler = {
 };
 
 function factorEvolutionConfig() {
+  const resourceProfile = trainingResources.current().profile;
+  const factorResources = resourceProfile.factor;
   const markets = envList("FACTOR_EVOLUTION_MARKETS").length
     ? envList("FACTOR_EVOLUTION_MARKETS").map(safeMarket)
     : ["ASX", "US", "CN"];
   return {
     enabled: process.env.FACTOR_EVOLUTION_AUTO_ENABLED !== "false",
     markets: [...new Set(markets)],
-    lightIntervalMs: Math.max(24 * 60 * 60 * 1000, Number(process.env.FACTOR_EVOLUTION_LIGHT_INTERVAL_HOURS || 168) * 60 * 60 * 1000),
-    heavyIntervalMs: Math.max(7 * 24 * 60 * 60 * 1000, Number(process.env.FACTOR_EVOLUTION_HEAVY_INTERVAL_HOURS || 720) * 60 * 60 * 1000),
-    lightSymbolLimit: Math.max(1, Math.min(40, Number(process.env.FACTOR_EVOLUTION_LIGHT_SYMBOL_LIMIT || 36))),
-    heavySymbolLimit: Math.max(3, Math.min(180, Number(process.env.FACTOR_EVOLUTION_HEAVY_SYMBOL_LIMIT || process.env.HISTORICAL_BACKTEST_LARGE_SAMPLE_LIMIT || 80))),
+    resourceProfile: resourceProfile.id,
+    lightIntervalMs: Math.max(24 * 60 * 60 * 1000, Number(process.env.FACTOR_EVOLUTION_LIGHT_INTERVAL_HOURS || factorResources.lightIntervalHours) * 60 * 60 * 1000),
+    heavyIntervalMs: Math.max(7 * 24 * 60 * 60 * 1000, Number(process.env.FACTOR_EVOLUTION_HEAVY_INTERVAL_HOURS || factorResources.heavyIntervalHours) * 60 * 60 * 1000),
+    lightSymbolLimit: Math.max(1, Math.min(100, Number(process.env.FACTOR_EVOLUTION_LIGHT_SYMBOL_LIMIT || factorResources.lightSymbols))),
+    heavySymbolLimit: Math.max(3, Math.min(300, Number(process.env.FACTOR_EVOLUTION_HEAVY_SYMBOL_LIMIT || factorResources.heavySymbols))),
     range: process.env.FACTOR_EVOLUTION_RANGE || "5y",
     horizonDays: Math.max(1, Math.min(60, Number(process.env.FACTOR_EVOLUTION_HORIZON_DAYS || 5))),
     targetUpside: Number(process.env.FACTOR_EVOLUTION_TARGET_UPSIDE || 5),
     stopLoss: Number(process.env.FACTOR_EVOLUTION_STOP_LOSS || 4),
-    lightGenerations: Math.max(1, Math.min(12, Number(process.env.FACTOR_EVOLUTION_LIGHT_GENERATIONS || 6))),
-    lightPopulation: Math.max(8, Math.min(80, Number(process.env.FACTOR_EVOLUTION_LIGHT_POPULATION || 36))),
+    lightGenerations: Math.max(1, Math.min(16, Number(process.env.FACTOR_EVOLUTION_LIGHT_GENERATIONS || factorResources.generations))),
+    lightPopulation: Math.max(8, Math.min(100, Number(process.env.FACTOR_EVOLUTION_LIGHT_POPULATION || factorResources.population))),
     checkIntervalMs: Math.max(60 * 1000, Number(process.env.FACTOR_EVOLUTION_CHECK_INTERVAL_MS || 10 * 60 * 1000)),
     startupDelayMs: Math.max(0, Number(process.env.FACTOR_EVOLUTION_STARTUP_DELAY_MS || 5 * 60 * 1000)),
   };
@@ -13356,6 +13739,54 @@ async function fetchFactorEvolutionPanel(market, symbols, range) {
   return rows.filter(Boolean);
 }
 
+async function evolveAlphaFromLocalPanel(market, panel = [], options = {}) {
+  const generations = Math.max(1, Number(options.generations || 4));
+  const population = Math.max(8, Number(options.population || 24));
+  const limit = Math.max(1, Number(options.limit || 3));
+  const rows = panel.filter((item) => item.available && item.candles?.length >= 80).slice(0, limit);
+  const results = [];
+  for (const item of rows) {
+    const symbol = normalizeMarketSymbol(item.symbol, market);
+    try {
+      const result = await runPythonQuantCore("alpha-evolution", {
+        market,
+        symbol,
+        candles: sanitizeCandleRows(item.candles),
+        horizon_days: 5,
+        generations,
+        population,
+      }, Number(process.env.FACTOR_EVOLUTION_TIMEOUT_MS || 120_000));
+      const saved = await writeAlphaEvolutionModelSnapshot(market, symbol, result, {
+        mode: options.mode || "light",
+        range: options.range || "10y",
+        horizonDays: 5,
+        generations,
+        population,
+      }).catch(() => null);
+      results.push({
+        symbol,
+        available: true,
+        sampleCount: result.sample_count || result.sampleCount || item.candles.length,
+        generations: result.trajectory?.length || generations,
+        testedCandidates: result.tested_candidates || result.testedCandidates || result.best_candidates?.length || 0,
+        promotedCandidates: result.promoted_candidates || result.promotedCandidates || 0,
+        topFitness: result.best_candidates?.[0]?.fitness ?? null,
+        savedAt: saved?.savedAt || null,
+      });
+    } catch (error) {
+      results.push({ symbol, available: false, error: error.message || String(error) });
+    }
+  }
+  return {
+    framework: "quantaalpha-inspired-local-evolution",
+    attempted: rows.length,
+    completed: results.filter((row) => row.available).length,
+    failed: results.filter((row) => !row.available).length,
+    sampleCount: results.reduce((sum, row) => sum + Number(row.sampleCount || 0), 0),
+    results,
+  };
+}
+
 async function runFactorEvolutionCycle(mode = "light", options = {}) {
   const config = factorEvolutionConfig();
   if (factorEvolutionScheduler.running) {
@@ -13367,6 +13798,7 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
     };
   }
   const runMode = mode === "heavy" ? "heavy" : "light";
+  const cycleMarkets = options.market ? [safeMarket(options.market)] : config.markets;
   factorEvolutionScheduler.running = true;
   factorEvolutionScheduler.activeMode = runMode;
   factorEvolutionScheduler.lastStartedAt = new Date().toISOString();
@@ -13377,8 +13809,13 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
   }).catch(() => null);
   try {
     const marketResults = [];
+    const generations = Number(options.generations || config.lightGenerations);
+    const population = Number(options.population || config.lightPopulation);
+    const evolutionSymbolLimit = runMode === "heavy"
+      ? Math.min(8, Math.max(3, Math.ceil(config.heavySymbolLimit / 30)))
+      : Math.min(4, Math.max(2, Math.ceil(config.lightSymbolLimit / 18)));
     if (runMode === "heavy") {
-      for (const market of config.markets) {
+      for (const market of cycleMarkets) {
         const trainingUniverse = await expandTrainingSymbolsForMarket({
           market,
           symbols: [],
@@ -13391,6 +13828,13 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
           items: panel,
           horizons: [5, 15, 30],
         }).catch((error) => ({ available: false, reason: error.message || String(error) }));
+        const evolution = await evolveAlphaFromLocalPanel(market, panel, {
+          mode: runMode,
+          range: config.range,
+          generations,
+          population,
+          limit: evolutionSymbolLimit,
+        });
         marketResults.push({
           market,
           mode: runMode,
@@ -13400,11 +13844,12 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
           sampleTotal: panel.reduce((sum, row) => sum + (row.candles?.length || 0), 0),
           crossSectionalAvailable: research.available !== false,
           research,
+          evolution,
           failedSymbols: panel.filter((row) => !row.available).map((row) => ({ symbol: row.symbol, reason: row.warning || row.error || "" })),
         });
       }
     } else {
-      for (const market of config.markets) {
+      for (const market of cycleMarkets) {
         const trainingUniverse = await expandTrainingSymbolsForMarket({
           market,
           symbols: [],
@@ -13417,6 +13862,13 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
           items: symbolResults,
           horizons: [5],
         }).catch((error) => ({ available: false, reason: error.message || String(error) }));
+        const evolution = await evolveAlphaFromLocalPanel(market, symbolResults, {
+          mode: runMode,
+          range: config.range,
+          generations,
+          population,
+          limit: evolutionSymbolLimit,
+        });
         marketResults.push({
           market,
           mode: runMode,
@@ -13426,6 +13878,7 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
           availableCount: symbolResults.filter((row) => row.available).length,
           failedCount: symbolResults.filter((row) => !row.available).length,
           research,
+          evolution,
           symbols: symbolResults.map((row) => ({ symbol: row.symbol, available: row.available, rows: row.candles?.length || 0, source: row.source, reason: row.warning || row.error || "" })),
         });
       }
@@ -13437,7 +13890,7 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
       finishedAt,
       markets: marketResults,
       config: {
-        markets: config.markets,
+        markets: cycleMarkets,
         lightIntervalHours: Number((config.lightIntervalMs / 3600000).toFixed(2)),
         heavyIntervalHours: Number((config.heavyIntervalMs / 3600000).toFixed(2)),
         lightSymbolLimit: config.lightSymbolLimit,
@@ -13515,17 +13968,16 @@ async function tickFactorEvolutionScheduler(reason = "timer") {
   const lightDue = isFactorEvolutionDue(state, "light", config.lightIntervalMs);
   if (!heavyDue && !lightDue) return;
   const mode = heavyDue ? "heavy" : "light";
-  console.log(`Factor evolution scheduler running ${mode} cycle (${reason}).`);
-  runFactorEvolutionCycle(mode)
-    .then((result) => {
-      console.log(`Factor evolution ${mode} cycle finished: ${JSON.stringify({
-        markets: result.markets?.length || 0,
-        finishedAt: result.finishedAt,
-      })}`);
-    })
-    .catch((error) => {
-      console.warn(`Factor evolution ${mode} cycle failed: ${error.message || error}`);
-    });
+  console.log(`Factor evolution scheduler queued ${mode} cycle (${reason}).`);
+  return Promise.all(config.markets.map((market) => backgroundJobs.create("factor-evolution", {
+    market,
+    mode,
+    reason,
+    resourceProfile: trainingResources.current().selected,
+    limit: mode === "heavy" ? config.heavySymbolLimit : config.lightSymbolLimit,
+    generations: config.lightGenerations,
+    population: config.lightPopulation,
+  })));
 }
 
 function marketRegimeFactor(candles) {
@@ -16398,8 +16850,13 @@ function compactTrainingReviewEvidence(result = {}, evaluation = {}, context = {
       metaTestRows: model.metaTestRows,
       eventCounts: model.eventCounts,
       metrics: model.metrics,
+      directionMetrics: model.directionMetrics,
       rankingMetrics: model.rankingMetrics,
       expectedValue: model.expectedValue,
+      longTradeExpectedValue: model.longTradeExpectedValue,
+      longTradeGate: model.longTradeGate,
+      selectiveRankingHead: model.selectiveRankingHead,
+      highConfidenceFalsePositiveRiskHead: model.highConfidenceFalsePositiveRiskHead,
       leakageControl: model.leakageControl,
       foldMetrics: (model.foldMetrics || []).map((fold) => ({
         fold: fold.fold,
@@ -17411,6 +17868,10 @@ async function handleApi(req, res, url) {
         rows: value.markets?.[market] || 0,
         verifiedRows: value.verifiedMarkets?.[market] || 0,
         verifiedPct: value.verifiedMarketPct?.[market] || 0,
+        symbols: value.symbols?.[market] || 0,
+        verifiedSymbols: value.verifiedSymbols?.[market] || 0,
+        verifiedSymbolPct: value.verifiedSymbolPct?.[market] || 0,
+        trainingUniverseCoveragePct: value.trainingUniverseCoveragePct?.[market] || 0,
       }])),
       isolationAudit: lastAudit,
       quarantine: {
@@ -17418,8 +17879,96 @@ async function handleApi(req, res, url) {
         duplicateRowsRemoved: lastAudit?.duplicateRowsRemoved ?? null,
         intervalKeysMigrated: lastAudit?.intervalKeysMigrated ?? null,
       },
-      warning: "Historical-universe coverage below 100% remains an explicit survivor-bias warning; it is never presented as verified PIT coverage.",
+      warning: Number(lake.pitDatasets?.universe?.trainingUniverseCoveragePct?.[market] || 0) < 100
+        ? "Historical-universe coverage is incomplete; survivor-bias risk remains explicit and unverified rows are excluded from production OOF."
+        : null,
     });
+    return;
+  }
+
+  if (url.pathname === "/api/data-replenishment" && req.method === "GET") {
+    sendJson(res, 200, await dataReplenishmentSnapshot(marketFromUrl(url)));
+    return;
+  }
+
+  if (url.pathname === "/api/data-replenishment/run" && req.method === "POST") {
+    const payload = await readJsonBody(req);
+    const market = safeMarket(payload.market || marketFromUrl(url));
+    const scope = String(payload.scope || "all").toLowerCase();
+    const snapshot = await dataReplenishmentSnapshot(market);
+    const resources = await trainingResources.get();
+    const dataProfile = resources.profile.data || {};
+    const jobs = [];
+    if (["all", "pit"].includes(scope)) {
+      const explicitSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
+        .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+      const requestedSymbols = explicitSymbols.length
+        ? explicitSymbols
+        : prioritizedPitGapSymbols(snapshot, market, Number(dataProfile.pitBatch || 30));
+      const job = await backgroundJobs.create("pit-enrichment", {
+        market,
+        symbols: requestedSymbols,
+        limit: requestedSymbols.length || Number(dataProfile.pitBatch || 30),
+        officialHistoryLimit: requestedSymbols.length || Number(dataProfile.officialPitBatch || 15),
+        corporateActionLimit: 0,
+        forceUniverse: payload.forceUniverse === true,
+        forceHistory: payload.forceHistory === true,
+        reason: `manual-data-replenishment:${resources.selected}`,
+        resourceProfile: resources.selected,
+      });
+      jobs.push({ family: "pit", id: job.id, status: job.status });
+    }
+    if (["all", "history"].includes(scope)) {
+      const activeHistory = (snapshot.jobs.history || []).find((job) => ["queued", "running"].includes(job.status));
+      if (activeHistory) {
+        jobs.push({ family: "history", id: activeHistory.id, status: activeHistory.status, reused: true });
+      } else {
+        const historySymbols = (snapshot.history.nextSymbols || []).map((row) => row.symbol);
+        const job = await backgroundJobs.create("history-backfill", {
+          market,
+          symbols: historySymbols,
+          range: snapshot.target.range,
+          requiredRows: snapshot.target.researchRows,
+          includeDelisted: true,
+          delistedBatch: Number(dataProfile.delistedBatch || 10),
+          reason: `manual-data-replenishment:${resources.selected}`,
+          resourceProfile: resources.selected,
+        });
+        jobs.push({ family: "history", id: job.id, status: job.status });
+      }
+    }
+    if (["all", "corporate-actions", "corporate_actions"].includes(scope)) {
+      const explicitSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
+        .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+      const targetedMissing = normalizeSymbolListForMarket(
+        snapshot.pit.datasets?.corporate_actions?.missingSymbols || [],
+        market,
+      );
+      const requestedSymbols = explicitSymbols.length ? explicitSymbols : targetedMissing;
+      const defaultLimit = { ASX: 350, US: 450, CN: 550 }[market];
+      const job = await backgroundJobs.create("corporate-action-backfill", {
+        market,
+        symbols: requestedSymbols,
+        limit: requestedSymbols.length
+          || Math.max(1, Math.min(650, Number(payload.limit || defaultLimit))),
+        refreshDays: Math.max(1, Number(payload.refreshDays || 30)),
+        force: payload.force === true,
+        reason: `manual-corporate-action-replenishment:${resources.selected}`,
+        resourceProfile: resources.selected,
+      });
+      jobs.push({ family: "corporate-actions", id: job.id, status: job.status });
+    }
+    if (payload.retrainAfter === true && trainingSupervisor) {
+      const training = await trainingSupervisor.trigger({
+        market,
+        mode: resources.selected === "deep" ? "full" : "weekly",
+        reason: "data-replenishment-follow-up",
+        source: "data-replenishment-ui",
+      });
+      jobs.push({ family: "training", ...training });
+    }
+    runtimeEvents.publish("data.replenishment_queued", { market, scope, resourceProfile: resources.selected, jobs });
+    sendJson(res, 202, { market, scope, resourceProfile: resources.selected, jobs, before: snapshot });
     return;
   }
 
@@ -17569,6 +18118,82 @@ async function handleApi(req, res, url) {
       limit,
       compact: url.searchParams.get("compact") === "1",
     }));
+    return;
+  }
+
+  if (url.pathname === "/api/training-resource-profile") {
+    if (req.method === "GET") {
+      const resources = await trainingResources.get();
+      sendJson(res, 200, { ...resources, jobs: backgroundJobs.status() });
+      return;
+    }
+    if (req.method === "POST") {
+      const payload = await readJsonBody(req);
+      const resources = await trainingResources.set(payload.profile || payload.selected);
+      runtimeEvents.publish("training.resources_changed", {
+        selected: resources.selected,
+        updatedAt: resources.updatedAt,
+      });
+      sendJson(res, 200, { ...resources, jobs: backgroundJobs.status() });
+      return;
+    }
+  }
+
+  if (url.pathname === "/api/learning-families/run" && req.method === "POST") {
+    const payload = await readJsonBody(req);
+    const market = safeMarket(payload.market || marketFromUrl(url));
+    const requested = String(payload.family || "all").toLowerCase();
+    const resources = await trainingResources.get();
+    const jobs = [];
+    if (["all", "training", "calibration"].includes(requested)) {
+      if (!trainingSupervisor) throw Object.assign(new Error("Training supervisor is not initialized."), { statusCode: 503 });
+      const training = await trainingSupervisor.trigger({
+        market,
+        mode: payload.mode || "weekly",
+        reason: `manual-learning-chain:${requested}`,
+        source: "continuous-learning-ui",
+      });
+      jobs.push({ family: "training+calibration", ...training });
+    }
+    if (["all", "factor", "alpha"].includes(requested)) {
+      const factor = resources.profile.factor;
+      const evolution = await backgroundJobs.create("factor-evolution", {
+        market,
+        mode: resources.selected === "deep" ? "heavy" : "light",
+        reason: `manual-learning-chain:${requested}`,
+        resourceProfile: resources.selected,
+        limit: resources.selected === "deep" ? factor.heavySymbols : factor.lightSymbols,
+        generations: factor.generations,
+        population: factor.population,
+      });
+      jobs.push({ family: "factor+alpha", id: evolution.id, status: evolution.status });
+    }
+    if (["all", "minute"].includes(requested)) {
+      const minute = await backgroundJobs.create("training", {
+        market,
+        force: true,
+        reason: `manual-learning-chain:${requested}`,
+        resourceProfile: resources.selected,
+      });
+      jobs.push({ family: "minute", id: minute.id, status: minute.status });
+    }
+    if (["all", "agent"].includes(requested)) {
+      const replay = await backgroundJobs.create("agent-replay", {
+        market,
+        reason: `manual-learning-chain:${requested}`,
+        resourceProfile: resources.selected,
+      });
+      jobs.push({ family: "agent", id: replay.id, status: replay.status });
+    }
+    if (["all", "acceptance"].includes(requested)) {
+      const evaluation = await backgroundJobs.create("learning-evaluation", {
+        market,
+        mode: "evaluate",
+        reason: `manual-learning-chain:${requested}`,
+      });
+      jobs.push({ family: "acceptance", id: evaluation.id, status: evaluation.status });
+    }
+    sendJson(res, 202, { accepted: true, market, resourceProfile: resources.selected, jobs });
     return;
   }
 
@@ -18560,7 +19185,7 @@ backgroundJobs.register("training", async (payload, update) => {
   const config = await readBackendMonitorConfig();
   const runtime = await readBackendMonitorRuntime();
   await update(0.2, { phase: "loading-local-bars" });
-  const result = await runBackendIntradayTraining(config, runtime, { recordEvidence: false });
+  const result = await runBackendIntradayTraining(config, runtime, { recordEvidence: false, force: payload.force === true });
   await writeBackendMonitorRuntime(runtime);
   await update(0.95, { phase: "persisted-model" });
   const rows = (result?.results || []).filter((row) => String(row?.market || "").toUpperCase() === market);
@@ -18576,14 +19201,175 @@ backgroundJobs.register("training", async (payload, update) => {
 });
 backgroundJobs.register("learning-evaluation", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
-  await update(0.2, { phase: "resolving-prediction-evidence" });
-  await context.checkpoint("prediction-evidence", { market, mode: payload.mode || "evaluate" });
+  await update(0.08, { phase: "resolving-prediction-labels" });
+  const resolution = await resolvePredictionSamplesFromDataLake(market, { signal: context.signal });
+  await context.checkpoint("prediction-label-resolution", resolution);
+  await update(0.58, {
+    phase: "evaluating-resolved-predictions",
+    newlyResolved: resolution.resolved,
+    pending: Math.max(0, resolution.pending - resolution.resolved),
+    cutoff: resolution.cutoff,
+  });
   const result = await learningProgress.evaluate(market, {
     mode: payload.mode || "evaluate",
     reason: payload.reason || "scheduled-evaluation",
   });
   await update(0.95, { phase: "persisted-learning-curve" });
-  return { market, point: result.points?.at(-1) || null, champion: result.champion || null };
+  return { market, resolution, point: result.points?.at(-1) || null, champion: result.champion || null };
+});
+async function runCnCorporateActionChunks(symbols, payload, update, context) {
+  const chunkSize = Math.max(10, Math.min(100, Number(payload.chunkSize || 50)));
+  const aggregate = { available: false, market: "CN", checked: 0, skippedFresh: 0, failed: 0, inserted: 0, batches: 0, results: [] };
+  for (let offset = 0; offset < symbols.length; offset += chunkSize) {
+    if (context.signal.aborted) throw Object.assign(new Error("A-share corporate-action backfill was cancelled."), { code: "JOB_CANCELLED" });
+    const chunk = symbols.slice(offset, offset + chunkSize);
+    const result = await runPythonQuantCore("baostock-corporate-actions", {
+      project_root: root,
+      symbols: chunk,
+      start_date: payload.startDate || "2000-01-01",
+      end_date: payload.endDate || new Date().toISOString().slice(0, 10),
+      refresh_days: payload.refreshDays || 30,
+      force: payload.force === true,
+    }, Number(process.env.BAOSTOCK_ACTION_CHUNK_TIMEOUT_MS || 4 * 60_000), { signal: context.signal });
+    aggregate.available ||= result.available === true;
+    for (const key of ["checked", "skippedFresh", "failed", "inserted", "batches"]) aggregate[key] += Number(result[key] || 0);
+    aggregate.results.push(...(result.results || []));
+    const completed = Math.min(symbols.length, offset + chunk.length);
+    await context.checkpoint(`cn-corporate-action-batch-${Math.ceil(completed / chunkSize)}`, { completed, total: symbols.length });
+    await update(0.12 + completed / Math.max(1, symbols.length) * 0.84, { phase: "querying-baostock-adjustment-history", completed, total: symbols.length });
+  }
+  return aggregate;
+}
+
+backgroundJobs.register("cn-corporate-action-backfill", async (payload, update, context) => {
+  await update(0.08, { phase: "loading-cn-training-universe" });
+  const requested = normalizeSymbolListForMarket(payload.symbols || [], "CN")
+    .filter((symbol) => !cleanCode(symbol, "CN").startsWith("^"));
+  const expanded = requested.length ? null : await expandTrainingSymbolsForMarket({
+    market: "CN",
+    symbols: [],
+    limit: Math.max(1, Math.min(650, Number(payload.limit || 550))),
+    largeSample: true,
+  });
+  const universe = requested.length ? requested : expanded.trainingSymbols;
+  await context.checkpoint("cn-corporate-action-universe", { symbols: universe.length });
+  await update(0.18, { phase: "querying-baostock-adjustment-history", symbols: universe.length });
+  const result = await runCnCorporateActionChunks(universe, payload, update, context);
+  await update(0.96, { phase: "cn-corporate-action-evidence-persisted", checked: result.checked || 0, failed: result.failed || 0 });
+  return result;
+});
+backgroundJobs.register("corporate-action-backfill", async (payload, update, context) => {
+  const market = safeMarket(payload.market || "ASX");
+  const requested = normalizeSymbolListForMarket(payload.symbols || [], market)
+    .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+  const expanded = requested.length ? null : await expandTrainingSymbolsForMarket({
+    market,
+    symbols: [],
+    limit: Math.max(1, Math.min(650, Number(payload.limit || ({ ASX: 350, US: 450, CN: 550 }[market])))),
+    largeSample: true,
+  });
+  const universe = requested.length ? requested : expanded.trainingSymbols;
+  await context.checkpoint("corporate-action-universe", { market, symbols: universe.length });
+  if (market === "CN") {
+    await update(0.12, { phase: "querying-baostock-adjustment-history", symbols: universe.length });
+    const result = await runCnCorporateActionChunks(universe, payload, update, context);
+    await update(0.96, { phase: "corporate-action-evidence-persisted", checked: result.checked || 0, failed: result.failed || 0 });
+    return result;
+  }
+  if (payload.force !== true) {
+    const priorJobs = await backgroundJobs.list({ type: "pit-enrichment", market, limit: 100 });
+    const recovered = new Map();
+    for (const summary of priorJobs.jobs || []) {
+      const job = await backgroundJobs.get(summary.id);
+      if (!job) continue;
+      const selectedCount = Number(job.result?.selected || 0);
+      const actionLimit = Number(job.payload?.corporateActionLimit ?? job.payload?.officialHistoryLimit ?? 0);
+      if (job.status !== "complete" || selectedCount <= 0 || actionLimit < selectedCount || job.payload?.historicalUniverseOnly === true) continue;
+      const failed = new Set((job.result?.results || [])
+        .filter((row) => row.dataset === "corporate-actions" && row.available === false)
+        .map((row) => cleanCode(row.symbol, market)));
+      for (const row of job.result?.results || []) {
+        const symbol = normalizeMarketSymbol(row.symbol || "", market);
+        const code = cleanCode(symbol, market);
+        if (!symbol || symbol === "MARKET" || failed.has(code) || !("corporateActionRows" in row)) continue;
+        recovered.set(code, {
+          dataset: "corporate_actions",
+          market,
+          symbol,
+          source: "persisted-pit-enrichment-query-receipt",
+          records: [{
+            id: `${code}:corporate-action-query-coverage:2000-01-01`,
+            event_time: "2000-01-01",
+            available_at: "2000-01-01",
+            first_seen_at: job.updatedAt || job.createdAt || new Date().toISOString(),
+            revision: "coverage-v1",
+            eventType: "coverage",
+            coverageStart: "2000-01-01",
+            coverageEnd: String(job.updatedAt || new Date().toISOString()).slice(0, 10),
+            historicalAvailabilityVerified: true,
+            historicalAvailabilityVerificationMethod: "completed-pit-provider-range-query",
+          }],
+        });
+      }
+    }
+    if (recovered.size) {
+      await persistPitBatches([...recovered.values()], { signal: context.signal });
+      await context.checkpoint("corporate-action-query-receipts-recovered", { receipts: recovered.size });
+    }
+  }
+  const existing = payload.force === true ? { items: [] } : await runPythonQuantCore("data-lake-pit-read", {
+    market,
+    symbols: universe,
+    datasets: ["corporate_actions"],
+    limit_per_symbol: 500,
+    broadcast_market_wide: false,
+    verified_only: true,
+  }, Number(process.env.DATA_LAKE_PANEL_READ_TIMEOUT_MS || 120_000), { signal: context.signal }).catch(() => ({ items: [] }));
+  const covered = new Set((existing.items || [])
+    .filter((item) => (item.corporateActions || []).some((row) => String(row.eventType || "").toLowerCase() === "coverage"))
+    .map((item) => cleanCode(item.symbol, market)));
+  const selected = universe.filter((symbol) => !covered.has(cleanCode(symbol, market)));
+  const results = [];
+  let cursor = 0;
+  let completed = 0;
+  const concurrency = Math.max(1, Math.min(3, Number(payload.concurrency || 2)));
+  const worker = async () => {
+    while (cursor < selected.length) {
+      if (context.signal.aborted) throw Object.assign(new Error("Corporate-action backfill was cancelled."), { code: "JOB_CANCELLED" });
+      const index = cursor++;
+      const symbol = selected[index];
+      try {
+        const records = await fetchCorporateActionHistory(symbol, market);
+        await persistPitBatches([{
+          dataset: "corporate_actions",
+          market,
+          symbol,
+          source: records[0]?.sourceProvider || `verified-${market.toLowerCase()}-corporate-action-history`,
+          records,
+        }], { signal: context.signal });
+        results.push({ symbol, available: true, events: records.filter((row) => row.eventType !== "coverage").length, coverageReceipt: records.some((row) => row.eventType === "coverage") });
+      } catch (error) {
+        results.push({ symbol, available: false, error: error.message || String(error) });
+      }
+      completed += 1;
+      if (completed % 10 === 0 || completed === selected.length) {
+        await context.checkpoint(`corporate-action-batch-${Math.ceil(completed / 10)}`, { completed, total: selected.length });
+      }
+      await update(0.10 + completed / Math.max(1, selected.length) * 0.84, { phase: "corporate-action-history", symbol, completed, total: selected.length });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, selected.length)) }, worker));
+  return {
+    available: results.some((row) => row.available),
+    market,
+    universe: universe.length,
+    alreadyCovered: covered.size,
+    checked: selected.length,
+    succeeded: results.filter((row) => row.available).length,
+    failed: results.filter((row) => !row.available).length,
+    coverageReceipts: results.filter((row) => row.coverageReceipt).length,
+    results,
+  };
 });
 backgroundJobs.register("historical-backtest-symbol", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
@@ -18628,23 +19414,88 @@ backgroundJobs.register("historical-backtest-symbol", async (payload, update, co
 
 backgroundJobs.register("history-backfill", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
-  const symbols = [...new Set((payload.symbols || []).map((symbol) => normalizeMarketSymbol(symbol, market)).filter(Boolean))].slice(0, 500);
-  const results = [];
-  for (let index = 0; index < symbols.length; index += 1) {
-    if (context.signal.aborted) throw Object.assign(new Error("History backfill was cancelled."), { code: "JOB_CANCELLED" });
-    const symbol = symbols[index];
-    const item = await fetchBacktestCandlesForSymbol(symbol, market, payload.range || ({ ASX: "10y", US: "10y", CN: "8y" }[market]));
-    if (item.candles?.length) {
-      await writeMarketHistoryCache(market, symbol, payload.interval || "1d", item.candles, { source: item.source });
+  let symbols = [...new Set((payload.symbols || []).map((symbol) => normalizeMarketSymbol(symbol, market)).filter(Boolean))].slice(0, 500);
+  if (payload.includeDelisted === true) {
+    let delistedSymbols = [];
+    if (market === "ASX") {
+      const cached = await readPitProviderCache("eodhd-asx-delisted-universe", 365 * 24 * 60 * 60_000);
+      delistedSymbols = (cached?.records || []).map((record) => record.symbol);
+    } else if (market === "US") {
+      const cached = await readPitProviderCache("fmp-us-historical-universe", 365 * 24 * 60 * 60_000);
+      delistedSymbols = (cached?.records || []).filter((record) => record.listed === false).map((record) => record.symbol);
+    } else if (market === "CN") {
+      const records = await fetchTushareHistoricalUniversePit().catch(() => []);
+      delistedSymbols = records.filter((record) => record.listed === false).map((record) => record.symbol);
     }
-    results.push({ symbol, rows: item.candles?.length || 0, source: item.source, warning: item.warning || item.error || "" });
-    await context.checkpoint(`symbol-${symbol}`, { rows: item.candles?.length || 0, source: item.source });
-    await update(0.05 + (index + 1) / Math.max(1, symbols.length) * 0.9, { phase: "history-backfill", symbol, completed: index + 1, total: symbols.length });
+    const selectedDelisted = stratifiedUniverseSymbols(delistedSymbols, Math.max(0, Number(payload.delistedBatch || 10)), market);
+    symbols = normalizeSymbolListForMarket([...symbols, ...selectedDelisted], market).slice(0, 500);
   }
+  const checkpointKey = (symbol) => `symbol-${symbol}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const resultBySymbol = new Map();
+  for (const symbol of symbols) {
+    const saved = context.checkpoints?.[checkpointKey(symbol)];
+    if (!saved?.completedAt) continue;
+    resultBySymbol.set(symbol, {
+      symbol,
+      rows: Number(saved.rows || 0),
+      source: saved.source || "unavailable",
+      warning: saved.error || saved.warning || "",
+      resumedFromCheckpoint: true,
+    });
+  }
+  const pendingSymbols = symbols.filter((symbol) => !resultBySymbol.has(symbol));
+  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency || process.env.HISTORY_BACKFILL_CONCURRENCY || 3)));
+  const symbolTimeoutMs = Math.max(15_000, Math.min(180_000, Number(payload.symbolTimeoutMs || process.env.HISTORY_BACKFILL_SYMBOL_TIMEOUT_MS || 60_000)));
+  let cursor = 0;
+  let completed = resultBySymbol.size;
+  const worker = async () => {
+    while (cursor < pendingSymbols.length) {
+      if (context.signal.aborted) throw Object.assign(new Error("History backfill was cancelled."), { code: "JOB_CANCELLED" });
+      const symbol = pendingSymbols[cursor++];
+      let row;
+      try {
+        let timer = null;
+        const item = await Promise.race([
+          fetchBacktestCandlesForSymbol(symbol, market, payload.range || ({ ASX: "10y", US: "10y", CN: "8y" }[market])),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(Object.assign(
+              new Error(`History provider waterfall timed out after ${symbolTimeoutMs}ms for ${symbol}.`),
+              { code: "HISTORY_SYMBOL_TIMEOUT" },
+            )), symbolTimeoutMs);
+            timer.unref?.();
+          }),
+        ]).finally(() => { if (timer) clearTimeout(timer); });
+        if (item.candles?.length) {
+          await writeMarketHistoryCache(market, symbol, payload.interval || "1d", item.candles, { source: item.source });
+        }
+        row = { symbol, rows: item.candles?.length || 0, source: item.source, warning: item.warning || item.error || "" };
+        await context.checkpoint(`symbol-${symbol}`, { rows: row.rows, source: row.source, warning: row.warning });
+      } catch (error) {
+        row = { symbol, rows: 0, source: "unavailable", warning: error.message || String(error) };
+        await context.checkpoint(`symbol-${symbol}`, { rows: 0, source: row.source, error: row.warning });
+      }
+      resultBySymbol.set(symbol, row);
+      completed += 1;
+      await update(0.05 + completed / Math.max(1, symbols.length) * 0.9, {
+        phase: "history-backfill",
+        symbol,
+        completed,
+        total: symbols.length,
+        concurrency,
+        symbolTimeoutMs,
+        resumed: symbols.length - pendingSymbols.length,
+      });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, pendingSymbols.length)) }, worker));
+  const results = symbols.map((symbol) => resultBySymbol.get(symbol)).filter(Boolean);
   return {
     market,
     requiredRows: Number(payload.requiredRows || 0),
     complete: results.filter((row) => row.rows >= Number(payload.requiredRows || 0)).length,
+    concurrency,
+    symbolTimeoutMs,
+    resumedFromCheckpoints: results.filter((row) => row.resumedFromCheckpoint).length,
     results,
   };
 });
@@ -18689,12 +19540,27 @@ backgroundJobs.register("data-lake-migrate", async (payload, update, context) =>
   return { migratedAt: new Date().toISOString(), files: files.length, complete: results.filter((row) => !row.error && !row.skipped).length, failed: results.filter((row) => row.error).length, dataLake, results };
 });
 let secCompanyTickerMapCache = null;
+let secRequestChain = Promise.resolve();
+let secNextRequestAt = 0;
+
+async function fetchSecJson(url, timeoutMs = 25_000) {
+  const waitMs = Math.max(110, Number(process.env.SEC_REQUEST_INTERVAL_MS || 160));
+  const task = secRequestChain.then(async () => {
+    const delay = Math.max(0, secNextRequestAt - Date.now());
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    secNextRequestAt = Date.now() + waitMs;
+    return fetchJson(url, timeoutMs, {
+      "user-agent": process.env.SEC_USER_AGENT || "GlobalQuantWatch/1.0 contact@example.com",
+      "accept-encoding": "gzip, deflate",
+    });
+  });
+  secRequestChain = task.catch(() => null);
+  return task;
+}
 
 async function secCompanyTickerMap() {
   if (secCompanyTickerMapCache?.expiresAt > Date.now()) return secCompanyTickerMapCache.value;
-  const payload = await fetchJson("https://www.sec.gov/files/company_tickers.json", 15_000, {
-    "user-agent": process.env.SEC_USER_AGENT || "GlobalQuantWatch/1.0 research-client",
-  });
+  const payload = await fetchSecJson("https://www.sec.gov/files/company_tickers.json", 20_000);
   const value = new Map(Object.values(payload || {}).map((row) => [
     String(row?.ticker || "").toUpperCase(),
     String(row?.cik_str || "").padStart(10, "0"),
@@ -18708,10 +19574,9 @@ async function fetchSecHistoricalPit(symbol) {
   const tickerMap = await secCompanyTickerMap();
   const cik = tickerMap.get(code.replace(".", "-")) || tickerMap.get(code);
   if (!cik) throw new Error(`SEC CIK mapping is unavailable for ${code}.`);
-  const headers = { "user-agent": process.env.SEC_USER_AGENT || "GlobalQuantWatch/1.0 research-client" };
   const [submissions, companyFacts] = await Promise.all([
-    fetchJson(`https://data.sec.gov/submissions/CIK${cik}.json`, 20_000, headers),
-    fetchJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, 25_000, headers),
+    fetchSecJson(`https://data.sec.gov/submissions/CIK${cik}.json`, 25_000),
+    fetchSecJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, 30_000),
   ]);
   return normalizeSecPitRecords(code, submissions, companyFacts).map((record) => ({
     ...record,
@@ -18786,6 +19651,49 @@ async function writePitProviderCache(name, payload) {
   await writeFile(path, JSON.stringify({ ...payload, savedAt: new Date().toISOString() }, null, 2), "utf8");
 }
 
+function csvObjectRows(text = "") {
+  const lines = String(text || "").trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) return [];
+  const headers = parseCsvLine(lines[0]);
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    return Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ""]));
+  });
+}
+
+async function fetchAlphaVantageHistoricalUniversePit({ force = false } = {}) {
+  if (!process.env.ALPHAVANTAGE_API_KEY) throw new Error("ALPHAVANTAGE_API_KEY is not configured.");
+  const cacheName = "alphavantage-us-historical-universe";
+  const cacheMaxAgeMs = Math.max(24 * 60 * 60_000, Number(process.env.ALPHAVANTAGE_LISTING_STATUS_CACHE_MS || 7 * 24 * 60 * 60_000));
+  if (!force) {
+    const cached = await readPitProviderCache(cacheName, cacheMaxAgeMs);
+    if (cached?.records?.length) return { records: cached.records, source: "alphavantage-listing-status-cache", cached: true, warnings: [] };
+  }
+  const warnings = [];
+  const rows = [];
+  for (const state of ["active", "delisted"]) {
+    await throttleAlphaVantage();
+    const endpoint = new URL("https://www.alphavantage.co/query");
+    endpoint.searchParams.set("function", "LISTING_STATUS");
+    endpoint.searchParams.set("state", state);
+    endpoint.searchParams.set("apikey", process.env.ALPHAVANTAGE_API_KEY);
+    const text = await fetchText(endpoint, 35_000, { accept: "text/csv,text/plain,*/*" }).catch((error) => {
+      warnings.push(`Alpha Vantage ${state}: ${error.message || String(error)}`);
+      return "";
+    });
+    if (/^(\s*\{|\s*Information|\s*Note|\s*Error Message)/i.test(text)) {
+      warnings.push(`Alpha Vantage ${state}: ${String(text).slice(0, 180)}`);
+      continue;
+    }
+    rows.push(...csvObjectRows(text));
+  }
+  const records = normalizeAlphaVantageListingStatusRecords(rows);
+  const deduped = [...new Map(records.map((record) => [record.id, record])).values()];
+  if (!deduped.length) throw new Error(warnings.join(" | ") || "Alpha Vantage returned no dated listing-status records.");
+  await writePitProviderCache(cacheName, { records: deduped });
+  return { records: deduped, source: "alphavantage-listing-status-pit", cached: false, warnings };
+}
+
 async function fetchFmpHistoricalUniversePit({ force = false } = {}) {
   if (!process.env.FMP_API_KEY) throw new Error("FMP_API_KEY is not configured.");
   const cacheMaxAgeMs = Math.max(24 * 60 * 60_000, Number(process.env.FMP_UNIVERSE_CACHE_MS || 7 * 24 * 60 * 60_000));
@@ -18845,6 +19753,274 @@ async function fetchFmpCompanyUniversePit(symbol, { force = false } = {}) {
   return records;
 }
 
+async function fetchEodhdCompanyUniversePit(symbol, market) {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const ticker = eodhdTickerForCode(code, key);
+  return withProviderApiKey("eodhd", {
+    backoffKey: `eodhd-${key.toLowerCase()}-company-pit`,
+    runtimeKey: `eodhd-${key.toLowerCase()}-company-pit`,
+    backoffMs: 90 * 60_000,
+    rotateOn: (message) => /HTTP\s+(401|402|403|429)|daily API requests limit|quota|rate limit|plan|permission|forbidden|exceeded|invalid api|invalid token|unauthori[sz]ed/i.test(message),
+    label: `EODHD ${key} company history`,
+  }, async (apiKey) => {
+    const endpoint = new URL(`https://eodhd.com/api/fundamentals/${ticker}`);
+    endpoint.searchParams.set("filter", "General");
+    endpoint.searchParams.set("api_token", apiKey);
+    endpoint.searchParams.set("fmt", "json");
+    const payload = await fetchJson(endpoint, 25_000);
+    const records = normalizeEodhdCompanyUniverseRecords(code, payload, { market: key, exchange: eodhdExchangeForCode(code, key) });
+    if (!records.length) throw new Error(`EODHD returned no dated listing history for ${ticker}.`);
+    return records;
+  });
+}
+
+async function fetchEodhdCorporateActionHistory(symbol, market) {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const ticker = eodhdTickerForCode(code, key);
+  return withProviderApiKey("eodhd", {
+    backoffKey: `eodhd-${key.toLowerCase()}-corporate-actions`,
+    runtimeKey: `eodhd-${key.toLowerCase()}-corporate-actions`,
+    backoffMs: 90 * 60_000,
+    rotateOn: (message) => /HTTP\s+(401|402|403|429)|daily API requests limit|quota|rate limit|plan|permission|forbidden|exceeded|invalid api|invalid token|unauthori[sz]ed/i.test(message),
+    label: `EODHD ${key} corporate actions`,
+  }, async (apiKey) => {
+    const load = async (kind) => {
+      const endpoint = new URL(`https://eodhd.com/api/${kind}/${ticker}`);
+      endpoint.searchParams.set("from", "2000-01-01");
+      endpoint.searchParams.set("api_token", apiKey);
+      endpoint.searchParams.set("fmt", "json");
+      return fetchJson(endpoint, 25_000);
+    };
+    const settled = await Promise.allSettled([load("div"), load("splits")]);
+    const records = [
+      ...(settled[0].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[0].value, { provider: `eodhd-${key.toLowerCase()}-dividends`, eventType: "dividend" }) : []),
+      ...(settled[1].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[1].value, { provider: `eodhd-${key.toLowerCase()}-splits`, eventType: "split" }) : []),
+    ];
+    if (!records.length && settled.every((result) => result.status === "rejected")) {
+      throw new Error(settled.map((result) => result.status === "rejected" ? result.reason?.message || String(result.reason) : "").filter(Boolean).join(" | ") || `No EODHD corporate actions for ${ticker}.`);
+    }
+    if (settled.some((result) => result.status === "fulfilled")) records.push({
+      id: `${code}:eodhd-corporate-action-coverage:2000-01-01`,
+      event_time: "2000-01-01",
+      available_at: "2000-01-01",
+      first_seen_at: new Date().toISOString(),
+      revision: "coverage-v1",
+      eventType: "coverage",
+      coverageStart: "2000-01-01",
+      coverageEnd: new Date().toISOString().slice(0, 10),
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerificationMethod: "eodhd-historical-dividend-split-range-query",
+      sourceProvider: `eodhd-${key.toLowerCase()}-corporate-actions`,
+    });
+    return records;
+  });
+}
+
+async function fetchFmpCorporateActionHistory(symbol) {
+  if (!process.env.FMP_API_KEY) throw new Error("FMP_API_KEY is not configured.");
+  const code = cleanCode(symbol, "US");
+  const load = async (kind) => {
+    const endpoint = new URL(`https://financialmodelingprep.com/stable/${kind}`);
+    endpoint.searchParams.set("symbol", code);
+    endpoint.searchParams.set("apikey", process.env.FMP_API_KEY);
+    return fetchJson(endpoint, 25_000);
+  };
+  const settled = await Promise.allSettled([load("dividends"), load("splits")]);
+  const records = [
+    ...(settled[0].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[0].value, { provider: "fmp-dividends-pit", eventType: "dividend" }) : []),
+    ...(settled[1].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[1].value, { provider: "fmp-splits-pit", eventType: "split" }) : []),
+  ];
+  if (!records.length && settled.every((result) => result.status === "rejected")) {
+    throw new Error(settled.map((result) => result.status === "rejected" ? result.reason?.message || String(result.reason) : "").filter(Boolean).join(" | ") || `No FMP corporate actions for ${code}.`);
+  }
+  if (settled.some((result) => result.status === "fulfilled")) records.push({
+    id: `${code}:fmp-corporate-action-coverage:2000-01-01`,
+    event_time: "2000-01-01",
+    available_at: "2000-01-01",
+    first_seen_at: new Date().toISOString(),
+    revision: "coverage-v1",
+    eventType: "coverage",
+    coverageStart: "2000-01-01",
+    coverageEnd: new Date().toISOString().slice(0, 10),
+    historicalAvailabilityVerified: true,
+    historicalAvailabilityVerificationMethod: "fmp-historical-dividend-split-range-query",
+    sourceProvider: "fmp-corporate-actions",
+  });
+  return records;
+}
+
+async function fetchTiingoCorporateActionHistory(symbol) {
+  const code = cleanCode(symbol, "US");
+  return withProviderApiKey("tiingo", {
+    backoffKey: "tiingo-us-corporate-actions",
+    runtimeKey: "tiingo-us-corporate-actions",
+    backoffMs: 90 * 60_000,
+    rotateOn: (message) => /401|402|403|429|quota|rate limit|invalid api|invalid token|unauthori[sz]ed/i.test(message),
+    label: "Tiingo US corporate actions",
+  }, async (apiKey) => {
+    const endpoint = new URL(`https://api.tiingo.com/tiingo/daily/${encodeURIComponent(code)}/prices`);
+    endpoint.searchParams.set("startDate", "2000-01-01");
+    endpoint.searchParams.set("endDate", new Date().toISOString().slice(0, 10));
+    endpoint.searchParams.set("resampleFreq", "daily");
+    endpoint.searchParams.set("columns", "date,divCash,splitFactor");
+    endpoint.searchParams.set("token", apiKey);
+    const payload = await fetchJson(endpoint, 35_000);
+    if (!Array.isArray(payload)) throw new Error(`Tiingo returned no corporate-action history for ${code}.`);
+    const records = [];
+    for (const row of payload) {
+      const eventDate = String(row.date || "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(eventDate)) continue;
+      const dividend = Number(row.divCash || 0);
+      const splitFactor = Number(row.splitFactor || 1);
+      if (Number.isFinite(dividend) && dividend !== 0) records.push({
+        id: `${code}:tiingo-dividend:${eventDate}`,
+        event_time: eventDate,
+        available_at: eventDate,
+        first_seen_at: eventDate,
+        revision: "historical-initial",
+        eventType: "dividend",
+        amount: dividend,
+        historicalAvailabilityVerified: true,
+        historicalAvailabilityVerificationMethod: "tiingo-historical-dividend-date",
+        sourceProvider: "tiingo-us-corporate-actions",
+      });
+      if (Number.isFinite(splitFactor) && splitFactor > 0 && Math.abs(splitFactor - 1) > 1e-12) records.push({
+        id: `${code}:tiingo-split:${eventDate}`,
+        event_time: eventDate,
+        available_at: eventDate,
+        first_seen_at: eventDate,
+        revision: "historical-initial",
+        eventType: "split",
+        ratio: splitFactor,
+        historicalAvailabilityVerified: true,
+        historicalAvailabilityVerificationMethod: "tiingo-historical-split-date",
+        sourceProvider: "tiingo-us-corporate-actions",
+      });
+    }
+    records.push({
+      id: `${code}:tiingo-corporate-action-coverage:2000-01-01`,
+      event_time: "2000-01-01",
+      available_at: "2000-01-01",
+      first_seen_at: new Date().toISOString(),
+      revision: "coverage-v1",
+      eventType: "coverage",
+      coverageStart: "2000-01-01",
+      coverageEnd: new Date().toISOString().slice(0, 10),
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerificationMethod: "tiingo-historical-price-action-range-query",
+      sourceProvider: "tiingo-us-corporate-actions",
+    });
+    return records;
+  });
+}
+
+async function fetchTushareCorporateActionHistory(symbol) {
+  if (!process.env.TUSHARE_TOKEN) throw new Error("TUSHARE_TOKEN is not configured.");
+  const backoffKey = "tushare-cn-dividend-pit";
+  const blocked = providerBackoffReason(backoffKey);
+  if (blocked) throw new Error(blocked);
+  const code = cleanCode(symbol, "CN");
+  const payload = await runTushareHistoricalRequest(() => fetchJsonPost("https://api.tushare.pro", {
+    api_name: "dividend",
+    token: process.env.TUSHARE_TOKEN,
+    params: { ts_code: tushareCode(code) },
+    fields: "ts_code,end_date,ann_date,div_proc,stk_div,stk_bo_rate,stk_co_rate,cash_div_tax,cash_div,record_date,ex_date,pay_date",
+  }, 25_000), Number(process.env.TUSHARE_DIVIDEND_INTERVAL_MS || 62_000));
+  if (Number(payload?.code || 0) !== 0) {
+    const message = payload?.msg || `Tushare error ${payload?.code}`;
+    if (/5次\/天|每天|daily|quota|频率超限/i.test(message)) backoffProvider(backoffKey, 24 * 60 * 60_000, `Tushare dividend daily quota exhausted: ${message}`);
+    throw new Error(message);
+  }
+  const rows = tableRows(payload).map((row) => ({
+    ...row,
+    eventType: Number(row.stk_div || 0) > 0 ? "stock-dividend" : "cash-dividend",
+    amount: row.cash_div_tax ?? row.cash_div,
+    ratio: row.stk_div,
+  }));
+  return normalizeCorporateActionRecords(code, rows, { provider: "tushare-dividend-pit", eventType: "dividend", sourceQuality: 0.96 });
+}
+
+async function fetchCorporateActionHistory(symbol, market) {
+  const key = safeMarket(market);
+  if (key === "CN") return fetchTushareCorporateActionHistory(symbol);
+  const providers = [
+    ...(key === "US" && process.env.FMP_API_KEY ? [() => fetchFmpCorporateActionHistory(symbol)] : []),
+    ...(key === "US" && providerConfigured("tiingo") ? [() => fetchTiingoCorporateActionHistory(symbol)] : []),
+    ...(providerConfigured("eodhd") ? [() => fetchEodhdCorporateActionHistory(symbol, key)] : []),
+  ];
+  const errors = [];
+  for (const provider of providers) {
+    try {
+      const records = await provider();
+      if (records.length) return records;
+    } catch (error) {
+      errors.push(error.message || String(error));
+    }
+  }
+  throw new Error(errors.join(" | ") || `No corporate-action history provider is configured for ${symbol}.`);
+}
+
+async function fetchEodhdDelistedUniverseCandidates(market, { force = false } = {}) {
+  const key = safeMarket(market);
+  if (!providerConfigured("eodhd")) return { records: [], symbols: [], warning: "EODHD is not configured." };
+  const cacheName = `eodhd-${key.toLowerCase()}-delisted-universe`;
+  if (!force) {
+    const cached = await readPitProviderCache(cacheName, Math.max(7 * 24 * 60 * 60_000, Number(process.env.DELISTED_UNIVERSE_CACHE_MS || 30 * 24 * 60 * 60_000)));
+    if (cached?.records?.length) {
+      return {
+        records: cached.records,
+        symbols: [...new Set(cached.records.map((record) => normalizeMarketSymbol(record.symbol, key)).filter(Boolean))],
+        warning: cached.warning || "",
+        cached: true,
+      };
+    }
+  }
+  const exchanges = key === "CN" ? ["SHG", "SHE"] : [key === "ASX" ? "AU" : "US"];
+  const retrievedAt = new Date().toISOString();
+  const settled = await Promise.allSettled(exchanges.map((exchange) => withProviderApiKey("eodhd", {
+    backoffKey: `eodhd-${key.toLowerCase()}-delisted-universe`,
+    runtimeKey: `eodhd-${key.toLowerCase()}-delisted-universe`,
+    backoffMs: 6 * 60 * 60_000,
+    rotateOn: (message) => /HTTP\s+(401|402|403|429)|daily API requests limit|quota|rate limit|plan|permission|forbidden|exceeded|invalid api|invalid token|unauthori[sz]ed/i.test(message),
+    label: `EODHD ${key} delisted universe`,
+  }, async (apiKey) => {
+    const endpoint = new URL(`https://eodhd.com/api/exchange-symbol-list/${exchange}`);
+    endpoint.searchParams.set("delisted", "1");
+    endpoint.searchParams.set("type", "common_stock");
+    endpoint.searchParams.set("fmt", "json");
+    endpoint.searchParams.set("api_token", apiKey);
+    return fetchJson(endpoint, 30_000);
+  })));
+  const rows = settled.flatMap((result) => result.status === "fulfilled" && Array.isArray(result.value) ? result.value : []);
+  const records = rows.flatMap((row, index) => {
+    const symbol = cleanCode(row.Code || row.code, key);
+    if (!symbol || !isValidMarketCode(symbol, key)) return [];
+    return [{
+      id: `${key}:${symbol}:delisted-candidate:${index}`,
+      symbol,
+      name: row.Name || row.name || symbol,
+      exchange: row.Exchange || row.exchange || eodhdExchangeForCode(symbol, key),
+      listed: false,
+      status: "delisted-candidate",
+      event_time: retrievedAt,
+      available_at: retrievedAt,
+      revision: "delisted-list-without-event-date",
+      historicalAvailabilityVerified: false,
+      historicalAvailabilityUnverified: true,
+      sourceProvider: `eodhd-${key.toLowerCase()}-delisted-universe`,
+    }];
+  });
+  const result = {
+    records,
+    symbols: [...new Set(records.map((record) => normalizeMarketSymbol(record.symbol, key)))],
+    warning: settled.flatMap((result) => result.status === "rejected" ? [result.reason?.message || String(result.reason)] : []).join(" | "),
+  };
+  if (records.length) await writePitProviderCache(cacheName, result);
+  return result;
+}
+
 async function fetchOpenFigiIdentifierMappings(symbols, market) {
   if (!process.env.OPENFIGI_API_KEY) throw new Error("OPENFIGI_API_KEY is not configured.");
   const key = safeMarket(market);
@@ -18869,15 +20045,36 @@ function tushareCode(symbol) {
   return `${code}.${/^(5|6|9)/.test(code) ? "SH" : "SZ"}`;
 }
 
+let tushareHistoricalRequestChain = Promise.resolve();
+let tushareHistoricalNextRequestAt = 0;
+
+async function runTushareHistoricalRequest(task, minimumIntervalMs = 650) {
+  const queued = tushareHistoricalRequestChain.then(async () => {
+    const delay = Math.max(0, tushareHistoricalNextRequestAt - Date.now());
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    tushareHistoricalNextRequestAt = Date.now() + Math.max(250, Number(minimumIntervalMs || 650));
+    return task();
+  });
+  tushareHistoricalRequestChain = queued.catch(() => null);
+  return queued;
+}
+
 async function fetchTushareHistoricalPit(symbol) {
   if (!process.env.TUSHARE_TOKEN) throw new Error("TUSHARE_TOKEN is not configured.");
+  const backoffKey = "tushare-cn-fina-indicator-pit";
+  const blocked = providerBackoffReason(backoffKey);
+  if (blocked) throw new Error(blocked);
   const payload = await fetchJsonPost("https://api.tushare.pro", {
     api_name: "fina_indicator",
     token: process.env.TUSHARE_TOKEN,
     params: { ts_code: tushareCode(symbol) },
     fields: "ts_code,ann_date,end_date,eps,dt_eps,total_revenue_ps,revenue_ps,capital_rese_ps,surplus_rese_ps,undist_profit_ps,extra_item,profit_dedt,gross_margin,current_ratio,quick_ratio,cash_ratio,invturn_days,arturn_days,inv_turn,ar_turn,ca_turn,fa_turn,assets_turn,op_income,valuechange_income,interst_income,daa,ebit,ebitda,fcff,fcfe,current_exint,noncurrent_exint,interestdebt,netdebt,tangible_asset,working_capital,networking_capital,invest_capital,retained_earnings,diluted2_eps,bps,ocfps,retainedps,cfps,ebit_ps,fcff_ps,fcfe_ps,netprofit_margin,grossprofit_margin,cogs_of_sales,expense_of_sales,profit_to_gr,op_of_gr,q_opincome,q_investincome,q_dtprofit,roe,roe_waa,roe_dt,roa,npta,roic,roe_yearly,roa2_yearly,debt_to_assets,assets_to_eqt,dp_assets_to_eqt,ca_to_assets,nca_to_assets,tbassets_to_totalassets,int_to_talcap,eqt_to_talcapital,currentdebt_to_debt,longdeb_to_debt,ocf_to_shortdebt,debt_to_eqt,eqt_to_debt,eqt_to_interestdebt,tangibleasset_to_debt,tangasset_to_intdebt,tangibleasset_to_netdebt,ocf_to_debt,ocf_to_interestdebt,ocf_to_netdebt,ebit_to_interest,or_yoy,op_yoy,ebt_yoy,netprofit_yoy,dt_netprofit_yoy,ocf_yoy,roe_yoy,bps_yoy,assets_yoy,eqt_yoy,tr_yoy,or_qoq,netprofit_qoq,update_flag",
   }, 20_000);
-  if (Number(payload?.code || 0) !== 0) throw new Error(payload?.msg || `Tushare error ${payload?.code}`);
+  if (Number(payload?.code || 0) !== 0) {
+    const message = payload?.msg || `Tushare error ${payload?.code}`;
+    if (/没有接口|权限|permission|频率超限|quota/i.test(message)) backoffProvider(backoffKey, 24 * 60 * 60_000, `Tushare fina_indicator unavailable: ${message}`);
+    throw new Error(message);
+  }
   return normalizeTusharePitRecords(cleanCode(symbol, "CN"), payload);
 }
 
@@ -18918,20 +20115,51 @@ async function fetchCnHistoricalPit(symbol) {
 
 async function fetchTushareHistoricalUniversePit() {
   if (!process.env.TUSHARE_TOKEN) return [];
-  const responses = await Promise.allSettled(["L", "D", "P"].map((listStatus) => fetchJsonPost("https://api.tushare.pro", {
-    api_name: "stock_basic",
-    token: process.env.TUSHARE_TOKEN,
-    params: { list_status: listStatus },
-    fields: "ts_code,symbol,name,exchange,list_status,list_date,delist_date",
-  }, 20_000)));
-  return responses.flatMap((result) => result.status === "fulfilled" ? normalizeTushareUniverseRecords(result.value) : []);
+  const cacheName = "tushare-cn-historical-universe";
+  const cached = await readPitProviderCache(cacheName, Math.max(24 * 60 * 60_000, Number(process.env.TUSHARE_UNIVERSE_CACHE_MS || 7 * 24 * 60 * 60_000)));
+  if (cached?.records?.length) return cached.records;
+  const responses = [];
+  const warnings = [];
+  for (const listStatus of ["L", "D", "P"]) {
+    try {
+      const payload = await runTushareHistoricalRequest(() => fetchJsonPost("https://api.tushare.pro", {
+        api_name: "stock_basic",
+        token: process.env.TUSHARE_TOKEN,
+        params: { list_status: listStatus },
+        fields: "ts_code,symbol,name,exchange,list_status,list_date,delist_date",
+      }, 20_000), Number(process.env.TUSHARE_STOCK_BASIC_INTERVAL_MS || 62_000));
+      if (Number(payload?.code || 0) !== 0) throw new Error(payload?.msg || `Tushare stock_basic error ${payload?.code}`);
+      responses.push(...normalizeTushareUniverseRecords(payload));
+    } catch (error) {
+      warnings.push(`Tushare ${listStatus} historical universe failed: ${error.message || String(error)}`);
+    }
+  }
+  if (!responses.length) throw new Error(warnings.join(" | ") || "Tushare returned no historical universe records.");
+  await writePitProviderCache(cacheName, { records: responses, warnings });
+  return responses;
 }
 
 const PIT_MACRO_SERIES = Object.freeze({
-  US: ["FEDFUNDS", "CPIAUCSL", "UNRATE", "GDP"],
-  ASX: ["FEDFUNDS", "IRSTCI01AUM156N", "CPALTT01AUM657N", "LRUNTTTTAUM156S"],
-  CN: ["FEDFUNDS", "IRSTCI01CNM156N", "CPALTT01CNM659N", "LRUNTTTTCNM156S"],
+  US: [
+    "FEDFUNDS", "DGS10", "T10Y2Y", "CPIAUCSL", "UNRATE", "GDP",
+    "VIXCLS", "BAMLC0A0CM", "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
+  ],
+  ASX: [
+    "FEDFUNDS", "DGS10", "T10Y2Y", "IRSTCI01AUM156N", "IRLTLT01AUM156N",
+    "CPALTT01AUM657N", "CPALTT01AUQ659N", "LRUNTTTTAUM156S", "AUSGDPRQPSMEI",
+    "VIXCLS", "BAMLC0A0CM",
+    "DEXUSAL", "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
+  ],
+  CN: [
+    "FEDFUNDS", "DGS10", "T10Y2Y", "IRSTCI01CNM156N", "CPALTT01CNM659N",
+    "LRUNTTTTCNM156S", "VIXCLS", "BAMLC0A0CM", "DEXCHUS",
+    "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
+  ],
 });
+
+const CONSERVATIVE_MARKET_MACRO_SERIES = new Set([
+  "DGS10", "T10Y2Y", "VIXCLS", "DEXUSAL", "DEXCHUS", "GOLDAMGBD228NLBM",
+]);
 
 async function fetchFredHistoricalPit(market) {
   if (!process.env.FRED_API_KEY) return [];
@@ -18943,8 +20171,22 @@ async function fetchFredHistoricalPit(market) {
     endpoint.searchParams.set("realtime_start", "1776-07-04");
     endpoint.searchParams.set("realtime_end", "9999-12-31");
     endpoint.searchParams.set("output_type", "4");
-    const value = await fetchJson(endpoint, 20_000);
-    return normalizeFredVintageRecords(seriesId, value.observations || []);
+    try {
+      const value = await fetchJson(endpoint, 20_000);
+      const rows = normalizeFredVintageRecords(seriesId, value.observations || []);
+      if (rows.length || !CONSERVATIVE_MARKET_MACRO_SERIES.has(seriesId)) return rows;
+    } catch (error) {
+      if (!CONSERVATIVE_MARKET_MACRO_SERIES.has(seriesId)) throw error;
+    }
+    const marketEndpoint = new URL("https://api.stlouisfed.org/fred/series/observations");
+    marketEndpoint.searchParams.set("series_id", seriesId);
+    marketEndpoint.searchParams.set("api_key", process.env.FRED_API_KEY);
+    marketEndpoint.searchParams.set("file_type", "json");
+    marketEndpoint.searchParams.set("observation_start", "1990-01-01");
+    marketEndpoint.searchParams.set("sort_order", "asc");
+    marketEndpoint.searchParams.set("limit", "100000");
+    const current = await fetchJson(marketEndpoint, 20_000);
+    return normalizeFredVintageRecords(seriesId, current.observations || [], { conservativeMarketClose: true });
   }));
   return results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
 }
@@ -18964,22 +20206,295 @@ async function pitUniverseWithFallback(market, force = false) {
   }
 }
 
+const DATA_REPLENISHMENT_TARGETS = Object.freeze({
+  ASX: Object.freeze({ symbols: 350, researchRows: 750, deepHistoryRows: 2_200, range: "10y" }),
+  US: Object.freeze({ symbols: 450, researchRows: 750, deepHistoryRows: 2_000, range: "10y" }),
+  CN: Object.freeze({ symbols: 550, researchRows: 750, deepHistoryRows: 1_800, range: "8y" }),
+});
+
+async function exactTrainingPitCoverage(market, symbols = []) {
+  const key = safeMarket(market);
+  const requested = normalizeSymbolListForMarket(symbols, key);
+  const denominator = requested.length;
+  const names = ["universe", "corporate_actions", "fundamentals", "financial_disclosures", "news"];
+  const buckets = Object.fromEntries(names.map((name) => [name, new Set()]));
+  if (!denominator) return Object.fromEntries(names.map((name) => [name, { verifiedSymbols: 0, trainingUniverseCoveragePct: 0, exact: true }]));
+  const panel = await runPythonQuantCore("data-lake-pit-read", {
+    market: key,
+    symbols: requested,
+    datasets: names,
+    limit_per_symbol: 24,
+    broadcast_market_wide: false,
+    verified_only: true,
+  }, Number(process.env.DATA_REPLENISHMENT_EXACT_PIT_TIMEOUT_MS || 180_000)).catch(() => ({ items: [] }));
+  for (const item of panel.items || []) {
+    const code = cleanCode(item.symbol, key);
+    if (!code) continue;
+    for (const feature of item.pointInTimeFeatures || []) {
+      if (buckets[feature.dataset]) buckets[feature.dataset].add(code);
+    }
+    if ((item.universeHistory || []).some((row) => row.historicalAvailabilityVerified === true)) buckets.universe.add(code);
+    if ((item.corporateActions || []).some((row) => row.historicalAvailabilityVerified === true)) buckets.corporate_actions.add(code);
+  }
+  return Object.fromEntries(names.map((name) => [name, {
+    verifiedSymbols: buckets[name].size,
+    trainingUniverseCoveragePct: Number((buckets[name].size / denominator * 100).toFixed(4)),
+    denominator,
+    exact: true,
+    missingSymbols: requested.filter((symbol) => !buckets[name].has(cleanCode(symbol, key))),
+  }]));
+}
+
+function prioritizedPitGapSymbols(snapshot = {}, market = "ASX", limit = 30) {
+  const key = safeMarket(market);
+  const names = key === "ASX"
+    ? ["universe", "financial_disclosures", "news"]
+    : ["universe", "fundamentals", "news"];
+  const scores = new Map();
+  for (const [priority, name] of names.entries()) {
+    for (const symbol of snapshot.pit?.datasets?.[name]?.missingSymbols || []) {
+      const normalized = normalizeMarketSymbol(symbol, key);
+      if (!normalized) continue;
+      const current = scores.get(normalized) || { score: 0, first: priority };
+      current.score += 1;
+      current.first = Math.min(current.first, priority);
+      scores.set(normalized, current);
+    }
+  }
+  return [...scores.entries()]
+    .sort((left, right) => right[1].score - left[1].score || left[1].first - right[1].first || left[0].localeCompare(right[0]))
+    .slice(0, Math.max(1, Number(limit || 30)))
+    .map(([symbol]) => symbol);
+}
+
+function firstStageDataReadiness(snapshot = {}) {
+  const market = safeMarket(snapshot.market || "ASX");
+  const target = snapshot.target || {};
+  const universe = snapshot.universe || {};
+  const history = snapshot.history || {};
+  const datasets = snapshot.pit?.datasets || {};
+  const ratio = (value, required) => required > 0 ? Math.max(0, Math.min(1, Number(value || 0) / required)) : 0;
+  const coverage = (name) => Math.max(0, Math.min(100, Number(datasets[name]?.trainingUniverseCoveragePct || 0)));
+  const numericFundamentalCoverage = coverage("fundamentals");
+  const financialDisclosureCoverage = coverage("financial_disclosures");
+  const financialPitCoverage = market === "ASX"
+    ? Math.max(numericFundamentalCoverage, financialDisclosureCoverage)
+    : numericFundamentalCoverage;
+  const financialDataset = market === "ASX" && financialDisclosureCoverage >= numericFundamentalCoverage
+    ? "financial_disclosures"
+    : "fundamentals";
+  const gates = {
+    universe: {
+      label: "训练股票池",
+      actual: Number(universe.selected || 0),
+      required: Number(target.symbols || 0),
+      passed: Number(universe.selected || 0) >= Number(target.symbols || 0),
+    },
+    researchHistory: {
+      label: "至少750根研究历史",
+      actual: Number(history.researchReadySymbols || 0),
+      required: Math.ceil(Number(target.symbols || 0) * 0.8),
+      passed: ratio(history.researchReadySymbols, target.symbols) >= 0.8,
+    },
+    deepHistory: {
+      label: "市场目标深历史",
+      actual: Number(history.deepHistorySymbols || 0),
+      required: Math.ceil(Number(target.symbols || 0) * 0.5),
+      passed: ratio(history.deepHistorySymbols, target.symbols) >= 0.5,
+    },
+    historicalUniverse: {
+      label: "历史股票池PIT覆盖",
+      actual: coverage("universe"),
+      required: 80,
+      passed: coverage("universe") >= 80,
+    },
+    corporateActions: {
+      label: "公司行动PIT覆盖",
+      actual: coverage("corporate_actions"),
+      required: 95,
+      passed: coverage("corporate_actions") >= 95,
+    },
+    fundamentals: {
+      label: market === "ASX" ? "官方财务披露PIT覆盖" : "历史财务PIT覆盖",
+      actual: financialPitCoverage,
+      required: 80,
+      passed: financialPitCoverage >= 80,
+      dataset: financialDataset,
+      numericCoverage: numericFundamentalCoverage,
+      disclosureCoverage: financialDisclosureCoverage,
+    },
+    events: {
+      label: "公司事件PIT覆盖",
+      actual: coverage("news"),
+      required: 80,
+      passed: coverage("news") >= 80,
+    },
+  };
+  const progressWeights = {
+    universe: 0.1,
+    researchHistory: 0.2,
+    deepHistory: 0.1,
+    historicalUniverse: 0.15,
+    corporateActions: 0.15,
+    fundamentals: 0.2,
+    events: 0.1,
+  };
+  const progressPct = Object.entries(gates).reduce((sum, [key, gate]) => (
+    sum + Math.min(1, Number(gate.actual || 0) / Math.max(1, Number(gate.required || 1))) * progressWeights[key]
+  ), 0) * 100;
+  const blockers = Object.entries(gates)
+    .filter(([, gate]) => !gate.passed)
+    .map(([id, gate]) => ({ id, label: gate.label, actual: gate.actual, required: gate.required }));
+  return {
+    stage: "stage-one-data",
+    met: blockers.length === 0,
+    progressPct: Number(progressPct.toFixed(2)),
+    gates,
+    blockers,
+    nextAction: blockers.some((row) => ["researchHistory", "deepHistory"].includes(row.id))
+      ? "history-backfill"
+      : blockers.some((row) => row.id === "historicalUniverse")
+        ? "pit-enrichment"
+      : blockers.some((row) => row.id === "corporateActions")
+        ? "corporate-action-backfill"
+        : blockers.length ? "pit-enrichment" : "strict-oof-challenger",
+    note: market === "ASX"
+      ? "ASX stage one accepts dated official financial-report disclosures as event evidence; it does not claim structured numeric statements. Model promotion still requires strict OOF, calibration, Top-K and cost gates."
+      : "Data readiness and model evidence are separate. Passing this stage never promotes a model without strict OOF, calibration, Top-K and cost gates.",
+  };
+}
+
+async function dataReplenishmentSnapshot(market = "ASX") {
+  const key = safeMarket(market);
+  const target = DATA_REPLENISHMENT_TARGETS[key];
+  const [resources, lake, universe, pitState, historyJobs, pitJobs] = await Promise.all([
+    trainingResources.get(),
+    runPythonQuantCore("data-lake-summary", { market: key }, 60_000).catch((error) => ({ available: false, items: [], pitDatasets: {}, error: error.message || String(error) })),
+    pitUniverseWithFallback(key, false),
+    readFile(join(snapshotBasePath, "data-lake", "pit-enrichment-state.json"), "utf8").then(JSON.parse).catch(() => ({ cursors: {} })),
+    backgroundJobs.list({ type: "history-backfill", market: key, limit: 5 }),
+    backgroundJobs.list({ type: "pit-enrichment", market: key, limit: 5 }),
+  ]);
+  const dailyRows = new Map((lake.items || [])
+    .filter((row) => row.market === key && row.interval === "1d")
+    .map((row) => [cleanCode(row.symbol, key), Number(row.rows || 0)]));
+  const activeUniverse = normalizeSymbolListForMarket((universe.rows || [])
+    .filter((row) => trainingEligibleUniverseRow(row, key))
+    .map((row) => row.symbol), key);
+  const broad = stratifiedUniverseSymbols(activeUniverse, target.symbols, key);
+  const targetSymbols = normalizeSymbolListForMarket([
+    ...(TRAINING_UNIVERSES[key] || []),
+    ...broad,
+  ], key).slice(0, target.symbols);
+  const exactPitCoverage = await exactTrainingPitCoverage(key, targetSymbols);
+  const historyCandidates = targetSymbols
+    .map((symbol, order) => ({ symbol, order, rows: dailyRows.get(cleanCode(symbol, key)) || 0 }))
+    .filter((row) => row.rows < target.deepHistoryRows)
+    .sort((left, right) => left.rows - right.rows || left.order - right.order);
+  const datasets = Object.fromEntries(Object.entries(lake.pitDatasets || {}).map(([name, value]) => [name, {
+    rows: Number(value.markets?.[key] || 0),
+    verifiedRows: Number(value.verifiedMarkets?.[key] || 0),
+    verifiedPct: Number(value.verifiedMarketPct?.[key] || 0),
+    symbols: Number(value.symbols?.[key] || 0),
+    verifiedSymbols: Number(value.verifiedSymbols?.[key] || 0),
+    verifiedSymbolPct: Number(value.verifiedSymbolPct?.[key] || 0),
+    trainingUniverseCoveragePct: Number(value.trainingUniverseCoveragePct?.[key] || 0),
+  }]));
+  for (const [name, exact] of Object.entries(exactPitCoverage)) {
+    datasets[name] = { ...(datasets[name] || {}), ...exact };
+  }
+  const pitCoverage = (dataset) => Number(datasets[dataset]?.trainingUniverseCoveragePct || 0);
+  const dataProfile = resources.profile.data || {};
+  const snapshot = {
+    market: key,
+    generatedAt: new Date().toISOString(),
+    resourceProfile: resources.selected,
+    target,
+    universe: {
+      source: universe.source || "configured-universe",
+      available: activeUniverse.length,
+      target: target.symbols,
+      selected: targetSymbols.length,
+    },
+    history: {
+      partitions: dailyRows.size,
+      researchReadySymbols: targetSymbols.filter((symbol) => (dailyRows.get(cleanCode(symbol, key)) || 0) >= target.researchRows).length,
+      deepHistorySymbols: targetSymbols.filter((symbol) => (dailyRows.get(cleanCode(symbol, key)) || 0) >= target.deepHistoryRows).length,
+      missingOrShort: historyCandidates.length,
+      nextSymbols: historyCandidates.slice(0, Number(dataProfile.historyBatch || 30)),
+    },
+    pit: {
+      datasets,
+      cursor: Number(pitState.cursors?.[key] || 0),
+      nextBatch: Number(dataProfile.pitBatch || 30),
+      officialBatch: Number(dataProfile.officialPitBatch || 15),
+    },
+    jobs: {
+      history: historyJobs.jobs || [],
+      pit: pitJobs.jobs || [],
+    },
+    blockers: [
+      targetSymbols.length < target.symbols ? `股票池 ${targetSymbols.length}/${target.symbols}` : null,
+      historyCandidates.length ? `${historyCandidates.length} 只股票历史不足 ${target.deepHistoryRows} 根` : null,
+      pitCoverage("universe") < 80 ? `历史可交易股票池PIT ${pitCoverage("universe").toFixed(1)}%` : null,
+      pitCoverage("corporate_actions") < 95 ? `公司行动PIT ${pitCoverage("corporate_actions").toFixed(1)}%` : null,
+      (key === "ASX" ? Math.max(pitCoverage("fundamentals"), pitCoverage("financial_disclosures")) : pitCoverage("fundamentals")) < 80
+        ? `${key === "ASX" ? "官方财务披露PIT" : "历史财务PIT"} ${(key === "ASX" ? Math.max(pitCoverage("fundamentals"), pitCoverage("financial_disclosures")) : pitCoverage("fundamentals")).toFixed(1)}%`
+        : null,
+      pitCoverage("news") < 80 ? `公司事件PIT ${pitCoverage("news").toFixed(1)}%` : null,
+    ].filter(Boolean),
+    note: "监控股只决定重点刷新；市场训练池、退市候选、历史行情与PIT事件由后台独立补齐。未验证的退市日期只用于研究抽样，不进入正式PIT门控。",
+  };
+  snapshot.stageOne = firstStageDataReadiness(snapshot);
+  return snapshot;
+}
+
 backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
-  const limit = Math.max(1, Math.min(60, Number(payload.limit || process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60)));
+  const limit = Math.max(1, Math.min(650, Number(payload.limit || process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60)));
   await update(0.02, { phase: "loading-point-in-time-universe", market });
   const universe = await pitUniverseWithFallback(market, payload.forceUniverse === true);
   const requestedSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
     .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
-  const candidates = requestedSymbols.length ? requestedSymbols : normalizeSymbolListForMarket([
-    ...(TRAINING_UNIVERSES[market] || []),
-    ...stratifiedUniverseSymbols((universe.rows || []).map((row) => row.symbol), Math.max(limit * 8, 160), market),
-  ], market).filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+  const eligibleUniverseSymbols = (universe.rows || [])
+    .filter((row) => trainingEligibleUniverseRow(row, market))
+    .map((row) => row.symbol);
+  const historicalCandidateRows = market === "ASX" && payload.historicalUniverseOnly === true
+    ? await readPitProviderCache("eodhd-asx-delisted-universe", 365 * 24 * 60 * 60_000)
+    : null;
+  const historicalCandidateSymbols = normalizeSymbolListForMarket(
+    (historicalCandidateRows?.records || []).map((record) => record.symbol),
+    market,
+  );
+  const candidates = requestedSymbols.length
+    ? requestedSymbols
+    : payload.historicalUniverseOnly === true
+      ? stratifiedUniverseSymbols(historicalCandidateSymbols, Math.max(limit * 3, limit), market)
+      : normalizeSymbolListForMarket([
+        ...(TRAINING_UNIVERSES[market] || []),
+        ...stratifiedUniverseSymbols(eligibleUniverseSymbols, Math.max(limit * 8, 160), market),
+      ], market).filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
   const statePath = join(snapshotBasePath, "data-lake", "pit-enrichment-state.json");
   const state = await readFile(statePath, "utf8").then(JSON.parse).catch(() => ({ cursors: {} }));
   state.cursors ||= {};
   const start = requestedSymbols.length ? 0 : Math.max(0, Number(state.cursors[market] || 0)) % Math.max(1, candidates.length);
-  const selected = Array.from({ length: Math.min(limit, candidates.length) }, (_, index) => candidates[(start + index) % candidates.length]);
+  const verifiedPit = requestedSymbols.length ? { items: [] } : await runPythonQuantCore("data-lake-pit-read", {
+    market,
+    symbols: candidates,
+    datasets: ["news", "fundamentals", "financial_disclosures"],
+    limit_per_symbol: 1,
+    broadcast_market_wide: false,
+    verified_only: true,
+  }, Number(process.env.DATA_LAKE_PANEL_READ_TIMEOUT_MS || 120_000), { signal: context.signal }).catch(() => ({ items: [] }));
+  const symbolsWithVerifiedPit = new Set((verifiedPit.items || [])
+    .filter((item) => (item.pointInTimeFeatures || []).length > 0)
+    .map((item) => cleanCode(item.symbol, market)));
+  const missingVerifiedPit = candidates.filter((symbol) => !symbolsWithVerifiedPit.has(cleanCode(symbol, market)));
+  const selected = requestedSymbols.length
+    ? requestedSymbols.slice(0, limit)
+    : missingVerifiedPit.length
+      ? missingVerifiedPit.slice(0, limit)
+      : Array.from({ length: Math.min(limit, candidates.length) }, (_, index) => candidates[(start + index) % candidates.length]);
   const results = [];
   let historicalUniverseRecords = [];
   let historicalUniverseSource = "";
@@ -18990,14 +20505,60 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
     });
     historicalUniverseSource = "tushare-historical-listing-status";
   } else if (market === "US") {
-    const fmpUniverse = await fetchFmpHistoricalUniversePit({ force: payload.forceUniverse === true }).catch((error) => {
-      results.push({ symbol: "MARKET", dataset: "universe", available: false, error: error.message || String(error) });
-      return null;
+    const providers = await Promise.allSettled([
+      fetchFmpHistoricalUniversePit({ force: payload.forceUniverse === true }),
+      fetchAlphaVantageHistoricalUniversePit({ force: payload.forceUniverse === true }),
+    ]);
+    const availableProviders = providers.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    historicalUniverseRecords = [...new Map(availableProviders.flatMap((provider) => provider.records || []).map((record) => [record.id, record])).values()];
+    historicalUniverseSource = availableProviders.map((provider) => provider.source).filter(Boolean).join("+") || "us-historical-universe-pit";
+    const warnings = [
+      ...providers.flatMap((result) => result.status === "rejected" ? [result.reason?.message || String(result.reason)] : []),
+      ...availableProviders.flatMap((provider) => provider.warnings || []),
+    ];
+    if (warnings.length) results.push({ symbol: "MARKET", dataset: "universe", available: historicalUniverseRecords.length > 0, warning: warnings.join(" | ") });
+  }
+  if (market === "ASX") {
+    const officialDelistings = await fetchAsxOfficialRecentDelistings({ force: payload.forceUniverse === true }).catch((error) => {
+      results.push({ symbol: "MARKET", dataset: "official-delistings", available: false, error: error.message || String(error) });
+      return { records: [] };
     });
-    historicalUniverseRecords = fmpUniverse?.records || [];
-    historicalUniverseSource = fmpUniverse?.source || "fmp-historical-universe-pit";
-    if (fmpUniverse?.warnings?.length) {
-      results.push({ symbol: "MARKET", dataset: "universe", available: true, warning: fmpUniverse.warnings.join(" | ") });
+    if (officialDelistings.records.length) {
+      await persistPitBatches([{
+        dataset: "universe",
+        market,
+        symbol: "MARKET",
+        source: "asx-official-delisted-entities",
+        records: officialDelistings.records,
+      }], { signal: context.signal });
+      results.push({
+        symbol: "MARKET",
+        dataset: "official-delistings",
+        available: true,
+        rows: officialDelistings.records.length,
+        cached: officialDelistings.cached,
+        historicalAvailabilityVerified: true,
+      });
+    }
+    const delisted = await fetchEodhdDelistedUniverseCandidates(market).catch((error) => ({ records: [], symbols: [], warning: error.message || String(error) }));
+    if (delisted.records.length) {
+      await persistPitBatches([{
+        dataset: "universe",
+        market,
+        symbol: "MARKET",
+        source: "eodhd-asx-delisted-universe-unverified-date",
+        records: delisted.records,
+      }], { signal: context.signal });
+      results.push({
+        symbol: "MARKET",
+        dataset: "delisted-universe-candidates",
+        available: true,
+        rows: delisted.records.length,
+        historicalAvailabilityVerified: false,
+        warning: "Delisted symbols improve survivor-bias sampling, but remain excluded from verified PIT membership until exact delisting dates are available.",
+      });
+    } else if (delisted.warning) {
+      results.push({ symbol: "MARKET", dataset: "delisted-universe-candidates", available: false, error: delisted.warning });
     }
   }
   if (historicalUniverseRecords.length) {
@@ -19041,7 +20602,14 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
     }], { signal: context.signal });
     results.push({ symbol: "MARKET", dataset: "macro", available: true, rows: macroRecords.length });
   }
-  const officialHistoryLimit = Math.max(1, Math.min(selected.length, Number(process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 20)));
+  const officialHistoryLimit = Math.max(1, Math.min(selected.length, Number(payload.officialHistoryLimit || process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 20)));
+  // Tushare's dividend endpoint is much tighter than stock_basic/fina_indicator.
+  // Only one A-share is scheduled per routine run so a concurrent batch cannot
+  // exhaust the minute quota. Subsequent jobs resume from the persisted cursor.
+  const requestedCorporateActionLimit = Number(payload.corporateActionLimit ?? officialHistoryLimit);
+  const corporateActionLimit = market === "CN"
+    ? Math.max(0, Math.min(1, Number(payload.corporateActionLimit ?? process.env.PIT_CN_ACTIONS_PER_RUN ?? 1)))
+    : Math.max(0, Math.min(selected.length, requestedCorporateActionLimit));
   const pendingBatches = [];
   const concurrency = Math.max(1, Math.min(8, Number(process.env.PIT_ENRICHMENT_CONCURRENCY || 4)));
   let cursor = 0;
@@ -19069,21 +20637,40 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
       const symbol = selected[index];
       cursor += 1;
       try {
-        const [value, newsValue, announcementValue, officialHistory, listingHistory] = await Promise.all([
-          fetchFundamentals(symbol, market),
-          fetchNewsItems(symbol, market, "all", { mode: "local" }).catch(() => ({ news: [] })),
-          fetchAsxAnnouncementsFactor(symbol, market).catch(() => ({ items: [] })),
+        const historicalUniverseOnly = payload.historicalUniverseOnly === true;
+        const [value, newsValue, announcementValue, officialHistory, listingHistory, corporateHistory, historicalAnnouncements] = await Promise.all([
+          historicalUniverseOnly ? Promise.resolve({ fundamentals: null, source: "historical-universe-only" }) : fetchFundamentals(symbol, market),
+          historicalUniverseOnly ? Promise.resolve({ news: [] }) : fetchNewsItems(symbol, market, "all", { mode: "local" }).catch(() => ({ news: [] })),
+          historicalUniverseOnly ? Promise.resolve({ items: [] }) : fetchAsxAnnouncementsFactor(symbol, market).catch(() => ({ items: [] })),
           index < officialHistoryLimit
             ? (market === "US" ? fetchUsHistoricalPit(symbol) : market === "CN" ? fetchCnHistoricalPit(symbol) : Promise.resolve([])).catch((error) => {
               results.push({ symbol, dataset: "historical-fundamentals", available: false, error: error.message || String(error) });
               return [];
             })
             : Promise.resolve([]),
-          index < officialHistoryLimit && market === "US"
+          historicalUniverseOnly
+            ? Promise.resolve({ records: [], warnings: [] })
+            : index < officialHistoryLimit && market === "US"
             ? fetchFmpCompanyUniversePit(symbol, { force: payload.forceUniverse === true })
               .then((records) => ({ records, warnings: [] }))
               .catch((error) => ({ records: [], warnings: [error.message || String(error)] }))
-            : Promise.resolve({ records: [], warnings: [] }),
+            : index < officialHistoryLimit && market === "ASX"
+              ? fetchEodhdCompanyUniversePit(symbol, market)
+                .then((records) => ({ records, warnings: [] }))
+                .catch((error) => ({ records: [], warnings: [error.message || String(error)] }))
+              : Promise.resolve({ records: [], warnings: [] }),
+          index < corporateActionLimit
+            ? fetchCorporateActionHistory(symbol, market).catch((error) => {
+              results.push({ symbol, dataset: "corporate-actions", available: false, error: error.message || String(error) });
+              return [];
+            })
+            : Promise.resolve([]),
+          index < officialHistoryLimit && market === "ASX"
+            ? fetchAsxHistoricalAnnouncementsPit(symbol, {
+              force: payload.forceHistory === true,
+              years: payload.historyYears,
+            }).catch((error) => ({ news: [], universe: [], corporateActions: [], warnings: [error.message || String(error)] }))
+            : Promise.resolve({ news: [], universe: [], corporateActions: [], financialDisclosures: [], warnings: [] }),
         ]);
         const retrievedAt = new Date().toISOString();
         const eventTime = value.fundamentals?.asOf || value.fundamentals?.updatedAt || retrievedAt;
@@ -19097,7 +20684,10 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
             values: value.fundamentals,
           }] });
         }
-        const officialHistoryRecords = Array.isArray(officialHistory) ? officialHistory : officialHistory?.records || [];
+        const officialHistoryRecords = [
+          ...(Array.isArray(officialHistory) ? officialHistory : officialHistory?.records || []),
+          ...(index < officialHistoryLimit ? value.historicalRecords || [] : []),
+        ];
         const officialHistoryWarnings = Array.isArray(officialHistory) ? [] : officialHistory?.warnings || [];
         const officialHistoryBySource = new Map();
         officialHistoryRecords.forEach((record) => {
@@ -19120,6 +20710,34 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
           source: "fmp-company-profile-listing-pit",
           records: listingHistory.records,
         });
+        if (historicalAnnouncements.universe.length) pendingBatches.push({
+          dataset: "universe",
+          market,
+          symbol,
+          source: "asx-official-historical-announcements",
+          records: historicalAnnouncements.universe,
+        });
+        if (corporateHistory.length) pendingBatches.push({
+          dataset: "corporate_actions",
+          market,
+          symbol,
+          source: corporateHistory[0]?.sourceProvider || "verified-corporate-action-history",
+          records: corporateHistory,
+        });
+        if (historicalAnnouncements.corporateActions.length) pendingBatches.push({
+          dataset: "corporate_actions",
+          market,
+          symbol,
+          source: "asx-official-historical-announcements",
+          records: historicalAnnouncements.corporateActions,
+        });
+        if (historicalAnnouncements.financialDisclosures?.length) pendingBatches.push({
+          dataset: "financial_disclosures",
+          market,
+          symbol,
+          source: "asx-official-financial-disclosures",
+          records: historicalAnnouncements.financialDisclosures,
+        });
         const publishedNews = normalizePublishedPitRecords(newsValue.news || [], { symbol, sourceQuality: 0.75 });
         if (publishedNews.length) pendingBatches.push({ dataset: "news", market, symbol, source: newsValue.source || "multi-news-cache", records: publishedNews });
         const announcements = normalizePublishedPitRecords((announcementValue.items || []).map((item) => ({
@@ -19129,15 +20747,24 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
           relevance: 1,
         })), { symbol, sourceQuality: 1 });
         if (announcements.length) pendingBatches.push({ dataset: "news", market, symbol, source: announcementValue.source || "official-announcements", records: announcements });
+        if (historicalAnnouncements.news.length) pendingBatches.push({
+          dataset: "news",
+          market,
+          symbol,
+          source: "asx-official-historical-announcements",
+          records: historicalAnnouncements.news,
+        });
         results.push({
           symbol,
-          available: Boolean(value.fundamentals || officialHistoryRecords.length || publishedNews.length || announcements.length),
+          available: Boolean(value.fundamentals || officialHistoryRecords.length || publishedNews.length || announcements.length || historicalAnnouncements.news.length || historicalAnnouncements.universe.length || historicalAnnouncements.corporateActions.length),
           source: value.source || "unknown",
           historicalRows: officialHistoryRecords.length,
           historicalSources: [...officialHistoryBySource.keys()],
-          historicalUniverseRows: listingHistory.records.length,
-          newsRows: publishedNews.length + announcements.length,
-          warning: [value.warning, officialHistoryRecords[0]?.fallbackWarning, ...officialHistoryWarnings, ...listingHistory.warnings].filter(Boolean).join(" | "),
+          historicalUniverseRows: listingHistory.records.length + historicalAnnouncements.universe.length,
+          corporateActionRows: corporateHistory.length + historicalAnnouncements.corporateActions.length,
+          financialDisclosureRows: historicalAnnouncements.financialDisclosures?.length || 0,
+          newsRows: publishedNews.length + announcements.length + historicalAnnouncements.news.length,
+          warning: [value.warning, officialHistoryRecords[0]?.fallbackWarning, ...officialHistoryWarnings, ...listingHistory.warnings, ...historicalAnnouncements.warnings].filter(Boolean).join(" | "),
         });
       } catch (error) {
         results.push({ symbol, available: false, error: error.message || String(error) });
@@ -19156,7 +20783,9 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
       total: pendingBatches.length,
     });
   }
-  if (!requestedSymbols.length) state.cursors[market] = (start + selected.length) % Math.max(1, candidates.length);
+  if (!requestedSymbols.length && !missingVerifiedPit.length) {
+    state.cursors[market] = (start + selected.length) % Math.max(1, candidates.length);
+  }
   state.updatedAt = new Date().toISOString();
   await mkdir(join(snapshotBasePath, "data-lake"), { recursive: true });
   await writeFile(statePath, JSON.stringify(state, null, 2), "utf8");
@@ -19165,8 +20794,13 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
     universeRows: universe.rows?.length || 0,
     universeWarning: universe.warning || "",
     macroRows: macroRecords.length,
-    historicalUniverseRows: historicalUniverseRecords.length,
+    historicalUniverseRows: historicalUniverseRecords.length + results.reduce((sum, row) => sum + Number(row.historicalUniverseRows || 0), 0),
+    corporateActionRows: results.reduce((sum, row) => sum + Number(row.corporateActionRows || 0), 0),
+    historicalFundamentalRows: results.reduce((sum, row) => sum + Number(row.historicalRows || 0), 0),
+    financialDisclosureRows: results.reduce((sum, row) => sum + Number(row.financialDisclosureRows || 0), 0),
+    newsRows: results.reduce((sum, row) => sum + Number(row.newsRows || 0), 0),
     selected: selected.length,
+    missingVerifiedPitBeforeRun: missingVerifiedPit.length,
     available: results.filter((row) => row.available).length,
     failed: results.filter((row) => !row.available).length,
     results,
@@ -19218,6 +20852,7 @@ backgroundJobs.register("factor-evolution", async (payload, update, context) => 
   await update(0.08, { phase: "loading-cross-sectional-panels", mode });
   await context.checkpoint("factor-evolution-start", { mode });
   const result = await runFactorEvolutionCycle(mode, {
+    market: payload.market,
     limit: payload.limit,
     generations: payload.generations,
     population: payload.population,
@@ -19345,7 +20980,7 @@ const evidenceRegistryImport = (SERVER_RUNTIME_ENABLED ? evidenceRegistry.import
     runtimeEvents.publish("learning-evidence.import_error", result);
     return result;
   });
-const backgroundJobReconciliation = (SERVER_RUNTIME_ENABLED ? evidenceRegistryImport.then(() => backgroundJobs.reconcile()) : Promise.resolve({
+const backgroundJobReconciliation = (SERVER_RUNTIME_ENABLED ? backgroundJobs.reconcile() : Promise.resolve({
   scanned: 0,
   repaired: 0,
   resumed: 0,
@@ -19550,6 +21185,8 @@ const paperAgentGenerationMigration = predictionEvidenceMigration.then(() => (SE
 });
 
 async function createSupervisorTrainingJob(market, plan = {}, context = {}) {
+  const resources = await trainingResources.get();
+  const resolvedPlan = trainingResources.trainingPlan(plan.trainingMode || plan.mode || "weekly", plan);
   return backgroundJobs.create("backtest", {
     market: safeMarket(market),
     symbols: [],
@@ -19558,13 +21195,15 @@ async function createSupervisorTrainingJob(market, plan = {}, context = {}) {
       targetUpside: Number(process.env.TRAINING_SUPERVISOR_TARGET_UPSIDE || 5),
       stopLoss: Number(process.env.TRAINING_SUPERVISOR_STOP_LOSS || 4),
     },
-    range: plan.range,
-    limit: plan.limit,
+    range: resolvedPlan.range,
+    limit: resolvedPlan.limit,
     largeSample: true,
     productionTraining: true,
-    mode: plan.trainingMode || plan.mode || "weekly",
-    trainingMode: plan.trainingMode || plan.mode || "weekly",
-    supervisorPlan: plan,
+    mode: resolvedPlan.trainingMode || resolvedPlan.mode || "weekly",
+    trainingMode: resolvedPlan.trainingMode || resolvedPlan.mode || "weekly",
+    trainingOptions: resolvedPlan,
+    resourceProfile: resources.selected,
+    supervisorPlan: resolvedPlan,
     supervisorContext: context,
   });
 }
@@ -19630,13 +21269,33 @@ initializeTrainingSupervisor();
 async function runBackendEnrichmentSchedulerTick() {
   const config = await readBackendMonitorConfig();
   if (!config.enabled) return { skipped: true, reason: "backend monitor disabled" };
+  const resources = await trainingResources.get();
+  const dataProfile = resources.profile.data || {};
   const runtime = await readBackendMonitorRuntime();
   runtime.lastRedditWarmupByMarket = runtime.lastRedditWarmupByMarket || {};
   runtime.lastNewsScheduleByMarket = runtime.lastNewsScheduleByMarket || {};
   runtime.lastPitEnrichmentByMarket = runtime.lastPitEnrichmentByMarket || {};
+  runtime.lastCorporateActionByMarket = runtime.lastCorporateActionByMarket || {};
+  runtime.lastHistoryReplenishmentByMarket = runtime.lastHistoryReplenishmentByMarket || {};
+  runtime.lastStageReadinessCheckByMarket = runtime.lastStageReadinessCheckByMarket || {};
+  runtime.stageOneReadinessByMarket = runtime.stageOneReadinessByMarket || {};
+  runtime.stageOneSnapshotsByMarket = runtime.stageOneSnapshotsByMarket || {};
   runtime.lastArtifactMaintenanceAt = Number(runtime.lastArtifactMaintenanceAt || 0);
   const queued = [];
   for (const market of Object.keys(MARKET_CONFIG)) {
+    const now = Date.now();
+    const stageCheckEveryMs = Math.max(6 * 60 * 60_000, Number(process.env.STAGE_ONE_READINESS_CHECK_MS || 24 * 60 * 60_000));
+    if (now - Number(runtime.lastStageReadinessCheckByMarket[market] || 0) >= stageCheckEveryMs) {
+      const stageSnapshot = await dataReplenishmentSnapshot(market).catch(() => null);
+      if (stageSnapshot?.stageOne) {
+        runtime.stageOneReadinessByMarket[market] = stageSnapshot.stageOne;
+        runtime.stageOneSnapshotsByMarket[market] = stageSnapshot;
+      }
+      runtime.lastStageReadinessCheckByMarket[market] = now;
+    }
+    const stageOne = runtime.stageOneReadinessByMarket[market] || { met: false, blockers: [] };
+    const stageSnapshot = runtime.stageOneSnapshotsByMarket[market] || null;
+    const stageBlockers = new Set((stageOne.blockers || []).map((row) => row.id));
     const cache = await newsDiskCacheSummary(market).catch(() => ({ summary: {} }));
     const decision = newsRefreshDecision(market, cache.summary?.latestCachedAt || null);
     const slotKey = `${decision.slot?.id || decision.reason || "none"}:${zonedDateParts(new Date(), backendMarketSession(market).timeZone).date}`;
@@ -19651,15 +21310,61 @@ async function runBackendEnrichmentSchedulerTick() {
       runtime.lastRedditWarmupByMarket[market] = Date.now();
       queued.push(job.id);
     }
-    const pitEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.PIT_ENRICHMENT_REFRESH_MS || 7 * 24 * 60 * 60_000));
+    const pitStageBlocked = ["historicalUniverse", "fundamentals", "events"].some((id) => stageBlockers.has(id));
+    const pitDefaultCadence = pitStageBlocked ? 24 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
+    const pitEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.PIT_ENRICHMENT_REFRESH_MS || pitDefaultCadence));
     if (Date.now() - Number(runtime.lastPitEnrichmentByMarket[market] || 0) >= pitEveryMs) {
+      const pitSymbols = prioritizedPitGapSymbols(stageSnapshot || {}, market, Number(dataProfile.pitBatch || 30));
       const job = await backgroundJobs.create("pit-enrichment", {
         market,
-        limit: Number(process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60),
-        reason: "scheduled-point-in-time-collection",
+        symbols: pitSymbols,
+        limit: Number(dataProfile.pitBatch || process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60),
+        officialHistoryLimit: pitSymbols.length || Number(dataProfile.officialPitBatch || process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 20),
+        corporateActionLimit: 0,
+        reason: pitStageBlocked ? "scheduled-stage-one-point-in-time-collection" : "scheduled-point-in-time-collection",
+        resourceProfile: resources.selected,
       });
       runtime.lastPitEnrichmentByMarket[market] = Date.now();
       queued.push(job.id);
+    }
+    const corporateStageBlocked = stageBlockers.has("corporateActions");
+    const corporateDefaultCadence = corporateStageBlocked ? 24 * 60 * 60_000 : 30 * 24 * 60 * 60_000;
+    const corporateActionEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.CORPORATE_ACTION_REFRESH_MS || corporateDefaultCadence));
+    if (Date.now() - Number(runtime.lastCorporateActionByMarket[market] || 0) >= corporateActionEveryMs) {
+      const job = await backgroundJobs.create("corporate-action-backfill", {
+        market,
+        symbols: normalizeSymbolListForMarket(stageSnapshot?.pit?.datasets?.corporate_actions?.missingSymbols || [], market),
+        limit: Number({ ASX: 350, US: 450, CN: 550 }[market]),
+        refreshDays: 30,
+        reason: corporateStageBlocked ? "scheduled-stage-one-corporate-action-history" : "scheduled-corporate-action-history",
+      });
+      runtime.lastCorporateActionByMarket[market] = Date.now();
+      queued.push(job.id);
+    }
+    const historyStageBlocked = ["researchHistory", "deepHistory"].some((id) => stageBlockers.has(id));
+    const historyDefaultCadence = historyStageBlocked ? 24 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
+    const historyEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.HISTORY_REPLENISHMENT_REFRESH_MS || historyDefaultCadence));
+    if (Date.now() - Number(runtime.lastHistoryReplenishmentByMarket[market] || 0) >= historyEveryMs) {
+      const recent = await backgroundJobs.list({ type: "history-backfill", market, limit: 3 });
+      const active = (recent.jobs || []).find((job) => ["queued", "running"].includes(job.status));
+      if (!active) {
+        const snapshot = await dataReplenishmentSnapshot(market).catch(() => null);
+        const symbols = (snapshot?.history?.nextSymbols || []).map((row) => row.symbol);
+        if (symbols.length) {
+          const job = await backgroundJobs.create("history-backfill", {
+            market,
+            symbols,
+            range: snapshot.target.range,
+            requiredRows: snapshot.target.researchRows,
+            includeDelisted: true,
+            delistedBatch: Number(dataProfile.delistedBatch || 10),
+            reason: historyStageBlocked ? "scheduled-stage-one-market-data-replenishment" : "scheduled-market-data-replenishment",
+            resourceProfile: resources.selected,
+          });
+          queued.push(job.id);
+        }
+      }
+      runtime.lastHistoryReplenishmentByMarket[market] = Date.now();
     }
   }
   if (Date.now() - runtime.lastArtifactMaintenanceAt >= 7 * 24 * 60 * 60_000) {
@@ -19782,18 +21487,28 @@ async function runLearningSchedulerTick(reason = "interval") {
   const statePath = join(snapshotBasePath, "learning-progress", "scheduler.json");
   const state = await readFile(statePath, "utf8").then(JSON.parse).catch(() => ({ lastDaily: {}, lastWeekly: {}, lastMonthly: {} }));
   state.lastDaily = state.lastDaily || {};
+  state.lastDailyJob = state.lastDailyJob || {};
   state.lastWeekly = state.lastWeekly || {};
   state.lastMonthly = state.lastMonthly || {};
+  state.lastWeeklyEvidence = state.lastWeeklyEvidence || {};
+  state.lastMonthlyEvidence = state.lastMonthlyEvidence || {};
   const queued = [];
   for (const market of Object.keys(MARKET_CONFIG)) {
     const session = backendMarketSession(market);
     const local = zonedDateParts(new Date(), session.timeZone);
     const closeMinute = Math.max(...session.ranges.map((range) => range[1]));
     const minute = local.hour * 60 + local.minute;
-    if (!session.weekend && minute >= closeMinute + 30 && state.lastDaily[market] !== local.date) {
+    const priorDailyJob = state.lastDailyJob[market]?.id
+      ? await backgroundJobs.get(state.lastDailyJob[market].id).catch(() => null)
+      : null;
+    const dailyAlreadyHealthy = state.lastDaily[market] === local.date
+      && priorDailyJob
+      && !["failed", "cancelled"].includes(priorDailyJob.status);
+    if (!session.weekend && minute >= closeMinute + 30 && !dailyAlreadyHealthy) {
       const job = await backgroundJobs.create("learning-evaluation", { market, mode: "evaluate", reason: `market-close:${reason}` });
       const replay = await backgroundJobs.create("agent-replay", { market, reason: `market-close:${reason}`, evaluationDate: local.date });
       state.lastDaily[market] = local.date;
+      state.lastDailyJob[market] = { id: job.id, replayJobId: replay.id, queuedAt: new Date().toISOString() };
       queued.push({ market, mode: "evaluate", jobId: job.id, replayJobId: replay.id });
     }
     const weekKey = `${local.year}-W${Math.ceil((local.day + new Date(local.year, local.month - 1, 1).getDay()) / 7)}-${local.month}`;
@@ -19801,18 +21516,35 @@ async function runLearningSchedulerTick(reason = "interval") {
       const progress = await learningProgress.snapshot(market);
       const resolved = Number(progress.observed?.samples?.resolvedRows || 0);
       const dates = Number(progress.observed?.samples?.independentDates || 0);
-      if (resolved >= 100 && dates >= 5 && trainingSupervisor) {
+      const previous = state.lastWeeklyEvidence[market] || { resolved: 0, dates: 0, signature: null };
+      const addedResolved = Math.max(0, resolved - Number(previous.resolved || 0));
+      const addedDates = Math.max(0, dates - Number(previous.dates || 0));
+      if ((addedResolved >= 100 || addedDates >= 5) && trainingSupervisor) {
         const result = await trainingSupervisor.trigger({ market, mode: "weekly", reason: `weekly-evidence:${reason}`, source: "learning-scheduler" });
-        queued.push({ market, mode: "weekly", accepted: result.accepted !== false });
+        queued.push({ market, mode: "weekly", accepted: result.accepted !== false, addedResolved, addedDates });
+        if (result.accepted !== false) state.lastWeeklyEvidence[market] = {
+          resolved,
+          dates,
+          signature: progress.observed?.datasetSignature || null,
+          queuedAt: new Date().toISOString(),
+        };
       }
       state.lastWeekly[market] = weekKey;
     }
     const monthKey = `${local.year}-${String(local.month).padStart(2, "0")}`;
     if (session.weekend && local.day <= 7 && state.lastMonthly[market] !== monthKey) {
       const progress = await learningProgress.snapshot(market);
-      if (Number(progress.observed?.samples?.resolvedRows || 0) >= 1_000 && Number(progress.observed?.samples?.independentDates || 0) >= 120 && trainingSupervisor) {
+      const observedSignature = progress.observed?.datasetSignature || null;
+      const lastSignature = state.lastMonthlyEvidence[market]?.signature || null;
+      if (observedSignature && observedSignature !== lastSignature && Number(progress.observed?.samples?.resolvedRows || 0) >= 1_000 && Number(progress.observed?.samples?.independentDates || 0) >= 120 && trainingSupervisor) {
         const result = await trainingSupervisor.trigger({ market, mode: "full", reason: `monthly-full:${reason}`, source: "learning-scheduler" });
         queued.push({ market, mode: "full", accepted: result.accepted !== false });
+        if (result.accepted !== false) state.lastMonthlyEvidence[market] = {
+          signature: observedSignature,
+          resolved: Number(progress.observed?.samples?.resolvedRows || 0),
+          dates: Number(progress.observed?.samples?.independentDates || 0),
+          queuedAt: new Date().toISOString(),
+        };
       }
       state.lastMonthly[market] = monthKey;
     }
@@ -19885,12 +21617,19 @@ if (SERVER_RUNTIME_ENABLED) {
 
 export {
   aiProviderStatus,
+  normalizeAlphaVantageListingStatusRecords,
+  parseNasdaqTraderRows,
   alpacaQuoteRows,
   alpacaRows,
   alpacaSnapshotQuoteFromPayload,
   alpacaTradeRows,
   factorSignal,
+  firstStageDataReadiness,
   analysisBatchLimit,
+  asxAnnouncementRows,
+  asxDelistedEntityRows,
+  asxHistoricalCorporateActionRecords,
+  asxHistoricalUniverseRecords,
   isLimitedProvider,
   localBatchAnalysis,
   localModelScopeForStrategy,
@@ -19919,6 +21658,9 @@ export {
   mergeServerSnapshots,
   mergeQuoteIntoCandles,
   normalizePredictionSample,
+  evaluatePredictionOutcome,
+  completedDailyCandleCutoff,
+  completedDailyCandleRows,
   summarizePredictionSamples,
   directionalOutcomeHit,
   pathOutcomeHit,

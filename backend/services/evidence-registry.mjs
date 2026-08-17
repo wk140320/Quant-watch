@@ -9,7 +9,9 @@ const FAMILY_BY_JOB = Object.freeze({
   training: "minute",
   "historical-backtest-symbol": "training",
   "factor-lab": "factor",
+  "factor-research": "factor",
   "factor-evolution": "alpha",
+  "calibration-audit": "calibration",
   "agent-replay": "agent",
   "intraday-training": "minute",
   "model-report": "acceptance",
@@ -35,7 +37,9 @@ function resultSummary(result) {
     framework: result.framework,
     market: result.market,
     updated: result.updated,
-    sampleCount: result.sampleCount,
+    sampleCount: result.sampleCount ?? (Array.isArray(result.markets)
+      ? result.markets.reduce((sum, row) => sum + Number(row?.evolution?.sampleCount || row?.sampleTotal || 0), 0)
+      : undefined),
     updatedAt: result.updatedAt,
     strictOofRows: result.strictOofRows,
     independentDates: result.independentDates,
@@ -49,7 +53,31 @@ function resultSummary(result) {
       productionEvidencePassed: row.productionEvidencePassed,
       metrics: row.metrics,
       directionMetrics: row.directionMetrics,
+      weights: row.weights,
+      directionWeights: row.directionWeights,
+      rankingMetrics: row.rankingMetrics,
+      expectedValue: row.expectedValue,
+      longTradeExpectedValue: row.longTradeExpectedValue,
+      longTradeGate: row.longTradeGate,
+      selectiveRankingHead: row.selectiveRankingHead,
+      highConfidenceFalsePositiveRiskHead: row.highConfidenceFalsePositiveRiskHead,
+      positiveFoldCount: row.positiveFoldCount,
+      foldCount: Array.isArray(row.foldMetrics) ? row.foldMetrics.length : 0,
+      oofRows: row.oofRows,
+      metaTestRows: row.metaTestRows,
     })),
+    marketEvidence: Array.isArray(result.markets) ? result.markets.map((row) => ({
+      market: row.market,
+      availableCount: row.availableCount,
+      sampleTotal: row.sampleTotal,
+      researchAvailable: row.research?.available !== false,
+      evolution: row.evolution ? {
+        attempted: row.evolution.attempted,
+        completed: row.evolution.completed,
+        failed: row.evolution.failed,
+        sampleCount: row.evolution.sampleCount,
+      } : null,
+    })) : [],
   };
 }
 
@@ -119,6 +147,51 @@ function createEvidenceRegistry({ dbPath, jobsPath } = {}) {
     updatedAt: null,
     error: null,
   };
+
+  function persistDerivedEvidence({
+    parentJob,
+    suffix,
+    family,
+    market,
+    status = "complete",
+    metricName = null,
+    metricValue = null,
+    evidence = {},
+    modelVersion = null,
+    dataVersion = null,
+  }) {
+    const recordedAt = String(parentJob.updatedAt || new Date().toISOString());
+    const runId = `${String(parentJob.trainingRunId || parentJob.id)}:${suffix}`;
+    const normalizedMarket = market ? String(market).toUpperCase() : null;
+    upsertRun.run(
+      runId,
+      String(parentJob.id),
+      family,
+      normalizedMarket,
+      status,
+      String(parentJob.createdAt || recordedAt),
+      recordedAt,
+      dataVersion,
+      modelVersion,
+      status === "failed" ? parentJob.failureCategory || "derived_evidence" : null,
+      json({ parentRunId: String(parentJob.trainingRunId || parentJob.id), result: evidence }),
+    );
+    const trajectoryId = createHash("sha256")
+      .update(`${parentJob.id}:${suffix}:${status}:${recordedAt}`)
+      .digest("hex");
+    insertTrajectory.run(
+      trajectoryId,
+      runId,
+      family,
+      normalizedMarket,
+      recordedAt,
+      status,
+      status === "complete" ? 1 : Number(parentJob.progress || 0),
+      metricName,
+      Number.isFinite(Number(metricValue)) ? Number(metricValue) : null,
+      json({ parentRunId: String(parentJob.trainingRunId || parentJob.id), result: evidence }),
+    );
+  }
 
   async function beginBatchTransaction() {
     let lastError = null;
@@ -210,6 +283,62 @@ function createEvidenceRegistry({ dbPath, jobsPath } = {}) {
           Number(job.progress || 0), null, null,
           json({ parentRunId: runId, detail: job.detail || null, result: summary, error: job.error || null, failureCategory: job.failureCategory || null }),
         );
+      }
+    }
+    if (["complete", "failed", "cancelled"].includes(String(job.status)) && String(job.type) === "backtest") {
+      for (const row of summary?.horizons || []) {
+        const direction = row.directionMetrics || {};
+        persistDerivedEvidence({
+          parentJob: job,
+          suffix: `calibration-${Number(row.horizon || 0)}d`,
+          family: "calibration",
+          market: job.market,
+          status: String(job.status),
+          metricName: "brierSkillScore",
+          metricValue: direction.brierSkillScore,
+          modelVersion: row.modelVersion || summary?.modelVersion || null,
+          dataVersion: summary?.dataVersion || null,
+          evidence: {
+            framework: "strict-oof-constrained-stacking-calibration",
+            horizon: row.horizon,
+            available: row.available === true,
+            productionEvidencePassed: row.productionEvidencePassed === true,
+            oofRows: row.oofRows || 0,
+            metaTestRows: row.metaTestRows || 0,
+            weights: row.weights || {},
+            directionWeights: row.directionWeights || {},
+            metrics: row.metrics || {},
+            directionMetrics: direction,
+            rankingMetrics: row.rankingMetrics || {},
+            expectedValue: row.expectedValue || {},
+            positiveFoldCount: row.positiveFoldCount || 0,
+            foldCount: row.foldCount || 0,
+          },
+        });
+      }
+    }
+    if (["complete", "failed", "cancelled"].includes(String(job.status)) && String(job.type) === "factor-evolution") {
+      for (const row of job.result?.markets || []) {
+        const research = row?.research || {};
+        persistDerivedEvidence({
+          parentJob: job,
+          suffix: `factor-research-${String(row?.market || "unknown").toLowerCase()}`,
+          family: "factor",
+          market: row?.market,
+          status: String(job.status),
+          metricName: "symbolCount",
+          metricValue: research.symbolCount ?? row.availableCount ?? row.symbolCount,
+          dataVersion: research.dataVersion || null,
+          evidence: {
+            framework: research.framework || "market-cross-sectional-factor-research",
+            available: research.available !== false,
+            reason: research.reason || null,
+            symbolCount: research.symbolCount ?? row.availableCount ?? row.symbolCount ?? 0,
+            sampleTotal: row.sampleTotal || 0,
+            horizons: research.horizons || [],
+            aggregateWeights: research.savedModel?.aggregateWeights || research.aggregateWeights || {},
+          },
+        });
       }
     }
   }

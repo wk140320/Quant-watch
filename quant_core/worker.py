@@ -11,6 +11,7 @@ from alpha_mining import analyze_alpha_evolution
 from artifact_maintenance import cleanup_training_artifacts
 from data_lake import audit as audit_data_lake
 from data_lake import backfill_local_pit_caches
+from data_lake import migrate_asx_financial_disclosures
 from data_lake import read_rows as read_data_lake_rows
 from data_lake import read_panel as read_data_lake_panel
 from data_lake import read_pit_panel as read_data_lake_pit_panel
@@ -30,6 +31,7 @@ from paper_agents import replay_oof as replay_paper_agents
 from paper_agents import reset as reset_paper_agents
 from paper_agents import step as step_paper_agents
 from paper_agents import upgrade_generation as upgrade_paper_agent_generation
+from pit_ingest import backfill_baostock_corporate_actions
 from production_training import recover_oof_artifacts, train_market_multitask
 from provider_budget import provider_plan
 from risk import assess_portfolio, build_paper_order_intent
@@ -363,6 +365,8 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return qlib_readiness()
     if operation == "baostock-candles":
         return baostock_candles(payload)
+    if operation == "baostock-corporate-actions":
+        return backfill_baostock_corporate_actions(payload)
     if operation == "data-lake-upsert":
         return upsert_data_lake(payload)
     if operation == "data-lake-read":
@@ -383,6 +387,8 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return upsert_pit_batches(payload)
     if operation == "data-lake-backfill-local-caches":
         return backfill_local_pit_caches(payload)
+    if operation == "data-lake-migrate-asx-financial-disclosures":
+        return migrate_asx_financial_disclosures(payload)
     if operation == "training-artifact-maintenance":
         return cleanup_training_artifacts(payload)
     if operation == "risk-assessment":

@@ -6,14 +6,14 @@
     <title>Global Quant Watch</title>
     <link rel="stylesheet" href="/styles.css?v=20260728-supervisor-background-1">
     <link rel="stylesheet" href="/frontend/styles/tokens.css?v=20260712-graphite-system">
-    <link rel="stylesheet" href="/frontend/styles/shell.css?v=20260713-provider-pool-ledger-17">
+    <link rel="stylesheet" href="/frontend/styles/shell.css?v=20260812-exact-stage-one-v91">
     <link rel="stylesheet" href="/frontend/styles/visual-workspaces.css?v=20260713-visual-workspaces-2">
     <link rel="stylesheet" href="/frontend/styles/institutional-polish.css?v=20260713-institutional-polish-2">
     <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260714-market-switch-performance-1">
     <link rel="stylesheet" href="/frontend/styles/simulation-layout.css?v=20260714-simulation-boundary-1">
     <link rel="stylesheet" href="/frontend/styles/performance.css?v=20260717-stable-load-2">
     <link rel="stylesheet" href="/frontend/styles/training-supervisor.css?v=20260714-training-supervisor-2">
-    <link rel="stylesheet" href="/frontend/styles/strategy-workspace.css?v=20260810-evidence-runtime-v85">
+    <link rel="stylesheet" href="/frontend/styles/strategy-workspace.css?v=20260810-continuous-learning-v87">
   </head>
   <body>
     <div class="app-shell">
@@ -222,6 +222,7 @@
             <div class="section-actions">
               <button id="refreshProviderBudget" class="secondary" type="button">检查数据源</button>
               <button id="refreshDataHealth" class="secondary" type="button">检查健康</button>
+              <button id="replenishMarketData" class="secondary" type="button">补齐当前市场</button>
               <button id="refreshNewsNow" type="button">刷新新闻</button>
               <a class="button-link secondary" href="/monitor.html"><i data-lucide="power"></i><span>后台控制</span></a>
             </div>
@@ -231,6 +232,9 @@
           </div>
           <div id="dataHealthPanel" class="quant-lab-panel compact-panel">
             <p class="muted">打开此页面或点击检查后显示数据健康状态。</p>
+          </div>
+          <div id="dataReplenishmentPanel" class="quant-lab-panel compact-panel data-replenishment-panel">
+            <p class="muted">正在等待读取市场训练池、历史深度和PIT补齐进度。</p>
           </div>
         </section>
 
@@ -634,6 +638,19 @@ CBA,20,118.50</textarea>
                 <button id="runFullLearning" class="secondary icon-text-button" type="button"><i data-lucide="layers-3"></i><span>全量训练</span></button>
               </div>
             </div>
+            <div class="training-resource-bar" aria-label="后台训练负载">
+              <div class="training-resource-copy">
+                <span>训练负载</span>
+                <strong id="trainingResourceLabel">均衡</strong>
+                <small id="trainingResourceDescription">日常推荐；后台训练不会阻塞页面。</small>
+              </div>
+              <div class="training-resource-segments" role="group" aria-label="选择训练负载">
+                <button id="trainingResourceLight" data-training-resource="light" type="button">轻量</button>
+                <button id="trainingResourceBalanced" data-training-resource="balanced" type="button">均衡</button>
+                <button id="trainingResourceDeep" data-training-resource="deep" type="button">深度</button>
+              </div>
+              <button id="runLearningChain" class="primary icon-text-button" type="button"><i data-lucide="workflow"></i><span>运行当前学习链</span></button>
+            </div>
             <div id="learningProgressSummary" class="continuous-learning-summary" aria-live="polite">
               <div><span>Champion</span><strong>读取中</strong></div>
               <div><span>5日准确率</span><strong>--</strong></div>
@@ -654,6 +671,7 @@ CBA,20,118.50</textarea>
               <span>Agent generation_v2</span><strong>读取中</strong><small>旧账本保留为只读基准</small>
             </div>
             <div id="learningEvidenceFamilies" class="learning-evidence-families" aria-live="polite"></div>
+            <div id="learningReadinessPanel" class="learning-readiness-panel" aria-live="polite"></div>
           </section>
           <div class="model-report-filters" aria-label="模型报告筛选">
             <label>模型族
@@ -801,6 +819,6 @@ CBA,20,118.50</textarea>
     <script src="/frontend/runtime/ui-runtime.js?v=20260717-stable-load-2"></script>
     <script src="/frontend/runtime/home-motion.js?v=20260712-home-motion"></script>
     <script src="/frontend/runtime/flow-navigation.js?v=20260713-flow-navigation-2"></script>
-    <script src="/frontend/runtime/shell-bootstrap.js?v=20260810-evidence-runtime-v85"></script>
+    <script src="/frontend/runtime/shell-bootstrap.js?v=20260812-exact-stage-one-v91"></script>
   </body>
 </html>

@@ -8,9 +8,16 @@ const {
   alpacaRows,
   alpacaSnapshotQuoteFromPayload,
   alpacaTradeRows,
+  asxAnnouncementRows,
+  asxDelistedEntityRows,
+  asxHistoricalCorporateActionRecords,
+  asxHistoricalUniverseRecords,
   aiProviderStatus,
   analysisBatchLimit,
+  normalizeAlphaVantageListingStatusRecords,
+  parseNasdaqTraderRows,
   factorSignal,
+  firstStageDataReadiness,
   isLimitedProvider,
   localBatchAnalysis,
   localModelScopeForStrategy,
@@ -39,6 +46,9 @@ const {
   mergeServerSnapshots,
   mergeQuoteIntoCandles,
   normalizePredictionSample,
+  evaluatePredictionOutcome,
+  completedDailyCandleCutoff,
+  completedDailyCandleRows,
   summarizePredictionSamples,
   directionalOutcomeHit,
   pathOutcomeHit,
@@ -66,10 +76,173 @@ const {
   universePayload,
 } = await import("../server.mjs");
 
+const { normalizePublishedPitRecords } = await import("../backend/services/pit-sources.mjs");
+
 test("Long research ranges retain multi-year candle capacity", () => {
   assert.equal(candleLimitForRange("8y"), 2080);
   assert.equal(candleLimitForRange("10y"), 2600);
   assert.equal(candleLimitForRange("15y"), 3900);
+});
+
+test("Stage-one readiness separates data coverage from model promotion", () => {
+  const readiness = firstStageDataReadiness({
+    market: "US",
+    target: { symbols: 100 },
+    universe: { selected: 100 },
+    history: { researchReadySymbols: 85, deepHistorySymbols: 55 },
+    pit: { datasets: {
+      corporate_actions: { trainingUniverseCoveragePct: 96 },
+      universe: { trainingUniverseCoveragePct: 85 },
+      fundamentals: { trainingUniverseCoveragePct: 82 },
+      news: { trainingUniverseCoveragePct: 81 },
+    } },
+  });
+  assert.equal(readiness.met, true);
+  assert.equal(readiness.nextAction, "strict-oof-challenger");
+  assert.match(readiness.note, /never promotes a model/i);
+
+  const blocked = firstStageDataReadiness({
+    market: "US",
+    target: { symbols: 100 },
+    universe: { selected: 100 },
+    history: { researchReadySymbols: 40, deepHistorySymbols: 20 },
+    pit: { datasets: {} },
+  });
+  assert.equal(blocked.met, false);
+  assert.equal(blocked.nextAction, "history-backfill");
+  assert.ok(blocked.blockers.some((row) => row.id === "fundamentals"));
+
+  const asxDisclosureReady = firstStageDataReadiness({
+    market: "ASX",
+    target: { symbols: 100 },
+    universe: { selected: 100 },
+    history: { researchReadySymbols: 85, deepHistorySymbols: 55 },
+    pit: { datasets: {
+      corporate_actions: { trainingUniverseCoveragePct: 96 },
+      universe: { trainingUniverseCoveragePct: 85 },
+      fundamentals: { trainingUniverseCoveragePct: 0 },
+      financial_disclosures: { trainingUniverseCoveragePct: 84 },
+      news: { trainingUniverseCoveragePct: 81 },
+    } },
+  });
+  assert.equal(asxDisclosureReady.met, true);
+  assert.equal(asxDisclosureReady.gates.fundamentals.dataset, "financial_disclosures");
+  assert.equal(asxDisclosureReady.gates.fundamentals.numericCoverage, 0);
+});
+
+test("ASX training universe excludes deferred-settlement and temporary security codes", () => {
+  assert.equal(trainingEligibleUniverseRow({ symbol: "BHP.AX", type: "Common Stock", name: "BHP Group Ltd" }, "ASX"), true);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "3DADA.AX", type: "Common Stock", name: "CDI 40:1 Deferred Settlement" }, "ASX"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "AHNDA.AX", type: "Common Stock", name: "Ordinary Fully Paid Deferred Settlement" }, "ASX"), false);
+});
+
+test("Alpha Vantage listing status creates dated PIT listing and delisting events", () => {
+  const rows = normalizeAlphaVantageListingStatusRecords([{
+    symbol: "ABC",
+    name: "ABC Holdings",
+    exchange: "NYSE",
+    assetType: "Stock",
+    ipoDate: "2012-03-05",
+    delistingDate: "2024-07-12",
+  }]);
+  assert.deepEqual(rows.map((row) => [row.status, row.event_time, row.historicalAvailabilityVerified]), [
+    ["active", "2012-03-05T00:00:00Z", true],
+    ["delisted", "2024-07-12T00:00:00Z", true],
+  ]);
+  assert.ok(rows.every((row) => row.sourceProvider === "alphavantage-listing-status-pit"));
+});
+
+test("Nasdaq symbol directory headers never enter the US universe", () => {
+  const rows = parseNasdaqTraderRows([
+    "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol",
+    "AAPL|Apple Inc. Common Stock|Q|AAPL|N|100|N|AAPL",
+    "File Creation Time: 0812202618:00|||||||",
+  ].join("\n"), "US");
+  assert.deepEqual(rows.map((row) => row.code), ["AAPL"]);
+  assert.equal(sanitizeUniverseRows([
+    { symbol: "ACTSYMBOL", name: "Security Name", type: "stock" },
+    { symbol: "MSFT", name: "Microsoft Corporation", type: "stock" },
+  ], "US").some((row) => row.code === "ACTSYMBOL"), false);
+  assert.equal(sanitizeUniverseRows([
+    { symbol: "DOFGO.OL", name: "DOF Group", type: "stock" },
+    { symbol: "FLTR.L", name: "Flutter Entertainment", type: "stock" },
+    { symbol: "BRK.B", name: "Berkshire Hathaway Class B", type: "stock" },
+  ], "US").map((row) => row.code).join(","), "BRK.B");
+});
+
+test("Published PIT announcements retain first availability and expose conservative event features", () => {
+  const [positive] = normalizePublishedPitRecords([{
+    title: "Price sensitive: record profit and on-market share buyback",
+    publishedAt: "2024-08-20",
+    priceSensitive: true,
+    sourceQuality: 1,
+  }], { symbol: "ABC" });
+  assert.equal(positive.available_at, "2024-08-20T23:59:59Z");
+  assert.equal(positive.historicalAvailabilityVerified, true);
+  assert.ok(positive.values.eventSentiment > 0);
+  assert.equal(positive.values.earningsEvent, 0);
+  assert.ok(positive.values.capitalAllocation > 0);
+  assert.equal(positive.values.sourceQuality, 1);
+
+  const [negative] = normalizePublishedPitRecords([{
+    title: "Placement and guidance withdrawn following regulatory investigation",
+    publishedAt: "2024-09-03T01:15:00Z",
+  }], { symbol: "XYZ" });
+  assert.ok(negative.values.eventSentiment < 0);
+  assert.ok(negative.values.dilutionRisk >= 0.9);
+  assert.ok(negative.values.regulatoryRisk >= 0.9);
+  assert.ok(negative.values.operationalMomentum < 0);
+});
+
+test("Prediction labels use next-session open and ignore an unfinished live quote", () => {
+  const sample = {
+    market: "ASX",
+    symbol: "CPU",
+    asOfDate: "2026-08-03",
+    close: 30,
+    horizonDays: 2,
+    targetUpside: 5,
+    stopLoss: 4,
+    labelDefinition: "next-session-open-target-stop-v2",
+    outcome: null,
+  };
+  const candles = [
+    { date: "2026-08-03", open: 29, high: 31, low: 28, close: 30 },
+    { date: "2026-08-04", open: 32, high: 33, low: 31, close: 32.5 },
+  ];
+  const pending = evaluatePredictionOutcome(sample, candles, {
+    currentDate: "2026-08-05",
+    currentPrice: 34,
+    completedBar: false,
+  });
+  assert.notEqual(pending.outcome?.resolved, true);
+  assert.equal(pending.interim?.observedDays, 1);
+  const resolved = evaluatePredictionOutcome(sample, [...candles, {
+    date: "2026-08-05", open: 32.5, high: 34, low: 32, close: 33.8,
+  }]);
+  assert.equal(resolved.outcome.resolved, true);
+  assert.equal(resolved.outcome.entryPrice, 32);
+  assert.equal(resolved.outcome.entryDate, "2026-08-04");
+  assert.equal(resolved.outcome.entryMethod, "next-session-open");
+
+  const missingOpen = evaluatePredictionOutcome(sample, [candles[0], {
+    date: "2026-08-04", high: 34, low: 31, close: 33,
+  }, {
+    date: "2026-08-05", open: 33, high: 35, low: 32, close: 34,
+  }]);
+  assert.notEqual(missingOpen.outcome?.resolved, true);
+  assert.equal(missingOpen.labelDataStatus, "waiting_for_next_session_open");
+});
+
+test("Daily label cutoff excludes the active session and weekends", () => {
+  assert.equal(completedDailyCandleCutoff("ASX", new Date("2026-08-11T02:00:00Z")), "2026-08-10");
+  assert.equal(completedDailyCandleCutoff("ASX", new Date("2026-08-11T07:00:00Z")), "2026-08-11");
+  assert.equal(completedDailyCandleCutoff("US", new Date("2026-08-09T04:00:00Z")), "2026-08-07");
+  const rows = completedDailyCandleRows([
+    { date: "2026-08-10", close: 10 },
+    { date: "2026-08-11", close: 11 },
+  ], "ASX", new Date("2026-08-11T02:00:00Z"));
+  assert.deepEqual(rows.map((row) => row.date), ["2026-08-10"]);
 });
 
 test("Training universe sampling spans the market instead of taking one alphabetical block", () => {
@@ -86,6 +259,52 @@ test("US training universe excludes warrants, units, rights, preferred shares, a
   assert.equal(trainingEligibleUniverseRow({ symbol: "AACIW", name: "Example Acquisition Inc. - Warrants", type: "stock" }, "US"), false);
   assert.equal(trainingEligibleUniverseRow({ symbol: "AAC.U", name: "Example Units, each consisting of one share and one warrant", type: "stock" }, "US"), false);
   assert.equal(trainingEligibleUniverseRow({ symbol: "PREF", name: "Example 7% Preferred Stock", type: "stock" }, "US"), false);
+});
+
+test("ASX training universe keeps ordinary shares and excludes exchange-traded products", () => {
+  assert.equal(trainingEligibleUniverseRow({ symbol: "BHP.AX", name: "BHP Group Ltd", type: "Common Stock" }, "ASX"), true);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "BEAR.AX", name: "Australian Equities Bear ETF", type: "ETF" }, "ASX"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "AN3PL.AX", name: "Bank Capital Notes", type: "Notes" }, "ASX"), false);
+});
+
+test("ASX historical announcements produce verified listing events without guessing dates", () => {
+  const rows = asxAnnouncementRows(`
+    <table><tr><td>10/08/2025</td><td>Price Sensitive</td><td><a href="/asxpdf/example.pdf">Admission to Official List 2 pages 20KB</a></td></tr></table>
+  `, 20);
+  assert.equal(rows.length, 1);
+  const events = asxHistoricalUniverseRecords(rows, "ABC");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].listed, true);
+  assert.equal(events[0].historicalAvailabilityVerified, true);
+  assert.match(events[0].available_at, /^2025-08-10T/);
+});
+
+test("ASX historical announcements separate corporate-action events from coverage receipts", () => {
+  const records = asxHistoricalCorporateActionRecords([{
+    id: "announcement-1",
+    title: "Final Dividend and Distribution Timetable",
+    publishedAt: "2025-08-10T00:00:00.000Z",
+  }], "ABC", { coverageStart: "2012-01-01", coverageEnd: "2026-08-11", complete: true });
+  assert.equal(records[0].eventType, "distribution-announcement");
+  assert.equal(records[0].historicalAvailabilityVerified, true);
+  assert.equal(records.at(-1).eventType, "coverage");
+  assert.equal(records.at(-1).coverageStart, "2012-01-01");
+});
+
+test("ASX official delisted table creates conservative verified universe exits", () => {
+  const rows = asxDelistedEntityRows(`
+    <table><tbody>
+      <tr><td>KORAB RESOURCES LIMITED</td><td>KOR</td><td>29/07/2026</td><td>Removed from the official list</td></tr>
+      <tr><td>null</td><td>null</td><td>15/07/2026</td><td>Debt security removed</td></tr>
+    </tbody></table>
+  `);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].symbol, "KOR.AX");
+  assert.equal(rows[0].available_at.slice(0, 10), "2026-07-29");
+  assert.equal(rows[0].historicalAvailabilityVerified, true);
+  const jsonp = asxDelistedEntityRows('processDelistedCompanies([{"code":"MCE","name_full":"MATRIX COMPOSITES & ENGINEERING LIMITED","reason_delisted":"Removed","delisting_date":"2026-07-23"}]);');
+  assert.equal(jsonp[0].symbol, "MCE.AX");
+  assert.equal(jsonp[0].event_time.slice(0, 10), "2026-07-23");
 });
 
 test("StockAnalysis ASX fundamentals parser preserves numeric scale and ratios", () => {
@@ -1037,4 +1256,21 @@ test("Provider key pool advances in order only after quota-style failures", asyn
   });
   assert.equal(result, "ok");
   assert.deepEqual(attempts, ["primary", "backup-one", "backup-two"]);
+});
+
+test("EODHD key pool treats plan and permission responses as failover errors", async () => {
+  const attempts = [];
+  const result = await withProviderApiKey("eodhd", {
+    env: { EODHD_API_KEY: "primary", EODHD_API_KEYS: "backup-one,backup-two" },
+    runtimeKey: "eodhd-unit-plan-failover",
+    backoffKey: "eodhd-unit-plan-failover",
+    keyBackoffMs: 1000,
+    backoffMs: 1000,
+  }, async (key) => {
+    attempts.push(key);
+    if (key === "primary") throw new Error("HTTP 403: plan permission exceeded");
+    return "ok";
+  });
+  assert.equal(result, "ok");
+  assert.deepEqual(attempts, ["primary", "backup-one"]);
 });

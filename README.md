@@ -139,6 +139,8 @@ OPENFIGI_API_KEY=
 
 `EODHD_API_KEYS`, `TWELVEDATA_API_KEYS`, and `TIINGO_API_KEYS` accept comma-separated backup credentials. The singular key remains primary; backups are tried in order only after quota, authentication, or plan-permission failures. Keys are never round-robin consumed and are never returned to the browser.
 
+The EODHD free package is a small evaluation source, not a bulk research feed: its published plan currently provides 20 calls per day and one year of history. The project therefore uses it only as a bounded fallback. Creating multiple accounts to bypass provider limits is not part of the data strategy; it would not supply the 8–15 years of point-in-time evidence required by production gates.
+
 OpenAI analysis is disabled by default. To enable it:
 
 ```bash
@@ -159,8 +161,14 @@ OPENAI_API_KEY=
 - Paper Agents are backend-owned and persisted in SQLite. Browser refreshes only update the display; they do not advance the Paper ledger.
 - Changing Paper Agent capital preserves positions, trades, and learning memory. Browser migration is non-destructive: an empty or poorer browser ledger cannot replace a richer backend ledger.
 - Paper fills require an open market, a real provider source, a positive price, and a current completed bar timestamp. Live broker execution is always disabled.
-- Historical US fundamentals combine SEC Company Facts with SimFin `asreported=true` statements. FMP contributes cached delisting and symbol-change events; OpenFIGI validates current identifiers but is deliberately excluded from historical-universe coverage.
+- Historical US fundamentals combine SEC Company Facts with SimFin `asreported=true` statements. Alpha Vantage `LISTING_STATUS` and FMP contribute dated active/delisted or symbol-change events; OpenFIGI validates current identifiers but is deliberately excluded from historical-universe coverage.
 - PIT enrichment is a background data-lake job. Provider failures are isolated per source, and current snapshots never receive a historical-availability flag unless the provider supplies a verifiable publication or effective timestamp.
+- The Data Sources workspace includes a market-level replenishment centre. It expands the training cross-section independently of the watchlist, reports real history/PIT coverage, and queues bounded history or PIT jobs according to the selected light, balanced, or deep resource profile.
+- The replenishment response includes `stageOne`: separate gates for universe breadth, 750-row research history, deep history, historical-universe PIT, corporate actions, historical fundamentals/official ASX financial-report disclosures, and company events. Every PIT percentage is the exact intersection with the current market training target rather than a global cache percentage. Before stage one, missing history/PIT is replenished daily in bounded batches; after passing, the cadence automatically falls back to weekly or monthly maintenance.
+- US SEC submissions and XBRL Company Facts require no API key. The system preserves filing timestamps and prefers these official point-in-time records over current-snapshot fundamentals.
+- ASX historical announcement metadata is read from the official year-by-year archive and cached locally. Announcement timestamps can feed the event model; verified admission/removal notices can feed historical-universe PIT. Dated annual, half-year and quarterly financial-report disclosures are stored in a separate PIT dataset, but their existence never fabricates numeric revenue, profit or balance-sheet values. EODHD free-plan fundamentals remain current-snapshot research data unless a real filing timestamp is present.
+- A-share corporate-action history uses BaoStock adjustment-factor dates as a free batch fallback when Tushare's dividend quota is unavailable. A verified range-query receipt is stored separately from actual split/dividend events, so a genuine no-event history is not misreported as missing and never becomes a predictive feature.
+- Completed market sessions resolve prior predictions from the next-session open and subsequent completed candles. Live or unfinished quotes can update display prices but cannot mature labels or rewrite an earlier model probability.
 
 ## Model Training And Evidence
 

@@ -9,6 +9,7 @@ import { createPythonQuantClient } from "../backend/services/python-quant.mjs";
 import { createRuntimeEventHub } from "../backend/services/runtime-events.mjs";
 import { createJobManager } from "../backend/services/job-manager.mjs";
 import { createEvidenceRegistry } from "../backend/services/evidence-registry.mjs";
+import { createTrainingResourceService } from "../backend/services/training-resources.mjs";
 import { safeReportId } from "../backend/services/model-reports.mjs";
 import { evidenceMetrics, isBetterChallenger, promotionDecision } from "../backend/services/learning-progress.mjs";
 import {
@@ -31,7 +32,10 @@ import {
 } from "../backend/domain/markets.mjs";
 import { readJsonBody, sendJson } from "../backend/http/json.mjs";
 import {
+  normalizeCorporateActionRecords,
   normalizeEastmoneyPitRecords,
+  normalizeEodhdCompanyUniverseRecords,
+  normalizeEodhdFinancialPitRecords,
   normalizeFmpHistoricalUniverseRecords,
   normalizeFmpSymbolChangeRecords,
   normalizeFredVintageRecords,
@@ -78,6 +82,36 @@ test("Official PIT normalizers preserve first-availability timestamps", () => {
   ]);
   assert.equal(fred[1].available_at, "2025-03-07T00:00:00Z");
   assert.ok(fred[1].values.macroRisk < 0);
+  assert.ok(fred[1].values.macroLaborImpulse < 0);
+  assert.equal(fred[1].values.macroDataCoverage, 1);
+
+  const aud = normalizeFredVintageRecords("DEXUSAL", [
+    { date: "2025-01-01", realtime_start: "2025-01-02", value: "0.62" },
+    { date: "2025-01-02", realtime_start: "2025-01-03", value: "0.64" },
+  ]);
+  assert.ok(aud[1].values.macroFxImpulse > 0);
+  assert.equal(aud[1].values.eventSentiment, 0);
+
+  const vix = normalizeFredVintageRecords("VIXCLS", [
+    { date: "2025-01-02", value: "18.0" },
+    { date: "2025-01-03", value: "20.0" },
+  ], { conservativeMarketClose: true });
+  assert.equal(vix[1].available_at, "2025-01-04T00:00:00.000Z");
+  assert.equal(vix[1].historicalAvailabilityMethod, "conservative-next-utc-day-market-observation");
+  assert.ok(vix[1].values.macroVolatilityImpulse < 0);
+
+  const australianInflation = normalizeFredVintageRecords("CPALTT01AUQ659N", [
+    { date: "2024-10-01", realtime_start: "2025-01-29", value: "2.4" },
+    { date: "2025-01-01", realtime_start: "2025-04-30", value: "3.0" },
+  ]);
+  assert.equal(australianInflation[1].available_at, "2025-04-30T00:00:00Z");
+  assert.ok(australianInflation[1].values.macroInflationImpulse < 0);
+
+  const australianGrowth = normalizeFredVintageRecords("AUSGDPRQPSMEI", [
+    { date: "2024-10-01", realtime_start: "2025-03-05", value: "1.2" },
+    { date: "2025-01-01", realtime_start: "2025-06-04", value: "2.0" },
+  ]);
+  assert.ok(australianGrowth[1].values.macroGrowthImpulse > 0);
 });
 
 test("Eastmoney PIT fundamentals use the later publication or revision timestamp", () => {
@@ -96,6 +130,44 @@ test("Eastmoney PIT fundamentals use the later publication or revision timestamp
   assert.equal(rows[0].available_at, "2026-04-30T23:59:59Z");
   assert.equal(rows[0].values.profitMargin, 0.2);
   assert.equal(rows[0].values.debtToAssets, 0.45);
+  assert.equal(rows[0].historicalAvailabilityVerified, true);
+});
+
+test("Corporate actions and listing histories preserve conservative availability", () => {
+  const actions = normalizeCorporateActionRecords("BHP", [{
+    exDate: "2025-03-06",
+    declarationDate: "2025-02-18",
+    recordDate: "2025-03-07",
+    paymentDate: "2025-03-27",
+    amount: 0.5,
+  }], { provider: "test-dividends", eventType: "dividend" });
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].available_at, "2025-02-18T23:59:59Z");
+  assert.equal(actions[0].event_time, "2025-03-06T00:00:00Z");
+  assert.equal(actions[0].historicalAvailabilityVerified, true);
+
+  const universe = normalizeEodhdCompanyUniverseRecords("BHP", {
+    General: { Name: "BHP Group", Exchange: "AU", IPODate: "1987-01-01" },
+  }, { market: "ASX" });
+  assert.equal(universe.length, 1);
+  assert.equal(universe[0].available_at, "1987-01-01T00:00:00Z");
+  assert.equal(universe[0].historicalAvailabilityVerified, true);
+});
+
+test("EODHD financial statements require a real filing timestamp for PIT training", () => {
+  const rows = normalizeEodhdFinancialPitRecords("BHP", {
+    Financials: {
+      Income_Statement: {
+        quarterly: {
+          "2025-03-31": { date: "2025-03-31", filing_date: "2025-05-02", totalRevenue: "1200" },
+          "2025-06-30": { date: "2025-06-30", totalRevenue: "1300" },
+        },
+      },
+    },
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].event_time, "2025-03-31T23:59:59Z");
+  assert.equal(rows[0].available_at, "2025-05-02T23:59:59Z");
   assert.equal(rows[0].historicalAvailabilityVerified, true);
 });
 
@@ -380,6 +452,32 @@ test("Background jobs enforce bounded concurrency and retry transient factor fai
   }
 });
 
+test("Training resource profiles persist and reconfigure background capacity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "quant-training-resources-"));
+  try {
+    const manager = createJobManager({ basePath: join(directory, "jobs"), maxConcurrent: 1 });
+    const resources = createTrainingResourceService({
+      configPath: join(directory, "profile.json"),
+      applyPolicy: (profile) => manager.configurePolicy(profile.jobs),
+    });
+    await resources.ready;
+    const deep = await resources.set("deep");
+    assert.equal(deep.selected, "deep");
+    assert.equal(manager.status().maxConcurrent, 3);
+    assert.equal(manager.status().maxHeavyConcurrent, 1);
+    assert.equal(deep.profile.data.historyBatch, 120);
+    assert.equal(deep.profile.data.officialPitBatch, 30);
+    const plan = resources.trainingPlan("weekly", { limit: 900, foldCount: 9 });
+    assert.equal(plan.limit, 450);
+    assert.equal(plan.foldCount, 7);
+    assert.equal(plan.treeThreads, 4);
+    const restored = createTrainingResourceService({ configPath: join(directory, "profile.json") });
+    assert.equal((await restored.get()).selected, "deep");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Runtime V3 resumes a closed Python worker as an interrupted training attempt", async () => {
   const directory = await mkdtemp(join(tmpdir(), "quant-jobs-worker-restart-"));
   let attempts = 0;
@@ -424,6 +522,45 @@ test("Background job list exposes heartbeat and reconciles persisted work", asyn
     assert.equal(listed.jobs[0].status, "complete");
     assert.ok(listed.jobs[0].heartbeatAt);
     assert.ok(listed.jobs[0].trainingRunId);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Restart reconciliation resumes queued history backfill without a manual profile toggle", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "quant-jobs-history-resume-"));
+  try {
+    const manager = createJobManager({ basePath: directory, maxConcurrent: 1 });
+    manager.register("history-backfill", async (_payload, update, context) => {
+      await update(0.7, { phase: "history-backfill" });
+      await context.checkpoint("symbol-AAPL", { rows: 2500, source: "unit-source" });
+      return { complete: 1 };
+    });
+    const persisted = {
+      id: "history-backfill-resume",
+      type: "history-backfill",
+      market: "US",
+      status: "queued",
+      runtimeVersion: 3,
+      attempt: 1,
+      maxAttempts: 2,
+      createdAt: "2026-08-01T00:00:00.000Z",
+      updatedAt: "2026-08-01T00:00:00.000Z",
+      payload: { market: "US", symbols: ["AAPL"] },
+      checkpoints: {},
+    };
+    await writeFile(join(directory, "history-backfill-resume.json"), JSON.stringify(persisted), "utf8");
+    const reconciled = await manager.reconcile();
+    let final = null;
+    for (let index = 0; index < 40; index += 1) {
+      final = await manager.get(persisted.id);
+      if (final?.status === "complete") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(reconciled.resumed, 1);
+    assert.equal(final?.status, "complete");
+    assert.equal(final?.result?.complete, 1);
+    assert.equal(final?.checkpoints?.["symbol-AAPL"]?.rows, 2500);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -806,6 +943,34 @@ test("Training supervisor schedules bounded automatic rework after a failed job"
   }
 });
 
+test("Training supervisor releases a cancelled job into bounded rework", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "quant-supervisor-cancelled-"));
+  const jobs = new Map();
+  try {
+    const supervisor = createTrainingSupervisor({
+      basePath: directory,
+      markets: ["ASX"],
+      config: { startupDelayMs: 0, maxAttempts: 3, retryDelayMs: 1000 },
+      async createTrainingJob() {
+        const job = { id: "job-cancelled", status: "cancelled", error: "operator cancelled stale matrix", updatedAt: new Date().toISOString() };
+        jobs.set(job.id, job);
+        return job;
+      },
+      async getJob(id) {
+        return jobs.get(id) || null;
+      },
+    });
+    await supervisor.trigger({ market: "ASX", reason: "unit-test" });
+    await supervisor.tick("unit-test-cancelled");
+    const status = await supervisor.status("ASX");
+    assert.equal(status.market.status, "rework_scheduled");
+    assert.equal(status.market.activeJobId, null);
+    assert.match(status.market.lastError, /operator cancelled stale matrix/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Model trajectory normalizes explainable factor evidence", () => {
   const event = normalizeModelEvent({
     market: "ASX",
@@ -909,6 +1074,36 @@ test("Evidence registry fans global Alpha runs into each market and classifies m
     assert.equal(registry.trajectories({ market: "ASX", family: "alpha" }).count, 1);
     assert.equal(registry.trajectories({ market: "CN", family: "alpha" }).count, 1);
     assert.equal(registry.trajectories({ market: "US", family: "minute" }).count, 1);
+  } finally {
+    registry.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Evidence registry derives calibration and factor research trajectories", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "quant-evidence-derived-"));
+  const registry = createEvidenceRegistry({ dbPath: join(directory, "evidence.sqlite3"), jobsPath: join(directory, "jobs") });
+  try {
+    registry.persistJob({
+      id: "backtest-calibration", type: "backtest", market: "ASX", trainingRunId: "run-calibration",
+      status: "complete", progress: 1, createdAt: "2026-08-10T00:00:00Z", updatedAt: "2026-08-10T00:10:00Z",
+      payload: {}, result: { productionTraining: { manifest: { model_version: "asx-v1", data_version: "data-v1" }, horizonModels: [{
+        horizon: 5, available: true, oofRows: 7000, metaTestRows: 2000, weights: { target: 0.35 },
+        directionWeights: { ridge: 0.35 }, directionMetrics: { brierSkillScore: 0.03 }, foldMetrics: [{}, {}, {}, {}, {}],
+      }] } },
+    }, { trajectory: true });
+    registry.persistJob({
+      id: "factor-evolution-derived", type: "factor-evolution", market: null,
+      status: "complete", progress: 1, createdAt: "2026-08-10T01:00:00Z", updatedAt: "2026-08-10T01:10:00Z",
+      payload: {}, result: { markets: [{ market: "ASX", availableCount: 36, research: { available: true, symbolCount: 36 } }] },
+    }, { trajectory: true });
+    const calibration = registry.trajectories({ market: "ASX", family: "calibration" });
+    const factor = registry.trajectories({ market: "ASX", family: "factor" });
+    assert.equal(calibration.count, 1);
+    assert.equal(calibration.rows[0].metricName, "brierSkillScore");
+    assert.equal(calibration.rows[0].evidence.result.oofRows, 7000);
+    assert.equal(factor.count, 1);
+    assert.equal(factor.rows[0].evidence.result.symbolCount, 36);
   } finally {
     registry.close();
     await rm(directory, { recursive: true, force: true });

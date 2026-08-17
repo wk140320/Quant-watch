@@ -11,6 +11,9 @@ if [[ ! -d "$DEST" ]]; then
 fi
 
 cd "$PROJECT_ROOT"
+STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/quant-watch-ready.XXXXXX")"
+trap 'rm -rf "$STAGING_DIR"' EXIT
+
 rsync -a \
   --exclude .git \
   --exclude .cache \
@@ -30,6 +33,11 @@ rsync -a \
   --exclude reports \
   --exclude 'record*' \
   --exclude Quant-watch-open-source.tar.gz \
-  ./ "$DEST/"
+  --exclude Quant-watch-ready-update.tar.gz \
+  ./ "$STAGING_DIR/"
+
+# Mirror the sanitized staging tree while preserving the destination repository.
+# This removes private or generated files left behind by older sync runs.
+rsync -a --delete --filter='P /.git/***' "$STAGING_DIR/" "$DEST/"
 
 echo "Synced safe project files to $DEST"
