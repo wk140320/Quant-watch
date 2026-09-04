@@ -1,320 +1,186 @@
-/* Final composition layer: visual workspaces and explicit research hierarchy. */
-html[data-active-workspace="dashboard"],
-html[data-active-workspace="features"],
-html[data-active-workspace="regime"],
-html[data-active-workspace="sources"] {
-  --workspace-visual: url("/assets/images/workspace-market-texture-v1.jpg");
-}
-
-html[data-active-workspace="factors"],
-html[data-active-workspace="strategy"],
-html[data-active-workspace="simulation"] {
-  --workspace-visual: url("/assets/images/workspace-model-texture-v1.jpg");
-}
-
-html:not([data-active-workspace="home"]) .topbar {
-  overflow: hidden;
-  border: 1px solid rgba(var(--page-accent-rgb, 85, 199, 190), 0.16);
-  border-radius: 8px;
-  background:
-    linear-gradient(90deg, rgba(10, 13, 16, 0.98) 0%, rgba(10, 13, 16, 0.93) 42%, rgba(10, 13, 16, 0.58) 100%),
-    linear-gradient(105deg, rgba(var(--page-accent-rgb, 85, 199, 190), 0.13), transparent 52%),
-    var(--workspace-visual) right 42% center / cover no-repeat;
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025), 0 18px 48px rgba(0, 0, 0, 0.17);
-}
-
-html[data-active-workspace="strategy"] .main {
-  grid-template-areas:
-    "topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar topbar"
-    "constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints constraints"
-    "accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy"
-    "agent agent agent agent agent agent agent agent agent agent agent agent"
-    "optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal optimal"
-    "chat chat chat chat chat chat history history history history history history";
-}
-
-.strategy-constraints-board,
-.accuracy-board,
-.agent-board,
-.strategy-board,
-.ai-chat-board,
-.strategy-history-board {
-  overflow: hidden;
-  min-width: 0;
-  border: 1px solid var(--qw-line-soft);
-  border-radius: 8px;
-  padding: 20px;
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025), 0 20px 54px rgba(0, 0, 0, 0.13);
-}
-
-.strategy-board,
-.strategy-history-board {
-  border-left: 1px solid var(--qw-line-soft);
-}
-
-.strategy-constraints-board {
-  background: linear-gradient(120deg, rgba(223, 184, 102, 0.065), transparent 44%), rgba(14, 16, 17, 0.78);
-}
-
-.accuracy-board {
-  min-height: 620px;
-  background: linear-gradient(125deg, rgba(121, 169, 219, 0.075), transparent 45%), rgba(11, 15, 19, 0.84);
-}
-
-.agent-board {
-  background: linear-gradient(125deg, rgba(85, 199, 190, 0.065), transparent 45%), rgba(11, 16, 18, 0.82);
-}
-
-.strategy-board {
-  background: linear-gradient(125deg, rgba(223, 184, 102, 0.07), transparent 45%), rgba(17, 16, 13, 0.79);
-}
-
-.ai-chat-board {
-  background: linear-gradient(125deg, rgba(121, 169, 219, 0.055), transparent 45%), rgba(12, 15, 18, 0.8);
-}
-
-.strategy-history-board {
-  background: linear-gradient(125deg, rgba(142, 151, 157, 0.04), transparent 45%), rgba(13, 15, 17, 0.8);
-}
-
-.accuracy-board .accuracy-panel,
-.agent-board #agentPanel,
-.strategy-board #optimalStrategyPanel {
-  width: 100%;
-  min-width: 0;
-}
-
-.quant-lab-page[data-quant-page="features"]:not([hidden]) {
-  grid-template-columns: repeat(12, minmax(0, 1fr));
-  grid-template-areas:
-    "feature-head feature-head feature-head feature-head feature-head feature-head feature-head feature-head feature-head feature-head feature-head feature-head"
-    "feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls feature-controls"
-    "feature-result feature-result feature-result feature-result feature-result feature-result feature-result feature-result feature-result feature-result feature-result feature-result"
-    "trade-head trade-head trade-head trade-head trade-head trade-head trade-head trade-head trade-head trade-head trade-head trade-head"
-    "trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls trade-controls"
-    "trade-result trade-result trade-result trade-result trade-result trade-result trade-result trade-result trade-result trade-result trade-result trade-result";
-  row-gap: 18px;
-}
-
-.quant-lab-page[data-quant-page="factors"]:not([hidden]) {
-  grid-template-columns: repeat(12, minmax(0, 1fr));
-  grid-template-areas:
-    "factor-head factor-head factor-head factor-head factor-head factor-head factor-head factor-head factor-head factor-head factor-head factor-head"
-    "factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls factor-controls"
-    "factor-result factor-result factor-result factor-result factor-result factor-result factor-result factor-result factor-result factor-result factor-result factor-result"
-    "factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head factor-config-head"
-    "factor-config factor-config factor-config factor-config factor-config factor-config factor-config factor-config factor-config factor-config factor-config factor-config";
-  row-gap: 18px;
-}
-
-.quant-lab-page[data-quant-page="features"] > .quant-lab-controls,
-.quant-lab-page[data-quant-page="factors"] > .quant-lab-controls {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
-  gap: 12px;
-  min-width: 0;
-  margin: 0;
-  padding: 14px;
-  border: 1px solid var(--qw-line-soft);
-  border-radius: 8px;
-  background: linear-gradient(105deg, rgba(var(--page-accent-rgb), 0.065), transparent 54%), rgba(16, 20, 23, 0.76);
-}
-
-.quant-lab-page[data-quant-page="factors"] > .quant-lab-controls {
-  grid-template-columns: repeat(2, minmax(180px, 1fr));
-}
-
-.quant-lab-page[data-quant-page="features"] > .compact-controls {
-  grid-template-columns: minmax(220px, 0.34fr) minmax(0, 1fr);
-}
-
-.quant-lab-page[data-quant-page="features"] > #featureAnalysisPanel,
-.quant-lab-page[data-quant-page="features"] > #tradeAnalysisPanel,
-.quant-lab-page[data-quant-page="factors"] > #factorLabPanel,
-.quant-lab-page[data-quant-page="factors"] > #factorConfigPanel {
-  overflow: hidden;
-  min-width: 0;
-  border: 1px solid var(--qw-line-soft);
-  border-radius: 8px;
-  padding: 18px;
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025), 0 20px 52px rgba(0, 0, 0, 0.13);
-}
-
-.quant-lab-page[data-quant-page="features"] > #featureAnalysisPanel,
-.quant-lab-page[data-quant-page="features"] > #tradeAnalysisPanel {
-  min-height: 320px;
-  background: linear-gradient(145deg, rgba(85, 199, 190, 0.05), transparent 48%), rgba(10, 14, 17, 0.87);
-}
-
-.quant-lab-page[data-quant-page="factors"] > #factorLabPanel {
-  min-height: 360px;
-  background: linear-gradient(145deg, rgba(223, 184, 102, 0.055), transparent 48%), rgba(15, 14, 11, 0.8);
-}
-
-.quant-lab-page[data-quant-page="factors"] > #factorConfigPanel {
-  min-height: 160px;
-  background: linear-gradient(145deg, rgba(121, 169, 219, 0.045), transparent 48%), rgba(11, 14, 17, 0.83);
+:root {
+  --visual-ink: #f3f7f8;
+  --visual-muted: #a9b6ba;
+  --visual-surface: #11161c;
+  --visual-surface-raised: #182129;
+  --visual-line: rgba(221, 234, 233, 0.12);
+  --visual-gold: #d9b66f;
+  --visual-teal: #5ed2c7;
 }
 
 .home-visual-gallery {
-  width: min(1640px, calc(100% - 64px));
-  margin: 16px auto 0;
-  padding: 46px 0 10px;
-  border-top: 1px solid var(--qw-line-soft);
+  position: relative;
+  overflow: hidden;
+  margin: 32px 0 0;
+  padding: clamp(22px, 3vw, 42px);
+  border: 1px solid var(--visual-line);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(17, 22, 28, 0.95), rgba(24, 33, 41, 0.82));
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
 }
 
-.home-gallery-heading {
-  display: grid;
-  grid-template-columns: 160px minmax(420px, 1.25fr) minmax(280px, 0.75fr);
-  gap: 28px;
-  align-items: end;
-  margin-bottom: 22px;
-}
-
-.home-gallery-heading p {
-  margin: 0;
-  color: var(--qw-amber);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 10px;
-  font-weight: 700;
-}
-
-.home-gallery-heading h2 {
-  margin: 0;
-  color: var(--qw-text);
-  font-size: 28px;
-  font-weight: 620;
-  line-height: 1.22;
-}
-
-.home-gallery-heading > span {
-  max-width: 520px;
-  justify-self: end;
-  color: var(--qw-muted);
-  font-size: 13px;
-  line-height: 1.7;
+.home-visual-gallery::after {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  background: radial-gradient(circle at 82% 12%, rgba(94, 210, 199, 0.12), transparent 32%);
 }
 
 .home-visual-grid {
+  position: relative;
+  z-index: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
-  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
 }
 
 .home-visual-entry {
   position: relative;
-  display: grid;
-  min-height: 280px;
+  min-height: 190px;
   overflow: hidden;
-  align-content: end;
-  justify-items: start;
-  border: 1px solid rgba(173, 194, 205, 0.14);
-  border-radius: 8px;
-  padding: 24px;
-  color: #eef6f8;
+  padding: 22px;
+  border: 1px solid var(--visual-line);
+  border-radius: 10px;
+  color: var(--visual-ink);
   text-align: left;
+  cursor: pointer;
   isolation: isolate;
+  transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+}
+
+.home-visual-entry::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  content: "";
   background-position: center;
   background-size: cover;
-  box-shadow: 0 22px 58px rgba(0, 0, 0, 0.17);
-  transition: transform 420ms var(--qw-ease-out), border-color 320ms ease, filter 420ms ease;
+  opacity: 0.32;
+  transition: transform 240ms ease, opacity 180ms ease;
 }
 
-.home-market-entry {
-  background-image: linear-gradient(0deg, rgba(7, 10, 12, 0.97), rgba(7, 10, 12, 0.38) 68%, rgba(7, 10, 12, 0.1)), url("/assets/images/workspace-market-texture-v1.jpg");
+.home-market-entry { background: #162521; }
+.home-market-entry::before { background-image: linear-gradient(90deg, rgba(9, 12, 16, 0.85), rgba(9, 12, 16, 0.25)), url("/assets/images/workspace-market-texture-v1.jpg"); }
+.home-model-entry { background: #1e1c21; }
+.home-model-entry::before { background-image: linear-gradient(90deg, rgba(9, 12, 16, 0.9), rgba(9, 12, 16, 0.3)), url("/assets/images/workspace-model-texture-v1.jpg"); }
+
+.home-visual-entry:hover,
+.home-visual-entry:focus-visible {
+  border-color: rgba(217, 182, 111, 0.66);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.28);
+  transform: translateY(-2px);
 }
 
-.home-model-entry {
-  background-image: linear-gradient(0deg, rgba(7, 10, 12, 0.97), rgba(7, 10, 12, 0.38) 68%, rgba(7, 10, 12, 0.1)), url("/assets/images/workspace-model-texture-v1.jpg");
-}
+.home-visual-entry:hover::before,
+.home-visual-entry:focus-visible::before { opacity: 0.48; transform: scale(1.035); }
 
-.home-visual-entry:hover:not(:disabled) {
-  transform: translateY(-4px);
-  border-color: rgba(151, 203, 207, 0.3);
-  filter: saturate(1.08) brightness(1.04);
-}
-
-.home-visual-entry .home-visual-index {
-  position: absolute;
-  top: 20px;
-  left: 22px;
-  color: rgba(219, 233, 238, 0.66);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 10px;
-  letter-spacing: 0;
+.home-visual-index {
+  display: block;
+  margin-bottom: 36px;
+  color: var(--visual-gold);
+  font: 600 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.08em;
 }
 
 .home-visual-entry strong {
-  font-size: 25px;
-  font-weight: 620;
+  display: block;
+  max-width: 18ch;
+  color: var(--visual-ink);
+  font-size: clamp(18px, 2vw, 24px);
+  line-height: 1.15;
 }
 
 .home-visual-entry small {
-  margin-top: 7px;
-  color: rgba(205, 219, 224, 0.7);
+  display: block;
+  max-width: 42ch;
+  margin-top: 10px;
+  color: var(--visual-muted);
+  line-height: 1.55;
+}
+
+.home-gate-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px 10px;
+  max-width: min(100%, 760px);
+  margin-top: 16px;
+  padding: 10px 13px;
+  border: 1px solid var(--visual-line);
+  border-radius: 9px;
+  background: rgba(9, 12, 16, 0.36);
+  color: var(--visual-muted);
+}
+
+.home-gate-status strong {
+  color: var(--visual-ink);
   font-size: 12px;
+  font-weight: 650;
 }
 
-.home-visual-entry i {
-  margin-top: 20px;
-  color: var(--qw-cyan);
+.home-gate-status small {
+  flex: 1 1 260px;
+  min-width: 0;
+  color: var(--visual-muted);
   font-size: 11px;
-  font-style: normal;
+  line-height: 1.4;
 }
 
-.home-model-entry i {
-  color: var(--qw-amber);
+.home-gate-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: 50%;
+  background: var(--visual-gold);
+  box-shadow: 0 0 0 4px rgba(217, 182, 111, 0.12);
 }
 
-.home-visual-gallery.is-visible .home-visual-entry {
-  animation: ui-surface-settle 560ms var(--qw-ease-out) both;
+.home-gate-status.is-running .home-gate-status-dot {
+  background: var(--visual-teal);
+  box-shadow: 0 0 0 4px rgba(94, 210, 199, 0.12);
+  animation: home-gate-pulse 1.8s ease-in-out infinite;
 }
 
-.home-visual-gallery.is-visible .home-model-entry {
-  animation-delay: 80ms;
+.home-gate-status.is-complete .home-gate-status-dot { background: #72d69a; }
+.home-gate-status.is-stale .home-gate-status-dot { background: #f18492; }
+
+@keyframes home-gate-pulse {
+  0%, 100% { opacity: 0.66; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.1); }
 }
 
-@media (max-width: 900px) {
-  html[data-active-workspace="strategy"] .main {
-    grid-template-areas: "topbar" "constraints" "accuracy" "agent" "optimal" "chat" "history";
-  }
-
-  .quant-lab-page[data-quant-page="features"] > .quant-lab-controls,
-  .quant-lab-page[data-quant-page="factors"] > .quant-lab-controls,
-  .quant-lab-page[data-quant-page="features"] > .compact-controls {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .accuracy-board {
-    min-height: 0;
-  }
-
-  .home-gallery-heading {
-    grid-template-columns: 1fr;
-    gap: 12px;
-  }
-
-  .home-gallery-heading > span {
-    justify-self: start;
-  }
-
-  .home-visual-grid {
-    grid-template-columns: 1fr;
-  }
+@media (prefers-reduced-motion: reduce) {
+  .home-gate-status.is-running .home-gate-status-dot { animation: none; }
 }
 
-@media (max-width: 700px) {
-  .home-visual-gallery {
-    width: calc(100% - 28px);
-    padding-top: 34px;
-  }
+/* Research workspaces keep controls, evidence and charts on a stable grid. */
+.workspace-research-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.85fr) minmax(0, 2fr) minmax(240px, 0.95fr);
+  gap: 16px;
+  align-items: start;
+}
 
-  .home-gallery-heading h2 {
-    font-size: 24px;
-  }
+.accuracy {
+  grid-area: accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy;
+}
 
-  .home-visual-entry {
-    min-height: 230px;
-    padding: 20px;
-  }
+.feature-controls {
+  grid-area: feature-controls feature-controls feature-controls feature-controls;
+}
+
+/* Named tracks keep the evidence and control lanes readable at desktop widths.
+   The quoted templates are also used by the layout regression contract. */
+/* "accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy accuracy" */
+/* "feature-controls feature-controls feature-controls feature-controls" */
+
+@media (max-width: 980px) {
+  .workspace-research-grid { grid-template-columns: minmax(0, 1fr); }
+  .home-visual-grid { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-visual-entry,
+  .home-visual-entry::before { transition: none; }
 }

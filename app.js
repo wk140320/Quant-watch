@@ -287,6 +287,10 @@ const state = {
   paperAgentEventSource: null,
   paperAgentPollTimer: null,
   paperAgentReloadTimer: null,
+  taskCenter: { jobs: [], summary: {}, updatedAt: null, loading: false, filter: "running" },
+  gate03Status: { loading: false, data: null, error: null },
+  taskCenterRefreshTimer: null,
+  taskCenterPollTimer: null,
   backendSchedulesAvailable: false,
   researchConfigByMarket: readJsonStorage("researchConfigByMarket", {}),
   modelChangeLogByMarket: readJsonStorage("modelChangeLogByMarket", {}),
@@ -659,6 +663,23 @@ function formatSnapshotTime(iso) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatTaskTimestamp(value, market = state.market) {
+  if (!value) return "暂无";
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.getTime())) return "暂无";
+  const timezone = activeMarketConfig(market).timezone || "Australia/Sydney";
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: timezone,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  }).format(parsed);
 }
 
 function updateSydneyClock() {
@@ -3023,6 +3044,482 @@ function renderHomePage() {
     renderHomePage.lastSummary = summaryCacheKey;
     safeStorage.setItem(`homeSummary:${state.market}`, homeSummary);
   }
+  renderTaskCenter();
+}
+
+function taskLabel(type = "job") {
+  return ({
+    "backtest": "严格 OOF 训练",
+    "history-backfill": "历史行情补齐",
+    "pit-enrichment": "PIT 事件补齐",
+    "corporate-action-backfill": "公司行动补齐",
+    "cn-corporate-action-backfill": "A股公司行动补齐",
+    "rqdata-backfill": "RQData 行情回填",
+    "factor-lab": "因子评估",
+    "factor-evolution": "Alpha 因子进化",
+    "factor-research": "因子研究",
+    "training": "分钟模型训练",
+    "agent-replay": "Agent 历史重放",
+    "learning-evaluation": "学习效果评估",
+    "model-report": "模型训练报告",
+    "training-supervisor": "训练门禁",
+    "news": "新闻缓存刷新",
+    "reddit": "Reddit 社媒缓存",
+  }[type] || type || "后台任务");
+}
+
+function taskStatusLabel(status = "") {
+  return ({ queued: "排队中", running: "运行中", paused: "已暂停", complete: "已完成", failed: "失败", cancelled: "已取消", deferred: "已延期" }[status] || status || "未知");
+}
+
+function taskLifecycleLabel(job = {}) {
+  if (job.supervisorReview?.status === "accepted") return "已验收·通过";
+  if (job.supervisorReview?.status === "rejected") return "已验收·未通过";
+  if (job.supervisorState === "rework_scheduled") return "待返工";
+  if (job.status === "complete" && job.detail?.phase === "supervisor-review-ready") return "待验收";
+  return taskStatusLabel(job.status);
+}
+
+function taskProgressValue(job = {}) {
+  return Math.max(0, Math.min(100, Number(job.progress || 0) * 100));
+}
+
+function taskStallLabel(job = {}) {
+  if (job.status !== "running") return "";
+  if (job.needsDiagnosis === true || job.taskHealth === "running-needs-diagnosis" || (job.stagnation && !job.stagnation.resolvedAt)) {
+    const category = job.stagnation?.category || "当前阶段";
+    const age = Number(job.stagnation?.progressAgeMs);
+    return Number.isFinite(age) ? `需诊断 · ${category} · ${Math.round(age / 60_000)} 分钟无实质进度` : `需诊断 · ${category}`;
+  }
+  const heartbeat = Date.parse(job.heartbeatAt || job.updatedAt || "");
+  if (!Number.isFinite(heartbeat)) return "";
+  const age = Date.now() - heartbeat;
+  return age > 90_000 ? `疑似卡顿 · ${Math.round(age / 1000)} 秒无心跳` : "";
+}
+
+function taskActionMarkup(job = {}) {
+  const id = escapeHtml(job.id || "");
+  const status = String(job.status || "");
+  const queued = ["queued", "paused"].includes(status);
+  const canPause = ["queued", "running"].includes(status);
+  const canStart = ["queued", "paused"].includes(status);
+  const canCancel = ["queued", "running", "paused"].includes(status);
+  const canRestart = ["failed", "cancelled", "deferred"].includes(status);
+  return `<div class="home-task-actions" aria-label="任务操作">
+    ${canStart ? `<button class="task-action primary" type="button" data-task-action="${status === "paused" ? "resume" : "start"}" data-task-id="${id}">${status === "paused" ? "恢复" : "开始"}</button>` : ""}
+    ${canPause ? `<button class="task-action" type="button" data-task-action="pause" data-task-id="${id}">${status === "running" ? "暂停" : "暂停排队"}</button>` : ""}
+    ${canCancel ? `<button class="task-action danger" type="button" data-task-action="cancel" data-task-id="${id}">取消</button>` : ""}
+    ${canRestart ? `<button class="task-action primary" type="button" data-task-action="restart" data-task-id="${id}">重新启动</button>` : ""}
+  </div>`;
+}
+
+async function runTaskAction(id, action, payload = {}) {
+  if (!id || !action) return;
+  try {
+    await requestJson(`/api/task-center/${encodeURIComponent(id)}/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    setStatus(`任务已${({ start: "开始", resume: "恢复", pause: "暂停", restart: "重新启动", cancel: "取消", up: "上移", down: "下移" }[action] || "更新")}`);
+    await loadTaskCenter({ timeoutMs: 5000 });
+  } catch (error) {
+    setStatus(`任务操作失败：${compactDisplayError(error.message || error)}`);
+    await loadTaskCenter({ timeoutMs: 5000 });
+  }
+}
+
+function taskSubtaskRows(items = [], tone = "") {
+  if (!Array.isArray(items) || !items.length) return `<p class="task-detail-empty">暂无记录</p>`;
+  return items.map((item) => `<div class="task-subtask ${tone}"><span>${escapeHtml(item.label || item.id || "阶段")}</span><small>${escapeHtml(item.status || "pending")}</small></div>`).join("");
+}
+
+function taskFlowMarkup(subtasks = {}) {
+  const all = Array.isArray(subtasks.all) && subtasks.all.length
+    ? subtasks.all
+    : [
+      ...(Array.isArray(subtasks.completed) ? subtasks.completed.map((item) => ({ ...item, status: "complete" })) : []),
+      ...(Array.isArray(subtasks.current) ? subtasks.current.map((item) => ({ ...item, status: "running" })) : []),
+      ...(Array.isArray(subtasks.pending) ? subtasks.pending : []),
+    ];
+  if (!all.length) return `<div class="task-flow-empty">暂无可展示的子任务流程</div>`;
+  const labelFor = (item) => item.status === "complete" ? "已完成" : item.status === "running" ? "进行中" : "未开始";
+  return `<div class="task-flow" role="list" aria-label="任务执行流程">${all.map((item, index) => {
+    const status = item.status === "complete" ? "complete" : item.status === "running" ? "running" : "pending";
+    const connector = index < all.length - 1 ? `<span class="task-flow-line ${status === "complete" ? "is-active" : ""}" aria-hidden="true"></span>` : "";
+    return `<div class="task-flow-step ${status}" role="listitem">
+      <span class="task-flow-dot" aria-hidden="true"></span>
+      <strong>${escapeHtml(item.label || item.id || "阶段")}</strong>
+      <small>${labelFor({ ...item, status })}</small>
+    </div>${connector}`;
+  }).join("")}</div>`;
+}
+
+function taskTrainingAuditMarkup(job = {}) {
+  const result = job.result && typeof job.result === "object" ? job.result : {};
+  const horizons = Array.isArray(result.horizons) ? result.horizons : [];
+  if (!horizons.length) return "";
+  const metric = (value, digits = 2, suffix = "") => Number.isFinite(Number(value)) ? `${Number(value).toFixed(digits)}${suffix}` : "—";
+  return `<section class="task-training-audit"><div class="task-detail-flow-title"><span>训练结果审计</span><small>${escapeHtml(result.framework || "严格样本外训练")}</small></div>
+    <div class="task-training-audit-grid">${horizons.map((item) => {
+      const m = item.directionMetrics || item.metrics || {};
+      const r = item.rankingMetrics || item.ranking || {};
+      return `<article><strong>${escapeHtml(`${item.horizon || "—"}日模型`)}</strong><span>状态 ${item.productionEvidencePassed === true ? "可晋级" : "未晋级"}</span><small>样本 ${escapeHtml(metric(m.samples, 0))} · 独立测试日 ${escapeHtml(metric(m.testDates, 0))}</small><small>BA ${escapeHtml(metric(m.balancedAccuracyPct, 2, "%"))} · 做多排名 Top10 ${escapeHtml(metric(r.top10DirectionHitRatePct, 2, "%"))}</small><small>Brier ${escapeHtml(metric(m.brierSkillScore, 4))} · ECE ${escapeHtml(metric(m.ecePct, 2, "%"))}</small></article>`;
+    }).join("")}</div></section>`;
+}
+
+async function openTaskDetail(id) {
+  if (!id) return;
+  const modal = document.createElement("div");
+  modal.className = "task-detail-modal";
+  modal.innerHTML = `<div class="task-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="taskDetailTitle">
+    <div class="task-detail-head"><div><p>TASK DETAIL</p><h2 id="taskDetailTitle">正在读取任务详情</h2></div><button type="button" class="task-detail-close" aria-label="关闭">×</button></div>
+    <div class="task-detail-body"><div class="task-detail-loading">读取当前阶段与检查点…</div></div>
+  </div>`;
+  document.body.appendChild(modal);
+  const close = () => modal.remove();
+  modal.querySelector(".task-detail-close")?.addEventListener("click", close);
+  modal.addEventListener("click", (event) => { if (event.target === modal) close(); });
+  try {
+    const job = await requestJson(`/api/task-center/${encodeURIComponent(id)}`, { cache: "no-store" });
+    const subtasks = job.subtasks || {};
+    modal.querySelector("#taskDetailTitle").textContent = `${taskLabel(job.type)} · ${job.market || "GLOBAL"}`;
+    modal.querySelector(".task-detail-body").innerHTML = `<div class="task-detail-summary">
+      <span><b>状态</b>${escapeHtml(taskLifecycleLabel(job))}</span>
+      <span><b>进度</b>${job.progress == null ? "等待阶段" : `${taskProgressValue(job).toFixed(1)}%`}</span>
+      <span><b>当前阶段</b>${escapeHtml(job.detail?.phase || job.detail?.stage || "暂无")}</span>
+      <span><b>更新时间</b>${escapeHtml(formatTaskTimestamp(job.updatedAt || job.heartbeatAt, job.market || state.market))}</span>
+    </div>
+    <div class="task-detail-flow-title"><span>执行流程</span><small>从左到右查看已完成、进行中与未开始阶段</small></div>
+    ${taskFlowMarkup(subtasks)}
+    ${taskTrainingAuditMarkup(job)}
+    <div class="task-detail-columns">
+      <section><h3>当前执行</h3>${taskSubtaskRows(subtasks.current, "current")}</section>
+      <section><h3>已完成</h3>${taskSubtaskRows(subtasks.completed, "complete")}</section>
+      <section><h3>未完成</h3>${taskSubtaskRows(subtasks.pending, "pending")}</section>
+    </div>
+    ${job.error ? `<div class="task-detail-error">${escapeHtml(job.error)}</div>` : ""}
+    <details class="task-detail-raw"><summary>查看检查点与审计记录</summary><pre>${escapeHtml(JSON.stringify({ checkpoints: job.checkpoints || {}, history: job.history || [] }, null, 2))}</pre></details>`;
+  } catch (error) {
+    modal.querySelector(".task-detail-body").innerHTML = `<div class="task-detail-error">读取失败：${escapeHtml(compactDisplayError(error.message || error))}</div>`;
+  }
+}
+
+function bindTaskCenterInteractions() {
+  const panel = $("homeTaskCenter");
+  if (!panel || panel.dataset.bound === "true") return;
+  panel.dataset.bound = "true";
+  panel.addEventListener("click", (event) => {
+    const moreButton = event.target.closest("[data-task-more]");
+    if (moreButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      void loadMoreTaskCenter();
+      return;
+    }
+    const actionButton = event.target.closest("[data-task-action]");
+    if (actionButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      void runTaskAction(actionButton.dataset.taskId, actionButton.dataset.taskAction);
+      return;
+    }
+    const row = event.target.closest("[data-task-row]");
+    if (row) void openTaskDetail(row.dataset.taskId);
+  });
+  panel.addEventListener("dragstart", (event) => {
+    const row = event.target.closest("[data-task-row]");
+    if (!row || row.dataset.draggable !== "true") return;
+    state.taskCenter.draggedId = row.dataset.taskId;
+    event.dataTransfer?.setData("text/plain", row.dataset.taskId);
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.dropEffect = "move";
+    }
+    row.classList.add("is-dragging");
+  });
+  panel.addEventListener("dragend", (event) => {
+    event.target.closest("[data-task-row]")?.classList.remove("is-dragging");
+    panel.querySelectorAll(".task-drop-target").forEach((node) => node.classList.remove("task-drop-target"));
+    state.taskCenter.draggedId = null;
+  });
+  panel.addEventListener("dragover", (event) => {
+    const target = event.target.closest('[data-task-row][data-draggable="true"]');
+    if (!target) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    panel.querySelectorAll(".task-drop-target").forEach((node) => node.classList.remove("task-drop-target"));
+    target.classList.add("task-drop-target");
+  });
+  panel.addEventListener("drop", (event) => {
+    event.preventDefault();
+    const target = event.target.closest('[data-task-row][data-draggable="true"]');
+    const draggedId = state.taskCenter.draggedId || event.dataTransfer?.getData("text/plain");
+    if (!target || !draggedId || target.dataset.taskId === draggedId) return;
+    const rows = [...panel.querySelectorAll('[data-task-row][data-draggable="true"]')];
+    const from = rows.findIndex((row) => row.dataset.taskId === draggedId);
+    const to = rows.findIndex((row) => row.dataset.taskId === target.dataset.taskId);
+    if (from < 0 || to < 0) return;
+    void runTaskAction(draggedId, "move", { position: to });
+    state.taskCenter.draggedId = null;
+    panel.querySelectorAll(".task-drop-target").forEach((node) => node.classList.remove("task-drop-target"));
+  });
+}
+
+function renderGate03Status() {
+  const node = $("homeGate03Status");
+  if (!node) return;
+  const snapshot = state.gate03Status?.data;
+  if (!snapshot) {
+    node.className = "home-gate-status is-loading";
+    node.innerHTML = `<span class="home-gate-status-dot" aria-hidden="true"></span><strong>${state.gate03Status?.error ? "Gate03 状态暂不可用" : "Gate03 状态读取中"}</strong><small>${escapeHtml(state.gate03Status?.error || "正在读取最近一次审计心跳")}</small>`;
+    return;
+  }
+  const process = snapshot.process || {};
+  const gate = snapshot.gate || {};
+  const status = snapshot.status || "not_started";
+  const statusLabel = {
+    running: "运行中",
+    completed: "已完成",
+    stale: "疑似失去心跳",
+    not_started: "尚未运行",
+  }[status] || status;
+  const progress = Number.isFinite(Number(process.progress)) ? `${(Number(process.progress) * 100).toFixed(0)}%` : "--";
+  const heartbeat = snapshot.heartbeat?.updatedAt ? formatTaskTimestamp(snapshot.heartbeat.updatedAt, state.market) : "暂无";
+  const tone = status === "running" ? "is-running" : status === "stale" ? "is-stale" : status === "completed" ? "is-complete" : "is-idle";
+  const evidence = gate.generatedAt
+    ? `${Number(gate.passedCount || 0)} 项通过 · ${Number(gate.blockedCount || 0)} 项阻断`
+    : "暂无已生成报告";
+  node.className = `home-gate-status ${tone}`;
+  node.innerHTML = `<span class="home-gate-status-dot" aria-hidden="true"></span><strong>Gate03 ${escapeHtml(statusLabel)} · ${escapeHtml(progress)}</strong><small>${escapeHtml(process.phaseLabel || "等待阶段信息")} · 最近心跳 ${escapeHtml(heartbeat)} · ${escapeHtml(evidence)}</small>`;
+}
+
+async function loadGate03Status(options = {}) {
+  if (state.gate03Status?.loading) return null;
+  state.gate03Status = { ...state.gate03Status, loading: true };
+  renderGate03Status();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), Math.max(700, Number(options.timeoutMs || 1400)));
+  try {
+    const data = await requestJson("/api/gate03-status", { signal: controller.signal, cache: "no-store" });
+    state.gate03Status = { loading: false, data, error: null };
+    renderGate03Status();
+    return data;
+  } catch (error) {
+    const message = error?.name === "AbortError" ? "状态读取超时，保留上次结果" : compactDisplayError(error.message || error);
+    state.gate03Status = { ...state.gate03Status, loading: false, error: message };
+    renderGate03Status();
+    return null;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function renderTaskCenter() {
+  const panel = $("homeTaskCenter");
+  if (!panel) return;
+  const taskState = state.taskCenter || {};
+  const summary = taskState.summary || {};
+  const activeCount = $("homeTaskActiveCount");
+  const queuedCount = $("homeTaskQueuedCount");
+  const pausedCount = $("homeTaskPausedCount");
+  const completeCount = $("homeTaskCompleteCount");
+  if (activeCount) activeCount.textContent = String(summary.running || 0);
+  if (queuedCount) queuedCount.textContent = String(summary.queued || 0);
+  if (pausedCount) pausedCount.textContent = String(summary.paused || 0);
+  if (completeCount) completeCount.textContent = String(summary.recent24h ?? summary.complete ?? 0);
+  const filter = ["running", "queued", "paused", "complete", "recent24h"].includes(state.taskCenter?.filter) ? state.taskCenter.filter : "running";
+  panel.classList.toggle("is-task-history", filter === "recent24h");
+  document.querySelectorAll("[data-task-filter]").forEach((button) => {
+    const active = button.dataset.taskFilter === filter;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const allJobs = Array.isArray(taskState.jobs) ? taskState.jobs : [];
+  const jobs = allJobs.filter((job) => filter === "recent24h"
+    ? Date.parse(job.updatedAt || job.createdAt || "") >= Date.now() - 24 * 60 * 60 * 1000
+    : filter === "complete"
+      ? ["complete", "failed", "cancelled", "deferred"].includes(job.status)
+      : job.status === filter);
+  // The homepage is the operations view, so it must show the real queue across
+  // all markets. Filtering by the selected market made a healthy CN/US/ASX
+  // run look like "0 running" whenever the user was viewing another market.
+  const visible = jobs
+    .sort((left, right) => {
+      if (["queued", "paused"].includes(filter) && left.queuePosition != null && right.queuePosition != null) {
+        return Number(left.queuePosition) - Number(right.queuePosition);
+      }
+      const activeLeft = ["queued", "running"].includes(left.status) ? 0 : 1;
+      const activeRight = ["queued", "running"].includes(right.status) ? 0 : 1;
+      return activeLeft - activeRight || String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || ""));
+    })
+    .slice(0, filter === "recent24h" ? 500 : 8);
+  const historyMeta = filter === "recent24h"
+    ? `<div class="home-task-history-meta"><strong>最近24小时已载入 ${jobs.length} 条</strong><span>可滚动查看；需要更早记录时继续加载。</span>${taskState.page?.hasMore ? `<button type="button" class="task-more-button" data-task-more>加载更早任务</button>` : ""}</div>`
+    : "";
+  if (!visible.length) {
+    if (taskState.loading) {
+      panel.innerHTML = `<div class="home-task-empty home-task-loading"><span class="home-task-loading-dot"></span><div><strong>正在连接任务中心</strong><small>正在读取 ${escapeHtml(activeMarketConfig().label)} 的后台状态，页面不会等待行情或训练完成。</small></div></div>`;
+      return;
+    }
+    if (taskState.error) {
+      panel.innerHTML = `<div class="home-task-empty home-task-error"><strong>后台任务暂时无法连接</strong><small>${escapeHtml(taskState.error)}。已保留最近一次本地记录，系统会自动重试。</small></div>`;
+      return;
+    }
+    const emptyText = filter === "running" ? "当前没有运行中的任务。后台开始执行后会自动出现在这里。"
+      : filter === "queued" ? "当前没有排队任务。"
+        : filter === "paused" ? "当前没有已暂停的任务。"
+          : filter === "recent24h" ? "最近24小时没有任务记录。"
+            : "最近没有完成或结束的任务记录。";
+    panel.innerHTML = `<p class="muted home-task-empty">${emptyText}</p>`;
+    return;
+  }
+  panel.innerHTML = `${historyMeta}${visible.map((job) => {
+    const pct = taskProgressValue(job);
+    const stall = taskStallLabel(job);
+    const phase = job.detail?.phase || job.detail?.stage || job.detail?.message || job.error || (job.status === "queued" ? "等待后台资源" : "等待阶段更新");
+    const result = job.resultSummary?.productionEligible === true ? "生产门控已满足"
+      : job.status === "complete" && job.resultSummary?.available === false ? "已完成，但证据不足"
+      : job.status === "failed" ? (job.failureCategory ? `失败分类：${job.failureCategory}` : "任务失败")
+        : job.supervisorReview?.status === "accepted" ? `监工验收通过${job.supervisorReview.score != null ? ` · 得分 ${job.supervisorReview.score}` : ""}`
+          : job.supervisorReview?.status === "rejected" ? `监工验收未通过${job.supervisorReview.score != null ? ` · 得分 ${job.supervisorReview.score}` : ""}`
+        : job.status === "complete" && job.detail?.phase === "supervisor-review-ready" ? "训练产物已生成，等待确定性验收"
+          : "结果待验收";
+    const tone = job.status === "failed" ? "danger" : job.status === "complete" ? "good" : stall ? "warn" : "active";
+    const createdAt = formatTaskTimestamp(job.createdAt, job.market || state.market);
+    const startedAt = formatTaskTimestamp(job.startedAt, job.market || state.market);
+    const updatedAt = formatTaskTimestamp(job.updatedAt || job.heartbeatAt, job.market || state.market);
+    const durationStart = Date.parse(job.startedAt || job.createdAt || "");
+    const durationEnd = Date.parse(job.updatedAt || job.heartbeatAt || "");
+    const duration = Number.isFinite(durationStart) && Number.isFinite(durationEnd) && durationEnd >= durationStart
+      ? `耗时 ${formatAge(durationEnd - durationStart)}`
+      : "耗时暂无";
+    const draggable = ["queued", "paused"].includes(job.status);
+    return `
+      <article class="home-task-row ${tone}" data-task-row data-task-id="${escapeHtml(job.id || "")}" draggable="${draggable ? "true" : "false"}" data-draggable="${draggable ? "true" : "false"}">
+        <div class="home-task-main"><strong>${escapeHtml(taskLabel(job.type))}</strong><span>${escapeHtml(job.market || state.market)} · ${escapeHtml(taskLifecycleLabel(job))}</span></div>
+        <div class="home-task-progress"><div><i style="width:${pct.toFixed(1)}%"></i></div><strong>${job.status === "complete" ? "100%" : `${pct.toFixed(1)}%`}</strong></div>
+        <div class="home-task-detail"><span>${escapeHtml(phase)}</span><small>${escapeHtml(result)}${stall ? ` · ${escapeHtml(stall)}` : updatedAt !== "暂无" ? ` · 最近更新 ${escapeHtml(updatedAt)}` : ""}</small></div>
+        <div class="home-task-time" aria-label="任务时间"><span>创建 ${escapeHtml(createdAt)}</span><span>开始 ${escapeHtml(startedAt)}</span><span>${escapeHtml(duration)}</span></div>
+        ${taskActionMarkup(job)}
+      </article>`;
+  }).join("")}`;
+}
+
+async function loadMoreTaskCenter() {
+  if (state.taskCenter?.loading || state.taskCenter?.filter !== "recent24h") return null;
+  const page = state.taskCenter.page || {};
+  const offset = Number(page.offset || 0) + (Array.isArray(state.taskCenter.jobs) ? state.taskCenter.jobs.length : 0);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 3500);
+  try {
+    const payload = await requestJson(`/api/task-center?limit=120&recentHours=24&includeSupervisor=false&fast=true&offset=${offset}`, { signal: controller.signal, cache: "no-store" });
+    const previous = Array.isArray(state.taskCenter.jobs) ? state.taskCenter.jobs : [];
+    state.taskCenter = { ...state.taskCenter, jobs: [...previous, ...(payload.jobs || [])], page: payload.page || {}, summary: payload.summary || state.taskCenter.summary, loading: false, error: null };
+    renderTaskCenter();
+    return payload;
+  } catch (error) {
+    setStatus(`加载更早任务失败：${compactDisplayError(error.message || error)}`);
+    return null;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function setTaskCenterFilter(filter) {
+  if (!["running", "queued", "paused", "complete", "recent24h"].includes(filter)) return;
+  state.taskCenter = { ...state.taskCenter, filter };
+  renderTaskCenter();
+  if (filter === "recent24h") void loadTaskCenter({ timeoutMs: 5000 });
+}
+
+async function loadTaskCenter(options = {}) {
+  if (state.taskCenter.loading) return null;
+  const market = safeMarket(state.market);
+  const cacheKey = `taskCenterSnapshot:${market}`;
+  const cached = readJsonStorage(cacheKey, null);
+  const previousJobs = Array.isArray(state.taskCenter?.jobs) && state.taskCenter.jobs.length
+    ? state.taskCenter.jobs
+    : Array.isArray(cached?.jobs) ? cached.jobs : [];
+  const previousSummary = Object.keys(state.taskCenter?.summary || {}).length
+    ? state.taskCenter.summary
+    : cached?.summary || {};
+  state.taskCenter = {
+    ...state.taskCenter,
+    jobs: previousJobs,
+    summary: previousSummary,
+    loading: true,
+    error: null,
+  };
+  renderTaskCenter();
+  const controller = new AbortController();
+  const timeoutMs = Math.max(1200, Number(options.timeoutMs || 2800));
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const recent = state.taskCenter.filter === "recent24h";
+    const payload = await requestJson(`/api/task-center?limit=${recent ? 120 : 80}${recent ? "&recentHours=24&includeSupervisor=false" : ""}&fast=true`, {
+      signal: controller.signal,
+      cache: "no-store",
+    });
+    safeStorage.setItem(cacheKey, JSON.stringify({
+      jobs: Array.isArray(payload.jobs) ? payload.jobs.slice(0, recent ? 120 : 80) : [],
+      summary: payload.summary || {},
+      updatedAt: payload.updatedAt || new Date().toISOString(),
+    }));
+    state.taskCenter = { ...payload, loading: false, error: null, filter: state.taskCenter.filter || "running" };
+    renderTaskCenter();
+    return payload;
+  } catch (error) {
+    const timedOut = error?.name === "AbortError" || /abort|timeout/i.test(String(error?.message || ""));
+    const message = timedOut ? `任务中心响应超过 ${Math.round(timeoutMs / 100) / 10} 秒` : compactDisplayError(error.message || error);
+    state.taskCenter = {
+      ...state.taskCenter,
+      jobs: previousJobs,
+      summary: previousSummary,
+      loading: false,
+      error: message,
+      updatedAt: cached?.updatedAt || state.taskCenter.updatedAt || null,
+    };
+    if (options.showError) setStatus(`后台任务读取失败：${message}`);
+    renderTaskCenter();
+    return null;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function updateTaskFromRuntimeEvent(eventType, payload = {}) {
+  const id = payload.id;
+  if (!id) return;
+  const jobs = Array.isArray(state.taskCenter?.jobs) ? [...state.taskCenter.jobs] : [];
+  const index = jobs.findIndex((job) => job.id === id);
+  const previous = index >= 0 ? jobs[index] : { id, type: payload.type, market: payload.market };
+  const status = eventType === "job.queued" ? "queued"
+    : eventType === "job.running" ? "running"
+      : eventType === "job.complete" ? "complete"
+        : ["job.failed", "job.retrying"].includes(eventType) ? (eventType === "job.retrying" ? "queued" : "failed")
+          : previous.status;
+  const next = {
+    ...previous,
+    ...payload,
+    status,
+    progress: payload.progress == null ? previous.progress || 0 : payload.progress,
+    detail: payload.detail || previous.detail || null,
+    error: payload.error || previous.error || null,
+    updatedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+  };
+  if (eventType === "job.progress_stagnation_recovered" && previous.stagnation) {
+    next.stagnation = { ...previous.stagnation, resolvedAt: next.updatedAt };
+  }
+  if (index >= 0) jobs[index] = next;
+  else jobs.unshift(next);
+  state.taskCenter = { ...state.taskCenter, jobs: jobs.slice(0, 80), updatedAt: next.updatedAt };
+  renderTaskCenter();
+  if (state.activePage === "sources" && ["job.progress", "job.checkpoint", "job.complete", "job.failed"].includes(eventType)) {
+    clearTimeout(state.taskCenterRefreshTimer);
+    state.taskCenterRefreshTimer = setTimeout(() => refreshDataReplenishment(false), 500);
+  }
 }
 
 const WORKSPACE_PAGE_LABELS = Object.freeze({
@@ -3143,6 +3640,7 @@ function setWorkspacePage(page, options = {}) {
   if (next === "home") {
     renderHomePage();
     window.QuantHomeMotion?.refresh();
+    deferWorkspaceStep(next, workspaceToken, "读取后台任务", () => loadTaskCenter({ quiet: true }), 40, { idle: true, timeout: 1200 });
   }
   if (next === "sources") {
     deferWorkspaceStep(next, workspaceToken, "刷新数据源预算", () => refreshProviderBudget(false), 40, { frame: true });
@@ -3155,7 +3653,11 @@ function setWorkspacePage(page, options = {}) {
     deferWorkspaceStep(next, workspaceToken, "渲染市场涨跌榜", renderMarketMoversPanel, 40, { frame: true });
     deferWorkspaceStep(next, workspaceToken, "渲染 AI 选股", renderAiPickPanel, 120, { idle: true, timeout: 900 });
   }
-  if (next === "dashboard") queueMainRender(["cards", "detail"]);
+  if (next === "dashboard") {
+    // Restore the large watchlist after the navigation frame so the rail and
+    // market controls remain responsive while cards/canvases are rebuilt.
+    deferWorkspaceStep(next, workspaceToken, "渲染监控台", () => queueMainRender(["cards", "detail"]), 40, { idle: true, timeout: 1200 });
+  }
   if (next === "factors") renderFactorConfigPanel();
   if (next === "strategy") {
     const strategyTab = activeStrategyWorkspaceTab();
@@ -4500,6 +5002,7 @@ function renderDataHealth(payload) {
   const marketProviders = Array.isArray(payload.marketProviders) ? payload.marketProviders : [];
   const newsProviders = Array.isArray(payload.newsProviders) ? payload.newsProviders : [];
   const socialProviders = Array.isArray(payload.socialProviders) ? payload.socialProviders : (payload.redditSocial ? [payload.redditSocial] : []);
+  const freePitSources = Array.isArray(payload.freePitSources) ? payload.freePitSources : [];
   const cacheRows = Array.isArray(payload.newsCache?.rows) ? payload.newsCache.rows : [];
   const redditCacheRows = Array.isArray(payload.redditSocial?.cache?.rows) ? payload.redditSocial.cache.rows : [];
   const redditSummary = payload.redditSocial?.cache?.summary || {};
@@ -4566,6 +5069,19 @@ function renderDataHealth(payload) {
       <summary>社媒源状态</summary>
       <div class="api-status-scroll">${socialProviders.slice(0, 8).map(providerPill).join("") || "<span class=\"muted\">暂无社媒源状态</span>"}</div>
     </details>
+    <details class="health-details" open>
+      <summary>免费 PIT 源状态</summary>
+      <div class="pit-source-health-list">
+        ${freePitSources.length ? freePitSources.map((provider) => `
+          <div class="pit-source-health-row">
+            <strong>${escapeHtml(provider.name || "source")}</strong>
+            <span>${escapeHtml(provider.market || "多市场")} · ${escapeHtml(provider.dataset || "")}</span>
+            <em class="${provider.pit === "shadow-only" || provider.pit === "event-timestamp" ? "warn" : "ready"}">${provider.pit === "shadow-only" || provider.pit === "event-timestamp" ? "Shadow" : "可进PIT"}</em>
+          </div>
+        `).join("") : "<p class=\"muted\">暂无免费 PIT 源状态。</p>"}
+      </div>
+      <p class="muted small-text">只有经过历史可用性验证的记录进入正式 OOF；BLS/GDELT 等没有完整 vintage 的数据只作为 Shadow 特征。</p>
+    </details>
     <details class="health-details">
       <summary>本地新闻缓存明细</summary>
       <div class="news-cache-list">
@@ -4621,10 +5137,49 @@ function renderDataReplenishment(payload) {
   const target = payload.target || {};
   const stageOne = payload.stageOne || {};
   const stageGates = stageOne.gates || {};
+  const frontier = payload.frontierAssessment || {};
+  const frontierStateLabels = {
+    "local-backfill-still-actionable": "本地补齐仍可继续",
+    "source-or-archive-frontier": "已到当前数据源前沿",
+    "lockbox-experiment-frontier": "可转固定锁箱实验",
+  };
+  const frontierState = frontier.frontier?.state || "source-or-archive-frontier";
+  const frontierLabel = frontierStateLabels[frontierState] || "需要诊断数据前沿";
+  const fallbackLanes = Array.isArray(frontier.fallbackLanes) ? frontier.fallbackLanes : [];
   const researchRequired = asNumber(stageGates.researchHistory?.required, Math.ceil(asNumber(universe.target, 0) * 0.8));
   const deepRequired = asNumber(stageGates.deepHistory?.required, Math.ceil(asNumber(universe.target, 0) * 0.5));
   const financialDatasetKey = stageGates.fundamentals?.dataset || "fundamentals";
   const financialPitLabel = stageGates.fundamentals?.label || "历史财务PIT覆盖";
+  const plan = payload.replenishmentPlan || {};
+  const planTotal = plan.total || {};
+  const planHistory = plan.history || {};
+  const planPit = plan.pit || {};
+  const planExecution = plan.execution || {};
+  const planEta = plan.eta || {};
+  const snapshotStatus = payload.snapshotState === "stale-refreshing"
+    ? "正在刷新，当前仍显示上一份完整快照"
+    : payload.snapshotState === "stale-data-lake"
+      ? "数据湖暂不可读，沿用上一份完整快照"
+      : "已审计快照";
+  const pitMissingLabels = {
+    fundamentals: "基本面",
+    financial_disclosures: "财报披露",
+    universe: "历史股票池",
+    corporate_actions: "公司行动",
+    news: "新闻事件",
+  };
+  const missingPitSummary = Object.entries(planPit.missingByDataset || {})
+    .filter(([, count]) => asNumber(count, 0) > 0)
+    .map(([key, count]) => `${pitMissingLabels[key] || key} ${formatCompactNumber(count, 0)}只`)
+    .join(" · ");
+  const formatPlanEta = (value) => {
+    const minutes = asNumber(value, 0);
+    if (!minutes) return "暂无法估计";
+    return minutes < 60 ? `约 ${minutes.toFixed(0)} 分钟 worker 时间` : `约 ${(minutes / 60).toFixed(1)} 小时 worker 时间`;
+  };
+  const activeJobLabel = planExecution.activeOrQueuedJobs
+    ? `${planExecution.runningJobs || 0} 运行 · ${planExecution.queuedJobs || 0} 排队`
+    : "暂无登记任务";
   const percentage = (value, total) => Math.max(0, Math.min(100, asNumber(value, 0) / Math.max(1, asNumber(total, 0)) * 100));
   const pitCard = (key, label, threshold) => {
     const row = datasets[key] || {};
@@ -4639,11 +5194,22 @@ function renderDataReplenishment(payload) {
   const recentJobs = [...(payload.jobs?.pit || []), ...(payload.jobs?.history || [])]
     .sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")))
     .slice(0, 6);
+  const jobProgressLabel = (job) => {
+    if (job.status === "queued") return "排队中";
+    if (job.status === "running") return `${Math.round(asNumber(job.progress, 0) * 100)}%`;
+    if (job.status === "complete") {
+      if (job.resultSummary?.available === false || asNumber(job.resultSummary?.failed, 0) > 0) return "已执行但无新增";
+      return "已完成";
+    }
+    if (job.status === "failed") return "失败";
+    if (job.status === "cancelled") return "已取消";
+    return `${Math.round(asNumber(job.progress, 0) * 100)}%`;
+  };
   panel.innerHTML = `
     <div class="replenishment-head">
       <div><span>市场级数据补齐</span><strong>${escapeHtml(payload.market)} · ${escapeHtml(payload.resourceProfile || "balanced")}</strong></div>
       <div class="stage-one-readiness ${stageOne.met ? "ready" : "blocked"}"><span>第一阶段</span><strong>${asNumber(stageOne.progressPct, 0).toFixed(1)}%</strong><small>${stageOne.met ? "数据门槛通过" : `下一步 ${escapeHtml(stageOne.nextAction || "补齐数据")}`}</small></div>
-      <p>${escapeHtml(payload.note || "")}</p>
+      <p>${escapeHtml(snapshotStatus)} · ${escapeHtml(payload.note || "")}</p>
     </div>
     <div class="replenishment-grid">
       <div class="replenishment-metric ${universe.selected >= universe.target ? "ready" : "blocked"}">
@@ -4666,6 +5232,33 @@ function renderDataReplenishment(payload) {
       ${pitCard(financialDatasetKey, financialPitLabel, 80)}
       ${pitCard("news", "新闻事件PIT", 80)}
     </div>
+    <div class="replenishment-frontier ${frontierState === "lockbox-experiment-frontier" ? "ready" : "blocked"}">
+      <div class="replenishment-frontier-head">
+        <div><span>数据前沿与替代方案</span><strong>${escapeHtml(frontierLabel)}</strong></div>
+        <small>${frontier.strictProduction?.productionOofAllowed === true ? "生产 OOF 可评估" : "生产 OOF 暂停 · longTradeGate 关闭"}</small>
+      </div>
+      <p>${escapeHtml(frontier.frontier?.note || "当前快照正在区分本地可补齐项与需要新授权源的缺口。")}</p>
+      <div class="replenishment-frontier-lanes">
+        ${fallbackLanes.map((lane) => `<span><b>${escapeHtml(lane.id || "研究车道")}</b> ${escapeHtml(lane.status || "待判定")} · ${formatCompactNumber(lane.eligibleSymbols || 0, 0)} 只</span>`).join("") || "<span>替代方案状态将在下一次完整快照中显示</span>"}
+      </div>
+    </div>
+    <div class="replenishment-plan">
+      <div class="replenishment-plan-head">
+        <div>
+          <span>真实剩余工作量</span>
+          <strong>至少还需 ${formatCompactNumber(planTotal.minimumRemainingRounds || 0, 0)} 轮</strong>
+        </div>
+        <div class="replenishment-plan-eta"><span>本地处理下限</span><strong>${escapeHtml(formatPlanEta(planEta.lowerBoundMinutes))}</strong><small>${escapeHtml(planEta.note || "以当前快照估算")}</small></div>
+      </div>
+      <div class="replenishment-plan-grid">
+        <div><span>历史行情</span><strong>${formatCompactNumber(planHistory.remainingRounds || 0, 0)} 轮</strong><small>缺 ${formatCompactNumber(planHistory.remainingSymbols || 0, 0)} 只 · 每轮 ${formatCompactNumber(planHistory.batchSize || 0, 0)} 只 · 当前 ${asNumber(planHistory.progressPct, 0).toFixed(1)}%</small></div>
+        <div><span>PIT 缺口</span><strong>${formatCompactNumber(planPit.remainingRounds || 0, 0)} 轮</strong><small>缺口合并 ${formatCompactNumber(planPit.remainingUniqueSymbols || 0, 0)} 只 · 每轮 ${formatCompactNumber(planPit.batchSize || 0, 0)} 只${missingPitSummary ? ` · ${escapeHtml(missingPitSummary)}` : ""}</small></div>
+        <div><span>最终复核</span><strong>${formatCompactNumber(plan.reAudit?.remainingRounds || 0, 0)} 轮</strong><small>${escapeHtml(plan.reAudit?.reason || "补齐后重新核对")}</small></div>
+        <div><span>当前调度</span><strong>${escapeHtml(activeJobLabel)}</strong><small>${escapeHtml(planExecution.note || "任务状态将在下一次快照更新")}</small></div>
+      </div>
+      ${planPit.qualityWarnings?.length ? `<p class="replenishment-plan-warning">行级验证质量仍需单独处理：${planPit.qualityWarnings.map((row) => `${escapeHtml(pitMissingLabels[row.dataset] || row.dataset)} ${asNumber(row.verifiedPct, 0).toFixed(1)}%`).join(" · ")}。这部分不按“缺少股票数”计轮次。</p>` : ""}
+      <p class="replenishment-plan-note">${escapeHtml(plan.basis || "轮次按当前已审计缺口计算；失败重试、限流和无数据返回不会计为完成")}</p>
+    </div>
     <div class="replenishment-actions">
       <button class="secondary" type="button" data-replenishment-scope="history">补历史行情</button>
       <button class="secondary" type="button" data-replenishment-scope="pit">补PIT事件</button>
@@ -4680,7 +5273,7 @@ function renderDataReplenishment(payload) {
     <details class="health-details" ${recentJobs.some((job) => ["queued", "running"].includes(job.status)) ? "open" : ""}>
       <summary>最近补齐任务</summary>
       <div class="replenishment-job-list">
-        ${recentJobs.map((job) => `<div><strong>${escapeHtml(job.type || "job")}</strong><span>${escapeHtml(job.status || "unknown")} · ${Math.round(asNumber(job.progress, 0) * 100)}%</span><small>${escapeHtml(job.detail?.phase || job.error || job.updatedAt || "")}</small></div>`).join("") || "<p class=\"muted\">尚无补齐任务。</p>"}
+        ${recentJobs.map((job) => `<div><strong>${escapeHtml(job.type || "job")}</strong><span>${escapeHtml(jobProgressLabel(job))}</span><small>${escapeHtml(job.detail?.phase || job.error || job.updatedAt || "")}</small></div>`).join("") || "<p class=\"muted\">尚无补齐任务。</p>"}
       </div>
     </details>
   `;
@@ -6446,13 +7039,6 @@ function modelReportPrimaryMetrics(model = {}) {
       ["Profit Factor", modelReportMetric(metrics.profitFactor, 2)],
     ];
   }
-  if (model.family === "ai_supervisor") {
-    return [
-      ["结论", String(model.verdict || "未审核")],
-      ["可用", model.available ? "是" : "否"],
-      ["审核分", modelReportMetric(model.score, 0)],
-    ];
-  }
   const metrics = model.metrics || {};
   return Object.entries(metrics).slice(0, 6).map(([label, value]) => [
     label,
@@ -6460,9 +7046,28 @@ function modelReportPrimaryMetrics(model = {}) {
   ]);
 }
 
+function modelReportEvidenceMeta(model = {}) {
+  const tier = String(model.evidenceTier || model.evidence_tier || "").trim().toUpperCase();
+  const meta = {
+    D0: { label: "D0 流程证据", className: "evidence-d0", researchOnly: true },
+    D1: { label: "D1 受限研究 OOF", className: "evidence-d1", researchOnly: true },
+    D2: { label: "D2 稳健研究候选", className: "evidence-d2", researchOnly: true },
+    D3: { label: "D3 前向 Qualified Shadow", className: "evidence-d3", researchOnly: true },
+    D4: { label: "D4 严格生产", className: "evidence-d4", researchOnly: false },
+  }[tier] || { label: "证据等级未提供", className: "evidence-unknown", researchOnly: true };
+  const lane = String(model.trainingLane || model.training_lane || "").trim();
+  return {
+    tier: tier || "UNKNOWN",
+    type: String(model.evidenceType || model.evidence_type || "").trim() || "未提供",
+    lane: lane || "未提供",
+    ...meta,
+  };
+}
+
 function modelReportCardHtml(model = {}) {
   const gate = model.hardGate || {};
   const metrics = modelReportPrimaryMetrics(model);
+  const evidenceMeta = modelReportEvidenceMeta(model);
   const sampleCount = model.sampleAudit?.uniqueRows ?? model.sampleCount ?? 0;
   const reasons = gate.failedChecks || model.blockingIssues || [];
   const status = model.status || (model.available ? "research" : "evidence_insufficient");
@@ -6511,8 +7116,16 @@ function modelReportCardHtml(model = {}) {
         <div>
           <span>${escapeHtml(model.family || "model")} ${model.horizon ? `· ${Number(model.horizon)}日` : ""}</span>
           <h3>${escapeHtml(model.name || model.modelId || "未命名模型")}</h3>
+          <div class="model-evidence-tier ${evidenceMeta.className}">
+            <b>${escapeHtml(evidenceMeta.label)}</b>
+            <small>${escapeHtml(evidenceMeta.lane)} · ${escapeHtml(evidenceMeta.type)}</small>
+          </div>
+          <div class="model-research-meta">
+            <span>Universe: ${escapeHtml(model.universe || model.universeVersion || model.sampleAudit?.universe || "未提供")}</span>
+            <span>dataAsOf: ${escapeHtml(model.dataAsOf || model.trainingAsOf || model.sampleAudit?.dataAsOf || "未提供")}</span>
+          </div>
         </div>
-        <b class="${gate.passed ? "pass" : "hold"}">${gate.passed ? "硬门槛通过" : escapeHtml(status)}</b>
+        <b class="${gate.passed && evidenceMeta.tier === "D4" ? "pass" : "hold"}">${gate.passed && evidenceMeta.tier === "D4" ? "严格门通过" : evidenceMeta.researchOnly ? "Research only" : escapeHtml(status)}</b>
       </header>
       <div class="model-evidence-metrics">
         ${metrics.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value))}</strong></div>`).join("")}
@@ -6777,12 +7390,20 @@ async function runCurrentLearningChain() {
 
 async function runLearningMode(mode = "evaluate") {
   const labels = { evaluate: "评估", incremental: "增量训练", weekly: "周度 Challenger", full: "全量训练" };
+  const changedHypothesis = mode === "evaluate" ? "" : String(window.prompt(
+    "请写下本轮唯一要验证的改动假设（例如：用行业残差标签替代绝对方向标签）。未填写不会启动训练。",
+    "",
+  ) || "").trim();
+  if (mode !== "evaluate" && !changedHypothesis) {
+    setStatus("本轮训练未启动：每次模型实验必须预先登记且只改变一个假设");
+    return null;
+  }
   try {
     setStatus(`${activeMarketConfig().label} ${labels[mode] || mode}已提交到后台`);
     const result = await requestJson("/api/training-supervisor/run", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ market: state.market, mode, reason: `manual-${mode}`, source: "continuous-learning-ui" }),
+      body: JSON.stringify({ market: state.market, mode, reason: `manual-${mode}`, source: "continuous-learning-ui", changedHypothesis }),
     });
     if (mode === "evaluate" && result.id) {
       for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -6815,7 +7436,7 @@ function renderModelReportPanel() {
     panel.innerHTML = `
       <div class="model-report-empty">
         <strong>尚未生成模型训练报告</strong>
-        <p>生成后会把 OOF、概率校准、因子、分钟模型、Paper Agent 和三方监工证据保存在本地。</p>
+        <p>生成后会把 OOF、概率校准、因子、分钟模型、Paper Agent 和固定门禁证据保存在本地。</p>
       </div>
     `;
     return;
@@ -6830,7 +7451,14 @@ function renderModelReportPanel() {
     && (status === "all" || model.status === status)
   ));
   const dataset = market?.dataset || {};
+  const staleBanner = report.isLatest === false ? `
+    <div class="model-report-stale" role="status">
+      <strong>这份报告已过期</strong>
+      <span>报告版本 ${escapeHtml(report.reportVersions?.[state.market] || market?.modelVersion || "未知")}，当前注册表最新版本 ${escapeHtml(report.latestRuns?.[state.market] || "未知")}。旧报告只供审计，不代表当前结论。</span>
+    </div>
+  ` : "";
   panel.innerHTML = `
+    ${staleBanner}
     <div class="model-report-summary">
       <div><span>生产就绪</span><strong class="${evidence.productionReady ? "pass" : "hold"}">${evidence.productionReady ? "是" : "否"}</strong></div>
       <div><span>市场版本</span><strong>${escapeHtml(market?.modelVersion || "尚无注册版本")}</strong></div>
@@ -6838,7 +7466,7 @@ function renderModelReportPanel() {
       <div><span>升级后任务失败率</span><strong>${modelReportMetric(evidence.jobReliability?.currentRuntime?.terminalFailureRatePct ?? evidence.jobReliability?.terminalFailureRatePct, 1, "%")}</strong></div>
     </div>
     <div class="model-report-actions">
-      <span>${escapeHtml(new Date(report.generatedAt).toLocaleString())} · ${escapeHtml(report.reportId)}</span>
+      <span>${escapeHtml(new Date(report.generatedAt).toLocaleString())} · ${report.ageHours == null ? "时效未知" : `${escapeHtml(Number(report.ageHours).toFixed(1))} 小时前`} · ${escapeHtml(report.reportId)}</span>
       <a class="secondary icon-text-button" href="${escapeHtml(report.links.html)}" target="_blank" rel="noopener"><i data-lucide="external-link"></i><span>打开 HTML</span></a>
       <a class="secondary icon-text-button" href="${escapeHtml(report.links.docx)}"><i data-lucide="download"></i><span>下载 Word</span></a>
     </div>
@@ -8708,7 +9336,7 @@ function productionTrainingSummaryHtml(training = null) {
           <div class="boost-row">
             <strong>${row.horizon || "-"}日 · ${escapeHtml(row.deploymentStatus || "research")} · OOF ${formatCompactNumber(row.oofRows || 0, 0)}</strong>
             <span>BSS ${numberOrPending(metrics.brierSkillScore, 3)} · ECE ${numberOrPending(metrics.ecePct, 2)}% · 概率分辨率 ${metrics.probabilityResolutionPassed ? "通过" : "不足"} · Rank IC ${numberOrPending(ranking.rankIc, 3)} · NDCG ${numberOrPending(ranking.ndcgAtK, 3)}</span>
-            <p>Top10目标先到 ${numberOrPending(ranking.top10TargetFirstRatePct, 1)}% · Top10方向 ${numberOrPending(ranking.top10DirectionHitRatePct, 1)}% · Top-K lift ${ranking.topDecileLift == null ? "n/a" : formatPct(ranking.topDecileLift)} · 回撤 ${ranking.maxDrawdownPct == null ? "n/a" : formatPct(-Math.abs(Number(ranking.maxDrawdownPct)))}</p>
+            <p>双向高置信 Top10 ${numberOrPending(metrics.selectiveTop10AccuracyPct, 1)}% · 做多排名 Top10 ${numberOrPending(ranking.top10DirectionHitRatePct, 1)}% · 目标先到 ${numberOrPending(ranking.top10TargetFirstRatePct, 1)}% · Top-K lift ${ranking.topDecileLift == null ? "n/a" : formatPct(ranking.topDecileLift)} · 回撤 ${ranking.maxDrawdownPct == null ? "n/a" : formatPct(-Math.abs(Number(ranking.maxDrawdownPct)))}</p>
             <p>目标/止损/超时 ${row.eventCounts?.target || 0}/${row.eventCounts?.stop || 0}/${row.eventCounts?.timeout || 0} · CQR覆盖 ${quantile.observedCoveragePct == null ? "n/a" : `${Number(quantile.observedCoveragePct).toFixed(1)}%`} · EV ${row.expectedValue?.expectedValuePct == null ? "n/a" : formatPct(row.expectedValue.expectedValuePct)}</p>
             ${weights.length ? `<p class="muted small-text">受约束权重：${weights.map(([name, value]) => `${escapeHtml(name)} ${Math.round(Number(value) * 100)}%`).join(" · ")}</p>` : ""}
             ${failed.length ? `<p class="muted small-text">生产门控未通过：${failed.map(escapeHtml).join("、")}</p>` : ""}
@@ -11039,6 +11667,16 @@ function connectRuntimeEventStream() {
   const streamMarket = state.market;
   const stream = new EventSource(`/api/runtime/stream?market=${encodeURIComponent(streamMarket)}`);
   state.paperAgentEventSource = stream;
+  ["job.queued", "job.running", "job.progress", "job.checkpoint", "job.progress_stalled", "job.progress_stagnation_recovered", "job.complete", "job.failed", "job.retrying"].forEach((eventType) => {
+    stream.addEventListener(eventType, (event) => {
+      try {
+        const envelope = JSON.parse(event.data || "{}");
+        updateTaskFromRuntimeEvent(eventType, envelope.payload || envelope);
+      } catch (error) {
+        console.warn("Unable to apply task progress event", error);
+      }
+    });
+  });
   const reload = () => schedulePaperAgentReload();
   ["paper-agent.trade", "paper-agent.config", "paper-agent.reset", "paper-agent.migrated"].forEach((type) => stream.addEventListener(type, reload));
   stream.addEventListener("monitor.complete", () => {
@@ -11080,7 +11718,7 @@ function connectRuntimeEventStream() {
       const envelope = JSON.parse(event.data || "{}");
       const payload = envelope.payload || envelope;
       if (payload.type === "factor-lab" && (!payload.market || safeMarket(payload.market) === state.market)) {
-        const job = await requestJson(`/api/jobs/${encodeURIComponent(payload.id)}`);
+        const job = await requestJson(`/api/training-runs/${encodeURIComponent(payload.id)}`);
         if (job?.result && state.activePage === "factors") {
           state.latestFactorLab = job.result;
           renderFactorLab(job.result);
@@ -11089,7 +11727,7 @@ function connectRuntimeEventStream() {
         return;
       }
       if (payload.type !== "backtest" || (payload.market && safeMarket(payload.market) !== state.market)) return;
-      const job = await requestJson(`/api/jobs/${encodeURIComponent(payload.id)}`);
+      const job = await requestJson(`/api/training-runs/${encodeURIComponent(payload.id)}`);
       if (!job?.result || safeMarket(job.result.market || state.market) !== state.market) return;
       state.historicalBacktestSummary = job.result;
       if (job.result.savedModel) {
@@ -15376,11 +16014,18 @@ function renderMarketSwitchShell() {
   if (state.activePage !== "dashboard") return;
   const cards = $("cards");
   const detail = $("detailPanel");
-  if (cards) cards.replaceChildren();
+  // Keep the full render path local to the workspace. The shell itself stays
+  // lightweight; queueActiveMainRender invokes this path after the target
+  // market snapshot is available.
+  const renderFullCards = () => {
+    if (cards) cards.replaceChildren();
+    renderCards();
+  };
+  if (cards) {
+    cards.innerHTML = `<div class="workspace-skeleton-panel" aria-live="polite"><strong>${escapeHtml(activeMarketConfig().label)}监控台已切换</strong><span>股票卡片与详情图表正在后台恢复，页面仍可操作。</span></div>`;
+  }
   if ($("analysisSource")) $("analysisSource").textContent = `分析：正在恢复 ${activeMarketConfig().label} 本地工作区`;
   if (detail) detail.innerHTML = `<div class="detail-loading-state"><strong>${activeMarketConfig().label}数据恢复中</strong><p class="muted">市场切换已完成，真实行情与模型快照正在后台挂载。</p></div>`;
-  renderCards();
-  renderDetail();
 }
 
 async function switchMarket(nextMarket) {
@@ -15448,7 +16093,7 @@ async function switchMarket(nextMarket) {
     safeUiStep("应用内存行情覆盖", () => applyStoredQuoteOverlays(market));
     safeUiStep("恢复市场提醒", evaluateAlerts);
   }
-  queueActiveMainRender();
+  deferMarketStep(token, "恢复目标市场内容", () => queueActiveMainRender(), 90, { idle: true });
   if (state.activePage === "regime") {
     safeUiStep("渲染股票池", renderUniversePanel);
     safeUiStep("渲染涨跌榜", renderMarketMoversPanel);
@@ -15577,6 +16222,10 @@ function boot() {
   document.querySelectorAll("[data-strategy-tab]").forEach((button) => {
     button.addEventListener("click", () => openStrategyWorkspaceTab(button.dataset.strategyTab));
   });
+  document.querySelectorAll("[data-task-filter]").forEach((button) => {
+    button.addEventListener("click", () => setTaskCenterFilter(button.dataset.taskFilter));
+  });
+  bindTaskCenterInteractions();
   bind("homeOpenDashboard", "click", () => setWorkspacePage("dashboard"));
   bind("homeOpenStrategy", "click", () => setWorkspacePage("strategy"));
   bind("homeBrandButton", "click", () => setWorkspacePage("home"));
@@ -15615,11 +16264,19 @@ function boot() {
     try {
       await loadWorkspaceBootstrap(state.market, { timeoutMs: 3500 });
       connectRuntimeEventStream();
+      await loadTaskCenter({ quiet: true });
+      await loadGate03Status({ quiet: true });
     } finally {
       document.documentElement.dataset.workspaceLoaded = "true";
       startupUiTask?.finish?.();
     }
   }, 80, { idle: false });
+  state.taskCenterPollTimer = window.setInterval(() => {
+    if (document.visibilityState !== "hidden") {
+      loadTaskCenter({ quiet: true });
+      loadGate03Status({ quiet: true });
+    }
+  }, 6000);
 
   deferUiStep("迁移后台 Paper Agent", migratePaperAgentsToBackend, 1250, { idle: true, timeout: 6000 });
   deferUiStep("恢复大盘快照", () => {

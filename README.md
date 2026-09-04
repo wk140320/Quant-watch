@@ -139,6 +139,8 @@ OPENFIGI_API_KEY=
 
 `EODHD_API_KEYS`, `TWELVEDATA_API_KEYS`, and `TIINGO_API_KEYS` accept comma-separated backup credentials. The singular key remains primary; backups are tried in order only after quota, authentication, or plan-permission failures. Keys are never round-robin consumed and are never returned to the browser.
 
+ASX PIT supplements are optional and remain server-side: `GROWTH_WITH_VALUE_API_KEY(S)` for Growth With Value's `inc/bs/cf` endpoints, and `STOCKMARKETAPI_API_KEY(S)` for StockMarketAPI.ai's ASX financials/filings endpoints. The former may be Shadow-only when it exposes fiscal periods without filing timestamps; the latter is strict only when a filing date can be joined. ASX official announcements and reports remain the no-key event evidence layer. `ASX Equity Stocks` is quote/depth data only and is never treated as PIT fundamentals.
+
 The EODHD free package is a small evaluation source, not a bulk research feed: its published plan currently provides 20 calls per day and one year of history. The project therefore uses it only as a bounded fallback. Creating multiple accounts to bypass provider limits is not part of the data strategy; it would not supply the 8–15 years of point-in-time evidence required by production gates.
 
 OpenAI analysis is disabled by default. To enable it:
@@ -208,7 +210,7 @@ POST /api/paper-agents/migrate
 GET  /api/paper-agents/events?market=ASX
 GET  /api/runtime/stream
 GET  /api/training-supervisor/status?market=ASX
-GET  /api/training-supervisor/logs?market=ASX&provider=openai
+GET  /api/training-supervisor/logs?market=ASX
 POST /api/training-supervisor/run
 POST /api/training-supervisor/review
 POST /api/training-supervisor/config
@@ -219,7 +221,7 @@ GET  /api/training-runs/:id
 GET  /api/agent-generations?market=ASX
 ```
 
-GlobalQuantMonitor 的“后台控制”页包含人工监工操作台：可以暂停总调度、暂停单个市场、独立启停三位 AI、填写操作备注、要求返工或重新验收最近完整产物。所有人工动作写入 `.cache/training-supervisor/events.jsonl`；人工操作不能跳过 OOF、PIT、校准、漂移与成本后期望门槛，也不能直接批准生产部署。
+GlobalQuantMonitor 的“后台控制”页包含训练门禁与调度控制台：可以暂停总调度、暂停单个市场、填写操作备注、启动返工或重新核验最近完整产物。所有人工动作写入 `.cache/training-supervisor/events.jsonl`；训练晋级只由本地 OOF、PIT、校准、漂移与成本后期望门槛决定，不调用外部 AI，也不能直接批准生产部署。
 
 News refresh windows and hourly Reddit cache warmup are scheduled by the backend while it is running. Long backtests and enrichment refreshes are asynchronous jobs, so the dashboard remains usable.
 

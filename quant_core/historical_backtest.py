@@ -652,6 +652,9 @@ def outcome_window(
         "entryDate": entry_row.get("date"),
         "entryPrice": entry,
         "entrySource": "next_session_vwap" if math.isfinite(explicit_vwap) and explicit_vwap > 0 else "next_session_open",
+        "exitDate": rows[end].get("date"),
+        "exitPrice": number(rows[end].get("close")),
+        "exitSource": "horizon_close",
         "targetBarrierPct": target_upside,
         "stopBarrierPct": stop_loss,
         "transactionCostBps": round_trip_cost_pct * 100.0,
@@ -775,6 +778,42 @@ def dot(weights: list[float], x: list[float]) -> float:
 
 
 def fit_ridge(samples: list[dict[str, Any]], target_key: str, penalty: float = 0.08, epochs: int = 40) -> dict[str, Any]:
+    # NumPy is used only as a vectorized implementation of the same
+    # standardized ridge baseline.  The pure-Python path remains available
+    # for the minimal runtime, but the old nested row/feature/epoch loops made
+    # multi-fold OOF training unnecessarily slow and memory-hostile.
+    try:
+        import numpy as np  # type: ignore
+        if samples:
+            width = len(samples[0].get("x") or [])
+            matrix = np.asarray(
+                [(list(row.get("x") or []) + [0.0] * width)[:width] for row in samples],
+                dtype=float,
+            )
+            matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+            weights_for_rows = np.asarray([max(0.0, training_weight(row)) for row in samples], dtype=float)
+            weights_for_rows = weights_for_rows / max(float(weights_for_rows.sum()), 1.0)
+            centers_np = (matrix * weights_for_rows[:, None]).sum(axis=0)
+            centered = matrix - centers_np
+            scales_np = np.sqrt((centered * centered * weights_for_rows[:, None]).sum(axis=0))
+            scales_np = np.where(scales_np > 1e-9, scales_np, 1.0)
+            standardized = centered / scales_np
+            targets_np = np.asarray([number(row.get(target_key)) for row in samples], dtype=float)
+            design = np.column_stack([np.ones(len(samples)), standardized])
+            regularizer = np.eye(width + 1, dtype=float) * float(penalty)
+            regularizer[0, 0] = 0.0
+            lhs = design.T @ (weights_for_rows[:, None] * design) + regularizer
+            rhs = design.T @ (weights_for_rows * targets_np)
+            solution = np.linalg.solve(lhs + np.eye(width + 1) * 1e-8, rhs)
+            return {
+                "weights": [float(value) for value in solution[1:]],
+                "intercept": float(solution[0]),
+                "centers": [float(value) for value in centers_np],
+                "scales": [float(value) for value in scales_np],
+                "solver": "numpy-vectorized-ridge",
+            }
+    except Exception:
+        pass
     centers, scales = fit_standardizer(samples)
     targets = [number(row[target_key]) for row in samples]
     weights_for_rows = [training_weight(row) for row in samples]
@@ -798,6 +837,42 @@ def fit_ridge(samples: list[dict[str, Any]], target_key: str, penalty: float = 0
 
 
 def fit_logistic(samples: list[dict[str, Any]], target_key: str, penalty: float = 0.08, epochs: int = 40) -> dict[str, Any]:
+    try:
+        import numpy as np  # type: ignore
+        if samples:
+            width = len(samples[0].get("x") or [])
+            matrix = np.asarray(
+                [(list(row.get("x") or []) + [0.0] * width)[:width] for row in samples],
+                dtype=float,
+            )
+            matrix = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+            weights_for_rows = np.asarray([max(0.0, training_weight(row)) for row in samples], dtype=float)
+            weights_for_rows = weights_for_rows / max(float(weights_for_rows.sum()), 1.0)
+            centers_np = (matrix * weights_for_rows[:, None]).sum(axis=0)
+            centered = matrix - centers_np
+            scales_np = np.sqrt((centered * centered * weights_for_rows[:, None]).sum(axis=0))
+            scales_np = np.where(scales_np > 1e-9, scales_np, 1.0)
+            standardized = centered / scales_np
+            targets_np = np.asarray([1.0 if number(row.get(target_key)) >= 0.5 else 0.0 for row in samples], dtype=float)
+            base = float(np.clip((targets_np * weights_for_rows).sum(), 0.02, 0.98))
+            intercept = float(np.log(base / (1.0 - base)))
+            coefficients = np.zeros(width, dtype=float)
+            step = min(0.08, max(0.01, 0.12 / max(1, width)))
+            for _ in range(max(8, min(60, int(epochs)))):
+                logits = np.clip(intercept + standardized @ coefficients, -18.0, 18.0)
+                probabilities = 1.0 / (1.0 + np.exp(-logits))
+                error = (probabilities - targets_np) * weights_for_rows
+                intercept -= step * float(error.sum())
+                coefficients -= step * (standardized.T @ error + 2.0 * float(penalty) * coefficients)
+            return {
+                "weights": [float(value) for value in coefficients],
+                "intercept": float(intercept),
+                "centers": [float(value) for value in centers_np],
+                "scales": [float(value) for value in scales_np],
+                "solver": "numpy-vectorized-logistic-gradient",
+            }
+    except Exception:
+        pass
     centers, scales = fit_standardizer(samples)
     targets = [1.0 if number(row[target_key]) >= 0.5 else 0.0 for row in samples]
     weights_for_rows = [training_weight(row) for row in samples]

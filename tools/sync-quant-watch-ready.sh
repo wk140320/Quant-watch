@@ -21,6 +21,7 @@ rsync -a \
   --exclude .pnpm-store \
   --exclude .share \
   --exclude .venv \
+  --exclude .ml-venv \
   --include .env.example \
   --exclude '.env*' \
   --exclude __pycache__ \

@@ -18,6 +18,9 @@ const LOW_PRIORITY_OPERATIONS = new Set([
   "local-model-train",
   "production-model-train",
   "production-model-recover-oof",
+  // Report rendering reads large OOF artifacts and writes DOCX/HTML. Keep it
+  // on the bounded research lane so it cannot block interactive analysis.
+  "model-report-generate",
 ]);
 const DATA_OPERATIONS = new Set([
   "data-lake-upsert",
@@ -28,13 +31,35 @@ const DATA_OPERATIONS = new Set([
   "data-lake-pit-upsert",
   "data-lake-pit-batch-upsert",
   "data-lake-pit-read",
+  "data-lake-pit-coverage",
   "data-lake-backfill-local-caches",
   "baostock-corporate-actions",
+  "rqdata-status",
+  "rqdata-candles",
+]);
+const DATA_WRITE_OPERATIONS = new Set([
+  "data-lake-upsert",
+  "data-lake-panel-upsert",
+  "data-lake-pit-upsert",
+  "data-lake-pit-batch-upsert",
+  "data-lake-backfill-local-caches",
+  "rqdata-candles",
 ]);
 const MAINTENANCE_OPERATIONS = new Set([
   "data-lake-audit",
   "training-artifact-maintenance",
 ]);
+
+function taskPriority(operation) {
+  const name = String(operation || "");
+  // A collected PIT record has no value until it is durably written.  Give
+  // write operations precedence over read-only audit/status work in the shared
+  // ingest lane, while keeping the ordering stable within the same class.
+  if (name === "data-lake-pit-batch-upsert") return 0;
+  if (["data-lake-pit-upsert", "data-lake-upsert", "data-lake-panel-upsert"].includes(name)) return 1;
+  if (["data-lake-summary", "data-lake-pit-read", "data-lake-pit-coverage", "data-lake-read", "data-lake-panel-read"].includes(name)) return 3;
+  return 2;
+}
 
 function positiveInteger(value, fallback, minimum = 1, maximum = 32) {
   const parsed = Number(value);
@@ -48,7 +73,14 @@ function createPythonQuantClient(options = {}) {
   if (!root) throw new Error("Python quant client requires an application root.");
   const workerPath = options.workerPath || join(root, "quant_core", "worker.py");
   const localPython = options.localPython || join(root, ".venv", "bin", "python");
-  const python = options.python || process.env.PYTHON_BIN || (existsSync(localPython) ? localPython : "python3");
+  const nativePython = options.nativePython || process.env.QUANT_ML_PYTHON_BIN || join(root, ".ml-venv", "bin", "python");
+  const useNativeRuntime = String(process.env.QUANT_USE_NATIVE_ML || "true").toLowerCase() !== "false";
+  // Keep the old environment as an explicit fallback. The isolated runtime
+  // prevents incompatible OpenMP/BLAS wheels from being loaded together.
+  const python = options.python
+    || (useNativeRuntime && existsSync(nativePython) ? nativePython : null)
+    || process.env.PYTHON_BIN
+    || (existsSync(localPython) ? localPython : "python3");
   const persistent = options.persistent ?? process.env.PYTHON_CORE_PERSISTENT !== "false";
   const outputLimit = Number(options.outputLimit || DEFAULT_OUTPUT_LIMIT);
   const idleTimeoutMs = Number(options.idleTimeoutMs ?? process.env.PYTHON_CORE_IDLE_TIMEOUT_MS ?? DEFAULT_IDLE_TIMEOUT_MS);
@@ -92,8 +124,12 @@ function createPythonQuantClient(options = {}) {
   let closed = false;
 
   function laneFor(operation) {
+    // PIT writes are serialized in the ingest lane. Read-only data audits and
+    // coverage scans use maintenance so they cannot make already-collected
+    // filings wait behind expensive Parquet reads.
+    if (DATA_WRITE_OPERATIONS.has(String(operation))) return lanes.ingest;
     if (MAINTENANCE_OPERATIONS.has(String(operation))) return lanes.maintenance;
-    if (DATA_OPERATIONS.has(String(operation))) return lanes.ingest;
+    if (DATA_OPERATIONS.has(String(operation))) return lanes.maintenance;
     if (FACTOR_OPERATIONS.has(String(operation))) return lanes.factor;
     return LOW_PRIORITY_OPERATIONS.has(String(operation)) ? lanes.research : lanes.interactive;
   }
@@ -109,6 +145,11 @@ function createPythonQuantClient(options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
+          OMP_NUM_THREADS: process.env.OMP_NUM_THREADS || "1",
+          OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS || "1",
+          MKL_NUM_THREADS: process.env.MKL_NUM_THREADS || "1",
+          VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS || "1",
+          NUMEXPR_MAX_THREADS: process.env.NUMEXPR_MAX_THREADS || "1",
           MPLCONFIGDIR: process.env.MPLCONFIGDIR || join(root, ".cache", "matplotlib"),
         },
       });
@@ -294,6 +335,11 @@ function createPythonQuantClient(options = {}) {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
+        OMP_NUM_THREADS: process.env.OMP_NUM_THREADS || "1",
+        OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS || "1",
+        MKL_NUM_THREADS: process.env.MKL_NUM_THREADS || "1",
+        VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS || "1",
+        NUMEXPR_MAX_THREADS: process.env.NUMEXPR_MAX_THREADS || "1",
         PYTHONUNBUFFERED: "1",
         MPLCONFIGDIR: process.env.MPLCONFIGDIR || join(root, ".cache", "matplotlib"),
       },
@@ -400,13 +446,22 @@ function createPythonQuantClient(options = {}) {
       };
       task.cleanup = () => options.signal?.removeEventListener?.("abort", onAbort);
       options.signal?.addEventListener?.("abort", onAbort, { once: true });
-      lane.queue.push(task);
+      task.priority = taskPriority(task.operation);
+      const queuedAfter = lane.queue.findIndex((candidate) => Number(candidate.priority ?? taskPriority(candidate.operation)) > task.priority);
+      if (queuedAfter < 0) lane.queue.push(task);
+      else lane.queue.splice(queuedAfter, 0, task);
       const defaultQueueTimeoutMs = lane.name === "research"
         ? 30 * 60_000
         : lane.name === "ingest" || lane.name === "maintenance"
           ? 3 * 60_000
           : 5 * 60_000;
-      const queueTimeoutMs = Math.max(5_000, Number(process.env[`PYTHON_CORE_${lane.name.toUpperCase()}_QUEUE_TIMEOUT_MS`] || defaultQueueTimeoutMs));
+      const priorityWriteTimeout = task.operation === "data-lake-pit-batch-upsert"
+        ? 12 * 60_000
+        : defaultQueueTimeoutMs;
+      const configuredQueueTimeout = Number(process.env[`PYTHON_CORE_${lane.name.toUpperCase()}_QUEUE_TIMEOUT_MS`] || 0);
+      const queueTimeoutMs = task.operation === "data-lake-pit-batch-upsert"
+        ? Math.max(priorityWriteTimeout, configuredQueueTimeout || 0)
+        : Math.max(5_000, configuredQueueTimeout || defaultQueueTimeoutMs);
       task.queueTimer = setTimeout(() => {
         const queuedIndex = lane.queue.findIndex((entry) => entry.id === task.id);
         if (queuedIndex < 0) return;

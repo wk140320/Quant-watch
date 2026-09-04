@@ -37,9 +37,17 @@ async function readJsonBody(req, options = {}) {
     size += buffer.length;
     if (size > maxBytes) throw httpError(413, `JSON request body exceeds the ${maxBytes} byte limit.`);
     chunks.push(buffer);
+    // Some local desktop HTTP clients keep the socket reusable after sending
+    // the complete fixed-length body. Once every declared byte is present we
+    // can parse immediately instead of waiting for a later connection-level
+    // end signal that may never arrive.
+    if (declaredLength > 0 && size >= declaredLength) break;
   }
 
   if (!size) return {};
+  if (declaredLength > 0 && size < declaredLength) {
+    throw httpError(400, "JSON request body ended before the declared content length was received.");
+  }
   try {
     return JSON.parse(Buffer.concat(chunks, size).toString("utf8"));
   } catch {

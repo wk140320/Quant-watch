@@ -6,9 +6,15 @@ import os
 import re
 import shutil
 import tempfile
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:
+    from pit_contract import normalize_pit_timestamps, parse_pit_timestamp
+except ImportError:  # pragma: no cover - package import fallback
+    from .pit_contract import normalize_pit_timestamps, parse_pit_timestamp
 
 
 MARKETS = {"ASX", "US", "CN"}
@@ -96,6 +102,36 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _verified_pit_row_allowed(
+    raw: dict[str, Any],
+    *,
+    dataset: str,
+    event_time: Any,
+    available_at: Any,
+) -> bool:
+    """Apply the strict PIT contract before a row reaches model hydration."""
+    if raw.get("historicalAvailabilityVerified") is not True or raw.get("historicalAvailabilityUnverified") is True:
+        return False
+    first_seen = raw.get("first_seen_at", raw.get("firstSeenAt"))
+    ingested = raw.get("ingested_at", raw.get("ingestedAt"))
+    parsed_event = parse_pit_timestamp(event_time, date_only="start")
+    parsed_available = parse_pit_timestamp(available_at, date_only="end")
+    parsed_first = parse_pit_timestamp(first_seen, date_only="end")
+    parsed_ingested = parse_pit_timestamp(ingested, date_only="end")
+    if any(value is None for value in (parsed_event, parsed_available, parsed_first, parsed_ingested)):
+        return False
+    if parsed_first < parsed_available or parsed_ingested < parsed_first:
+        return False
+    source = str(raw.get("source") or raw.get("sourceProvider") or "").lower()
+    period_semantics = (
+        ("sec-edgar" in source and bool(raw.get("reportDate") or raw.get("filingDate") or raw.get("observation_period_end") or raw.get("observationPeriodEnd")))
+        or (dataset == "macro" and ("fred" in source or "alfred" in source) and bool(raw.get("seriesId")))
+    )
+    if dataset in {"fundamentals", "financial_disclosures", "news", "macro", "social"} and parsed_available < parsed_event and not period_semantics:
+        return False
+    return parsed_available <= datetime.now(timezone.utc)
+
+
 def _ohlcv_validation_reason(row: dict[str, Any]) -> str | None:
     prices = {name: _number(row.get(name)) for name in ("open", "high", "low", "close")}
     if prices["close"] is None or prices["close"] <= 0:
@@ -179,6 +215,140 @@ def _partition(root: Path, market: str, exchange: str, interval: str, symbol: st
 def _legacy_partition(root: Path, market: str, interval: str, symbol: str) -> Path:
     safe_interval = "".join(char for char in interval if char.isalnum() or char in "_-") or "1d"
     return root / "ohlcv" / f"market={market}" / f"interval={safe_interval}" / f"symbol={symbol}" / "data.parquet"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _snapshot_manifest(root: Path, market: str, snapshot_id: str) -> dict[str, Any] | None:
+    path = root / "snapshots" / f"market={market}" / f"{snapshot_id}.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if payload.get("snapshotId") == snapshot_id else None
+
+
+def _pit_semantic_identity_sql() -> str:
+    """Return the SQL identity shared by PIT writes and the semantic auditor."""
+    identity = """
+      coalesce(
+        nullif(json_extract_string(payload_json, '$.id'), ''),
+        nullif(json_extract_string(payload_json, '$.url'), ''),
+        nullif(json_extract_string(payload_json, '$.link'), ''),
+        record_key
+      )
+    """
+    entity = """
+      upper(coalesce(
+        nullif(json_extract_string(payload_json, '$.relatedSymbol'), ''),
+        nullif(json_extract_string(payload_json, '$.related_symbol'), ''),
+        nullif(json_extract_string(payload_json, '$.relatedTicker'), ''),
+        nullif(json_extract_string(payload_json, '$.code'), ''),
+        nullif(json_extract_string(payload_json, '$.ticker'), ''),
+        ''
+      ))
+    """
+    return f"""
+      concat(
+        dataset, ':', market, ':', exchange, ':', symbol, ':', event_time, ':',
+        available_at, ':', revision, ':', {identity},
+        case when {entity} <> '' and (dataset in ('news', 'social', 'universe')
+                    or upper(cast(symbol as varchar)) in ('MARKET', '000000'))
+             then concat('|entity=', {entity}) else '' end
+      )
+    """
+
+
+def create_training_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Create a content-addressed, immutable manifest for a training run."""
+    root = _root(payload)
+    market = _market(payload.get("market"))
+    requested_datasets = {
+        str(value).lower()
+        for value in payload.get("datasets") or ("ohlcv", *sorted(PIT_DATASETS))
+        if str(value).lower() == "ohlcv" or str(value).lower() in PIT_DATASETS
+    }
+    patterns: list[tuple[str, Any]] = []
+    if "ohlcv" in requested_datasets:
+        patterns.append(("ohlcv", (root / "ohlcv" / f"market={market}").glob("exchange=*/interval=*/symbol=*/data.parquet")))
+        patterns.append(("ohlcv", (root / "ohlcv" / f"market={market}").glob("interval=*/symbol=*/data.parquet")))
+    for dataset in sorted(requested_datasets - {"ohlcv"}):
+        patterns.append((dataset, (root / dataset / f"market={market}").glob("exchange=*/symbol=*/data.parquet")))
+    files: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for dataset, iterator in patterns:
+        for path in iterator:
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root).as_posix()
+            if relative in seen_paths:
+                continue
+            seen_paths.add(relative)
+            files.append({
+                "dataset": dataset,
+                "path": relative,
+                "bytes": int(path.stat().st_size),
+                "sha256": _sha256_file(path),
+            })
+    files.sort(key=lambda item: item["path"])
+    symbols = sorted({str(value).upper() for value in payload.get("symbols") or [] if str(value).strip()})
+    content = {
+        "schema": "training-snapshot-v1-content-addressed",
+        "market": market,
+        "datasets": sorted(requested_datasets),
+        "symbols": symbols,
+        "files": files,
+    }
+    snapshot_id = hashlib.sha256(
+        json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:32]
+    manifest = {
+        **content,
+        "snapshotId": snapshot_id,
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "fileCount": len(files),
+        "contentHash": hashlib.sha256(
+            json.dumps(files, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+    target = root / "snapshots" / f"market={market}" / f"{snapshot_id}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        temporary = target.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        temporary.replace(target)
+    return {**manifest, "path": str(target)}
+
+
+def _snapshot_path_allowed(root: Path, manifest: dict[str, Any], target: Path) -> bool:
+    try:
+        relative = target.relative_to(root).as_posix()
+    except ValueError:
+        return False
+    return any(item.get("path") == relative for item in manifest.get("files") or [])
+
+
+def _snapshot_dataset_paths(root: Path, manifest: dict[str, Any], dataset: str) -> list[Path]:
+    output: list[Path] = []
+    for item in manifest.get("files") or []:
+        if item.get("dataset") != dataset:
+            continue
+        path = (root / str(item.get("path") or "")).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        if path.is_file():
+            output.append(path)
+    return output
 
 
 def _write_catalog(root: Path) -> bool:
@@ -333,15 +503,34 @@ def read_rows(payload: dict[str, Any]) -> dict[str, Any]:
     target = _partition(root, market, exchange, interval, symbol)
     if not target.exists():
         target = _legacy_partition(root, market, interval, symbol)
+    snapshot_id = str(payload.get("snapshot_id") or payload.get("snapshotId") or "").strip()
+    if snapshot_id:
+        manifest = _snapshot_manifest(root, market, snapshot_id)
+        if manifest is None or not _snapshot_path_allowed(root, manifest, target):
+            return {
+                "available": False,
+                "market": market,
+                "symbol": symbol,
+                "interval": interval,
+                "snapshotId": snapshot_id,
+                "reason": "partition_not_in_training_snapshot",
+                "candles": [],
+                "rows": 0,
+            }
     if not target.exists():
         return {"available": False, "market": market, "symbol": symbol, "interval": interval, "candles": [], "rows": 0}
     limit = max(1, min(20_000, int(payload.get("limit") or 6_500)))
     escaped_target = str(target).replace("'", "''")
-    connection = duckdb.connect()
-    cursor = connection.execute(f"SELECT * FROM read_parquet('{escaped_target}') ORDER BY timestamp DESC LIMIT {limit}")
-    columns = [description[0] for description in cursor.description]
-    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    connection.close()
+    connection = payload.get("_connection")
+    owns_connection = connection is None
+    connection = connection or duckdb.connect()
+    try:
+        cursor = connection.execute(f"SELECT * FROM read_parquet('{escaped_target}') ORDER BY timestamp DESC LIMIT {limit}")
+        columns = [description[0] for description in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        if owns_connection:
+            connection.close()
     rows.reverse()
     candles = [{
         "date": row.get("timestamp"),
@@ -372,43 +561,91 @@ def read_rows(payload: dict[str, Any]) -> dict[str, Any]:
             "schema": OHLCV_SCHEMA_VERSION,
             "rows": [_row_content_identity(row) for row in rows],
         }, 64),
+        "snapshotId": snapshot_id or None,
         "candles": candles,
     }
 
 
 def read_panel(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import duckdb  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("duckdb is required for the Parquet data lake") from exc
     market = _market(payload.get("market"))
     interval = str(payload.get("interval") or "1d")
     min_rows = max(1, min(20_000, int(payload.get("min_rows", payload.get("minRows", 1)) or 1)))
     items = []
     failures = []
-    for raw_symbol in payload.get("symbols") or []:
-        try:
-            symbol = _symbol(raw_symbol, market)
-            result = read_rows({
-                "root": payload.get("root"),
-                "market": market,
-                "exchange": _exchange(market, symbol),
-                "symbol": symbol,
-                "interval": interval,
-                "limit": payload.get("limit") or 6_500,
-            })
-            if result.get("available") and int(result.get("rows") or 0) >= min_rows:
-                candles = result.get("candles") or []
+    panel_connection = duckdb.connect()
+    try:
+        target_paths: dict[str, Path] = {}
+        snapshot_id = str(payload.get("snapshot_id") or payload.get("snapshotId") or "").strip()
+        root = _root(payload)
+        manifest = _snapshot_manifest(root, market, snapshot_id) if snapshot_id else None
+        for raw_symbol in payload.get("symbols") or []:
+            try:
+                symbol = _symbol(raw_symbol, market)
+                target = _partition(root, market, _exchange(market, symbol), interval, symbol)
+                if not target.exists():
+                    target = _legacy_partition(root, market, interval, symbol)
+                if not target.exists() or (snapshot_id and (manifest is None or not _snapshot_path_allowed(root, manifest, target))):
+                    continue
+                target_paths[symbol] = target
+            except Exception as exc:  # noqa: BLE001 - isolate one malformed identity.
+                failures.append({"symbol": str(raw_symbol), "error": str(exc)})
+        if target_paths:
+            parquet_list = "[" + ",".join("'" + str(path).replace("'", "''") + "'" for path in target_paths.values()) + "]"
+            limit = max(1, min(20_000, int(payload.get("limit") or 6_500)))
+            cursor = panel_connection.execute(f"""
+                WITH ranked AS (
+                    SELECT *, row_number() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS row_order
+                    FROM read_parquet({parquet_list}, union_by_name=true)
+                )
+                SELECT * EXCLUDE (row_order) FROM ranked
+                WHERE row_order <= {limit}
+                ORDER BY symbol, timestamp
+            """)
+            columns = [description[0] for description in cursor.description]
+            grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for values in cursor.fetchall():
+                row = dict(zip(columns, values))
+                grouped[str(row.get("symbol") or "").upper()].append(row)
+            for symbol, rows in grouped.items():
+                if len(rows) < min_rows:
+                    continue
+                candles = [{
+                    "date": row.get("timestamp"),
+                    "open": row.get("open"),
+                    "high": row.get("high"),
+                    "low": row.get("low"),
+                    "close": row.get("close"),
+                    "volume": row.get("volume"),
+                    "amount": row.get("amount"),
+                    "turnoverRate": row.get("turnover_rate"),
+                    "available_at": row.get("available_at"),
+                    "adjustment": row.get("adjustment"),
+                } for row in rows]
+                adjustment = (
+                    "split-dividend-adjusted"
+                    if any(row.get("adjustment") == "split-dividend-adjusted" for row in rows)
+                    else next((row.get("adjustment") for row in reversed(rows) if row.get("adjustment")), "unknown")
+                )
                 items.append({
                     "market": market,
-                    "exchange": result.get("exchange"),
+                    "exchange": _exchange(market, symbol),
                     "symbol": symbol,
                     "source": "local-parquet-data-lake",
-                    "adjustment": result.get("adjustment") or "unknown",
-                    "corporateActionAdjusted": result.get("adjustment") == "split-dividend-adjusted",
+                    "adjustment": adjustment,
+                    "corporateActionAdjusted": adjustment == "split-dividend-adjusted",
                     "rows": len(candles),
                     "first": candles[0].get("date") if candles else None,
                     "last": candles[-1].get("date") if candles else None,
                     "candles": candles,
                 })
-        except Exception as exc:  # noqa: BLE001 - one damaged partition must not block the panel.
-            failures.append({"symbol": str(raw_symbol), "error": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - a panel read must return a failure, not corrupt data.
+        failures.append({"symbol": "__panel__", "error": str(exc)})
+    finally:
+        panel_connection.close()
     return {
         "available": bool(items),
         "market": market,
@@ -469,7 +706,10 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
     if not files and (root / "ohlcv").exists():
         files = list((root / "ohlcv").glob("market=*/interval=*/symbol=*/data.parquet"))
     rows: list[dict[str, Any]] = []
-    catalog_ready = _write_catalog(root) if files else (root / "quant.duckdb").exists()
+    # Summary reads Parquet directly. Refreshing the shared DuckDB catalog here
+    # would take an exclusive file lock while an ingest worker is writing, which
+    # used to turn a temporary lock conflict into a misleading zero-row report.
+    catalog_ready = (root / "quant.duckdb").exists()
     if files:
         pattern = (
             str(root / "ohlcv" / "market=*" / "exchange=*" / "interval=*" / "symbol=*" / "data.parquet")
@@ -497,6 +737,14 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
         market: len({row["symbol"] for row in rows if row["market"] == market and row["interval"] == "1d"})
         for market in MARKETS
     }
+    daily_symbol_pattern = None
+    daily_partition_files = list((root / "ohlcv").glob("market=*/exchange=*/interval=1d/symbol=*/data.parquet")) if (root / "ohlcv").exists() else []
+    if daily_partition_files:
+        daily_symbol_pattern = str(root / "ohlcv" / "market=*" / "exchange=*" / "interval=1d" / "symbol=*" / "data.parquet").replace("'", "''")
+    else:
+        legacy_daily_files = list((root / "ohlcv").glob("market=*/interval=1d/symbol=*/data.parquet")) if (root / "ohlcv").exists() else []
+        if legacy_daily_files:
+            daily_symbol_pattern = str(root / "ohlcv" / "market=*" / "interval=1d" / "symbol=*" / "data.parquet").replace("'", "''")
     pit_summary: dict[str, dict[str, Any]] = {}
     for dataset in sorted(PIT_DATASETS):
         pit_files = list((root / dataset).glob("market=*/exchange=*/symbol=*/data.parquet"))
@@ -505,6 +753,11 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
         verified_market_rows = {market: 0 for market in MARKETS}
         market_symbols = {market: 0 for market in MARKETS}
         verified_market_symbols = {market: 0 for market in MARKETS}
+        verified_training_symbols = {market: 0 for market in MARKETS}
+        market_observation_dates = {market: set() for market in MARKETS}
+        market_available_dates = {market: set() for market in MARKETS}
+        market_series = {market: set() for market in MARKETS}
+        market_verified_series = {market: set() for market in MARKETS}
         if pit_files:
             pattern = str(root / dataset / "market=*" / "exchange=*" / "symbol=*" / "data.parquet").replace("'", "''")
             connection = duckdb.connect()
@@ -529,8 +782,67 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
                         verified_market_symbols[pit_market] = int(verified_symbol_count or 0)
                         dataset_rows += int(count)
                         verified_rows += int(verified or 0)
+                if daily_symbol_pattern:
+                    training_result = connection.execute(f"""
+                        SELECT p.market, count(DISTINCT CASE WHEN
+                          try_cast(json_extract(p.payload_json, '$.historicalAvailabilityVerified') AS BOOLEAN) = true
+                          AND coalesce(try_cast(json_extract(p.payload_json, '$.historicalAvailabilityUnverified') AS BOOLEAN), false) = false
+                          THEN CASE
+                            WHEN p.market = 'ASX' THEN regexp_replace(upper(coalesce(nullif(json_extract_string(p.payload_json, '$.symbol'), ''), p.symbol)), '\\.AX$', '')
+                            WHEN p.market = 'CN' THEN regexp_replace(replace(upper(coalesce(nullif(json_extract_string(p.payload_json, '$.symbol'), ''), p.symbol)), '.', ''), '^(SH|SZ)', '')
+                            ELSE upper(coalesce(nullif(json_extract_string(p.payload_json, '$.symbol'), ''), p.symbol))
+                          END END)
+                        FROM read_parquet('{pattern}', union_by_name=true) p
+                        JOIN (
+                          SELECT DISTINCT market, upper(symbol) AS symbol
+                          FROM read_parquet('{daily_symbol_pattern}', union_by_name=true)
+                          WHERE interval = '1d'
+                        ) d ON d.market = p.market AND d.symbol = CASE
+                          WHEN p.market = 'ASX' THEN regexp_replace(upper(coalesce(nullif(json_extract_string(p.payload_json, '$.symbol'), ''), p.symbol)), '\\.AX$', '')
+                          WHEN p.market = 'CN' THEN regexp_replace(replace(upper(coalesce(nullif(json_extract_string(p.payload_json, '$.symbol'), ''), p.symbol)), '.', ''), '^(SH|SZ)', '')
+                          ELSE upper(coalesce(nullif(json_extract_string(p.payload_json, '$.symbol'), ''), p.symbol))
+                        END
+                        GROUP BY p.market
+                    """).fetchall()
+                    for training_market, covered in training_result:
+                        if training_market in verified_training_symbols:
+                            verified_training_symbols[training_market] = int(covered or 0)
+                else:
+                    # Small isolated PIT fixtures may intentionally contain no
+                    # OHLCV universe.  Preserve the historical symbol-level
+                    # contract there, while production summaries use the
+                    # stricter intersection with daily OHLCV above.
+                    verified_training_symbols = dict(verified_market_symbols)
+                if dataset == "macro":
+                    macro_rows = connection.execute(f"""
+                        SELECT market,
+                          json_extract_string(payload_json, '$.seriesId') AS series_id,
+                          CAST(event_time AS VARCHAR) AS event_time,
+                          CAST(available_at AS VARCHAR) AS available_at,
+                          try_cast(json_extract(payload_json, '$.historicalAvailabilityVerified') AS BOOLEAN) AS verified,
+                          coalesce(try_cast(json_extract(payload_json, '$.historicalAvailabilityUnverified') AS BOOLEAN), false) AS unverified
+                        FROM read_parquet('{pattern}', union_by_name=true)
+                    """).fetchall()
+                    for pit_market, series_id, event_time, available_at, verified, unverified in macro_rows:
+                        if pit_market not in market_observation_dates:
+                            continue
+                        if series_id:
+                            market_series[pit_market].add(str(series_id))
+                        if event_time:
+                            market_observation_dates[pit_market].add(str(event_time)[:10])
+                        if available_at:
+                            market_available_dates[pit_market].add(str(available_at)[:10])
+                        if verified and not unverified and series_id:
+                            market_verified_series[pit_market].add(str(series_id))
             finally:
                 connection.close()
+        macro_date_coverage = {
+            market: round(
+                min(1.0, len(market_available_dates[market]) / max(1, len(market_observation_dates[market]))) * 100.0,
+                4,
+            )
+            for market in MARKETS
+        }
         pit_summary[dataset] = {
             "partitions": len(pit_files),
             "rows": dataset_rows,
@@ -548,11 +860,17 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
                 market: round(verified_market_symbols[market] / max(1, market_symbols[market]) * 100.0, 4)
                 for market in MARKETS
             },
+            "trainingUniverseVerifiedSymbols": verified_training_symbols,
+            "trainingUniverseDenominator": "verified-pit-symbols" if not daily_symbol_pattern else "verified-pit-symbols-intersect-daily-ohlcv",
             "trainingUniverseCoveragePct": {
-                market: round(min(1.0, verified_market_symbols[market] / max(1, daily_symbol_counts[market])) * 100.0, 4)
+                market: round(min(1.0, verified_training_symbols[market] / max(1, daily_symbol_counts[market])) * 100.0, 4)
                 for market in MARKETS
             },
-            "pointInTime": True,
+            "marketDateCoveragePct": macro_date_coverage if dataset == "macro" else {market: None for market in MARKETS},
+            "seriesCount": {market: len(market_series[market]) for market in MARKETS},
+            "verifiedSeriesCount": {market: len(market_verified_series[market]) for market in MARKETS},
+            "pointInTime": bool(dataset_rows and verified_rows == dataset_rows),
+            "pointInTimeSchema": True,
             "requiredTimestamp": "available_at",
         }
     return {
@@ -562,7 +880,11 @@ def summary(payload: dict[str, Any]) -> dict[str, Any]:
         "rows": sum(int(row["rows"]) for row in rows),
         "markets": {market: sum(int(row["rows"]) for row in rows if row["market"] == market) for market in MARKETS},
         "dailySymbols": daily_symbol_counts,
-        "items": rows[:2_000],
+        # A market-scoped summary is used to calculate the exact training
+        # universe.  Truncating it at 2,000 partitions silently hid newer CN
+        # symbols from the replenishment queue. Keep the cross-market health
+        # response bounded, but return the complete requested market.
+        "items": rows[:10_000] if market_filter else rows[:2_000],
         "pitDatasets": pit_summary,
         "pitRows": sum(int(item["rows"]) for item in pit_summary.values()),
         "duckdb": catalog_ready,
@@ -607,9 +929,15 @@ def _inspect_audit_partition(path: Path, connection: Any = None) -> tuple[list[t
             connection.close()
 
 
-def _repair_ohlcv_partition(path: Path, connection: Any, quarantine_root: Path) -> dict[str, int]:
+def _repair_ohlcv_partition(
+    path: Path,
+    connection: Any,
+    quarantine_root: Path,
+    *,
+    max_unexplained_jump_ratio: float = 4.0,
+) -> dict[str, int]:
     escaped = str(path).replace("'", "''")
-    invalid_predicate = """
+    base_invalid_predicate = """
       close IS NULL OR close <= 0
       OR (open IS NOT NULL AND open <= 0) OR (high IS NOT NULL AND high <= 0) OR (low IS NOT NULL AND low <= 0)
       OR (high IS NOT NULL AND low IS NOT NULL AND high < low)
@@ -619,8 +947,25 @@ def _repair_ohlcv_partition(path: Path, connection: Any, quarantine_root: Path) 
       OR (low IS NOT NULL AND close IS NOT NULL AND low > close)
       OR (volume IS NOT NULL AND volume < 0)
     """
+    # A raw OHLC partition does not carry enough information to prove that a
+    # multi-x jump is a legitimate split/dividend event.  Treat it as
+    # unverifiable at the lake layer and preserve it in quarantine; the
+    # corporate-action PIT layer can later re-ingest an explicitly explained
+    # replacement series.  This prevents a provider scale error from becoming
+    # a label or model feature.
+    sequenced = f"""
+      SELECT *,
+        lag(close) OVER (PARTITION BY market, coalesce(exchange, market), symbol, interval ORDER BY timestamp) AS previous_close,
+        lag(timestamp) OVER (PARTITION BY market, coalesce(exchange, market), symbol, interval ORDER BY timestamp) AS previous_timestamp
+      FROM read_parquet('{escaped}', union_by_name=true)
+    """
+    # A large move after a long listing/quote gap is not evidence of a bad
+    # scale factor.  Only inspect jumps inside a continuous daily segment;
+    # the gap itself remains visible to history-quality diagnostics.
+    jump_predicate = f"previous_close > 0 AND previous_timestamp IS NOT NULL AND date_diff('day', CAST(previous_timestamp AS DATE), CAST(timestamp AS DATE)) BETWEEN 0 AND 10 AND (close / previous_close >= {float(max_unexplained_jump_ratio)} OR close / previous_close <= {1.0 / float(max_unexplained_jump_ratio)})"
+    invalid_predicate = f"({base_invalid_predicate}) OR ({jump_predicate})"
     invalid_count = int(connection.execute(
-        f"SELECT count(*) FROM read_parquet('{escaped}', union_by_name=true) WHERE {invalid_predicate}"
+        f"SELECT count(*) FROM ({sequenced}) AS sequenced_rows WHERE {invalid_predicate}"
     ).fetchone()[0])
     duplicate_count = int(connection.execute(f"""
         SELECT coalesce(sum(rows - 1), 0) FROM (
@@ -642,7 +987,7 @@ def _repair_ohlcv_partition(path: Path, connection: Any, quarantine_root: Path) 
         quarantine = quarantine_root / relative
         quarantine.parent.mkdir(parents=True, exist_ok=True)
         escaped_quarantine = str(quarantine).replace("'", "''")
-        connection.execute(f"COPY (SELECT * FROM read_parquet('{escaped}', union_by_name=true) WHERE {invalid_predicate}) TO '{escaped_quarantine}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        connection.execute(f"COPY (SELECT * EXCLUDE(previous_close, previous_timestamp) FROM ({sequenced}) AS sequenced_rows WHERE {invalid_predicate}) TO '{escaped_quarantine}' (FORMAT PARQUET, COMPRESSION ZSTD)")
     temporary = path.with_suffix(f".{os.getpid()}.quality.tmp.parquet")
     escaped_temporary = str(temporary).replace("'", "''")
     connection.execute(f"""
@@ -652,7 +997,7 @@ def _repair_ohlcv_partition(path: Path, connection: Any, quarantine_root: Path) 
               PARTITION BY market, coalesce(exchange, market), symbol, interval, timestamp
               ORDER BY saved_at DESC NULLS LAST, available_at DESC NULLS LAST
             ) AS row_order
-            FROM read_parquet('{escaped}', union_by_name=true)
+            FROM ({sequenced}) AS sequenced_rows
             WHERE NOT ({invalid_predicate})
           )
           SELECT concat(market, ':', coalesce(exchange, market), ':', symbol, ':', interval, ':', timestamp) AS key,
@@ -688,6 +1033,23 @@ def audit(payload: dict[str, Any]) -> dict[str, Any]:
     quality_repair = {"invalid": 0, "duplicates": 0, "keysMigrated": 0}
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     audit_connection = duckdb.connect()
+
+    def repair_until_stable(destination: Path, quarantine_root: Path) -> dict[str, int]:
+        """Repeat jump isolation because removing one bad row can expose the next jump."""
+        totals = {"invalid": 0, "duplicates": 0, "keysMigrated": 0}
+        # A long run of provider-scale jumps can require more than one pass:
+        # removing one bad row may expose the next bad predecessor.  Keep the
+        # loop bounded, but high enough for the largest supported partition;
+        # the final audit still reports any residue instead of claiming a
+        # clean lake silently.
+        for _ in range(128):
+            repaired = _repair_ohlcv_partition(destination, audit_connection, quarantine_root)
+            for name, value in repaired.items():
+                totals[name] += int(value)
+            if not any(int(value) for value in repaired.values()):
+                break
+        return totals
+
     for path in [*legacy_files, *partitioned_files]:
         try:
             grouped, sources = _inspect_audit_partition(path, audit_connection)
@@ -718,9 +1080,8 @@ def audit(payload: dict[str, Any]) -> dict[str, Any]:
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.resolve() == path.resolve():
                 if payload.get("repair_quality", payload.get("repairQuality", True)) is not False:
-                    repaired = _repair_ohlcv_partition(
+                    repaired = repair_until_stable(
                         destination,
-                        audit_connection,
                         root / "quarantine" / f"quality={stamp}",
                     )
                     for name, value in repaired.items():
@@ -733,9 +1094,8 @@ def audit(payload: dict[str, Any]) -> dict[str, Any]:
             else:
                 shutil.move(str(path), str(destination))
                 if payload.get("repair_quality", payload.get("repairQuality", True)) is not False:
-                    repaired = _repair_ohlcv_partition(
+                    repaired = repair_until_stable(
                         destination,
-                        audit_connection,
                         root / "quarantine" / f"quality={stamp}",
                     )
                     for name, value in repaired.items():
@@ -762,6 +1122,17 @@ def audit(payload: dict[str, Any]) -> dict[str, Any]:
                     continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(path), str(destination))
+                # A trusted identity does not prove that every OHLCV row is
+                # valid.  Re-run the same quality repair after recovering an
+                # audit quarantine entry; otherwise an old bad jump can be
+                # reintroduced into the active lake on the next audit.
+                if payload.get("repair_quality", payload.get("repairQuality", True)) is not False:
+                    repaired = repair_until_stable(
+                        destination,
+                        root / "quarantine" / f"quality={stamp}",
+                    )
+                    for name, value in repaired.items():
+                        quality_repair[name] += int(value)
                 recovered.append({
                     "market": market,
                     "exchange": expected_exchange,
@@ -775,7 +1146,7 @@ def audit(payload: dict[str, Any]) -> dict[str, Any]:
                 failed.append({"path": str(path), "error": f"quarantine recovery: {exc}"})
     audit_connection.close()
     _write_catalog(root)
-    return {
+    result = {
         "available": True,
         "auditedAt": datetime.now(timezone.utc).isoformat(),
         "migrated": len(migrated),
@@ -792,6 +1163,28 @@ def audit(payload: dict[str, Any]) -> dict[str, Any]:
         "quarantinedItems": quarantined,
         "failures": failed,
     }
+    # Keep the audit itself as an immutable, content-addressed evidence item.
+    # This makes a later model run able to prove which lake state it inspected,
+    # without relying on a mutable dashboard cache.
+    audit_payload = {
+        "schema": "data-lake-audit-evidence-v1",
+        "root": str(root),
+        "result": result,
+    }
+    audit_id = hashlib.sha256(
+        json.dumps(audit_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()[:32]
+    result["auditId"] = audit_id
+    audit_payload["auditId"] = audit_id
+    audit_dir = root / "audit-evidence"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = audit_dir / f"{audit_id}.json"
+    if not audit_path.exists():
+        temporary = audit_path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(audit_payload, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
+        temporary.replace(audit_path)
+    result["auditPath"] = str(audit_path)
+    return result
 
 
 def upsert_pit_records(payload: dict[str, Any]) -> dict[str, Any]:
@@ -812,18 +1205,28 @@ def upsert_pit_records(payload: dict[str, Any]) -> dict[str, Any]:
     for raw in payload.get("records") or []:
         if not isinstance(raw, dict):
             continue
-        available_at = str(raw.get("available_at") or raw.get("availableAt") or "")[:40]
-        event_time = str(raw.get("event_time") or raw.get("eventTime") or raw.get("publishedAt") or raw.get("date") or "")[:40]
-        if not available_at or not event_time:
+        timestamps = normalize_pit_timestamps(raw)
+        available_at = str(raw.get("available_at") or raw.get("availableAt") or timestamps.get("published_at") or "")[:40]
+        event_time = str(raw.get("event_time") or raw.get("eventTime") or timestamps.get("observation_period_end") or raw.get("publishedAt") or raw.get("date") or "")[:40]
+        if not available_at or not event_time or not timestamps.get("complete"):
             continue
         revision = str(raw.get("revision") or raw.get("version") or "initial")[:40]
-        first_seen_at = str(raw.get("first_seen_at") or raw.get("firstSeenAt") or available_at)[:40]
+        first_seen_at = str(raw.get("first_seen_at") or raw.get("firstSeenAt") or timestamps.get("published_at") or available_at)[:40]
+        ingested_at = str(raw.get("ingested_at") or raw.get("ingestedAt") or saved_at)[:40]
         verified = bool(raw.get("historicalAvailabilityVerified") is True) and not bool(raw.get("historicalAvailabilityUnverified"))
         normalized_raw = {
             **raw,
             "event_time": event_time,
             "available_at": available_at,
+            "observation_period_end": timestamps.get("observation_period_end"),
+            "published_at": timestamps.get("published_at"),
+            "effective_at": timestamps.get("effective_at"),
             "first_seen_at": first_seen_at,
+            "ingested_at": ingested_at,
+            "pitTimestampSchema": timestamps.get("schema"),
+            "pitTimestampFallbackUsed": bool(timestamps.get("fallbackUsed")),
+            "pitTimestampFallbackFields": list(timestamps.get("fallbackFields") or []),
+            "pitTimestampOrderValid": bool(timestamps.get("orderValid")),
             "revision": revision,
             "historicalAvailabilityVerified": verified,
             "historicalAvailabilityVerificationMethod": str(
@@ -887,14 +1290,44 @@ def upsert_pit_records(payload: dict[str, Any]) -> dict[str, Any]:
             """)
             connection.execute("INSERT OR REPLACE INTO pit_rows SELECT * FROM incoming")
         escaped_temporary = str(temporary).replace("'", "''")
-        connection.execute(f"COPY (SELECT * FROM pit_rows ORDER BY available_at, event_time) TO '{escaped_temporary}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-        count = int(connection.execute("SELECT count(*) FROM pit_rows").fetchone()[0])
+        semantic_key = _pit_semantic_identity_sql()
+        ranked = f"""
+          SELECT *, row_number() OVER (
+            PARTITION BY {semantic_key}
+            ORDER BY
+              CASE WHEN json_extract_string(payload_json, '$.historicalAvailabilityVerified') = 'true'
+                        AND coalesce(json_extract_string(payload_json, '$.historicalAvailabilityUnverified'), 'false') <> 'true'
+                   THEN 0 ELSE 1 END,
+              CASE WHEN coalesce(json_extract_string(payload_json, '$.pitTimestampFallbackUsed'), 'false') = 'true'
+                   THEN 1 ELSE 0 END,
+              coalesce(try_cast(json_extract_string(payload_json, '$.sourceQuality') AS DOUBLE), 0) DESC,
+              saved_at ASC NULLS LAST,
+              record_key ASC
+          ) AS _pit_rank
+          FROM pit_rows
+        """
+        before_dedup = int(connection.execute("SELECT count(*) FROM pit_rows").fetchone()[0])
+        connection.execute(
+            f"COPY (SELECT * EXCLUDE(_pit_rank) FROM ({ranked}) WHERE _pit_rank = 1 "
+            f"ORDER BY available_at, event_time) TO '{escaped_temporary}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
+        count = int(connection.execute(f"SELECT count(*) FROM ({ranked}) WHERE _pit_rank = 1").fetchone()[0])
     finally:
         connection.close()
         if incoming_path:
             incoming_path.unlink(missing_ok=True)
     temporary.replace(target)
-    return {"available": True, "dataset": dataset, "market": market, "exchange": exchange, "symbol": symbol, "inserted": len(rows), "rows": count, "parquet": str(target)}
+    return {
+        "available": True,
+        "dataset": dataset,
+        "market": market,
+        "exchange": exchange,
+        "symbol": symbol,
+        "inserted": len(rows),
+        "rows": count,
+        "duplicateRowsCollapsed": max(0, before_dedup - count),
+        "parquet": str(target),
+    }
 
 
 def upsert_pit_batches(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1159,6 +1592,40 @@ def _pit_feature_values(dataset: str, raw: dict[str, Any], source: Any = None) -
         "operationalMomentum": inferred_sentiment if operational else 0.0,
         "eventIntensity": event_intensity,
     }
+    if dataset in {"fundamentals", "financial_disclosures"}:
+        # Preserve several normalized, point-in-time fundamental dimensions.
+        # The old pipeline compressed these into fundamentalQuality, which
+        # made it impossible to tell growth, profitability and leverage apart.
+        def signed(name: str, *aliases: str) -> float:
+            value = values.get(name)
+            if value is None:
+                value = next((values.get(alias) for alias in aliases if values.get(alias) is not None), None)
+            return _normalized_score(value, 0.0)
+
+        def ratio(name: str, *aliases: str) -> float:
+            value = values.get(name)
+            if value is None:
+                value = next((values.get(alias) for alias in aliases if values.get(alias) is not None), None)
+            try:
+                return max(-1.0, min(1.0, (float(value) - 1.0) / 3.0)) if value is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        output.update({
+            "fundamentalRevenueGrowth": signed("revenueGrowth", "or_yoy", "tr_yoy", "revenue_yoy"),
+            "fundamentalProfitGrowth": signed("profitGrowth", "earningsGrowth", "netprofit_yoy", "dt_netprofit_yoy"),
+            "fundamentalRoe": signed("roe", "roe_waa", "roe_yearly", "roe_yoy"),
+            "fundamentalRoa": signed("roa", "roa2_yearly"),
+            "fundamentalGrossMargin": signed("grossMargin", "gross_margin", "grossprofit_margin"),
+            "fundamentalNetMargin": signed("netMargin", "profitMargin", "netprofit_margin"),
+            "fundamentalDebtToAssets": -abs(signed("debtToAssets", "debt_to_assets")),
+            "fundamentalCurrentRatio": ratio("currentRatio", "current_ratio"),
+            "fundamentalCashRatio": ratio("cashRatio", "cash_ratio"),
+            "fundamentalOperatingCashFlowGrowth": signed("operatingCashFlowGrowth", "ocf_yoy"),
+            "fundamentalAssetGrowth": signed("assetGrowth", "assets_yoy"),
+            "fundamentalEquityGrowth": signed("equityGrowth", "eqt_yoy"),
+            "fundamentalEpsGrowth": signed("epsGrowth", "eps_yoy", "dt_eps_yoy"),
+        })
     if dataset == "macro":
         output["__seriesId"] = str(raw.get("seriesId") or values.get("seriesId") or "UNKNOWN")
         for name in MACRO_FEATURE_NAMES:
@@ -1176,6 +1643,18 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("duckdb is required for the Parquet data lake") from exc
     root = _root(payload)
     market = _market(payload.get("market"))
+    snapshot_id = str(payload.get("snapshot_id") or payload.get("snapshotId") or "").strip()
+    snapshot = _snapshot_manifest(root, market, snapshot_id) if snapshot_id else None
+    if snapshot_id and snapshot is None:
+        return {
+            "available": False,
+            "market": market,
+            "snapshotId": snapshot_id,
+            "reason": "training_snapshot_not_found",
+            "items": [],
+            "marketPointInTimeFeatures": [],
+            "rows": 0,
+        }
     symbols = {_symbol(symbol, market) for symbol in payload.get("symbols") or [] if str(symbol or "").strip()}
     datasets = [str(value).lower() for value in payload.get("datasets") or ("financial_disclosures", "news", "social", "fundamentals", "macro", "corporate_actions", "universe") if str(value).lower() in PIT_DATASETS]
     limit_per_symbol = max(1, min(2_000, int(payload.get("limit_per_symbol", payload.get("limitPerSymbol", 400)) or 400)))
@@ -1189,10 +1668,21 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
     connection = duckdb.connect()
     try:
         for dataset in datasets:
-            files = list((root / dataset / f"market={market}").glob("exchange=*/symbol=*/data.parquet"))
+            files = (
+                _snapshot_dataset_paths(root, snapshot, dataset)
+                if snapshot is not None
+                else list((root / dataset / f"market={market}").glob("exchange=*/symbol=*/data.parquet"))
+            )
             for path in files:
                 partition_symbol = path.parent.name.split("=", 1)[-1]
                 market_wide_partition = dataset in {"macro", "universe"} and partition_symbol in {"MARKET", "000000"}
+                # A snapshot can contain thousands of symbol partitions.  Do
+                # the identity filter before opening a Parquet file; opening
+                # every unrelated partition was the dominant cost of PIT
+                # hydration and made otherwise healthy training jobs appear
+                # stuck during feature-matrix construction.
+                if symbols and not market_wide_partition and partition_symbol not in symbols:
+                    continue
                 if symbols and partition_symbol not in symbols and not market_wide_partition:
                     continue
                 query_limit = limit_per_symbol * max(1, len(symbols)) if market_wide_partition else limit_per_symbol
@@ -1207,7 +1697,21 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                         raw = json.loads(payload_json or "{}")
                     except json.JSONDecodeError:
                         continue
-                    target_symbols = [symbol]
+                    if verified_only and not _verified_pit_row_allowed(
+                        raw,
+                        dataset=dataset,
+                        event_time=event_time,
+                        available_at=available_at,
+                    ):
+                        continue
+                    row_symbol = str(symbol or "").strip()
+                    if market == "CN" and row_symbol.isdigit():
+                        row_symbol = row_symbol.zfill(6)
+                    try:
+                        canonical_row_symbol = _symbol(row_symbol, market)
+                    except ValueError:
+                        continue
+                    target_symbols = [canonical_row_symbol]
                     if dataset == "macro" and market_wide_partition:
                         target_symbols = sorted(symbols) if symbols else [symbol]
                     elif dataset == "universe":
@@ -1220,13 +1724,26 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                         "dataset": dataset,
                         "event_time": event_time,
                         "available_at": available_at,
+                        "observation_period_end": raw.get("observation_period_end", raw.get("observationPeriodEnd", event_time)),
+                        "published_at": raw.get("published_at", raw.get("publishedAt", available_at)),
+                        "effective_at": raw.get("effective_at", raw.get("effectiveAt", raw.get("effective_date", raw.get("effectiveDate", event_time)))),
+                        "ingested_at": raw.get("ingested_at", raw.get("ingestedAt")),
+                        "first_seen_at": raw.get("first_seen_at", raw.get("firstSeenAt")),
+                        "pitTimestampSchema": raw.get("pitTimestampSchema"),
+                        "pitTimestampFallbackUsed": bool(raw.get("pitTimestampFallbackUsed")),
+                        "pitTimestampFallbackFields": list(raw.get("pitTimestampFallbackFields") or []),
+                        "pitTimestampOrderValid": bool(raw.get("pitTimestampOrderValid")),
                         "revision": revision,
                         "source": source,
                         "historicalAvailabilityVerified": bool(raw.get("historicalAvailabilityVerified") is True)
                             and not bool(raw.get("historicalAvailabilityUnverified")),
                     }
                     if dataset == "macro" and market_wide_partition and not broadcast_market_wide:
-                        market_features.append({**common, "values": _pit_feature_values(dataset, raw, source)})
+                        market_features.append({
+                            **common,
+                            "values": _pit_feature_values(dataset, raw, source),
+                            "rawValues": raw.get("values") if isinstance(raw.get("values"), dict) else {},
+                        })
                         source_counts[dataset] = source_counts.get(dataset, 0) + 1
                         continue
                     for target_symbol in target_symbols:
@@ -1234,7 +1751,11 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                             continue
                         bucket = items.setdefault(target_symbol, {"features": [], "universe": [], "actions": []})
                         if dataset in {"news", "social", "fundamentals", "financial_disclosures", "macro"}:
-                            bucket["features"].append({**common, "values": _pit_feature_values(dataset, raw, source)})
+                            bucket["features"].append({
+                                **common,
+                                "values": _pit_feature_values(dataset, raw, source),
+                                "rawValues": raw.get("values") if isinstance(raw.get("values"), dict) else {},
+                            })
                         elif dataset == "universe":
                             event_type = raw.get("eventType") or raw.get("type")
                             bucket["universe"].append({
@@ -1264,6 +1785,7 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
         "available": True,
         "market": market,
         "verifiedOnly": verified_only,
+        "snapshotId": snapshot_id or None,
         "items": [
             {
                 "symbol": symbol,
@@ -1302,6 +1824,76 @@ def read_pit_panel(payload: dict[str, Any]) -> dict[str, Any]:
                 for symbol, rows in items.items()
             },
         }, 24),
+    }
+
+
+def verified_pit_coverage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return requested symbols with verified PIT evidence without loading it.
+
+    Enrichment only needs a coverage decision.  Opening every historical
+    partition to build a full panel made an enrichment batch wait behind its
+    own audit, so this path only opens files for its candidate symbols.
+    """
+    try:
+        import duckdb  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("duckdb is required for the Parquet data lake") from exc
+    root = _root(payload)
+    market = _market(payload.get("market"))
+    requested = {_symbol(symbol, market) for symbol in payload.get("symbols") or [] if str(symbol or "").strip()}
+    datasets = [
+        str(value).lower()
+        for value in payload.get("datasets") or ("financial_disclosures", "news", "fundamentals")
+        if str(value).lower() in PIT_DATASETS
+    ]
+    if not requested:
+        return {"available": True, "symbols": [], "byDataset": {}, "files": 0}
+    found: set[str] = set()
+    by_dataset: dict[str, list[str]] = {}
+    file_count = 0
+    connection = duckdb.connect()
+    try:
+        for dataset in datasets:
+            paths: list[Path] = []
+            for symbol in requested:
+                paths.extend((root / dataset / f"market={market}").glob(f"exchange=*/symbol={symbol}/data.parquet"))
+            if dataset == "universe":
+                paths.extend((root / dataset / f"market={market}").glob("exchange=*/symbol=MARKET/data.parquet"))
+                paths.extend((root / dataset / f"market={market}").glob("exchange=*/symbol=000000/data.parquet"))
+            if not paths:
+                by_dataset[dataset] = []
+                continue
+            file_count += len(paths)
+            quoted_paths = ", ".join("'" + str(path).replace("'", "''") + "'" for path in paths)
+            rows = connection.execute(f"""
+                SELECT symbol, payload_json
+                FROM read_parquet([{quoted_paths}], union_by_name=true)
+                WHERE json_extract_string(payload_json, '$.historicalAvailabilityVerified') = 'true'
+                  AND coalesce(json_extract_string(payload_json, '$.historicalAvailabilityUnverified'), 'false') != 'true'
+            """).fetchall()
+            covered: list[str] = []
+            for raw_symbol, payload_json in rows:
+                if dataset == "universe":
+                    try:
+                        raw = json.loads(payload_json or "{}")
+                    except json.JSONDecodeError:
+                        raw = {}
+                    raw_symbol = raw.get("symbol") or raw.get("code") or raw_symbol
+                try:
+                    normalized = _symbol(str(raw_symbol or ""), market)
+                except ValueError:
+                    continue
+                if normalized in requested:
+                    found.add(normalized)
+                    covered.append(normalized)
+            by_dataset[dataset] = sorted(set(covered))
+    finally:
+        connection.close()
+    return {
+        "available": True,
+        "symbols": sorted(found),
+        "byDataset": by_dataset,
+        "files": file_count,
     }
 
 

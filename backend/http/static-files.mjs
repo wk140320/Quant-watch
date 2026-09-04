@@ -1,6 +1,6 @@
 import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import { promisify } from "node:util";
-import { readFile, stat } from "node:fs/promises";
+import { readFileSync, statSync } from "node:fs";
 import { extname, normalize, relative, resolve } from "node:path";
 
 const CONTENT_TYPES = Object.freeze({
@@ -53,7 +53,11 @@ export async function serveStaticRequest(req, res, url, options = {}) {
   }
 
   const filePath = resolvedStaticPath(options.root, url.pathname);
-  const [body, metadata] = await Promise.all([readFile(filePath), stat(filePath)]);
+  // The UI shell is local and small. A synchronous read avoids an intermittent
+  // macOS async-file stall that otherwise leaves `/` open with no response;
+  // compression remains asynchronous for clients that explicitly request it.
+  const body = readFileSync(filePath);
+  const metadata = statSync(filePath);
   const extension = extname(filePath);
   const accepted = String(req.headers["accept-encoding"] || "");
   const encoding = body.length >= 1_024 && COMPRESSIBLE.has(extension)

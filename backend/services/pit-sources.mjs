@@ -17,7 +17,12 @@ function isoDay(value, endOfDay = false) {
 }
 
 function safeIsoTimestamp(value, fallback = null) {
-  const parsed = new Date(value || "");
+  const text = String(value || "").trim();
+  const compact = /^(\d{4})(\d{2})(\d{2})T?(\d{2})?(\d{2})?(\d{2})?Z?$/.exec(text);
+  const normalized = compact
+    ? `${compact[1]}-${compact[2]}-${compact[3]}T${compact[4] || "00"}:${compact[5] || "00"}:${compact[6] || "00"}Z`
+    : text;
+  const parsed = new Date(normalized);
   return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : fallback;
 }
 
@@ -108,6 +113,41 @@ function normalizeSecPitRecords(symbol, submissions = {}, companyFacts = {}) {
     values.sourceQuality = 1;
   }
   return records;
+}
+
+function normalizeSecDisclosureRecords(symbol, submissionRows = []) {
+  const code = String(symbol || "").trim().toUpperCase();
+  const rows = Array.isArray(submissionRows) ? submissionRows : [];
+  const allowedForms = /^(?:10-K|10-Q|8-K|20-F|40-F|6-K)(?:\/A)?$/i;
+  return rows.flatMap((row, index) => {
+    const form = String(row?.form || "").trim().toUpperCase();
+    const filed = isoDay(row?.filingDate, true);
+    const accepted = safeIsoTimestamp(row?.acceptanceDateTime, filed);
+    const eventTime = isoDay(row?.reportDate || row?.filingDate, true);
+    if (!code || !allowedForms.test(form) || !eventTime || !accepted) return [];
+    return [{
+      id: `${code}:sec:${String(row?.accessionNumber || index)}:${accepted}`,
+      symbol: code,
+      form,
+      accession: row?.accessionNumber || null,
+      primaryDocument: row?.primaryDocument || null,
+      reportDate: row?.reportDate || row?.filingDate || null,
+      filingDate: row?.filingDate || null,
+      event_time: eventTime,
+      available_at: accepted,
+      first_seen_at: accepted,
+      revision: String(row?.accessionNumber || row?.primaryDocument || form).slice(0, 80),
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerificationMethod: "sec-edgar-acceptance-datetime",
+      sourceProvider: "sec-edgar-filing-history-pit",
+      disclosureType: /^(?:10-K|20-F|40-F)(?:\/A)?$/i.test(form)
+        ? "annual-filing"
+        : /^(?:10-Q)(?:\/A)?$/i.test(form)
+          ? "quarterly-filing"
+          : "current-filing",
+      values: { filingEvent: 1, sourceQuality: 1 },
+    }];
+  });
 }
 
 function normalizeTusharePitRecords(symbol, payload = {}) {
@@ -285,6 +325,201 @@ function normalizeSimfinPitRecords(symbol, payload = {}) {
   ])).values()].sort((left, right) => (
     left.available_at.localeCompare(right.available_at) || left.event_time.localeCompare(right.event_time)
   ));
+}
+
+// FMP statement rows expose the period end separately from filing/acceptance
+// timestamps.  A row without one of those publication timestamps is useful for
+// a current profile, but must not enter point-in-time model training.
+function normalizeFmpStatementPitRecords(symbol, payload = {}, options = {}) {
+  const statement = String(options.statement || "financial-statement");
+  const sourceProvider = String(options.sourceProvider || "fmp-financial-statements-pit");
+  const rows = normalizedObjectRows(payload);
+  const records = rows.flatMap((raw, index) => {
+    const row = {
+      ...(raw.values && typeof raw.values === "object" ? raw.values : {}),
+      ...(raw.data && typeof raw.data === "object" && !Array.isArray(raw.data) ? raw.data : {}),
+      ...raw,
+    };
+    const eventTime = safeIsoTimestamp(firstValue(row, [
+      "date", "reportDate", "calendarYear", "periodEndDate", "fiscalDateEnding",
+    ]), null) || isoDay(firstValue(row, ["date", "reportDate", "periodEndDate", "fiscalDateEnding"]), true);
+    const availableAt = safeIsoTimestamp(firstValue(row, [
+      "acceptedDate", "fillingDate", "filingDate", "publishedDate", "publicationDate", "datePublished",
+    ]), null) || isoDay(firstValue(row, [
+      "acceptedDate", "fillingDate", "filingDate", "publishedDate", "publicationDate", "datePublished",
+    ]), true);
+    if (!eventTime || !availableAt || availableAt < eventTime) return [];
+    const revenue = finite(firstValue(row, ["revenue", "totalRevenue"]));
+    const netIncome = finite(firstValue(row, ["netIncome", "netIncomeApplicableToCommonShares"]));
+    const assets = finite(firstValue(row, ["totalAssets", "assets"]));
+    const liabilities = finite(firstValue(row, ["totalLiabilities", "liabilities"]));
+    const equity = finite(firstValue(row, ["totalStockholdersEquity", "totalEquity", "stockholdersEquity", "totalEquityGrossMinorityInterest"]));
+    const operatingCashFlow = finite(firstValue(row, ["operatingCashFlow", "netCashProvidedByOperatingActivities"]));
+    const capitalExpenditure = finite(firstValue(row, ["capitalExpenditure", "investmentsInPropertyPlantAndEquipment"]));
+    const dilutedEps = finite(firstValue(row, ["epsdiluted", "epsDiluted", "eps"]));
+    const values = {
+      revenue,
+      netIncome,
+      assets,
+      liabilities,
+      equity,
+      operatingCashFlow,
+      capitalExpenditure,
+      dilutedEps,
+      profitMargin: revenue !== null && netIncome !== null
+        ? clamp(netIncome / Math.max(1, Math.abs(revenue)))
+        : null,
+      debtToAssets: assets !== null && liabilities !== null
+        ? clamp(liabilities / Math.max(1, Math.abs(assets)), 0, 3)
+        : null,
+      sourceQuality: Number(options.sourceQuality ?? 0.93),
+    };
+    if (!Object.values(values).some((value) => value !== null && value !== undefined && value !== 0.93)) return [];
+    return [{
+      id: `${symbol}:${statement}:${String(firstValue(row, ["cik", "reportedCurrency", "period"]) || "row")}:${eventTime.slice(0, 10)}:${availableAt.slice(0, 10)}:${index}`,
+      event_time: eventTime,
+      available_at: availableAt,
+      revision: String(firstValue(row, ["acceptedDate", "fillingDate", "filingDate", "finalLink", "link"]) || availableAt).slice(0, 80),
+      statement,
+      fiscalYear: firstValue(row, ["calendarYear", "fiscalYear"]),
+      fiscalPeriod: firstValue(row, ["period", "fiscalPeriod"]),
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityMethod: "fmp-published-filing-timestamp",
+      sourceProvider,
+      values,
+    }];
+  });
+  return [...new Map(records.map((record) => [
+    `${record.statement}:${record.event_time}:${record.available_at}:${record.fiscalPeriod || ""}`,
+    record,
+  ])).values()].sort((left, right) => (
+    left.available_at.localeCompare(right.available_at) || left.event_time.localeCompare(right.event_time)
+  ));
+}
+
+function externalFinancialRows(payload = {}) {
+  if (Array.isArray(payload)) return payload;
+  const candidates = [
+    payload?.data,
+    payload?.financials,
+    payload?.statements,
+    payload?.results,
+    payload?.rows,
+    payload?.items,
+  ];
+  const direct = candidates.find((value) => Array.isArray(value));
+  if (direct) return direct;
+  return Object.values(payload || {})
+    .filter((value) => Array.isArray(value))
+    .flat();
+}
+
+function normalizeExternalFinancialPitRecords(symbol, payload = {}, options = {}) {
+  const sourceProvider = String(options.sourceProvider || "external-financials-pit");
+  const sourceName = String(options.sourceName || sourceProvider);
+  const retrievedAt = safeIsoTimestamp(options.retrievedAt, new Date().toISOString());
+  const filings = Array.isArray(options.filings) ? options.filings : [];
+  const rows = externalFinancialRows(payload);
+  const number = (value) => {
+    if (value === null || value === undefined || value === "") return null;
+    const parsed = Number(String(value).replace(/[$,%\s,]/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const normalized = rows.flatMap((raw, index) => {
+    const row = raw && typeof raw === "object" ? raw : {};
+    const year = firstValue(row, ["fiscalYear", "fiscal_year", "year", "calendarYear"]);
+    const periodEnd = firstValue(row, [
+      "periodEnd", "period_end", "periodEndDate", "period_end_date", "reportDate", "report_date",
+      "date", "fiscalDateEnding", "fiscal_date_ending",
+    ]);
+    const eventTime = safeIsoTimestamp(periodEnd, null)
+      || (/^\d{4}$/.test(String(year || "")) ? isoDay(`${year}-06-30`, true) : null);
+    if (!eventTime) return [];
+    const fiscalYear = String(year || eventTime.slice(0, 4));
+    const periodType = firstValue(row, ["periodType", "period_type", "period", "reportType", "report_type"]);
+    const filing = filings.find((candidate) => {
+      const filingText = JSON.stringify(candidate || {}).toLowerCase();
+      const sameYear = filingText.includes(String(fiscalYear).toLowerCase());
+      const samePeriod = !periodType || /annual|fy|full/i.test(String(periodType))
+        ? /annual|full|fy/i.test(filingText)
+        : /half|interim|h1|h2/i.test(filingText);
+      return sameYear && samePeriod;
+    });
+    const directAvailable = firstValue(row, [
+      "availableAt", "available_at", "filedAt", "filed_at", "filingDate", "filing_date",
+      "publishedAt", "published_at", "publishedDate", "published_date", "releaseDate", "release_date",
+      "announcementDate", "announcement_date",
+    ]);
+    const filingAvailable = firstValue(filing, ["filingDate", "filing_date", "publishedAt", "published_at"]);
+    const availableAt = safeIsoTimestamp(directAvailable || filingAvailable, null);
+    const verified = Boolean(availableAt && availableAt >= eventTime);
+    const values = {
+      revenue: number(firstValue(row, ["revenue", "totalRevenue", "total_revenue", "sales"])),
+      netIncome: number(firstValue(row, ["netIncome", "net_income", "profitAfterTax", "profit_after_tax"])),
+      assets: number(firstValue(row, ["totalAssets", "total_assets", "assets"])),
+      liabilities: number(firstValue(row, ["totalLiabilities", "total_liabilities", "liabilities"])),
+      equity: number(firstValue(row, ["totalEquity", "total_equity", "shareholdersEquity", "shareholders_equity"])),
+      operatingCashFlow: number(firstValue(row, ["operatingCashFlow", "operating_cash_flow", "cashFromOperatingActivities"])),
+      capitalExpenditure: number(firstValue(row, ["capitalExpenditures", "capital_expenditures", "capitalExpenditure", "capex"])),
+      dilutedEps: number(firstValue(row, ["epsDiluted", "eps_diluted", "dilutedEps", "eps"])),
+      cashAndEquivalents: number(firstValue(row, ["cashAndEquivalents", "cash_and_equivalents", "cash"])),
+      longTermDebt: number(firstValue(row, ["longTermDebt", "long_term_debt", "debt"])),
+      sharesOutstanding: number(firstValue(row, ["sharesOutstanding", "shares_outstanding"])),
+    };
+    if (!Object.values(values).some((value) => value !== null)) return [];
+    const effectiveAvailableAt = availableAt || retrievedAt;
+    return [{
+      id: `${symbol}:${sourceName}:${eventTime.slice(0, 10)}:${effectiveAvailableAt.slice(0, 10)}:${index}`,
+      event_time: eventTime,
+      available_at: effectiveAvailableAt,
+      first_seen_at: retrievedAt,
+      revision: String(firstValue(row, ["revision", "version", "filingId", "filing_id", "accession"]) || effectiveAvailableAt).slice(0, 100),
+      statement: String(periodType || "financial-statement"),
+      fiscalYear,
+      fiscalPeriod: periodType || null,
+      historicalAvailabilityVerified: verified,
+      historicalAvailabilityUnverified: !verified,
+      historicalAvailabilityVerificationMethod: verified
+        ? `${sourceName}-filing-or-publication-date`
+        : `${sourceName}-period-only-unverified`,
+      sourceProvider,
+      warning: verified ? null : `${sourceName} did not provide a verifiable filing/publication timestamp for this period; Shadow-only.`,
+      values: {
+        ...values,
+        profitMargin: values.revenue !== null && values.netIncome !== null
+          ? clamp(values.netIncome / Math.max(1, Math.abs(values.revenue)))
+          : null,
+        debtToAssets: values.assets !== null && values.liabilities !== null
+          ? clamp(values.liabilities / Math.max(1, Math.abs(values.assets)), 0, 3)
+          : null,
+        sourceQuality: Number(options.sourceQuality ?? 0.75),
+      },
+    }];
+  });
+  return [...new Map(normalized.map((record) => [
+    `${record.event_time}:${record.statement}:${record.fiscalPeriod || ""}`,
+    record,
+  ])).values()].sort((left, right) => (
+    left.event_time.localeCompare(right.event_time) || left.available_at.localeCompare(right.available_at)
+  ));
+}
+
+function normalizeGrowthWithValuePitRecords(symbol, payload = {}, options = {}) {
+  return normalizeExternalFinancialPitRecords(symbol, payload, {
+    ...options,
+    sourceName: "growth-with-value",
+    sourceProvider: options.sourceProvider || "growth-with-value-asx-financials",
+    sourceQuality: options.sourceQuality ?? 0.72,
+  });
+}
+
+function normalizeStockMarketApiPitRecords(symbol, payload = {}, options = {}) {
+  return normalizeExternalFinancialPitRecords(symbol, payload, {
+    ...options,
+    sourceName: "stockmarketapi-ai",
+    sourceProvider: options.sourceProvider || "stockmarketapi-ai-asx-financials",
+    sourceQuality: options.sourceQuality ?? 0.84,
+  });
 }
 
 function normalizeFmpHistoricalUniverseRecords(payload = {}) {
@@ -505,13 +740,15 @@ function nextUtcDay(day) {
 function normalizeFredVintageRecords(seriesId, observations = [], options = {}) {
   const rows = observations.map((row) => ({
     date: String(row.date || "").slice(0, 10),
+    realtimeStart: String(row.realtime_start || row.realtimeStart || "").slice(0, 10),
+    realtimeEnd: String(row.realtime_end || row.realtimeEnd || "").slice(0, 10),
     availableAt: [
       nextUtcDay(row.date),
       options.conservativeMarketClose === true ? null : isoDay(row.realtime_start, false),
     ].filter(Boolean).sort().at(-1),
     value: finite(row.value),
   })).filter((row) => row.value !== null && row.availableAt && /^\d{4}-\d{2}-\d{2}$/.test(row.date));
-  rows.sort((left, right) => left.date.localeCompare(right.date));
+  rows.sort((left, right) => left.date.localeCompare(right.date) || left.availableAt.localeCompare(right.availableAt));
   const changes = [];
   return rows.map((row, index) => {
     const previous = index ? rows[index - 1].value : row.value;
@@ -527,12 +764,18 @@ function normalizeFredVintageRecords(seriesId, observations = [], options = {}) 
     const featureName = MACRO_FEATURE_BY_SERIES[seriesId];
     const featureValue = Number.isFinite(direction) ? sentiment : surprise;
     const featureValues = featureName ? { [featureName]: featureValue } : {};
+    const vintage = row.realtimeStart || row.availableAt.slice(0, 10);
+    const realtimeEnd = row.realtimeEnd || "9999-12-31";
     return {
-      id: `${seriesId}:${row.date}:${row.availableAt.slice(0, 10)}`,
+      id: `${seriesId}:${row.date}:${vintage}:${realtimeEnd}:${row.value}`,
       seriesId,
       event_time: `${row.date}T00:00:00Z`,
       available_at: row.availableAt,
-      revision: "initial-release",
+      release_date: vintage,
+      realtime_start: vintage,
+      realtime_end: realtimeEnd,
+      vintage,
+      revision: `fred-vintage-${vintage}`,
       historicalAvailabilityVerified: true,
       historicalAvailabilityMethod: options.conservativeMarketClose === true
         ? "conservative-next-utc-day-market-observation"
@@ -552,13 +795,22 @@ function normalizeFredVintageRecords(seriesId, observations = [], options = {}) 
 }
 
 function normalizePublishedPitRecords(items = [], options = {}) {
+  const verified = options.historicalAvailabilityVerified !== false;
   return items.flatMap((item, index) => {
     const publishedAt = item.publishedAt || item.available_at || item.date;
     const text = String(publishedAt || "").trim();
-    const availableAt = /^\d{4}-\d{2}-\d{2}$/.test(text)
+    const dateOnlyPublishedAt = /^\d{4}-\d{2}-\d{2}$/.test(text);
+    const availableAt = dateOnlyPublishedAt
       ? isoDay(text, true)
       : safeIsoTimestamp(text);
     if (!availableAt) return [];
+    // A provider date must never become a verified PIT timestamp before it is
+    // observable locally.  This guards the daily-announcement path where a
+    // date-only value is normalized to 23:59 and would otherwise be future
+    // dated while the fetch is still in progress.
+    const availableAtMs = Date.parse(availableAt);
+    const futurePublishedAt = Number.isFinite(availableAtMs) && availableAtMs > Date.now();
+    const recordVerified = verified && !futurePublishedAt;
     const title = String(item.title || "");
     const description = String(item.description || item.summary || "");
     const textContent = `${title} ${description}`.toLowerCase();
@@ -602,7 +854,16 @@ function normalizePublishedPitRecords(items = [], options = {}) {
       revision: "initial",
       sourceQuality,
       values,
-      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerified: recordVerified,
+      historicalAvailabilityUnverified: !recordVerified,
+      historicalAvailabilityVerificationMethod: recordVerified
+        ? "source-published-timestamp"
+        : futurePublishedAt
+          ? "future-source-published-timestamp-quarantined"
+          : "source-published-timestamp-without-revision-vintage",
+      warning: futurePublishedAt
+        ? "Source publication timestamp is in the future relative to local observation time; Shadow-only until revalidated."
+        : item.warning || null,
     }];
   });
 }
@@ -721,9 +982,13 @@ function normalizeEodhdFinancialPitRecords(symbol, payload = {}, options = {}) {
 }
 
 export {
+  safeIsoTimestamp,
   normalizeCorporateActionRecords,
   normalizeAlphaVantageListingStatusRecords,
   normalizeEodhdFinancialPitRecords,
+  normalizeFmpStatementPitRecords,
+  normalizeGrowthWithValuePitRecords,
+  normalizeStockMarketApiPitRecords,
   normalizeFmpHistoricalUniverseRecords,
   normalizeFmpSymbolChangeRecords,
   normalizeOpenFigiMappings,
@@ -731,6 +996,8 @@ export {
   normalizeEodhdCompanyUniverseRecords,
   normalizeFredVintageRecords,
   normalizePublishedPitRecords,
+  secRecentRows,
+  normalizeSecDisclosureRecords,
   normalizeSecPitRecords,
   normalizeSimfinPitRecords,
   normalizeTusharePitRecords,
