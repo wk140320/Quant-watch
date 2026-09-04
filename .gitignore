@@ -6,6 +6,7 @@ catboost_info/
 node_modules/
 .pnpm-store/
 .venv/
+.ml-venv/
 __pycache__/
 *.py[cod]
 npm-debug.log*

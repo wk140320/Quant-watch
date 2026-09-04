@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="/frontend/styles/tokens.css?v=20260712-graphite-system">
     <link rel="stylesheet" href="/frontend/styles/shell.css?v=20260812-exact-stage-one-v91">
     <link rel="stylesheet" href="/frontend/styles/visual-workspaces.css?v=20260713-visual-workspaces-2">
-    <link rel="stylesheet" href="/frontend/styles/institutional-polish.css?v=20260713-institutional-polish-2">
+    <link rel="stylesheet" href="/frontend/styles/institutional-polish.css?v=20260815-task-center-times-1">
     <link rel="stylesheet" href="/frontend/styles/quiet-gold-flow.css?v=20260714-market-switch-performance-1">
     <link rel="stylesheet" href="/frontend/styles/simulation-layout.css?v=20260714-simulation-boundary-1">
     <link rel="stylesheet" href="/frontend/styles/performance.css?v=20260717-stable-load-2">
@@ -101,6 +101,39 @@
                 <strong id="homeEvidenceState">本地快照优先</strong>
                 <small id="homeSnapshotState">等待快照</small>
               </div>
+            </div>
+          </section>
+
+          <section class="home-task-center reveal-on-scroll" aria-labelledby="homeTaskCenterTitle">
+            <div class="home-task-heading">
+              <div>
+                <p>BACKGROUND CONTROL</p>
+                <h2 id="homeTaskCenterTitle">后台任务进度</h2>
+                <span>补数、OOF、因子、Alpha 与 Agent 任务会在后台持续运行，进度通过实时事件自动更新。</span>
+                <div id="homeGate03Status" class="home-gate-status" aria-live="polite">
+                  <span class="home-gate-status-dot" aria-hidden="true"></span>
+                  <strong>Gate03 状态读取中</strong>
+                  <small>正在读取最近一次审计心跳</small>
+                </div>
+              </div>
+              <div class="home-task-heading-actions">
+                <div class="home-task-stats" aria-label="后台任务摘要">
+                  <span><b id="homeTaskActiveCount">0</b> 运行中</span>
+                  <span><b id="homeTaskQueuedCount">0</b> 排队</span>
+                  <span><b id="homeTaskPausedCount">0</b> 已暂停</span>
+                  <span><b id="homeTaskCompleteCount">0</b> 最近24小时</span>
+                </div>
+                <div class="home-task-filters" role="tablist" aria-label="后台任务状态">
+                  <button class="home-task-filter is-active" type="button" role="tab" aria-selected="true" data-task-filter="running">运行中</button>
+                  <button class="home-task-filter" type="button" role="tab" aria-selected="false" data-task-filter="queued">排队中</button>
+                  <button class="home-task-filter" type="button" role="tab" aria-selected="false" data-task-filter="paused">已暂停</button>
+                  <button class="home-task-filter" type="button" role="tab" aria-selected="false" data-task-filter="recent24h">最近24小时</button>
+                </div>
+                <button class="secondary" type="button" data-home-target="sources">打开数据中心</button>
+              </div>
+            </div>
+            <div id="homeTaskCenter" class="home-task-list" aria-live="polite">
+              <p class="muted">正在连接任务中心…本地记录将优先显示。</p>
             </div>
           </section>
 
@@ -618,7 +651,7 @@ CBA,20,118.50</textarea>
             <div>
               <p class="section-kicker">Immutable OOF evidence</p>
               <h2>全模型训练报告</h2>
-              <p>分类、排序、收益区间、因子、分钟模型、Paper Agent 与 AI 监工分别使用适合任务的指标；缺失证据不会补造分数。</p>
+              <p>分类、排序、收益区间、因子、分钟模型与 Paper Agent 分别使用适合任务的指标；缺失证据不会补造分数，模型晋级只看固定样本外门槛。</p>
             </div>
             <div class="inline-actions">
               <button id="refreshModelReports" class="secondary icon-text-button" type="button"><i data-lucide="refresh-cw"></i><span>刷新报告</span></button>
@@ -681,7 +714,6 @@ CBA,20,118.50</textarea>
                 <option value="intraday">分钟模型</option>
                 <option value="factor_research">因子研究</option>
                 <option value="paper_agent">Paper Agent</option>
-                <option value="ai_supervisor">AI 监工</option>
               </select>
             </label>
             <label>周期
@@ -819,6 +851,6 @@ CBA,20,118.50</textarea>
     <script src="/frontend/runtime/ui-runtime.js?v=20260717-stable-load-2"></script>
     <script src="/frontend/runtime/home-motion.js?v=20260712-home-motion"></script>
     <script src="/frontend/runtime/flow-navigation.js?v=20260713-flow-navigation-2"></script>
-    <script src="/frontend/runtime/shell-bootstrap.js?v=20260812-exact-stage-one-v91"></script>
+    <script src="/frontend/runtime/shell-bootstrap.js?v=20260818-task-history-4"></script>
   </body>
 </html>

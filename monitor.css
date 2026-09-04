@@ -1279,7 +1279,7 @@ h3 {
 
 .supervisor-ops-stat span,
 .supervisor-ops-stat small,
-.supervisor-reviewer-row p {
+.supervisor-gate-row p {
   color: var(--muted);
   font-size: 9px;
   line-height: 1.55;
@@ -1295,14 +1295,14 @@ h3 {
   white-space: nowrap;
 }
 
-.supervisor-ops-reviewers {
+.supervisor-gate-groups {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-top: 10px;
 }
 
-.supervisor-reviewer-row {
+.supervisor-gate-row {
   min-width: 0;
   padding: 12px 13px;
   border: 1px solid var(--line-soft);
@@ -1310,18 +1310,11 @@ h3 {
   background: rgba(17, 19, 16, 0.62);
 }
 
-.supervisor-reviewer-row header {
+.supervisor-gate-row header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
-}
-
-.supervisor-reviewer-actions {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 7px;
 }
 
 .monitor-switch {
@@ -1376,19 +1369,19 @@ h3 {
   outline-offset: 2px;
 }
 
-.supervisor-reviewer-row strong,
-.supervisor-reviewer-row small {
+.supervisor-gate-row strong,
+.supervisor-gate-row small {
   display: block;
 }
 
-.supervisor-reviewer-row strong {
+.supervisor-gate-row strong {
   overflow: hidden;
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.supervisor-reviewer-row small {
+.supervisor-gate-row small {
   margin-top: 2px;
   overflow: hidden;
   color: var(--muted);
@@ -1397,7 +1390,7 @@ h3 {
   white-space: nowrap;
 }
 
-.supervisor-reviewer-row p {
+.supervisor-gate-row p {
   min-height: 28px;
   margin: 9px 0 0;
 }
@@ -1475,6 +1468,10 @@ h3 {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-top: 9px;
+}
+
+.supervisor-log-grid.deterministic-log-grid {
+  grid-template-columns: 1fr;
 }
 
 .supervisor-log-grid > section {
@@ -1802,7 +1799,7 @@ select:focus {
     grid-column: 1 / -1;
   }
 
-  .supervisor-ops-reviewers {
+  .supervisor-gate-groups {
     grid-template-columns: 1fr;
   }
 
@@ -2008,7 +2005,7 @@ select:focus {
   }
 
   .supervisor-ops-overview,
-  .supervisor-ops-reviewers,
+  .supervisor-gate-groups,
   .supervisor-manual-grid,
   .supervisor-operator-rows {
     grid-template-columns: 1fr;

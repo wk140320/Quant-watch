@@ -242,3 +242,17 @@ test("Main and desktop shells use bounded local-first loading", async () => {
   assert.match(monitor, /api\/model-trajectories/);
   assert.match(swift, /api\/ping/);
 });
+
+test("Model evidence UI separates Top10 meanings and warns when a report is stale", async () => {
+  const [source, shell, css] = await Promise.all([
+    readFile(new URL("../app.js", import.meta.url), "utf8"),
+    readFile(new URL("../frontend/runtime/shell-bootstrap.js", import.meta.url), "utf8"),
+    readFile(new URL("../styles.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(source, /双向高置信 Top10/);
+  assert.match(source, /做多排名 Top10/);
+  assert.match(source, /这份报告已过期/);
+  assert.match(source, /reportVersions/);
+  assert.match(shell, /做多排名 Top10/);
+  assert.match(css, /\.model-report-stale/);
+});

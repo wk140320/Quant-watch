@@ -1,71 +1,80 @@
-function createRuntimeEventHub(options = {}) {
-  const clients = new Set();
+function createRuntimeEventHub({ historyLimit = 240 } = {}) {
+  const limit = Math.max(1, Number(historyLimit) || 240);
   const history = [];
-  const historyLimit = Math.max(20, Number(options.historyLimit || 200));
-  let sequence = 0;
+  const clients = new Set();
+  let nextId = 0;
+
+  function matchesMarket(event, market) {
+    if (!market) return true;
+    const payloadMarket = event?.payload?.market || event?.payload?.job?.market || null;
+    return !payloadMarket || String(payloadMarket).toUpperCase() === String(market).toUpperCase();
+  }
+
+  function writeEvent(client, event) {
+    if (!matchesMarket(event, client.market)) return;
+    try {
+      client.response.write(`id: ${event.id}\n`);
+      client.response.write(`event: ${event.type}\n`);
+      client.response.write(`data: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      clients.delete(client);
+    }
+  }
 
   function publish(type, payload = {}) {
     const event = {
-      id: ++sequence,
-      type: String(type || "runtime"),
+      id: ++nextId,
+      type: String(type || "runtime.event"),
+      payload: payload && typeof payload === "object" ? payload : { value: payload },
       createdAt: new Date().toISOString(),
-      payload,
     };
     history.push(event);
-    if (history.length > historyLimit) history.splice(0, history.length - historyLimit);
-    const body = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
-    for (const client of [...clients]) {
-      try {
-        client.write(body);
-      } catch {
-        clients.delete(client);
-      }
-    }
+    while (history.length > limit) history.shift();
+    for (const client of clients) writeEvent(client, event);
     return event;
   }
 
-  function subscribe(req, res, options = {}) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    });
-    res.write(": connected\n\n");
-    const since = Number(options.since || req.headers["last-event-id"] || 0);
-    history.filter((event) => event.id > since).forEach((event) => {
-      res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-    });
-    clients.add(res);
-    const heartbeat = setInterval(() => {
-      try {
-        res.write(`: heartbeat ${Date.now()}\n\n`);
-      } catch {
-        clearInterval(heartbeat);
-        clients.delete(res);
-      }
-    }, 25_000);
-    heartbeat.unref?.();
-    const close = () => {
-      clearInterval(heartbeat);
-      clients.delete(res);
+  function summary({ recentLimit = 20 } = {}) {
+    const count = Math.max(0, Number(recentLimit) || 0);
+    return {
+      clients: clients.size,
+      lastEventId: nextId,
+      recent: count ? history.slice(-count) : [],
     };
-    req.on("close", close);
-    req.on("error", close);
   }
 
-  return {
-    publish,
-    subscribe,
-    summary: (options = {}) => {
-      const recentLimit = Math.max(0, Math.min(historyLimit, Number(options.recentLimit ?? 20)));
-      return {
-        clients: clients.size,
-        lastEventId: sequence,
-        recent: recentLimit > 0 ? history.slice(-recentLimit) : [],
-      };
-    },
-  };
+  function subscribe(request, response, { since = 0, market = null } = {}) {
+    const client = { request, response, market: market || null };
+    response.statusCode = 200;
+    response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    response.setHeader("Cache-Control", "no-cache, no-transform");
+    response.setHeader("Connection", "keep-alive");
+    response.flushHeaders?.();
+    response.write(": connected\n\n");
+    const sinceId = Number(since) || 0;
+    for (const event of history) {
+      if (event.id > sinceId) writeEvent(client, event);
+    }
+    clients.add(client);
+    const heartbeat = setInterval(() => {
+      try {
+        response.write(`: heartbeat ${Date.now()}\n\n`);
+      } catch {
+        clearInterval(heartbeat);
+        clients.delete(client);
+      }
+    }, 25_000);
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      clients.delete(client);
+    };
+    request.once("close", cleanup);
+    request.once("aborted", cleanup);
+    response.once("close", cleanup);
+    return cleanup;
+  }
+
+  return { publish, summary, subscribe };
 }
 
 export { createRuntimeEventHub };

@@ -1,0 +1,71 @@
+{
+  "schema": "metric-contract-5d-v2",
+  "horizonTradingDays": 5,
+  "signalTime": "completed-session-close",
+  "entry": "next-session-open-or-vwap",
+  "return": "net-of-market-specific-fees-and-slippage",
+  "evaluationUnit": "date-symbol prediction with explicit eligible masks and date-balanced aggregation",
+  "metrics": {
+    "balancedAccuracy": {
+      "task": "net-up direction classification",
+      "rawThreshold": 0.5,
+      "threshold": "selected on earlier OOF dates only",
+      "abstentions": "excluded from directional confusion matrix and reported as coverage",
+      "singleClass": "null with explicit insufficient-support reason"
+    },
+    "mcc": {
+      "task": "binary direction classification",
+      "undefined": "null when the complete confusion-matrix denominator is zero"
+    },
+    "brierSkillScore": {
+      "task": "probability quality",
+      "baseline": "class prevalence estimated only from the corresponding training window; evaluation prevalence is legacy-only",
+      "formula": "1 - model_brier / training_prevalence_baseline_brier"
+    },
+    "top10DirectionHitRate": {
+      "task": "long-only daily ranking",
+      "selection": "top decile within each complete audited daily cross-section",
+      "hit": "net five-day return greater than zero"
+    },
+    "top10ProfitHitRate": {
+      "task": "long-only daily ranking",
+      "selection": "same daily top-decile set as top10DirectionHitRate",
+      "hit": "cost-adjusted actual return greater than zero",
+      "notInterchangeableWith": "target-first path event"
+    },
+    "ndcgAt10": {
+      "task": "daily grouped ranking",
+      "relevance": "pre-registered net-positive and relative-return relevance",
+      "k": 10,
+      "aggregation": "date equal weighted",
+      "smallDatePolicy": "dates with fewer than 30 eligible symbols are reported and excluded"
+    },
+    "expectedValue": {
+      "task": "eligible long-only signals",
+      "components": "target-first gain minus stop-first loss plus timeout net return",
+      "availability": "null when the long-trade gate is inactive"
+    },
+    "confidenceIntervals": {
+      "method": "moving date-block bootstrap",
+      "primaryBlockTradingDays": 10,
+      "overlapAware": true
+    }
+  },
+  "promotionPolicy": {
+    "ordinaryAccuracyIsBlocking": false,
+    "requiresPositiveBrierSkill": true,
+    "requiresPositiveCostAdjustedExpectedValue": true,
+    "requiresStableRollingWindows": true,
+    "requiresCompleteOuterCrossSection": true,
+    "requiresOneReadConsumedLockbox": true,
+    "noTradeWhenEvidenceFails": true
+  },
+  "undefinedMetricPolicy": {
+    "noRows": "null",
+    "singleClassBalancedAccuracy": "null",
+    "zeroMccDenominator": "null",
+    "noValidRankDates": "null",
+    "incomparablePairedPanel": "no delta",
+    "neverUseZeroAsMissing": true
+  }
+}

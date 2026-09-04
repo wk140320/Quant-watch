@@ -1,0 +1,53 @@
+{
+  "schema": "research-fallback-contract-v1",
+  "status": "ACTIVE_RESEARCH_ONLY",
+  "purpose": "Reachable verified-data benchmark while the strict full-market PIT lane is blocked.",
+  "strictLane": {
+    "productionGateChanged": false,
+    "formalOofAllowed": false,
+    "longTradeGateAllowed": false,
+    "championUpdateAllowed": false
+  },
+  "dataPolicy": {
+    "includeOnly": [
+      "historicalAvailabilityVerified=true",
+      "valid event/available/first-seen/ingested ordering",
+      "frozen market, symbol, feature and label identities"
+    ],
+    "exclude": [
+      "unverified PIT rows",
+      "future or ambiguous timestamps",
+      "synthetic or inferred fundamentals",
+      "forced fallback probabilities or forced positive ranks"
+    ],
+    "missingFundamentals": "Omit unavailable columns; never encode missing verified fundamentals as observed zero."
+  },
+  "tasks": [
+    "cost_adjusted_net_up_classifier",
+    "date_grouped_top_k_ranker",
+    "downside_risk_and_abstention_gate"
+  ],
+  "horizonsTradingDays": [10, 20],
+  "researchAcceptance": {
+    "minimumIndependentDates": 30,
+    "minimumSignals": 300,
+    "balancedAccuracyPctAtLeast": 52.0,
+    "brierSkillStrictlyAbove": 0.0,
+    "ecePctAtMost": 8.0,
+    "top10HitRatePctAtLeast": 52.0,
+    "costAfterExpectedValueStrictlyAbove": 0.0,
+    "positiveRollingFoldCountAtLeast": 3,
+    "noTradeWhenExpectedNetEvNonPositive": true
+  },
+  "nonPromotionRules": [
+    "Research thresholds are not production thresholds.",
+    "Research cannot activate longTradeGate or overwrite a Champion.",
+    "Each comparable experiment requires one changed hypothesis and a new lockbox.",
+    "Unresolved PIT ambiguity is NO_MODEL, not a degraded model."
+  ],
+  "reentryConditions": [
+    "At least one new real ASX official PDF is accepted and written to strict PIT datasets.",
+    "Gate03 is rerun with updated evidence and permits the strict lane.",
+    "Strict calibration, Top-K, cost-after-EV and rolling stability gates pass on untouched evidence."
+  ]
+}

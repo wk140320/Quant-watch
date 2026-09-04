@@ -516,6 +516,66 @@ select:focus {
   overflow-wrap: anywhere;
 }
 
+.replenishment-frontier {
+  margin: 12px 0;
+  border: 1px solid rgba(104, 142, 170, 0.24);
+  border-left: 4px solid var(--warn);
+  border-radius: 8px;
+  background: rgba(8, 20, 33, 0.62);
+  padding: 12px;
+}
+
+.replenishment-frontier.ready {
+  border-left-color: var(--good);
+}
+
+.replenishment-frontier-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.replenishment-frontier-head span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.replenishment-frontier-head strong {
+  display: block;
+  margin-top: 3px;
+  color: #e0f2fe;
+  font-size: 14px;
+}
+
+.replenishment-frontier-head small,
+.replenishment-frontier p,
+.replenishment-frontier-lanes {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.replenishment-frontier p {
+  margin: 7px 0;
+}
+
+.replenishment-frontier-lanes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+
+.replenishment-frontier-lanes span {
+  overflow-wrap: anywhere;
+}
+
+.replenishment-frontier-lanes b {
+  color: #e0f2fe;
+  font-weight: 650;
+}
+
 .health-details {
   border: 1px solid rgba(104, 142, 170, 0.18);
   border-radius: 8px;
@@ -6501,6 +6561,58 @@ html[data-active-workspace="strategy"] .main {
   font-size: 14px;
 }
 
+.model-evidence-tier {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  margin-top: 6px;
+}
+
+.model-evidence-tier b,
+.model-evidence-tier small {
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.model-evidence-tier small {
+  color: #87949a;
+  font-weight: 500;
+}
+
+.model-evidence-tier.evidence-d0 b,
+.model-evidence-tier.evidence-unknown b {
+  color: #a9b3b7;
+}
+
+.model-evidence-tier.evidence-d1 b,
+.model-evidence-tier.evidence-d2 b {
+  color: #e7c06f;
+}
+
+.model-evidence-tier.evidence-d3 b {
+  color: #d9a36b;
+}
+
+.model-evidence-tier.evidence-d4 b {
+  color: #72d69a;
+}
+
+.model-research-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 5px;
+  color: #7f8d93;
+  font-size: 10px;
+}
+
+.model-research-meta span {
+  color: inherit;
+  font-size: inherit;
+  text-transform: none;
+}
+
 .model-evidence-card header b {
   flex: 0 0 auto;
   padding: 4px 8px;
@@ -6782,4 +6894,19 @@ html[data-active-workspace="strategy"] .main {
   .investment-memo-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+.model-report-stale {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning, #e7c06f) 42%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning, #e7c06f) 9%, var(--surface, #11161c));
+  color: var(--text, #f3f7f8);
+}
+
+.model-report-stale span {
+  color: var(--muted, #a7b0b5);
+  line-height: 1.45;
 }

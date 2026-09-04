@@ -115,6 +115,44 @@ function trainingArtifact(job = {}) {
   return job?.result?.productionTraining || job?.result?.result?.productionTraining || null;
 }
 
+function candidateStatusClass(value) {
+  const status = String(value || "NO_MODEL").toUpperCase();
+  if (status === "ELIGIBLE" || status === "PRODUCTION_ELIGIBLE") return "ELIGIBLE";
+  if (status.startsWith("PARTIAL")) return "PARTIAL";
+  if (status === "AVAILABLE") return "AVAILABLE";
+  if (status.includes("NO_MODEL")) return "NO_MODEL";
+  if (status.includes("INSUFFICIENT")) return "EVIDENCE_INSUFFICIENT";
+  return status;
+}
+
+function candidateEvidenceSemantics(model = {}, training = {}, candidateStatus = "NO_MODEL") {
+  const statusClass = candidateStatusClass(candidateStatus);
+  const families = model?.modelFamilyStatus || training?.manifest?.model_family_status || {};
+  const familyAvailable = (name) => String(families?.[name] || "").toUpperCase() === "AVAILABLE";
+  const artifactProduced = Boolean(training && (training.manifest || model || training.dataset));
+  const predictiveModelProduced = Boolean(
+    model?.predictiveModelProduced === true
+    || (familyAvailable("direction") && model?.available !== false),
+  );
+  const tradeModelProduced = Boolean(
+    model?.tradeModelProduced === true
+    || (predictiveModelProduced && familyAvailable("ranking") && model?.longTradeGate?.active === true),
+  );
+  const promotionEligible = Boolean(model?.productionEvidencePassed === true || statusClass === "ELIGIBLE");
+  const evidenceType = statusClass === "PARTIAL"
+    ? "partial_oof_attempt"
+    : statusClass === "NO_MODEL" || statusClass === "EVIDENCE_INSUFFICIENT"
+      ? "no_model_attempt"
+      : promotionEligible
+        ? "eligible_strict_oof"
+        : "strict_oof";
+  return { statusClass, evidenceType, artifactProduced, predictiveModelProduced, tradeModelProduced, promotionEligible };
+}
+
+function isStrictOofEvidence(point = {}) {
+  return ["strict_oof", "eligible_strict_oof"].includes(String(point.evidenceType || ""));
+}
+
 function fiveDayModel(training = {}) {
   return (training?.horizonModels || []).find((model) => Number(model?.horizon) === 5) || null;
 }
@@ -122,7 +160,16 @@ function fiveDayModel(training = {}) {
 function pointFromTrainingJob(job = {}) {
   const training = trainingArtifact(job);
   const model = fiveDayModel(training);
+  const candidateStatus = String(
+    model?.status
+      || model?.trainingStatus
+      || training?.manifest?.candidate_status
+      || training?.manifest?.candidateStatus
+      || (model?.available ? "AVAILABLE" : "NO_MODEL"),
+  ).toUpperCase();
+  const semantics = candidateEvidenceSemantics(model, training, candidateStatus);
   const dataset = training?.dataset || {};
+  const panelSampling = dataset.panelSampling || {};
   const pathMetrics = model?.metrics || {};
   const metrics = model?.directionMetrics || pathMetrics;
   const accuracy = metrics.directionAccuracyPct ?? metrics.accuracyPct ?? metrics.accuracy;
@@ -138,12 +185,29 @@ function pointFromTrainingJob(job = {}) {
     createdAt: job.updatedAt || job.createdAt || iso(),
     status: job.status,
     runtimeVersion: number(job.runtimeVersion, 1),
-    evidenceType: model?.available ? "strict_oof" : "training_attempt",
-    promotionEligible: Boolean(model?.available),
+    evidenceType: semantics.evidenceType,
+    // `available` means that some strict OOF evidence exists.  It is not a
+    // promotion decision: partial/no-model candidates must remain visible as
+    // attempts without being presented as eligible models.
+    attemptRecorded: true,
+    artifactProduced: semantics.artifactProduced,
+    predictiveModelProduced: semantics.predictiveModelProduced,
+    tradeModelProduced: semantics.tradeModelProduced,
+    promotionEligible: semantics.promotionEligible,
+    candidateStatus,
+    modelFamilyStatus: model?.modelFamilyStatus || training?.manifest?.model_family_status || {},
     datasetSignature: training?.manifest?.data_version || job.signature || null,
     samples: {
       rawRows: number(dataset.rawRows),
-      effectiveRows: number(dataset.effectiveRows || dataset.validRows),
+      eligibleRows: number(dataset.eligibleRows ?? panelSampling.eligiblePanelRows ?? dataset.rawRows),
+      effectiveRows: number(
+        dataset.effectiveRows
+        ?? dataset.fittedRows
+        ?? panelSampling.sampledPanelRows
+        ?? model?.rowCount
+        ?? dataset.validRows,
+      ),
+      fittedRows: number(dataset.fittedRows ?? model?.rowCount ?? panelSampling.sampledPanelRows),
       oofRows: number(model?.oofRows),
       independentDates: number(metrics.testDates || pathMetrics.testDates),
       targetEvents: number(model?.eventCounts?.target),
@@ -182,6 +246,9 @@ function pointFromTrainingJob(job = {}) {
   };
   if (!training) point.blockers.push("没有形成生产训练产物");
   if (!model?.available) point.blockers.push("5日模型没有严格 OOF 预测");
+  if (["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].includes(semantics.statusClass)) {
+    point.blockers.push(`候选状态为 ${candidateStatus}，不能作为晋级模型`);
+  }
   if (point.samples.oofRows < 1_000) point.blockers.push(`OOF ${point.samples.oofRows}/1000`);
   if (point.samples.independentDates < 120) point.blockers.push(`独立测试日 ${point.samples.independentDates}/120`);
   return point;
@@ -192,7 +259,16 @@ function promotionDecision(candidate, champion) {
   const metrics = candidate.metrics || {};
   const samples = candidate.samples || {};
   if (candidate.status !== "complete") blockers.push(`训练状态为 ${candidate.status}`);
-  if (candidate.evidenceType !== "strict_oof") blockers.push("仅严格 OOF 训练可晋级");
+  if (!isStrictOofEvidence(candidate)) blockers.push("仅严格 OOF 训练可晋级");
+  if (["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].includes(String(candidate.candidateStatus || "").toUpperCase())) {
+    blockers.push(`候选状态 ${candidate.candidateStatus} 不允许晋级`);
+  }
+  if (Object.values(candidate.modelFamilyStatus || {}).some((status) => {
+    const value = status && typeof status === "object" ? status.status : status;
+    return ["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].includes(String(value || "").toUpperCase());
+  })) {
+    blockers.push("至少一个核心模型族没有有效 OOF 专家");
+  }
   if (samples.oofRows < 1_000) blockers.push("OOF 测试样本不足 1000");
   if (samples.independentDates < 120) blockers.push("独立测试日期不足 120");
   if (!(number(metrics.brierSkill, -1) > 0)) blockers.push("Brier Skill 未大于 0");
@@ -213,7 +289,7 @@ function promotionDecision(candidate, champion) {
 function challengerQuality(point = {}) {
   const metrics = point.metrics || {};
   const samples = point.samples || {};
-  const strict = point.evidenceType === "strict_oof" && point.status === "complete" ? 1 : 0;
+  const strict = isStrictOofEvidence(point) && point.status === "complete" && point.predictiveModelProduced === true ? 1 : 0;
   return [
     strict,
     number(metrics.brierSkill, -10),
@@ -240,8 +316,12 @@ function defaultState(market) {
     market,
     updatedAt: null,
     champion: null,
+    latestAttempt: null,
+    latestEligibleModel: null,
     latestRun: null,
     frozenBaseline: null,
+    bestResearchArtifact: null,
+    bestComparablePredictiveCandidate: null,
     bestChallenger: null,
     // Kept as a read-compatible alias for older frontends.
     challenger: null,
@@ -265,9 +345,12 @@ function createLearningProgressService(options = {}) {
   const basePath = options.basePath;
   const jobsPath = options.jobsPath;
   const predictionPathFor = options.predictionPathFor;
+  const jobIndex = typeof options.jobIndex === "function" ? options.jobIndex : null;
   const publish = typeof options.publish === "function" ? options.publish : () => {};
   if (!basePath || !jobsPath || typeof predictionPathFor !== "function") throw new Error("Learning progress service requires persistence paths.");
   const memory = new Map();
+  const backgroundImports = new Map();
+  const observationRefreshes = new Map();
 
   const pathFor = (market) => join(basePath, `${marketCode(market).toLowerCase()}.json`);
 
@@ -276,8 +359,55 @@ function createLearningProgressService(options = {}) {
     if (memory.has(key)) return memory.get(key);
     const state = await readFile(pathFor(key), "utf8").then(JSON.parse).catch(() => defaultState(key));
     const normalized = { ...defaultState(key), ...state, market: key };
-    normalized.bestChallenger = normalized.bestChallenger || normalized.challenger || null;
-    normalized.challenger = normalized.bestChallenger;
+    const normalizePoint = (point) => {
+      if (!point || typeof point !== "object") return point;
+      const semantics = candidateEvidenceSemantics(
+        {
+          available: point.predictiveModelProduced === true || point.evidenceType === "strict_oof",
+          productionEvidencePassed: point?.promotion?.promoted === true,
+          modelFamilyStatus: point.modelFamilyStatus || {},
+          longTradeGate: { active: point.tradeModelProduced === true },
+        },
+        { manifest: {}, dataset: point.samples || {} },
+        point.candidateStatus || "NO_MODEL",
+      );
+      const samples = { ...(point.samples || {}) };
+      if (number(samples.effectiveRows) <= 0 && number(samples.rawRows) > 0) {
+        samples.effectiveRows = number(samples.fittedRows || samples.rawRows);
+        samples.fittedRows = number(samples.fittedRows || samples.effectiveRows);
+        samples.eligibleRows = number(samples.eligibleRows || samples.rawRows);
+        samples.countSource = "legacy-derived-from-raw-rows";
+      }
+      return {
+        ...point,
+        evidenceType: semantics.evidenceType,
+        attemptRecorded: true,
+        artifactProduced: point.artifactProduced ?? semantics.artifactProduced,
+        predictiveModelProduced: point.predictiveModelProduced ?? semantics.predictiveModelProduced,
+        tradeModelProduced: point.tradeModelProduced ?? semantics.tradeModelProduced,
+        samples,
+        // Repair the old ambiguous flag on read. Promotion is determined only
+        // by the immutable promotion decision, never by model availability.
+        promotionEligible: point?.promotion?.promoted === true,
+        candidateStatus: point.candidateStatus
+          || (point?.promotion?.promoted === true ? "ELIGIBLE" : "REJECTED_LEGACY"),
+      };
+    };
+    normalized.points = (Array.isArray(normalized.points) ? normalized.points : []).map(normalizePoint);
+    normalized.latestRun = normalizePoint(normalized.latestRun);
+    normalized.latestAttempt = normalizePoint(normalized.latestAttempt);
+    normalized.latestEligibleModel = normalizePoint(normalized.latestEligibleModel);
+    normalized.latestStrictRun = normalizePoint(normalized.latestStrictRun);
+    normalized.bestChallenger = normalizePoint(normalized.bestChallenger);
+    normalized.bestResearchArtifact = normalizePoint(normalized.bestResearchArtifact);
+    normalized.bestComparablePredictiveCandidate = normalizePoint(normalized.bestComparablePredictiveCandidate);
+    normalized.champion = normalizePoint(normalized.champion);
+    normalized.bestResearchArtifact = normalized.bestResearchArtifact || normalized.bestChallenger || normalized.challenger || null;
+    normalized.bestComparablePredictiveCandidate = normalized.bestComparablePredictiveCandidate
+      || (normalized.bestResearchArtifact?.predictiveModelProduced === true ? normalized.bestResearchArtifact : null);
+    normalized.bestChallenger = normalized.bestComparablePredictiveCandidate;
+    normalized.challenger = normalized.bestComparablePredictiveCandidate;
+    normalized.latestAttempt = normalized.latestAttempt || normalized.latestRun || normalized.points?.at?.(-1) || null;
     normalized.latestRun = normalized.latestRun || normalized.points?.at?.(-1) || null;
     memory.set(key, normalized);
     return memory.get(key);
@@ -338,15 +468,60 @@ function createLearningProgressService(options = {}) {
     };
   }
 
+  function emptyObservationalPoint(market) {
+    const key = marketCode(market);
+    return {
+      id: `observed-${key.toLowerCase()}-empty`,
+      market: key,
+      horizon: null,
+      createdAt: iso(),
+      mode: "evaluate",
+      status: "complete",
+      evidenceType: "live_observational",
+      promotionEligible: false,
+      datasetSignature: null,
+      samples: { rawRows: 0, resolvedRows: 0, uniquePredictions: 0, independentDates: 0 },
+      metrics: evidenceMetrics([]),
+      blockers: ["尚无已解析的5日预测"],
+      promotion: { promoted: false, blockers: ["observational evidence unavailable"] },
+    };
+  }
+
+  function scheduleBackgroundRefresh(key, state) {
+    if (!jobIndex || backgroundImports.has(key)) return;
+    const importPromise = importJobs(key, { scanLimit: 100 })
+      .catch(() => state)
+      .finally(() => backgroundImports.delete(key));
+    backgroundImports.set(key, importPromise);
+  }
+
+  function scheduleObservationRefresh(key) {
+    if (observationRefreshes.has(key)) return;
+    const refresh = observationalPoint(key)
+      .then((point) => {
+        memory.set(`${key}:observed`, point);
+        return point;
+      })
+      .catch(() => emptyObservationalPoint(key))
+      .finally(() => observationRefreshes.delete(key));
+    observationRefreshes.set(key, refresh);
+  }
+
   async function recordPoint(market, point) {
     const state = await load(market);
     if (state.points.some((row) => row.id === point.id || (point.sourceJobId && row.sourceJobId === point.sourceJobId))) return state;
     const decision = promotionDecision(point, state.champion);
     point.promotion = decision;
+    point.promotionEligible = decision.promoted === true;
+    state.latestAttempt = point;
     state.latestRun = point;
+    if (point.artifactProduced === true && isBetterChallenger(point, state.bestResearchArtifact)) {
+      state.bestResearchArtifact = point;
+    }
     if (decision.promoted) {
       state.champion = point;
-    } else if (point.evidenceType === "strict_oof") {
+      state.latestEligibleModel = point;
+    } else if (isStrictOofEvidence(point) && point.predictiveModelProduced === true) {
       if (!state.frozenBaseline) {
         state.frozenBaseline = {
           ...point,
@@ -364,9 +539,10 @@ function createLearningProgressService(options = {}) {
             : "严格 OOF 基线已记录，但独立测试日期尚未达到120。",
         };
       }
-      if (isBetterChallenger(point, state.bestChallenger)) state.bestChallenger = point;
+      if (isBetterChallenger(point, state.bestComparablePredictiveCandidate)) state.bestComparablePredictiveCandidate = point;
     }
-    state.challenger = state.bestChallenger;
+    state.bestChallenger = state.bestComparablePredictiveCandidate;
+    state.challenger = state.bestComparablePredictiveCandidate;
     state.points.push(point);
     state.points = state.points.slice(-1_000);
     if (point.sourceJobId) state.importedJobs = [...new Set([...(state.importedJobs || []), point.sourceJobId])].slice(-5_000);
@@ -452,23 +628,81 @@ function createLearningProgressService(options = {}) {
 
   async function snapshot(market) {
     const key = marketCode(market);
+    // Production serves a local-first progress view.  The evidence index is
+    // updated in the background, so a large archived OOF file can never hold
+    // the page request open.  Small unit-test fixtures without an index keep
+    // the original synchronous import semantics.
+    if (jobIndex) {
+      const state = await load(key);
+      scheduleBackgroundRefresh(key, state);
+      scheduleObservationRefresh(key);
+      const observed = memory.get(`${key}:observed`) || state.latestObservation || emptyObservationalPoint(key);
+      const points = state.points
+        .slice(-1_000)
+        .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
+        .slice(-180);
+      const fixed = points.filter(isStrictOofEvidence);
+      const rolling = points.filter((point) => point.evidenceType.includes("observational") || point.evidenceType === "legacy_mixed_horizon");
+      if (!rolling.some((point) => point.id === observed.id)) rolling.push(observed);
+      const latestStrictRun = fixed.at(-1) || null;
+      return {
+        available: true,
+        market: key,
+        updatedAt: state.updatedAt,
+        champion: state.champion,
+        latestAttempt: state.latestAttempt,
+        latestEligibleModel: state.latestEligibleModel,
+        bestResearchArtifact: state.bestResearchArtifact,
+        bestComparablePredictiveCandidate: state.bestComparablePredictiveCandidate,
+        latestRun: latestStrictRun || state.latestRun,
+        latestStrictRun,
+        latestObservation: observed,
+        observed,
+        curves: { fixed, rolling: rolling.slice(-180) },
+        schedule: state.schedule,
+        frozenTest: state.frozenTest,
+        jobReliability: jobReliability(state),
+        blockers: [
+          ...(state.champion ? [] : ["尚无满足硬门槛的5日 Champion"]),
+          ...(observed.samples.independentDates < 120 ? [`当前仅 ${observed.samples.independentDates} 个独立已解析日期`] : []),
+          ...(jobReliability(state).terminal >= 5 && jobReliability(state).successPct < 95 ? ["Runtime V3 训练任务成功率尚未达到 95%"] : []),
+        ],
+        order_execution_enabled: false,
+        refresh: { mode: "background-index", pendingJobsImport: backgroundImports.has(key), pendingObservation: observationRefreshes.has(key) },
+      };
+    }
+    // Completed OOF artifacts are immutable evidence. Import a bounded batch on
+    // every read so that a later observational tick can never hide a newer
+    // strict training run merely because legacy points already exist.
     let state = await load(key);
-    if (!(state.points || []).length) state = await importJobs(key, { scanLimit: 24 });
+    state = await importJobs(key, { scanLimit: 100 });
     const observed = await observationalPoint(key);
     const reliability = jobReliability(state);
-    const points = state.points.slice(-180);
-    const fixed = points.filter((point) => point.evidenceType === "strict_oof");
+    const points = state.points
+      .slice(-1_000)
+      .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
+      .slice(-180);
+    const fixed = points.filter(isStrictOofEvidence);
     const rolling = points.filter((point) => point.evidenceType.includes("observational") || point.evidenceType === "legacy_mixed_horizon");
     if (!rolling.some((point) => point.id === observed.id)) rolling.push(observed);
+    const latestStrictRun = fixed.at(-1) || null;
     return {
       available: true,
       market: key,
       updatedAt: state.updatedAt,
       champion: state.champion,
-      latestRun: state.latestRun,
+      latestAttempt: state.latestAttempt,
+      latestEligibleModel: state.latestEligibleModel,
+      // Existing clients read latestRun; make it the latest comparable OOF
+      // run when one exists, while retaining the observation separately.
+      latestRun: latestStrictRun || state.latestRun,
+      latestStrictRun,
+      latestObservation: observed,
       frozenBaseline: state.frozenBaseline,
-      bestChallenger: state.bestChallenger,
-      challenger: state.bestChallenger,
+      bestResearchArtifact: state.bestResearchArtifact,
+      bestComparablePredictiveCandidate: state.bestComparablePredictiveCandidate,
+      bestChallenger: state.bestComparablePredictiveCandidate,
+      challenger: state.bestComparablePredictiveCandidate,
       observed,
       curves: {
         fixed,
@@ -489,4 +723,4 @@ function createLearningProgressService(options = {}) {
   return { evaluate, load, recordJob, recordPoint, snapshot };
 }
 
-export { createLearningProgressService, evidenceMetrics, isBetterChallenger, promotionDecision };
+export { candidateEvidenceSemantics, createLearningProgressService, evidenceMetrics, isBetterChallenger, pointFromTrainingJob, promotionDecision };

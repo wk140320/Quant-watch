@@ -1,0 +1,57 @@
+{
+  "schema": "research-evidence-tier-v2",
+  "version": "2026-09-03",
+  "lanes": [
+    {"id": "core_research", "evidenceTier": "D1", "promotionAllowed": false, "description": "Verified price/volume core with restricted research universe."},
+    {"id": "sparse_expert", "evidenceTier": "D1", "promotionAllowed": false, "description": "Verified sparse event or fundamental expert on an eligible subset."},
+    {"id": "transfer_research", "evidenceTier": "D1", "promotionAllowed": false, "description": "Common feature intersection across markets for research only."},
+    {"id": "prequential_shadow", "evidenceTier": "D3", "promotionAllowed": false, "description": "Forward paper/shadow evidence without production activation."},
+    {"id": "strict_production", "evidenceTier": "D4", "promotionAllowed": true, "description": "Original strict production route, frozen while Gate03 is closed."}
+  ],
+  "researchEvidence": {
+    "D1": {"type": "restricted_oof", "minimumIndependentDates": 30, "minimumSignals": 300, "balancedAccuracyPctAtLeast": 52.0, "brierSkillStrictlyAbove": 0.0, "ecePctAtMost": 8.0, "top10HitRatePctAtLeast": 52.0, "netEvStrictlyAbove": 0.0, "positiveFoldCountAtLeast": 2},
+    "D2": {"type": "robust_research", "minimumIndependentDates": 60, "minimumSignals": 300, "balancedAccuracyPctAtLeast": 54.0, "brierSkillAtLeast": 0.005, "ecePctAtMost": 6.0, "top10HitRatePctAtLeast": 55.0, "top10BlockCiLowerPctAbove": 50.0, "netEvStrictlyAbove": 0.0, "positiveFoldCountAtLeast": 3, "maxDrawdownPctAtMost": 20.0},
+    "D3": {"type": "prequential_shadow", "minimumForwardDays": 60, "minimumSignals": 300, "top10BlockCiLowerPctAbove": 50.0, "netEvStrictlyAbove": 0.0, "brierSkillStrictlyAbove": 0.0, "ecePctAtMost": 5.0, "maxDrawdownPctAtMost": 15.0}
+  },
+  "strictLane": {"productionGateChanged": false, "formalOofAllowed": false, "longTradeGateAllowed": false, "championUpdateAllowed": false},
+  "marketFeaturePolicy": {
+    "ASX": {
+      "core": ["verified OHLCV", "action-safe price mask", "verified macro", "verified disclosures/news"],
+      "disabledInCore": ["numeric fundamentals", "social"],
+      "note": "数值PIT覆盖不足时不外推到核心研究宇宙。"
+    },
+    "US": {
+      "core": ["verified OHLCV", "action-safe price mask", "verified macro"],
+      "sparseExperts": ["SEC PIT fundamentals", "SEC disclosures", "verified news"],
+      "disabledWithoutProof": ["analyst revisions", "social"]
+    },
+    "CN": {
+      "core": ["verified OHLCV", "trade-constraint mask", "verified macro"],
+      "sparseExperts": ["PIT fundamentals", "disclosures", "verified news"],
+      "disabledWithoutProof": ["social"]
+    }
+  },
+  "featureContracts": {
+    "sparseExpert": {
+      "requiredRowFields": ["symbol", "signalAt", "availableAt", "sourceId", "sourceHash", "historicalAvailabilityVerified"],
+      "activationRule": "availableAt <= signalAt and historicalAvailabilityVerified=true; otherwise missing and expert abstains."
+    },
+    "transferResearch": {
+      "normalization": "market-day cross-sectional percentile before shared model input",
+      "sharedInputs": ["returns", "realized volatility", "dollar liquidity", "volume pressure", "actionability mask"],
+      "marketSpecificInputs": "excluded from the shared intersection"
+    },
+    "prequentialShadow": {
+      "requiredRule": "Every feature read at signalAt must have availableAt <= signalAt; labels mature after the declared horizon.",
+      "forbidden": ["future revised fundamentals", "post-signal corporate-action backfill", "same-day close when unavailable at signal time"]
+    }
+  },
+  "modelSearchBudget": {"familiesPerLabel": 8, "configsPerFamily": 12, "seedsForFinalists": 3, "deepArchitectures": 3},
+  "nonPromotionRules": [
+    "D1-D3 evidence cannot update latestEligibleModel or Champion.",
+    "D1-D3 evidence cannot activate longTradeGate.",
+    "Every comparable experiment declares exactly one changed hypothesis and a new lockbox.",
+    "Unverified PIT rows are excluded rather than converted into neutral values.",
+    "When no candidate passes its tier, the valid result is D0/no-model."
+  ]
+}

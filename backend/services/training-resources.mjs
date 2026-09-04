@@ -6,7 +6,7 @@ const PROFILES = Object.freeze({
     id: "light",
     label: "轻量",
     description: "电脑正在使用时运行；单任务、单线程树模型，优先保持页面流畅。",
-    jobs: { maxConcurrent: 1, maxHeavyConcurrent: 1 },
+    jobs: { maxConcurrent: 1, maxHeavyConcurrent: 1, maxDataHeavyConcurrent: 1, maxResearchHeavyConcurrent: 1 },
     training: { incrementalSymbols: 60, weeklySymbols: 120, fullSymbols: 180, foldCount: 5, testDates: 120 },
     models: { treeMaxRows: 25_000, treeIterations: 56, treeThreads: 1, baselineMaxRows: 5_000, quantileMaxRows: 5_000 },
     factor: { lightSymbols: 18, heavySymbols: 80, generations: 3, population: 20, lightIntervalHours: 168, heavyIntervalHours: 720 },
@@ -17,7 +17,7 @@ const PROFILES = Object.freeze({
     id: "balanced",
     label: "均衡",
     description: "日常推荐；前端优先，后台保持一条重型训练链并持续积累证据。",
-    jobs: { maxConcurrent: 2, maxHeavyConcurrent: 1 },
+    jobs: { maxConcurrent: 2, maxHeavyConcurrent: 2, maxDataHeavyConcurrent: 1, maxResearchHeavyConcurrent: 1 },
     training: { incrementalSymbols: 120, weeklySymbols: 250, fullSymbols: 400, foldCount: 6, testDates: 120 },
     models: { treeMaxRows: 40_000, treeIterations: 72, treeThreads: 2, baselineMaxRows: 6_000, quantileMaxRows: 6_000 },
     factor: { lightSymbols: 36, heavySymbols: 120, generations: 6, population: 36, lightIntervalHours: 72, heavyIntervalHours: 336 },
@@ -28,7 +28,7 @@ const PROFILES = Object.freeze({
     id: "deep",
     label: "深度",
     description: "电脑空闲时运行；扩大横截面、折数和树模型拟合深度，耗时与发热明显增加。",
-    jobs: { maxConcurrent: 3, maxHeavyConcurrent: 1 },
+    jobs: { maxConcurrent: 3, maxHeavyConcurrent: 2, maxDataHeavyConcurrent: 1, maxResearchHeavyConcurrent: 1 },
     training: { incrementalSymbols: 200, weeklySymbols: 450, fullSymbols: 650, foldCount: 7, testDates: 180 },
     models: { treeMaxRows: 80_000, treeIterations: 120, treeThreads: 4, baselineMaxRows: 12_000, quantileMaxRows: 12_000 },
     factor: { lightSymbols: 80, heavySymbols: 180, generations: 10, population: 64, lightIntervalHours: 24, heavyIntervalHours: 168 },
@@ -108,17 +108,25 @@ function createTrainingResourceService({ configPath, applyPolicy } = {}) {
       : key === "incremental"
         ? profile.training.incrementalSymbols
         : profile.training.weeklySymbols;
+    const explicit = (name, fallback, { min = 1, max = Number.POSITIVE_INFINITY } = {}) => {
+      if (plan[name] === undefined || plan[name] === null || plan[name] === "") return fallback;
+      const value = Number(plan[name]);
+      if (!Number.isFinite(value)) return fallback;
+      return Math.max(min, Math.min(max, value));
+    };
     return {
       ...plan,
       resourceProfile: selected,
       limit: Math.max(10, Math.min(symbolCap, Math.max(symbolCap, Number(plan.limit || 0)))),
-      foldCount: profile.training.foldCount,
-      testDates: Math.max(120, Math.min(profile.training.testDates, Number(plan.testDates || profile.training.testDates))),
-      treeMaxRows: profile.models.treeMaxRows,
-      treeIterations: profile.models.treeIterations,
-      treeThreads: profile.models.treeThreads,
-      baselineMaxRows: profile.models.baselineMaxRows,
-      quantileMaxRows: profile.models.quantileMaxRows,
+      // Supervisor rework plans are deliberate resource controls. Preserve them
+      // instead of silently replacing a six-fold retry with the selected profile.
+      foldCount: explicit("foldCount", profile.training.foldCount, { min: 2, max: 8 }),
+      testDates: explicit("testDates", profile.training.testDates, { min: 120, max: profile.training.testDates }),
+      treeMaxRows: explicit("treeMaxRows", profile.models.treeMaxRows, { min: 1_000 }),
+      treeIterations: explicit("treeIterations", profile.models.treeIterations, { min: 16, max: 500 }),
+      treeThreads: explicit("treeThreads", profile.models.treeThreads, { min: 1, max: 8 }),
+      baselineMaxRows: explicit("baselineMaxRows", profile.models.baselineMaxRows, { min: 1_000 }),
+      quantileMaxRows: explicit("quantileMaxRows", profile.models.quantileMaxRows, { min: 1_000 }),
     };
   }
 

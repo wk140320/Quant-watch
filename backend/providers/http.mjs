@@ -56,6 +56,29 @@ async function fetchJsonPost(url, payload, timeoutMs = 10000, extraHeaders = {})
   }
 }
 
+async function fetchFormJsonPost(url, payload, timeoutMs = 10000, extraHeaders = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        ...requestHeaders("application/json,text/plain,*/*"),
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        ...extraHeaders,
+      },
+      body: new URLSearchParams(Object.entries(payload || {}).map(([key, value]) => [key, String(value ?? "")])).toString(),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${redactProviderText(await response.text())}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchText(url, timeoutMs = 10000, extraHeaders = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -115,6 +138,7 @@ async function fetchJsonWithCurl(url, timeoutMs = 10000, extraHeaders = {}) {
 
 export {
   fetchJson,
+  fetchFormJsonPost,
   fetchJsonPost,
   fetchJsonWithCurl,
   fetchText,

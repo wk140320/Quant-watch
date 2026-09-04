@@ -5,6 +5,7 @@ import importlib.util
 import socket
 import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
 from alpha_mining import analyze_alpha_evolution
@@ -15,10 +16,32 @@ from data_lake import migrate_asx_financial_disclosures
 from data_lake import read_rows as read_data_lake_rows
 from data_lake import read_panel as read_data_lake_panel
 from data_lake import read_pit_panel as read_data_lake_pit_panel
+from data_lake import verified_pit_coverage as data_lake_verified_pit_coverage
 from data_lake import summary as data_lake_summary
 from data_lake import upsert as upsert_data_lake
 from data_lake import upsert_panel as upsert_data_lake_panel
 from data_lake import upsert_pit_batches, upsert_pit_records
+from data_semantics import audit_lake as audit_pit_data_lake
+from calibration_contracts import (
+    adaptive_conformal_interval,
+    calibration_diagnostics,
+    choose_calibrator,
+    chronological_calibration_split,
+    no_trade_gate,
+)
+from evolution_contracts import (
+    champion_replacement,
+    dependency_gate,
+    experiment_budget,
+    failure_evidence,
+    new_evidence_required,
+    paper_trajectory,
+    repeated_root_cause_action,
+    rollback_reference,
+    transition_task,
+)
+from factor_research import evaluate_factor, factor_card, factor_pool_audit
+from model_contracts import candidate_admission, family_contract, qualified_family_models
 from features import analyze_cross_sectional_factors, analyze_factors, analyze_features
 from historical_backtest import batch_historical_backtest, run_historical_backtest
 from local_model import train_local_model_suite
@@ -32,8 +55,9 @@ from paper_agents import reset as reset_paper_agents
 from paper_agents import step as step_paper_agents
 from paper_agents import upgrade_generation as upgrade_paper_agent_generation
 from pit_ingest import backfill_baostock_corporate_actions
-from production_training import recover_oof_artifacts, train_market_multitask
+from production_training import model_library_status, recover_oof_artifacts, train_market_multitask
 from provider_budget import provider_plan
+from rqdata_provider import fetch_candles as fetch_rqdata_candles, status as rqdata_status
 from risk import assess_portfolio, build_paper_order_intent
 from store import append_event, control_plane_summary, list_events, list_market_rows, list_order_intents, market_data_summary, record_market_rows, record_order_intent
 from trades import analyze_trades
@@ -64,44 +88,61 @@ def ibkr_readiness(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _legacy_module_available(module: str) -> bool:
+    """Keep optional research packages visible without blocking health checks."""
+    legacy_root = Path(__file__).resolve().parents[1] / ".venv" / "lib"
+    return any(
+        (site_packages / module).exists()
+        for site_packages in legacy_root.glob("python*/site-packages")
+    )
+
+
 def qlib_readiness() -> dict[str, Any]:
     qlib_spec = importlib.util.find_spec("qlib")
     lightgbm_spec = importlib.util.find_spec("lightgbm")
     torch_spec = importlib.util.find_spec("torch")
-    installed = qlib_spec is not None
+    qlib_in_current = qlib_spec is not None
+    torch_in_current = torch_spec is not None
+    qlib_in_legacy = not qlib_in_current and _legacy_module_available("qlib")
+    torch_in_legacy = not torch_in_current and _legacy_module_available("torch")
+    installed = qlib_in_current or qlib_in_legacy
     lightgbm_installed = lightgbm_spec is not None
-    torch_installed = torch_spec is not None
-    lightgbm_ready = installed and lightgbm_installed
-    sequence_ready = installed and torch_installed
+    torch_installed = torch_in_current or torch_in_legacy
+    # The production worker uses the isolated native runtime directly. Qlib
+    # remains an optional research adapter and may live in the legacy venv.
+    lightgbm_ready = lightgbm_installed
+    sequence_ready = torch_installed
     return {
         "available": installed,
         "package": "Microsoft Qlib",
         "qlib_installed": installed,
         "lightgbm_installed": lightgbm_installed,
         "torch_installed": torch_installed,
+        "qlib_runtime": "native-ml" if qlib_in_current else ("legacy-venv" if qlib_in_legacy else None),
+        "torch_runtime": "native-ml" if torch_in_current else ("legacy-venv" if torch_in_legacy else None),
         "models": [
             {
                 "id": "lightgbm",
                 "label": "LightGBM",
                 "ready": lightgbm_ready,
-                "status": "ready" if lightgbm_ready else ("missing_qlib" if not installed else "missing_lightgbm"),
-                "reason": "ready" if lightgbm_ready else ("缺 Qlib" if not installed else "缺 LightGBM"),
+                "status": "ready" if lightgbm_ready else "missing_lightgbm",
+                "reason": "ready" if lightgbm_ready else "缺 LightGBM",
                 "use": "tabular factors after six-gate quality audit and walk-forward split",
             },
             {
                 "id": "lstm",
                 "label": "LSTM",
                 "ready": sequence_ready,
-                "status": "ready" if sequence_ready else ("missing_qlib" if not installed else "missing_torch"),
-                "reason": "ready" if sequence_ready else ("缺 Qlib" if not installed else "缺 PyTorch"),
+                "status": "ready" if sequence_ready else "missing_torch",
+                "reason": "ready" if sequence_ready else "缺 PyTorch",
                 "use": "time-series sequence factors; scaler fitted on train window only",
             },
             {
                 "id": "transformer",
                 "label": "Transformer",
                 "ready": sequence_ready,
-                "status": "ready" if sequence_ready else ("missing_qlib" if not installed else "missing_torch"),
-                "reason": "ready" if sequence_ready else ("缺 Qlib" if not installed else "缺 PyTorch"),
+                "status": "ready" if sequence_ready else "missing_torch",
+                "reason": "ready" if sequence_ready else "缺 PyTorch",
                 "use": "multi-factor temporal attention; purged/embargoed labels required",
             },
         ],
@@ -114,9 +155,11 @@ def qlib_readiness() -> dict[str, Any]:
             "standardization",
         ],
         "message": (
-            "Qlib is importable; model adapters can be enabled after data handler configuration."
+            "Native ML runtime is ready; Qlib research adapter is available from the legacy environment."
+            if installed and qlib_in_legacy and not qlib_in_current
+            else "Qlib is importable; model adapters can be enabled after data handler configuration."
             if installed
-            else "Qlib is not installed in this Python environment; current factor lab continues with the built-in walk-forward engine."
+            else "Qlib is not installed; current factor lab continues with the built-in walk-forward engine."
         ),
     }
 
@@ -227,6 +270,9 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
                 "local-model-suite",
                 "persistent-paper-agents",
                 "parquet-duckdb-data-lake",
+                "point-in-time-data-semantics-audit",
+                "factor-card-and-redundancy-audit",
+                "model-family-evidence-contract",
             ],
             "order_execution_enabled": False,
         }
@@ -340,6 +386,8 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return result
     if operation == "production-model-train":
         return train_market_multitask(payload)
+    if operation == "ml-readiness":
+        return model_library_status()
     if operation == "model-report-generate":
         return generate_model_report(
             root=payload.get("root"),
@@ -367,6 +415,10 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return baostock_candles(payload)
     if operation == "baostock-corporate-actions":
         return backfill_baostock_corporate_actions(payload)
+    if operation == "rqdata-status":
+        return rqdata_status(payload)
+    if operation == "rqdata-candles":
+        return fetch_rqdata_candles(payload)
     if operation == "data-lake-upsert":
         return upsert_data_lake(payload)
     if operation == "data-lake-read":
@@ -375,12 +427,148 @@ def dispatch(payload: dict[str, Any]) -> dict[str, Any]:
         return read_data_lake_panel(payload)
     if operation == "data-lake-pit-read":
         return read_data_lake_pit_panel(payload)
+    if operation == "data-lake-pit-coverage":
+        return data_lake_verified_pit_coverage(payload)
     if operation == "data-lake-panel-upsert":
         return upsert_data_lake_panel(payload)
     if operation == "data-lake-summary":
         return data_lake_summary(payload)
     if operation == "data-lake-audit":
         return audit_data_lake(payload)
+    if operation == "data-lake-semantic-audit":
+        return audit_pit_data_lake(payload)
+    if operation == "factor-card":
+        return factor_card(
+            str(payload.get("name") or ""),
+            source_version=str(payload.get("source_version") or payload.get("sourceVersion") or "unbound"),
+            feature_schema=str(payload.get("feature_schema") or payload.get("featureSchema") or "factor-panel-v2"),
+        )
+    if operation == "factor-evaluate":
+        return evaluate_factor(
+            payload.get("rows") or [],
+            str(payload.get("name") or payload.get("factor") or ""),
+            value_key=payload.get("value_key", payload.get("valueKey")),
+            label_key=str(payload.get("label_key") or payload.get("labelKey") or "label"),
+            min_breadth=int(payload.get("min_breadth", payload.get("minBreadth", 10)) or 10),
+        )
+    if operation == "factor-pool-audit":
+        return factor_pool_audit(
+            payload.get("rows") or [],
+            payload.get("names") or payload.get("factors") or [],
+            min_dates=int(payload.get("min_dates", payload.get("minDates", 120)) or 120),
+            max_correlation=float(payload.get("max_correlation", payload.get("maxCorrelation", 0.65)) or 0.65),
+        )
+    if operation == "model-family-contract":
+        return family_contract(
+            str(payload.get("family") or ""),
+            horizon=int(payload.get("horizon") or 5),
+            feature_schema=str(payload.get("feature_schema") or payload.get("featureSchema") or "unknown"),
+        )
+    if operation == "model-candidate-admission":
+        return candidate_admission(
+            payload.get("candidate") or {},
+            payload.get("null_model", payload.get("nullModel")) or {},
+            family=str(payload.get("family") or (payload.get("candidate") or {}).get("family") or ""),
+            min_rows=int(payload.get("min_rows", payload.get("minRows", 1_000)) or 1_000),
+            min_dates=int(payload.get("min_dates", payload.get("minDates", 120)) or 120),
+        )
+    if operation == "qualified-family-models":
+        return qualified_family_models(payload.get("candidates") or [])
+    if operation == "calibration-split":
+        return chronological_calibration_split(
+            payload.get("rows") or [],
+            fit_pct=float(payload.get("fit_pct", payload.get("fitPct", 0.55)) or 0.55),
+            calibration_pct=float(payload.get("calibration_pct", payload.get("calibrationPct", 0.20)) or 0.20),
+            selection_pct=float(payload.get("selection_pct", payload.get("selectionPct", 0.15)) or 0.15),
+            purge_days=int(payload.get("purge_days", payload.get("purgeDays", 5)) or 5),
+            embargo_days=int(payload.get("embargo_days", payload.get("embargoDays", 5)) or 5),
+        )
+    if operation == "calibration-diagnostics":
+        return calibration_diagnostics(
+            payload.get("rows") or [],
+            payload.get("probabilities") or [],
+            actual_key=str(payload.get("actual_key") or payload.get("actualKey") or "actualTarget"),
+            date_key=str(payload.get("date_key") or payload.get("dateKey") or "date"),
+            min_bucket_events=int(payload.get("min_bucket_events", payload.get("minBucketEvents", 30)) or 30),
+            min_bucket_dates=int(payload.get("min_bucket_dates", payload.get("minBucketDates", 30)) or 30),
+        )
+    if operation == "calibrator-select":
+        return choose_calibrator(
+            payload.get("fit_rows", payload.get("fitRows")) or [],
+            payload.get("calibration_rows", payload.get("calibrationRows")) or [],
+            probability_key=str(payload.get("probability_key") or payload.get("probabilityKey") or "probability"),
+            actual_key=str(payload.get("actual_key") or payload.get("actualKey") or "actualTarget"),
+            date_key=str(payload.get("date_key") or payload.get("dateKey") or "date"),
+        )
+    if operation == "conformal-interval":
+        return adaptive_conformal_interval(
+            payload.get("rows") or [],
+            prediction_key=str(payload.get("prediction_key") or payload.get("predictionKey") or "prediction"),
+            actual_key=str(payload.get("actual_key") or payload.get("actualKey") or "actualReturn"),
+            date_key=str(payload.get("date_key") or payload.get("dateKey") or "date"),
+            alpha=float(payload.get("alpha", 0.20) or 0.20),
+            window_dates=int(payload.get("window_dates", payload.get("windowDates", 120)) or 120),
+        )
+    if operation == "no-trade-gate":
+        return no_trade_gate(
+            probability=float(payload.get("probability", 0.0) or 0.0),
+            lower_probability=payload.get("lower_probability", payload.get("lowerProbability")),
+            expected_value_pct=payload.get("expected_value_pct", payload.get("expectedValuePct")),
+            lower_return_pct=payload.get("lower_return_pct", payload.get("lowerReturnPct")),
+            threshold=float(payload.get("threshold", 0.57) or 0.57),
+            min_lower_probability=float(payload.get("min_lower_probability", payload.get("minLowerProbability", 0.50)) or 0.50),
+            min_expected_value_pct=float(payload.get("min_expected_value_pct", payload.get("minExpectedValuePct", 0.0)) or 0.0),
+            min_lower_return_pct=float(payload.get("min_lower_return_pct", payload.get("minLowerReturnPct", 0.0)) or 0.0),
+            data_quality_ok=payload.get("data_quality_ok", payload.get("dataQualityOk", True)) is True,
+            model_evidence_ok=payload.get("model_evidence_ok", payload.get("modelEvidenceOk", True)) is True,
+        )
+    if operation == "portfolio-cost-impact":
+        from portfolio_contracts import cost_impact
+        return cost_impact(
+            notional=float(payload.get("notional", 0.0) or 0.0),
+            average_dollar_volume=payload.get("average_dollar_volume", payload.get("averageDollarVolume")),
+            participation_rate=float(payload.get("participation_rate", payload.get("participationRate", 0.10)) or 0.10),
+            spread_bps=float(payload.get("spread_bps", payload.get("spreadBps", 8.0)) or 8.0),
+            commission_bps=float(payload.get("commission_bps", payload.get("commissionBps", 1.0)) or 1.0),
+            impact_bps=float(payload.get("impact_bps", payload.get("impactBps", 25.0)) or 25.0),
+        )
+    if operation == "portfolio-constraints":
+        from portfolio_contracts import portfolio_constraint_audit
+        return portfolio_constraint_audit(
+            payload.get("positions") or [],
+            equity=float(payload.get("equity", 0.0) or 0.0),
+            cash=float(payload.get("cash", 0.0) or 0.0),
+            max_positions=int(payload.get("max_positions", payload.get("maxPositions", 6)) or 6),
+            max_position_pct=float(payload.get("max_position_pct", payload.get("maxPositionPct", 0.12)) or 0.12),
+            max_sector_pct=float(payload.get("max_sector_pct", payload.get("maxSectorPct", 0.25)) or 0.25),
+            min_cash_pct=float(payload.get("min_cash_pct", payload.get("minCashPct", 0.25)) or 0.25),
+        )
+    if operation == "paper-backtest":
+        from portfolio_contracts import run_executable_paper_backtest
+        return run_executable_paper_backtest(
+            payload.get("rows") or [],
+            initial_cash=float(payload.get("initial_cash", payload.get("initialCash", 100_000.0)) or 100_000.0),
+            max_position_pct=float(payload.get("max_position_pct", payload.get("maxPositionPct", 0.12)) or 0.12),
+            min_cash_pct=float(payload.get("min_cash_pct", payload.get("minCashPct", 0.25)) or 0.25),
+        )
+    if operation == "evolution-transition":
+        return transition_task(payload.get("task") or {}, str(payload.get("target") or payload.get("status") or ""), evidence_id=payload.get("evidence_id", payload.get("evidenceId")), reason=payload.get("reason"))
+    if operation == "evolution-dependency-gate":
+        return dependency_gate(payload.get("task") or {}, payload.get("tasks") or [])
+    if operation == "evolution-failure-evidence":
+        return failure_evidence(root_cause=str(payload.get("root_cause") or payload.get("rootCause") or ""), attempt=int(payload.get("attempt") or 0), evidence_id=str(payload.get("evidence_id") or payload.get("evidenceId") or ""), next_action=str(payload.get("next_action") or payload.get("nextAction") or ""), task_id=payload.get("task_id", payload.get("taskId")))
+    if operation == "evolution-pivot":
+        return repeated_root_cause_action(payload.get("records") or [], str(payload.get("root_cause") or payload.get("rootCause") or ""), threshold=int(payload.get("threshold", 3) or 3))
+    if operation == "evolution-new-evidence":
+        return new_evidence_required(payload.get("previous") or {}, snapshot_id=payload.get("snapshot_id", payload.get("snapshotId")), changed_hypothesis=payload.get("changed_hypothesis", payload.get("changedHypothesis")))
+    if operation == "evolution-champion-replacement":
+        return champion_replacement(payload.get("candidate") or {}, payload.get("champion"), tolerance=float(payload.get("tolerance", 0.0) or 0.0))
+    if operation == "evolution-rollback-reference":
+        return rollback_reference(payload.get("champion") or {}, reason=str(payload.get("reason") or "manual rollback"))
+    if operation == "evolution-paper-trajectory":
+        return paper_trajectory(market=str(payload.get("market") or "ASX"), symbol=str(payload.get("symbol") or ""), signal_at=str(payload.get("signal_at") or payload.get("signalAt") or ""), action=str(payload.get("action") or "NO_TRADE"), model_version=payload.get("model_version", payload.get("modelVersion")), expected_value_pct=payload.get("expected_value_pct", payload.get("expectedValuePct")), outcome_return_pct=payload.get("outcome_return_pct", payload.get("outcomeReturnPct")), reason=payload.get("reason"))
+    if operation == "evolution-budget":
+        return experiment_budget(payload.get("records") or [], year_month=str(payload.get("year_month") or payload.get("yearMonth") or ""), max_hypotheses=int(payload.get("max_hypotheses", payload.get("maxHypotheses", 12)) or 12), max_factor_candidates=int(payload.get("max_factor_candidates", payload.get("maxFactorCandidates", 60)) or 60), max_model_candidates=int(payload.get("max_model_candidates", payload.get("maxModelCandidates", 24)) or 24))
     if operation == "data-lake-pit-upsert":
         return upsert_pit_records(payload)
     if operation == "data-lake-pit-batch-upsert":

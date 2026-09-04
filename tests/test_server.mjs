@@ -17,6 +17,7 @@ const {
   normalizeAlphaVantageListingStatusRecords,
   parseNasdaqTraderRows,
   factorSignal,
+  dataFrontierAssessment,
   firstStageDataReadiness,
   isLimitedProvider,
   localBatchAnalysis,
@@ -25,6 +26,12 @@ const {
   providerConfigured,
   providerKeyPoolStatus,
   withProviderApiKey,
+  comparisonKeyFromManifest,
+  championPromotionDecision,
+  researchRegistryPointerPolicy,
+  researchRegistryPointers,
+  modelReportFreshness,
+  researchRouteStatus,
   redditCacheTtlForItem,
   redditProviderStatus,
   runPythonQuantCore,
@@ -76,7 +83,159 @@ const {
   universePayload,
 } = await import("../server.mjs");
 
+import {
+  normalizeAbnLookupRecords,
+  normalizeGleifIdentityRecords,
+  publicIdentitySourceStatus,
+} from "../backend/services/identity-sources.mjs";
+
 const { normalizePublishedPitRecords } = await import("../backend/services/pit-sources.mjs");
+
+test("ComparisonKey changes when the frozen data or cost contract changes", () => {
+  const base = comparisonKeyFromManifest({
+    market: "US",
+    data_version: "data-v1",
+    feature_schema_hash: "features-v1",
+    universe_version: "universe-v1",
+    label_definition: "net-up-v1",
+    transaction_cost_bps: 12,
+    split_policy: "purged-walk-forward-v1",
+  });
+  const changedData = comparisonKeyFromManifest({
+    market: "US",
+    data_version: "data-v2",
+    feature_schema_hash: "features-v1",
+    universe_version: "universe-v1",
+    label_definition: "net-up-v1",
+    transaction_cost_bps: 12,
+    split_policy: "purged-walk-forward-v1",
+  });
+  const changedCost = comparisonKeyFromManifest({
+    market: "US",
+    data_version: "data-v1",
+    feature_schema_hash: "features-v1",
+    universe_version: "universe-v1",
+    label_definition: "net-up-v1",
+    transaction_cost_bps: 24,
+    split_policy: "purged-walk-forward-v1",
+  });
+  const changedTestMembership = comparisonKeyFromManifest({
+    market: "US",
+    data_version: "data-v1",
+    feature_schema_hash: "features-v1",
+    universe_version: "universe-v1",
+    label_definition: "net-up-v1",
+    transaction_cost_bps: 12,
+    split_policy: "purged-walk-forward-v1",
+    test_membership_hash: "test-members-v2",
+  });
+  assert.notEqual(base.key, changedData.key);
+  assert.notEqual(base.key, changedCost.key);
+  assert.notEqual(base.key, changedTestMembership.key);
+  assert.equal(base.fields.market, "US");
+});
+
+test("Champion cannot be replaced across comparison keys or without non-inferiority evidence", () => {
+  const entry = {
+    eligible: true,
+    productionEvidencePassed: true,
+    deploymentStatus: "production",
+  };
+  const training = { productionActivationApproved: true };
+  const differentKey = championPromotionDecision(entry, { modelVersion: "old", comparisonKey: "old-key" }, training, "new-key");
+  assert.equal(differentKey.explicitlyApproved, false);
+  assert.equal(differentKey.blockReason, "comparison-key-mismatch-with-existing-champion");
+  const sameKeyWithoutEvidence = championPromotionDecision(entry, { modelVersion: "old", comparisonKey: "same-key" }, training, "same-key");
+  assert.equal(sameKeyWithoutEvidence.explicitlyApproved, false);
+  assert.equal(sameKeyWithoutEvidence.blockReason, "missing-pairwise-non-inferiority-evidence");
+  const approved = championPromotionDecision(
+    entry,
+    { modelVersion: "old", comparisonKey: "same-key" },
+    { ...training, comparisonEvidence: { comparisonKey: "same-key", nonInferior: true, coveragePct: 100 } },
+    "same-key",
+  );
+  assert.equal(approved.explicitlyApproved, true);
+});
+
+test("A partial or no-model family can never become a Champion", () => {
+  const entry = {
+    available: true,
+    eligible: true,
+    productionEvidencePassed: true,
+    deploymentStatus: "production",
+    status: "PARTIAL",
+    trainingStatus: "PARTIAL",
+    modelFamilyStatus: { path: "NO_MODEL", direction: "NO_MODEL", ranking: "AVAILABLE" },
+  };
+  const decision = championPromotionDecision(
+    entry,
+    null,
+    { productionActivationApproved: true },
+    "same-key",
+  );
+  assert.equal(decision.explicitlyApproved, false);
+  assert.equal(decision.blockReason, "strict-production-evidence-or-explicit-approval-missing");
+});
+
+test("Research registry isolates every candidate status from production pointers", () => {
+  const statuses = ["RESEARCH", "AVAILABLE", "PARTIAL", "NO_MODEL"];
+  for (const candidateStatus of statuses) {
+    const currentChampion = { modelVersion: "production-v1" };
+    const decision = researchRegistryPointerPolicy({
+      trainingLane: "core_research",
+      candidateStatus,
+      requestedPointer: "latestEligibleModel",
+      currentPointer: currentChampion,
+    });
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.pointerUnchanged, true);
+    assert.deepEqual(decision.pointer, currentChampion);
+    assert.equal(decision.reason, "research_candidate_cannot_write_production_pointer");
+  }
+
+  const pointers = researchRegistryPointers([
+    { modelVersion: "research-d3", evidenceTier: "D3", available: true, savedAt: "2026-09-03T02:00:00Z" },
+    { modelVersion: "research-d1", evidenceTier: "D1", available: true, savedAt: "2026-09-03T01:00:00Z" },
+  ]);
+  assert.equal(pointers.latestResearchAttempt.modelVersion, "research-d3");
+  assert.equal(pointers.qualifiedShadow.modelVersion, "research-d3");
+  assert.equal(pointers.productionChampion, null);
+  assert.equal(pointers.latestEligibleModel, null);
+  assert.equal(pointers.longTradeGate, null);
+});
+
+test("Model report freshness uses one generatedAt and registry comparison contract", () => {
+  const fresh = modelReportFreshness({
+    generatedAt: "2026-09-03T00:00:00.000Z",
+    scope: ["ASX", "US"],
+    reportVersions: { ASX: "asx-v1", US: "us-v1" },
+  }, { ASX: "asx-v1", US: "us-v1" }, Date.parse("2026-09-03T02:00:00.000Z"));
+  assert.equal(fresh.ageHours, 2);
+  assert.equal(fresh.isLatest, true);
+  assert.deepEqual(fresh.latestRuns, { ASX: "asx-v1", US: "us-v1" });
+
+  const stale = modelReportFreshness({
+    generatedAt: "2026-09-03T00:00:00.000Z",
+    scope: ["ASX"],
+    reportVersions: { ASX: "asx-v0" },
+  }, { ASX: "asx-v1" }, Date.parse("2026-09-03T02:00:00.000Z"));
+  assert.equal(stale.isLatest, false);
+});
+
+test("Research status API separates route, data, model, label and strict blockers", () => {
+  const status = researchRouteStatus({
+    pendingTaskIds: ["R0004"],
+    modelTrainingStarted: false,
+    formalOofStarted: false,
+  });
+  assert.equal(status.strictProduction.status, "BLOCKED_GATE03");
+  assert.equal(status.strictProduction.canStart, false);
+  assert.equal(status.research.status, "WAITING_ROUTE_EVIDENCE");
+  assert.equal(status.research.canStartD1, false);
+  assert.equal(status.data.status, "WAITING_ROUTE_EVIDENCE");
+  assert.equal(status.model.status, "NOT_STARTED_BY_POLICY");
+  assert.equal(status.labels.status, "WAITING_PRE_REGISTERED_HYPOTHESIS");
+});
 
 test("Long research ranges retain multi-year candle capacity", () => {
   assert.equal(candleLimitForRange("8y"), 2080);
@@ -128,6 +287,33 @@ test("Stage-one readiness separates data coverage from model promotion", () => {
   assert.equal(asxDisclosureReady.met, true);
   assert.equal(asxDisclosureReady.gates.fundamentals.dataset, "financial_disclosures");
   assert.equal(asxDisclosureReady.gates.fundamentals.numericCoverage, 0);
+});
+
+test("Data frontier exposes a bounded research fallback without lowering production gates", () => {
+  const assessment = dataFrontierAssessment({
+    market: "ASX",
+    target: { symbols: 350 },
+    history: { researchReadySymbols: 320, deepHistorySymbols: 247 },
+    blockers: ["ASX numeric fundamentals 4.0%"],
+    stageOne: { met: false, blockers: [{ id: "fundamentals", label: "ASX numeric fundamentals 4.0%" }] },
+    pit: { datasets: {
+      fundamentals: { trainingUniverseCoveragePct: 4, verifiedSymbols: 14 },
+      universe: { trainingUniverseCoveragePct: 92 },
+      corporate_actions: { trainingUniverseCoveragePct: 100 },
+      news: { trainingUniverseCoveragePct: 99 },
+    } },
+    replenishmentPlan: {
+      history: { immediatelyActionableRounds: 0 },
+      pit: { immediatelyActionableRounds: 0 },
+    },
+  });
+  assert.equal(assessment.frontier.state, "source-or-archive-frontier");
+  assert.equal(assessment.frontier.externalVerifiedSourceRequired, true);
+  assert.equal(assessment.strictProduction.gatesUnchanged, true);
+  assert.equal(assessment.strictProduction.productionOofAllowed, false);
+  assert.equal(assessment.fallbackLanes[0].eligibleSymbols, 14);
+  assert.equal(assessment.fallbackLanes[0].status, "research-shadow-only");
+  assert.equal(assessment.fallbackLanes[2].status, "blocked-until-strict-gates");
 });
 
 test("ASX training universe excludes deferred-settlement and temporary security codes", () => {
@@ -192,6 +378,14 @@ test("Published PIT announcements retain first availability and expose conservat
   assert.ok(negative.values.dilutionRisk >= 0.9);
   assert.ok(negative.values.regulatoryRisk >= 0.9);
   assert.ok(negative.values.operationalMomentum < 0);
+
+  const [future] = normalizePublishedPitRecords([{
+    title: "Future-dated provider announcement",
+    publishedAt: "2999-01-01T00:00:00Z",
+  }], { symbol: "FUTURE" });
+  assert.equal(future.historicalAvailabilityVerified, false);
+  assert.equal(future.historicalAvailabilityUnverified, true);
+  assert.equal(future.historicalAvailabilityVerificationMethod, "future-source-published-timestamp-quarantined");
 });
 
 test("Prediction labels use next-session open and ignore an unfinished live quote", () => {
@@ -259,6 +453,29 @@ test("US training universe excludes warrants, units, rights, preferred shares, a
   assert.equal(trainingEligibleUniverseRow({ symbol: "AACIW", name: "Example Acquisition Inc. - Warrants", type: "stock" }, "US"), false);
   assert.equal(trainingEligibleUniverseRow({ symbol: "AAC.U", name: "Example Units, each consisting of one share and one warrant", type: "stock" }, "US"), false);
   assert.equal(trainingEligibleUniverseRow({ symbol: "PREF", name: "Example 7% Preferred Stock", type: "stock" }, "US"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "CEF1", name: "Example Closed-End Fund", type: "stock", assetClass: "cef" }, "US"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "SPAC", name: "Example Acquisition Corp", type: "stock", assetClass: "spac" }, "US"), false);
+  assert.equal(trainingEligibleUniverseRow({ symbol: "ADRX", name: "Example American Depositary Receipt", type: "adr", assetClass: "adr" }, "US"), true);
+});
+
+test("Identity sources remain auditable and do not claim historical PIT", () => {
+  const gleif = normalizeGleifIdentityRecords({
+    data: [{
+      id: "5493001KJTIIGC8Y1R12",
+      attributes: {
+        entity: { legalName: { name: "Example Holdings Pty Ltd" }, status: "ACTIVE" },
+        registration: { initialRegistrationDate: "2015-03-01" },
+      },
+    }],
+  }, { symbol: "ABC", market: "ASX", retrievedAt: "2026-08-22T00:00:00Z" });
+  assert.equal(gleif.length, 1);
+  assert.equal(gleif[0].historicalAvailabilityVerified, false);
+  assert.equal(gleif[0].identityType, "LEI");
+  const abn = normalizeAbnLookupRecords("<Abn>12345678901</Abn><OrganisationName>Example Pty Ltd</OrganisationName>", {
+    symbol: "ABC", market: "ASX", retrievedAt: "2026-08-22T00:00:00Z",
+  });
+  assert.equal(abn[0].abn, "12345678901");
+  assert.equal(publicIdentitySourceStatus({}).find((row) => row.name === "abn-lookup-public-api").status, "requires_guid");
 });
 
 test("ASX training universe keeps ordinary shares and excludes exchange-traded products", () => {
@@ -1241,6 +1458,32 @@ test("Provider key pools preserve primary-first failover order and remove duplic
   assert.equal(Object.prototype.hasOwnProperty.call(status, "keys"), false);
 });
 
+test("FMP key pool supports team-provided backup keys without exposing values", () => {
+  const env = {
+    FMP_API_KEY: "primary-key",
+    FMP_API_KEYS: "team-one, team-two team-one",
+    FMP_API_KEY_BACKUP_1: "team-three",
+  };
+  assert.deepEqual(providerApiKeys("fmp", env), ["primary-key", "team-one", "team-two", "team-three"]);
+  const status = providerKeyPoolStatus("fmp");
+  assert.equal(status.failoverOnly, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(status, "keys"), false);
+});
+
+test("Additional team provider pools are recognized without exposing values", () => {
+  const env = {
+    ALPHAVANTAGE_API_KEY: "alpha-primary",
+    ALPHAVANTAGE_API_KEYS: "alpha-one,alpha-two alpha-one",
+    MARKETAUX_API_KEY: "news-primary",
+    MARKETAUX_API_KEYS: "news-one,news-two",
+    FINNHUB_API_KEY: "finnhub-primary",
+    FINNHUB_API_KEYS: "finnhub-backup",
+  };
+  assert.deepEqual(providerApiKeys("alphavantage", env), ["alpha-primary", "alpha-one", "alpha-two"]);
+  assert.deepEqual(providerApiKeys("marketaux", env), ["news-primary", "news-one", "news-two"]);
+  assert.deepEqual(providerApiKeys("finnhub", env), ["finnhub-primary", "finnhub-backup"]);
+});
+
 test("Provider key pool advances in order only after quota-style failures", async () => {
   const attempts = [];
   const result = await withProviderApiKey("tiingo", {
@@ -1273,4 +1516,21 @@ test("EODHD key pool treats plan and permission responses as failover errors", a
   });
   assert.equal(result, "ok");
   assert.deepEqual(attempts, ["primary", "backup-one"]);
+});
+
+test("FMP key pool advances only after a provider limit response", async () => {
+  const attempts = [];
+  const result = await withProviderApiKey("fmp", {
+    env: { FMP_API_KEY: "primary", FMP_API_KEYS: "team-one,team-two" },
+    runtimeKey: "fmp-unit-failover",
+    backoffKey: "fmp-unit-failover",
+    keyBackoffMs: 1000,
+    backoffMs: 1000,
+  }, async (key) => {
+    attempts.push(key);
+    if (key === "primary") throw new Error("HTTP 429: rate limit");
+    return "ok";
+  });
+  assert.equal(result, "ok");
+  assert.deepEqual(attempts, ["primary", "team-one"]);
 });

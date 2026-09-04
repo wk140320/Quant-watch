@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { appendFile, mkdir, readFile, readdir, stat, writeFile, unlink } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { loadEnvironment } from "./backend/config/env.mjs";
+import { loadEnvironment } from "./backend/config/env-loader.mjs";
 import {
   MARKET_CONFIG,
   TRAINING_UNIVERSES,
@@ -20,21 +20,27 @@ import { readJsonBody, sendJson } from "./backend/http/json.mjs";
 import { serveStaticRequest } from "./backend/http/static-files.mjs";
 import {
   fetchJson,
+  fetchFormJsonPost,
   fetchJsonPost,
   fetchJsonWithCurl,
   fetchText,
 } from "./backend/providers/http.mjs";
 import { createTushareAdapter } from "./backend/providers/cn/tushare.mjs";
+import { createEastmoneyCorporateActionAdapter } from "./backend/providers/cn/eastmoney.mjs";
 import { createAlpacaAdapter } from "./backend/providers/us/alpaca.mjs";
+import { createAbsAdapter } from "./backend/providers/au/abs.mjs";
 import { createPythonQuantClient } from "./backend/services/python-quant.mjs";
 import { createRuntimeEventHub } from "./backend/services/runtime-events.mjs";
 import { createJobManager } from "./backend/services/job-manager.mjs";
 import { loadModelTrajectories } from "./backend/services/model-trajectories.mjs";
 import { createTrainingSupervisor } from "./backend/services/training-supervisor.mjs";
+import { validatePromotionEvidenceV3 } from "./backend/services/promotion-evidence.mjs";
 import { createModelReportService } from "./backend/services/model-reports.mjs";
 import { createLearningProgressService } from "./backend/services/learning-progress.mjs";
 import { createEvidenceRegistry } from "./backend/services/evidence-registry.mjs";
 import { createTrainingResourceService } from "./backend/services/training-resources.mjs";
+import { buildTaskDiagnostics } from "./backend/services/task-diagnostics.mjs";
+import { researchStateFromTraining, researchStateTransition } from "./backend/services/research-state.mjs";
 import {
   normalizeAlphaVantageListingStatusRecords,
   normalizeCorporateActionRecords,
@@ -42,16 +48,33 @@ import {
   normalizeEodhdCompanyUniverseRecords,
   normalizeEodhdFinancialPitRecords,
   normalizeFmpHistoricalUniverseRecords,
+  normalizeFmpStatementPitRecords,
   normalizeFmpSymbolChangeRecords,
   normalizeFredVintageRecords,
+  normalizeGrowthWithValuePitRecords,
   normalizeOpenFigiMappings,
   normalizePublishedPitRecords,
+  safeIsoTimestamp,
+  secRecentRows,
+  normalizeSecDisclosureRecords,
   normalizeSecPitRecords,
   normalizeSimfinPitRecords,
+  normalizeStockMarketApiPitRecords,
   normalizeTusharePitRecords,
   normalizeTushareUniverseRecords,
   tableRows,
 } from "./backend/services/pit-sources.mjs";
+import {
+  buildPitGapReport,
+  normalizeBlsMacroRecords,
+  normalizeCninfoAnnouncementRecords,
+  publicPitSourceCatalog,
+} from "./backend/services/free-pit-sources.mjs";
+import {
+  fetchAbnLookupRecords,
+  fetchGleifIdentityRecords,
+  publicIdentitySourceStatus,
+} from "./backend/services/identity-sources.mjs";
 
 const root = new URL(".", import.meta.url).pathname;
 const DEFAULT_REDDIT_ENV_PATH = "/Users/wukai/Documents/9900/client-base-eclair/.env";
@@ -62,10 +85,15 @@ const { alpacaQuoteRows, alpacaRows, alpacaTradeRows } = createAlpacaAdapter({
   isIntradayInterval,
 });
 const { tushareRows } = createTushareAdapter({ sanitizeCandleRows });
+const { fetchMacro: fetchAbsMacro } = createAbsAdapter({ fetchText });
+const { fetchCorporateActions: fetchEastmoneyCorporateActions } = createEastmoneyCorporateActionAdapter({
+  fetchJson,
+  normalizeCorporateActionRecords,
+});
 
 const port = Number(process.env.PORT || 8787);
 const host = process.env.HOST || "127.0.0.1";
-const APP_VERSION = "2026-08-12-exact-stage-one-v91";
+const APP_VERSION = "2026-08-22-pit-gated-v112";
 const SERVER_STARTED_AT = new Date().toISOString();
 const SERVER_RUNTIME_ENABLED = process.env.SERVER_DISABLE_LISTEN !== "true";
 const providerBackoff = new Map();
@@ -74,6 +102,16 @@ const PROVIDER_KEY_ENV = Object.freeze({
   eodhd: { primary: "EODHD_API_KEY", pool: "EODHD_API_KEYS" },
   twelvedata: { primary: "TWELVEDATA_API_KEY", pool: "TWELVEDATA_API_KEYS" },
   tiingo: { primary: "TIINGO_API_KEY", pool: "TIINGO_API_KEYS" },
+  fmp: { primary: "FMP_API_KEY", pool: "FMP_API_KEYS" },
+  alphavantage: { primary: "ALPHAVANTAGE_API_KEY", pool: "ALPHAVANTAGE_API_KEYS" },
+  marketaux: { primary: "MARKETAUX_API_KEY", pool: "MARKETAUX_API_KEYS" },
+  growthwithvalue: { primary: "GROWTH_WITH_VALUE_API_KEY", pool: "GROWTH_WITH_VALUE_API_KEYS" },
+  stockmarketapi: { primary: "STOCKMARKETAPI_API_KEY", pool: "STOCKMARKETAPI_API_KEYS" },
+  fred: { primary: "FRED_API_KEY", pool: "FRED_API_KEYS" },
+  // Finnhub exposes reported financials only for entitled plans, but keeping
+  // it in the pooled provider layer lets an upgraded entitlement become a
+  // real ASX PIT source without changing the enrichment job again.
+  finnhub: { primary: "FINNHUB_API_KEY", pool: "FINNHUB_API_KEYS" },
 });
 const marketResponseCache = new Map();
 const marketCandlesCache = new Map();
@@ -83,7 +121,12 @@ const historicalBacktestCache = new Map();
 const newsResponseCache = new Map();
 const macroResponseCache = new Map();
 const universeResponseCache = new Map();
-const universePitPersistedMarkets = new Set();
+const dataReplenishmentSnapshotCache = new Map();
+const dataReplenishmentSnapshotRefreshes = new Map();
+const learningProgressDataLakeCache = new Map();
+const learningProgressDataLakeRefreshes = new Map();
+const macroPitRefreshInFlight = new Map();
+const universePitPersistedMarkets = new Map();
 const fundamentalsResponseCache = new Map();
 const secFilingsCache = new Map();
 const localModelTrainingCache = new Map();
@@ -101,20 +144,290 @@ const evidenceRegistry = createEvidenceRegistry({
   jobsPath: join(snapshotBasePath, "background-jobs"),
 });
 let learningProgress = null;
+function isAutoRecoverableEnrichmentFailure(job) {
+  const category = String(job?.failureCategory || "");
+  if (["timeout", "interrupted", "restart_budget_exhausted", "resource_exhaustion"].includes(category)) return true;
+  // Older persisted jobs classified Python ingest queue timeouts as generic
+  // data evidence failures because their error text contained "data". Keep
+  // those records auditable, but allow one bounded recovery with a changed
+  // batch after the queue-timeout classifier is deployed.
+  return /queue wait exceeded|PYTHON_CORE_QUEUE_TIMEOUT/i.test(String(job?.error || ""));
+}
+async function autoRecoverEnrichmentJob(job) {
+  if (!job?.market || !["history-backfill", "pit-enrichment", "corporate-action-backfill", "cn-corporate-action-backfill"].includes(job.type)) return null;
+  const recoveryAttempt = Number(job.payload?.autoRecoveryAttempt || 0);
+  if (job.status !== "failed" || recoveryAttempt >= 2) return null;
+  if (!isAutoRecoverableEnrichmentFailure(job)) return null;
+  const recent = await backgroundJobs?.list({ type: job.type, market: job.market, limit: 12 }).catch(() => ({ jobs: [] }));
+  if ((recent.jobs || []).some((entry) => ["queued", "running"].includes(entry.status))) return null;
+  // A restart-budget terminal record may deliberately omit its payload to
+  // keep the persisted failure artifact small.  Recover the market from the
+  // immutable job envelope so an exhausted enrichment task can still create
+  // a bounded next batch instead of silently ending the chain.
+  const original = { market: job.market, ...(job.payload || {}) };
+  const retry = {
+    ...original,
+    autoRecoveryAttempt: recoveryAttempt + 1,
+    resume: false,
+    reason: `automatic-enrichment-recovery:${job.failureCategory || "failed"}`,
+  };
+  if (job.type === "pit-enrichment") {
+    retry.liveUniverse = false;
+    retry.refreshUniverse = false;
+    retry.refreshIdentity = false;
+    retry.refreshMacro = false;
+    retry.publicMacro = false;
+    retry.identityLimit = 0;
+    retry.officialHistoryLimit = recoveryAttempt >= 1 ? 0 : Math.min(12, Number(original.officialHistoryLimit || 12));
+    retry.limit = recoveryAttempt >= 1 ? Math.min(8, Number(original.limit || 8)) : Math.min(24, Number(original.limit || 24));
+    retry.symbols = Array.isArray(original.symbols) ? original.symbols.slice(0, retry.limit) : [];
+  } else if (job.type === "history-backfill") {
+    retry.includeDelisted = false;
+    retry.concurrency = 1;
+    retry.symbolTimeoutMs = Math.min(recoveryAttempt >= 1 ? 30_000 : 45_000, Number(original.symbolTimeoutMs || 45_000));
+    retry.symbols = Array.isArray(original.symbols) ? original.symbols.slice(0, recoveryAttempt >= 1 ? 10 : 30) : [];
+  } else {
+    retry.concurrency = 1;
+    retry.symbols = Array.isArray(original.symbols) ? original.symbols.slice(0, recoveryAttempt >= 1 ? 10 : 30) : [];
+  }
+  const next = await backgroundJobs.create(job.type, retry).catch(() => null);
+  if (next) {
+    runtimeEvents.publish("data.replenishment_auto_recovery", {
+      market: job.market,
+      type: job.type,
+      failedJobId: job.id,
+      jobId: next.id,
+      failureCategory: job.failureCategory || "failed",
+      mode: "reduced-batch-resume",
+    });
+  }
+  return next;
+}
 const backgroundJobs = createJobManager({
   basePath: join(snapshotBasePath, "background-jobs"),
   publish: (type, payload) => runtimeEvents.publish(type, payload),
-  onTerminal: (job) => learningProgress?.recordJob(job),
+  onTerminal: async (job) => {
+    await learningProgress?.recordJob(job);
+    await autoRecoverEnrichmentJob(job);
+    await continueHistoricalBacktestAfterHistoryBackfill(job);
+    // A completed enrichment job changes the local lake, so refresh the
+    // persisted readiness snapshot after the job. Without this, the UI can
+    // keep showing the pre-job history percentage until the next scheduler tick.
+    if (["history-backfill", "pit-enrichment", "corporate-action-backfill", "cn-corporate-action-backfill"].includes(job.type)
+      && job.market) {
+      setTimeout(() => {
+        (async () => {
+          // Do not hand off from the pre-job snapshot.  The previous
+          // non-blocking read let every terminal callback schedule another
+          // batch before the data-lake refresh had observed the completed
+          // writes, which made the queue look busy without reducing the
+          // audited gap.
+          const snapshot = await dataReplenishmentSnapshot(job.market, { force: true, waitForFresh: true });
+          // A terminal batch should hand off to the next bounded batch
+          // immediately. Keep the scheduler's normal cadence for unrelated
+          // work, but reset only the completed family's cursor so a provider
+          // pool is never fanned out concurrently.
+          if (job.status === "complete" && snapshot?.stageOne) {
+            const runtime = await readBackendMonitorRuntime();
+            const previousSnapshot = runtime.stageOneSnapshotsByMarket?.[job.market] || null;
+            runtime.stageOneReadinessByMarket = runtime.stageOneReadinessByMarket || {};
+            runtime.stageOneSnapshotsByMarket = runtime.stageOneSnapshotsByMarket || {};
+            runtime.pitNoProgressByMarket = runtime.pitNoProgressByMarket || {};
+            runtime.corporateNoProgressByMarket = runtime.corporateNoProgressByMarket || {};
+            runtime.stageOneReadinessByMarket[job.market] = snapshot.stageOne;
+            runtime.stageOneSnapshotsByMarket[job.market] = snapshot;
+            runtime.lastStageReadinessCheckByMarket = runtime.lastStageReadinessCheckByMarket || {};
+            runtime.lastStageReadinessCheckByMarket[job.market] = Date.now();
+            if (job.type === "history-backfill") {
+              runtime.lastHistoryReplenishmentByMarket = runtime.lastHistoryReplenishmentByMarket || {};
+              runtime.historyNoProgressByMarket = runtime.historyNoProgressByMarket || {};
+              // A passing stage-one gate can still leave a quality backlog
+              // (for example, symbols below the deep-history target). Keep
+              // the next bounded batch eligible immediately; the active-job
+              // check prevents duplicate work while the next batch starts.
+              const historyBacklog = Number(snapshot.history?.missingOrShort || 0) > 0;
+              const requiredRows = Number(job.result?.requiredRows || job.payload?.requiredRows || 0);
+              const resultRows = Array.isArray(job.result?.results) ? job.result.results : [];
+              const attemptedSymbols = resultRows.length
+                || (Array.isArray(job.payload?.symbols) ? job.payload.symbols.length : 0)
+                || Number(job.detail?.total || job.detail?.completed || 0);
+              const qualifyingRows = requiredRows > 0
+                ? resultRows.filter((row) => Number(row?.rows || 0) >= requiredRows).length
+                : 0;
+              const previousHistory = previousSnapshot?.history || {};
+              const hasHistoryComparison = Number.isFinite(Number(previousHistory.missingOrShort))
+                && Number.isFinite(Number(snapshot.history?.missingOrShort));
+              const reducedHistoryGap = hasHistoryComparison
+                && Number(snapshot.history.missingOrShort) < Number(previousHistory.missingOrShort);
+              const increasedResearchReady = hasHistoryComparison
+                && Number(snapshot.history?.researchReadySymbols || 0) > Number(previousHistory.researchReadySymbols || 0);
+              const increasedDeepHistory = hasHistoryComparison
+                && Number(snapshot.history?.deepHistorySymbols || 0) > Number(previousHistory.deepHistorySymbols || 0);
+              const noProgress = historyBacklog && attemptedSymbols > 0 && requiredRows > 0 && (
+                hasHistoryComparison
+                  ? !reducedHistoryGap && !increasedResearchReady && !increasedDeepHistory
+                  : qualifyingRows === 0
+              );
+              if (noProgress) {
+                const prior = runtime.historyNoProgressByMarket[job.market] || {};
+                const attempts = Number(prior.attempts || 0) + 1;
+                const baseBackoffMs = Math.max(
+                  30 * 60_000,
+                  Number(process.env.HISTORY_NO_PROGRESS_BACKOFF_MS || 2 * 60 * 60_000),
+                );
+                const backoffMs = Math.min(24 * 60 * 60_000, baseBackoffMs * (2 ** Math.min(3, attempts - 1)));
+                runtime.historyNoProgressByMarket[job.market] = {
+                  attempts,
+                  lastJobId: job.id,
+                  lastCheckedAt: new Date().toISOString(),
+                  attemptedSymbols,
+                  qualifyingSymbols: qualifyingRows,
+                  requiredRows,
+                  diagnostics: job.result?.historyDiagnostics || null,
+                  blockedUntil: new Date(Date.now() + backoffMs).toISOString(),
+                  reason: "completed-batch-produced-no-symbol-at-required-depth",
+                };
+                // Do not immediately resubmit the same short-history cohort.
+                // A real provider cooldown or a later candidate rotation is
+                // required before the next attempt.
+                runtime.lastHistoryReplenishmentByMarket[job.market] = Date.now();
+              } else {
+                delete runtime.historyNoProgressByMarket[job.market];
+                runtime.lastHistoryReplenishmentByMarket[job.market] = historyBacklog ? 0 : Date.now();
+              }
+            }
+            if (job.type === "pit-enrichment") {
+              runtime.lastPitEnrichmentByMarket = runtime.lastPitEnrichmentByMarket || {};
+              const pitDatasets = snapshot.pit?.datasets || {};
+              const strictPitBacklog = snapshot.snapshotState === "stale-data-lake"
+                || Number(pitDatasets.universe?.verifiedPct ?? pitDatasets.universe?.trainingUniverseCoveragePct ?? 0) < 80
+                || Number(pitDatasets.corporate_actions?.verifiedPct ?? pitDatasets.corporate_actions?.trainingUniverseCoveragePct ?? 0) < 95
+                || Number(pitDatasets.fundamentals?.verifiedPct ?? pitDatasets.fundamentals?.trainingUniverseCoveragePct ?? 0) < 80
+                || Number(pitDatasets.news?.trainingUniverseCoveragePct || 0) < 80;
+              const previousPitSignature = previousSnapshot
+                ? dataReplenishmentPitGapSignature(previousSnapshot)
+                : runtime.pitGapSignatureByMarket?.[job.market] || null;
+              const currentPitSignature = dataReplenishmentPitGapSignature(snapshot);
+              const pitGapReduced = Boolean(previousPitSignature && currentPitSignature !== previousPitSignature);
+              const priorPitNoProgress = runtime.pitNoProgressByMarket[job.market] || {};
+              if (strictPitBacklog && previousPitSignature && !pitGapReduced) {
+                const unchangedRuns = Number(priorPitNoProgress.unchangedRuns || 0) + 1;
+                const nextPitNoProgress = {
+                  ...priorPitNoProgress,
+                  signature: currentPitSignature,
+                  unchangedRuns,
+                  lastCompletedAt: new Date().toISOString(),
+                  reason: "completed-batch-produced-no-audited-pit-gap-reduction",
+                };
+                if (unchangedRuns >= 2) {
+                  nextPitNoProgress.blockedUntil = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
+                  runtimeEvents.publish("data.replenishment_diagnostic", {
+                    market: job.market,
+                    family: "pit-enrichment",
+                    reason: nextPitNoProgress.reason,
+                    unchangedRuns,
+                    blockedUntil: nextPitNoProgress.blockedUntil,
+                    gapSignature: currentPitSignature,
+                  });
+                }
+                runtime.pitNoProgressByMarket[job.market] = nextPitNoProgress;
+                // Keep the next attempt behind the normal cadence.  The
+                // second unchanged completion is then converted to a durable
+                // diagnostic by the scheduler instead of another blind retry.
+                runtime.lastPitEnrichmentByMarket[job.market] = Date.now();
+              } else {
+                delete runtime.pitNoProgressByMarket[job.market];
+                runtime.lastPitEnrichmentByMarket[job.market] = strictPitBacklog ? 0 : Date.now();
+              }
+            }
+            if (["corporate-action-backfill", "cn-corporate-action-backfill"].includes(job.type)) {
+              runtime.lastCorporateActionByMarket = runtime.lastCorporateActionByMarket || {};
+              runtime.corporateNoProgressByMarket = runtime.corporateNoProgressByMarket || {};
+              const corporateActions = snapshot.pit?.datasets?.corporate_actions || {};
+              const corporateBacklog = Number(corporateActions.verifiedPct ?? corporateActions.trainingUniverseCoveragePct ?? 0) < 95
+                || (Array.isArray(corporateActions.missingSymbols) && corporateActions.missingSymbols.length > 0);
+              const previousCorporateActions = previousSnapshot?.pit?.datasets?.corporate_actions || {};
+              const currentMissing = Array.isArray(corporateActions.missingSymbols) ? corporateActions.missingSymbols.length : 0;
+              const previousMissing = Array.isArray(previousCorporateActions.missingSymbols) ? previousCorporateActions.missingSymbols.length : null;
+              // A duplicate event append can move record-level verifiedPct by
+              // a few basis points without verifying one new training symbol.
+              // Only a new verified symbol, a meaningful universe-coverage
+              // move, or a smaller missing-symbol set is real progress.
+              const verifiedCoverageDelta = Number(corporateActions.trainingUniverseCoveragePct || 0)
+                - Number(previousCorporateActions.trainingUniverseCoveragePct || 0);
+              const corporateCoverageImproved = Number(corporateActions.verifiedSymbols || 0) > Number(previousCorporateActions.verifiedSymbols || 0)
+                || verifiedCoverageDelta >= 0.1
+                || (previousMissing !== null && currentMissing < previousMissing);
+              // Raw rows can be duplicates, unverified records, or rows for
+              // symbols outside the training universe. They are useful audit
+              // output but are not evidence that the corporate-action gap
+              // moved. Only the refreshed verified snapshot can authorize a
+              // follow-up batch.
+              const noProgress = corporateBacklog && previousSnapshot && !corporateCoverageImproved;
+              if (noProgress) {
+                const prior = runtime.corporateNoProgressByMarket[job.market] || {};
+                const attempts = Number(prior.attempts || 0) + 1;
+                const baseBackoffMs = Math.max(
+                  30 * 60_000,
+                  Number(process.env.CORPORATE_NO_PROGRESS_BACKOFF_MS || 2 * 60 * 60_000),
+                );
+                const backoffMs = Math.min(24 * 60 * 60_000, baseBackoffMs * (2 ** Math.min(3, attempts - 1)));
+                const blockedUntil = new Date(Date.now() + backoffMs).toISOString();
+                runtime.corporateNoProgressByMarket[job.market] = {
+                  ...prior,
+                  attempts,
+                  lastJobId: job.id,
+                  lastCheckedAt: new Date().toISOString(),
+                  inserted: Number(job.result?.inserted || 0),
+                  failed: Number(job.result?.failed || 0),
+                  blockedUntil,
+                  reason: "completed-batch-produced-no-audited-corporate-action-progress",
+                };
+                runtime.lastCorporateActionByMarket[job.market] = Date.now();
+                runtimeEvents.publish("data.replenishment_diagnostic", {
+                  market: job.market,
+                  family: "corporate-actions",
+                  reason: runtime.corporateNoProgressByMarket[job.market].reason,
+                  attempts,
+                  inserted: Number(job.result?.inserted || 0),
+                  failed: Number(job.result?.failed || 0),
+                  blockedUntil,
+                });
+              } else {
+                delete runtime.corporateNoProgressByMarket[job.market];
+                runtime.lastCorporateActionByMarket[job.market] = corporateBacklog ? 0 : Date.now();
+              }
+            }
+            await writeBackendMonitorRuntime(runtime);
+            await runBackendEnrichmentSchedulerTick();
+          }
+        })().catch((error) => runtimeEvents.publish("data.replenishment_snapshot_error", {
+          market: job.market,
+          jobId: job.id,
+          error: error?.message || String(error),
+        }));
+      }, 0).unref?.();
+    }
+  },
   onPersist: (job, options) => evidenceRegistry.persistJob(job, options),
 });
 const trainingResources = createTrainingResourceService({
   configPath: join(snapshotBasePath, "training-resource-profile.json"),
   applyPolicy: (profile) => backgroundJobs.configurePolicy(profile.jobs),
 });
+// Re-apply the persisted resource profile after startup reconciliation. A
+// recovered queued job must wake the job manager even when its profile file
+// resolves after the supervisor has restored its state.
+trainingResources.ready.then((resources) => {
+  backgroundJobs.configurePolicy(resources.profile?.jobs || {});
+}).catch((error) => {
+  runtimeEvents.publish("training.resources_restore_error", { error: error.message || String(error) });
+});
 learningProgress = createLearningProgressService({
   basePath: join(snapshotBasePath, "learning-progress"),
   jobsPath: join(snapshotBasePath, "background-jobs"),
   predictionPathFor: predictionSamplesPathForMarket,
+  jobIndex: (filters) => evidenceRegistry.backgroundJobs(filters),
   publish: (type, payload) => runtimeEvents.publish(type, payload),
 });
 const modelReports = createModelReportService({
@@ -124,6 +437,7 @@ const modelReports = createModelReportService({
 });
 let backendMonitorTimer = null;
 let backendEnrichmentTimer = null;
+let backendEnrichmentTickRunning = false;
 let trainingSupervisorTimer = null;
 let learningSchedulerTimer = null;
 let trainingSupervisor = null;
@@ -140,6 +454,7 @@ const backendMonitorState = {
   lastAnalyses: [],
   lastQuotes: [],
   lastTraining: null,
+  lastIntradayEvidenceSignatureByMarket: {},
 };
 
 function dataLakeExchange(market, symbol = "") {
@@ -210,18 +525,57 @@ function persistPitDataset(dataset, market, symbol, records = [], source = "unkn
 function persistPitBatches(batches = [], options = {}) {
   const usable = batches.filter((batch) => Array.isArray(batch?.records) && batch.records.length);
   if (!usable.length) return Promise.resolve({ available: true, batches: 0, inserted: 0, results: [] });
-  return runPythonQuantCore("data-lake-pit-batch-upsert", {
-    batches: usable.map((batch) => ({
+  const maxRecords = Math.max(100, Math.min(4_000, Number(process.env.PIT_INGEST_RECORDS_PER_WRITE || 800)));
+  const maxGroups = Math.max(1, Math.min(24, Number(process.env.PIT_INGEST_GROUPS_PER_WRITE || 6)));
+  const chunks = [];
+  let current = [];
+  let currentRecords = 0;
+  const flush = () => {
+    if (!current.length) return;
+    chunks.push(current);
+    current = [];
+    currentRecords = 0;
+  };
+  for (const batch of usable) {
+    const normalized = {
       dataset: batch.dataset,
       market: safeMarket(batch.market),
       exchange: dataLakeExchange(batch.market, batch.symbol),
       symbol: batch.symbol,
       source: batch.source || "unknown",
-      records: batch.records,
-    })),
-  }, Number(options.timeoutMs || process.env.DATA_LAKE_INGEST_TIMEOUT_MS || 180_000), {
-    signal: options.signal,
-  });
+    };
+    for (let offset = 0; offset < batch.records.length;) {
+      if (current.length >= maxGroups || currentRecords >= maxRecords) flush();
+      const capacity = Math.max(1, maxRecords - currentRecords);
+      const records = batch.records.slice(offset, offset + capacity);
+      current.push({ ...normalized, records });
+      currentRecords += records.length;
+      offset += records.length;
+    }
+  }
+  flush();
+  return chunks.reduce(async (prior, chunk) => {
+    const aggregate = await prior;
+    if (options.signal?.aborted) throw Object.assign(new Error("PIT data persistence was cancelled."), { code: "JOB_CANCELLED" });
+    const result = await runPythonQuantCore("data-lake-pit-batch-upsert", {
+      batches: chunk,
+    // Parquet rewrites for a long historical event series can legitimately
+    // exceed the ordinary interactive ingest timeout. These writes run in a
+    // dedicated background lane and are checkpointed/idempotent, so give them
+    // a bounded but realistic budget instead of discarding collected PIT data.
+    }, Math.max(
+      Number(options.timeoutMs || 0),
+      Number(process.env.PIT_INGEST_TIMEOUT_MS || 12 * 60_000),
+    ), {
+      signal: options.signal,
+    });
+    return {
+      available: aggregate.available && result.available !== false,
+      batches: aggregate.batches + Number(result.batches || 0),
+      inserted: aggregate.inserted + Number(result.inserted || 0),
+      results: [...aggregate.results, ...(result.results || [])],
+    };
+  }, Promise.resolve({ available: true, batches: 0, inserted: 0, results: [] }));
 }
 const NEWS_DISK_CACHE_TTL_MS = Number(process.env.NEWS_DISK_CACHE_TTL_MS || 7 * 24 * 60 * 60 * 1000);
 const NEWS_DISK_CACHE_CLEANUP_MS = Number(process.env.NEWS_DISK_CACHE_CLEANUP_MS || 7 * 24 * 60 * 60 * 1000);
@@ -812,6 +1166,7 @@ function redditStatusBase() {
     !process.env.REDDIT_USER_AGENT ? "REDDIT_USER_AGENT" : null,
     !existsSync(packageSrcPath) ? "reddit-data-access package src" : null,
   ].filter(Boolean);
+  const configuredKeys = redditEnvKeys.filter((key) => Boolean(process.env[key]));
   return {
     name: "reddit",
     configured: redditProviderConfigured(),
@@ -821,6 +1176,8 @@ function redditStatusBase() {
     packageAvailable: existsSync(packageSrcPath),
     envSource,
     envPathConfigured: Boolean(process.env.REDDIT_ENV_PATH || existsSync(DEFAULT_REDDIT_ENV_PATH)),
+    configuredKeyCount: configuredKeys.length,
+    configuredKeyNames: configuredKeys,
     refreshMs: Number(process.env.REDDIT_REFRESH_MS || 60 * 60 * 1000),
     missing,
   };
@@ -953,6 +1310,23 @@ async function redditCacheSummary(market = null, options = {}) {
   const base = join(snapshotBasePath, "social", "reddit");
   const rows = [];
   const markets = market ? [safeMarket(market).toLowerCase()] : Object.keys(MARKET_CONFIG).map((key) => key.toLowerCase());
+  // Health/status calls must never parse every Reddit payload. The full scan is
+  // reserved for the data-center view; compact status only needs to know that
+  // cache files exist and how many are present.
+  if (options.fast === true) {
+    let totalFiles = 0;
+    await Promise.all(markets.map(async (marketDir) => {
+      const files = await readdir(join(base, marketDir), { withFileTypes: true }).catch(() => []);
+      totalFiles += files.filter((file) => file.isFile() && file.name.endsWith(".json") && file.name !== "_market-pool.json").length;
+    }));
+    const value = {
+      available: totalFiles > 0,
+      rows: [],
+      summary: { totalFiles, itemCount: null, latestCachedAt: null },
+    };
+    redditCacheSummaryMemory.set(cacheKey, { savedAt: Date.now(), value });
+    return value;
+  }
   await Promise.all(markets.map(async (marketDir) => {
     const dir = join(base, marketDir);
     const files = await readdir(dir, { withFileTypes: true }).catch(() => []);
@@ -990,11 +1364,11 @@ async function redditCacheSummary(market = null, options = {}) {
 
 async function redditProviderStatus(market = null, options = {}) {
   const status = redditStatusBase();
-  const cache = await redditCacheSummary(market).catch(() => ({ rows: [], summary: { totalFiles: 0, itemCount: 0, latestCachedAt: null } }));
+  const cache = await redditCacheSummary(market, { fast: options.compact === true }).catch(() => ({ rows: [], summary: { totalFiles: 0, itemCount: 0, latestCachedAt: null } }));
   return {
     ...status,
     cacheCount: cache.summary?.totalFiles || 0,
-    itemCount: cache.summary?.itemCount || 0,
+    itemCount: options.compact ? (cache.summary?.itemCount ?? null) : (cache.summary?.itemCount || 0),
     lastCachedAt: cache.summary?.latestCachedAt || null,
     cache: options.compact ? { available: cache.available, summary: cache.summary } : cache,
     background: redditBackgroundStatus(),
@@ -1696,11 +2070,34 @@ function marketHistoryCacheLimit(interval = "1d") {
 
 async function writeMarketHistoryCache(market, symbol, interval, candles = [], meta = {}) {
   if (!["1d", "1wk", "1mo"].includes(interval)) return;
-  const rows = sanitizeCandleRows(candles)
+  const incomingRows = sanitizeCandleRows(candles)
     .filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
     .sort((a, b) => a.date.localeCompare(b.date))
     .slice(-marketHistoryCacheLimit(interval));
+  if (incomingRows.length < 2) return;
+  const path = marketHistoryPathFor(market, symbol, interval);
+  let existing = null;
+  try {
+    existing = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    existing = null;
+  }
+  // A provider may return only a recent window after a quota or edge-limit
+  // fallback. Merge by date so a short response cannot erase a longer cache.
+  const mergedByDate = new Map(
+    sanitizeCandleRows(existing?.candles || [])
+      .filter((row) => /^\d{4}-\d{2}-\d{2}$/.test(row.date))
+      .map((row) => [row.date, row]),
+  );
+  for (const row of incomingRows) mergedByDate.set(row.date, row);
+  const rows = [...mergedByDate.values()]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-marketHistoryCacheLimit(interval));
   if (rows.length < 2) return;
+  const sourceSet = [...new Set([
+    ...(String(existing?.source || "").split("+").filter(Boolean)),
+    meta.source || "market-history-cache",
+  ])];
   const payload = {
     market: safeMarket(market),
     symbol: cleanCode(symbol, market),
@@ -1708,19 +2105,18 @@ async function writeMarketHistoryCache(market, symbol, interval, candles = [], m
       ? (/^(SH|6|5|9)/.test(cleanCode(symbol, market)) ? "SSE" : "SZSE")
       : safeMarket(market)),
     interval,
-    source: meta.source || "market-history-cache",
+    source: sourceSet.join("+") || "market-history-cache",
     unit: meta.unit || undefined,
-    closeOnly: Boolean(meta.closeOnly),
+    closeOnly: Boolean(meta.closeOnly || existing?.closeOnly),
     savedAt: new Date().toISOString(),
-    quote: compactPersistedQuote(meta.quote, market),
+    quote: compactPersistedQuote(meta.quote, market) || existing?.quote || null,
     candles: rows,
   };
   const body = JSON.stringify(payload);
   if (body.length > Number(process.env.MARKET_HISTORY_CACHE_MAX_BYTES || 8_000_000)) return;
-  const path = marketHistoryPathFor(market, symbol, interval);
   await mkdir(join(snapshotBasePath, "market-history", safeMarket(market).toLowerCase()), { recursive: true });
   await writeFile(path, body, "utf8");
-  void runPythonQuantCore("data-lake-upsert", {
+  const persistToDataLake = runPythonQuantCore("data-lake-upsert", {
     market: payload.market,
     symbol: payload.symbol,
     exchange: payload.exchange,
@@ -1728,14 +2124,20 @@ async function writeMarketHistoryCache(market, symbol, interval, candles = [], m
     source: payload.source,
     available_at: payload.savedAt,
     candles: rows,
-  }, Number(process.env.DATA_LAKE_INGEST_TIMEOUT_MS || 90_000)).catch((error) => {
-    runtimeEvents.publish("data-lake.ingest_error", {
-      market: payload.market,
-      symbol: payload.symbol,
-      interval,
-      error: error.message || String(error),
+  }, Number(process.env.DATA_LAKE_INGEST_TIMEOUT_MS || 90_000), { signal: meta.signal });
+  if (meta.awaitDataLake === true) {
+    // A backfill is only complete once the durable training store has the candles.
+    await persistToDataLake;
+  } else {
+    void persistToDataLake.catch((error) => {
+      runtimeEvents.publish("data-lake.ingest_error", {
+        market: payload.market,
+        symbol: payload.symbol,
+        interval,
+        error: error.message || String(error),
+      });
     });
-  });
+  }
   if (interval === "1d") {
     const overlay = marketOverlayFromHistoryPayload(payload, market, symbol);
     if (overlay) stageMarketOverlayIndexUpdate(market, overlay).catch(() => null);
@@ -1963,6 +2365,23 @@ async function readLatestMarketHistoryPayload(market, symbol, interval = "1d") {
   };
 }
 
+async function readLocalMarketHistoryPayload(market, symbol, interval = "1d") {
+  const key = safeMarket(market);
+  const candidates = await Promise.all(marketHistorySymbolCandidates(symbol, key).map(async (candidate) => {
+    try {
+      const payload = JSON.parse(await readFile(marketHistoryPathFor(key, candidate, interval), "utf8"));
+      return payload && typeof payload === "object" ? payload : null;
+    } catch {
+      return null;
+    }
+  }));
+  return candidates.filter(Boolean).sort((a, b) => {
+    const left = Date.parse(a.savedAt || "") || 0;
+    const right = Date.parse(b.savedAt || "") || 0;
+    return right - left;
+  })[0] || null;
+}
+
 function invalidateMarketResponseForSymbol(market, symbol) {
   const key = safeMarket(market);
   const code = cleanCode(symbol, key);
@@ -2120,6 +2539,74 @@ function productionModelRegistryIndexPath(market) {
   return join(productionModelRegistryDir(market), "index.json");
 }
 
+function comparisonKeyFromManifest(manifest = {}) {
+  const fields = manifest.comparison_key_fields || manifest.comparisonKeyFields || {
+    market: manifest.market || null,
+    horizon: 5,
+    dataVersion: manifest.data_version || manifest.dataVersion || null,
+    featureSchemaHash: manifest.feature_schema_hash || manifest.featureSchemaHash || null,
+    universeVersion: manifest.universe_version || manifest.universeVersion || null,
+    labelDefinition: manifest.label_definition || manifest.labelDefinition || null,
+    transactionCostBps: manifest.transaction_cost_bps ?? manifest.transactionCostBps ?? null,
+    splitPolicy: manifest.split_policy || manifest.splitPolicy || null,
+    foldCount: manifest.fold_count || manifest.foldCount || null,
+    embargoDays: manifest.embargo_days || manifest.embargoDays || null,
+    testSetSignature: manifest.test_set_signature || manifest.testSetSignature || null,
+    trainMembershipHash: manifest.train_membership_hash || manifest.trainMembershipHash || null,
+    testMembershipHash: manifest.test_membership_hash || manifest.testMembershipHash || null,
+    universeMembershipHash: manifest.universe_membership_hash || manifest.universeMembershipHash || null,
+    labelHash: manifest.label_hash || manifest.labelHash || null,
+    featureHash: manifest.feature_hash || manifest.featureHash || null,
+    costHash: manifest.cost_hash || manifest.costHash || null,
+    splitHash: manifest.split_hash || manifest.splitHash || null,
+  };
+  const supplied = String(manifest.comparison_key || manifest.comparisonKey || "").trim();
+  return {
+    key: supplied || createHash("sha256").update(JSON.stringify(fields)).digest("hex").slice(0, 32),
+    fields,
+  };
+}
+
+function championPromotionDecision(entry = {}, priorChampion = null, training = {}, comparisonKey = "") {
+  const championComparisonMatches = !priorChampion
+    ? true
+    : Boolean(priorChampion.comparisonKey && priorChampion.comparisonKey === comparisonKey);
+  const comparisonEvidence = training.comparisonEvidence
+    || training.pairwiseComparison
+    || training.promotionEvidence?.comparison
+    || null;
+  const nonInferiorToChampion = !priorChampion || (
+    championComparisonMatches
+    && comparisonEvidence?.nonInferior === true
+    && (!comparisonEvidence.comparisonKey || comparisonEvidence.comparisonKey === comparisonKey)
+    && Number(comparisonEvidence.coveragePct ?? comparisonEvidence.coverage ?? 0) >= 90
+  );
+  const explicitlyApproved = entry.eligible === true
+    && entry.productionEvidencePassed === true
+    && entry.available !== false
+    && !["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].includes(String(entry.trainingStatus || entry.status || "").toUpperCase())
+    && Object.values(entry.modelFamilyStatus || {}).every((status) => {
+      const value = status && typeof status === "object" ? status.status : status;
+      return !["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].includes(String(value || "").toUpperCase());
+    })
+    && ["champion", "production"].includes(String(entry.deploymentStatus || "").toLowerCase())
+    && training.productionActivationApproved === true
+    && championComparisonMatches
+    && nonInferiorToChampion;
+  return {
+    championComparisonMatches,
+    nonInferiorToChampion,
+    explicitlyApproved,
+    blockReason: explicitlyApproved
+      ? null
+      : priorChampion && !championComparisonMatches
+        ? "comparison-key-mismatch-with-existing-champion"
+        : priorChampion && !nonInferiorToChampion
+          ? "missing-pairwise-non-inferiority-evidence"
+        : "strict-production-evidence-or-explicit-approval-missing",
+  };
+}
+
 async function readProductionModelGate(market, horizon = 5) {
   const key = safeMarket(market);
   try {
@@ -2135,13 +2622,37 @@ async function readProductionModelGate(market, horizon = 5) {
     }
     const payload = JSON.parse(await readFile(join(productionModelRegistryDir(key), champion.filename), "utf8"));
     const model = (payload.horizonModels || []).find((row) => Number(row.horizon) === Number(horizon));
+    let promotionEvidence = null;
+    try {
+      promotionEvidence = JSON.parse(await readFile(join(
+        snapshotBasePath,
+        "training-supervisor",
+        "promotion-evidence",
+        key.toLowerCase(),
+        "latest.json",
+      ), "utf8"));
+    } catch {
+      promotionEvidence = null;
+    }
+    const evidenceMatches = validatePromotionEvidenceV3(promotionEvidence, {
+      market: key,
+      modelVersion: payload.manifest?.model_version || null,
+    }).valid;
     const eligible = payload.productionEligibility?.eligible === true
       && model?.available === true
-      && model?.productionEvidencePassed === true;
+      && !["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].includes(String(model?.trainingStatus || model?.status || "").toUpperCase())
+      && model?.modelFamilyStatus?.path !== "NO_MODEL"
+      && model?.modelFamilyStatus?.direction !== "NO_MODEL"
+      && model?.productionEvidencePassed === true
+      && evidenceMatches;
     return {
       eligible,
-      reason: eligible ? "strict_market_oof_passed" : "strict_market_oof_failed",
+      reason: eligible
+        ? "strict_market_oof_passed"
+        : evidenceMatches ? "strict_market_oof_failed" : "promotion_evidence_missing_or_not_approved",
       modelVersion: payload.manifest?.model_version || champion.modelVersion || null,
+      promotionEvidenceId: promotionEvidence?.evidenceId || null,
+      promotionDecision: promotionEvidence?.decision || "hold_shadow",
     };
   } catch {
     return { eligible: false, reason: "market_model_registry_missing" };
@@ -2355,6 +2866,7 @@ async function writePredictionWeightModelSnapshot(market, summary = {}) {
   const horizonCalibrations = Array.isArray(summary.horizonCalibrations) ? summary.horizonCalibrations : [];
   const productionTraining = summary.productionTraining || null;
   if (!calibration && !horizonCalibrations.length && !productionTraining) return null;
+  if (productionTraining?.manifest?.training_lane && productionTraining.manifest.training_lane !== "strict_production") return null;
   await mkdir(join(snapshotBasePath, "models"), { recursive: true });
   const payload = {
     market: key,
@@ -2388,11 +2900,242 @@ async function writePredictionWeightModelSnapshot(market, summary = {}) {
   return payload;
 }
 
+function researchModelRegistryDir(market) {
+  return join(snapshotBasePath, "models", "research", safeMarket(market).toLowerCase());
+}
+
+function researchModelRegistryIndexPath(market) {
+  return join(researchModelRegistryDir(market), "research-registry.json");
+}
+
+const RESEARCH_TRAINING_LANES = new Set([
+  "core_research",
+  "sparse_expert",
+  "transfer_research",
+  "prequential_shadow",
+]);
+
+const PRODUCTION_POINTER_NAMES = new Set([
+  "productionChampion",
+  "latestEligibleModel",
+  "longTradeGate",
+  "champion",
+]);
+
+function researchRegistryPointerPolicy({ trainingLane, candidateStatus = "RESEARCH", requestedPointer = "research", currentPointer = null } = {}) {
+  const lane = String(trainingLane || "").trim().toLowerCase();
+  const isResearch = RESEARCH_TRAINING_LANES.has(lane);
+  if (isResearch && PRODUCTION_POINTER_NAMES.has(String(requestedPointer || ""))) {
+    return {
+      allowed: false,
+      trainingLane: lane,
+      candidateStatus: String(candidateStatus || "RESEARCH"),
+      pointerUnchanged: true,
+      pointer: currentPointer,
+      reason: "research_candidate_cannot_write_production_pointer",
+    };
+  }
+  return {
+    allowed: true,
+    trainingLane: lane,
+    candidateStatus: String(candidateStatus || "RESEARCH"),
+    pointerUnchanged: false,
+    pointer: currentPointer,
+    target: isResearch ? "research" : "production",
+  };
+}
+
+function researchRegistryPointers(versions = []) {
+  const rows = Array.isArray(versions) ? versions.filter((row) => row && typeof row === "object") : [];
+  const quality = (row) => [
+    Number(row.evidenceTier === "D3" ? 3 : row.evidenceTier === "D2" ? 2 : row.evidenceTier === "D1" ? 1 : 0),
+    Number(row.available ? 1 : 0),
+    String(row.savedAt || ""),
+  ];
+  const better = (left, right) => {
+    if (!right) return true;
+    const a = quality(left);
+    const b = quality(right);
+    for (let index = 0; index < a.length; index += 1) {
+      if (a[index] !== b[index]) return a[index] > b[index];
+    }
+    return false;
+  };
+  const pointer = (tier) => rows.filter((row) => row.evidenceTier === tier).reduce((best, row) => better(row, best) ? row : best, null);
+  return {
+    latestResearchAttempt: rows[0] || null,
+    bestD1: pointer("D1"),
+    bestD2: pointer("D2"),
+    qualifiedShadow: pointer("D3"),
+    productionChampion: null,
+    latestEligibleModel: null,
+    longTradeGate: null,
+  };
+}
+
+function modelReportFreshness(report = {}, registryVersions = {}, nowMs = Date.now()) {
+  const generatedMs = Date.parse(report.generatedAt || "");
+  const ageHours = Number.isFinite(generatedMs) ? Math.max(0, (nowMs - generatedMs) / 3_600_000) : null;
+  const latestRuns = {};
+  const reportVersions = { ...(report.reportVersions || {}) };
+  for (const market of report.scope || []) {
+    const key = safeMarket(market);
+    latestRuns[key] = registryVersions[key] || null;
+    reportVersions[key] = reportVersions[key] || null;
+  }
+  const compared = Object.keys(latestRuns).filter((market) => latestRuns[market] || reportVersions[market]);
+  return {
+    ...report,
+    generatedAt: report.generatedAt || null,
+    ageHours: ageHours == null ? null : Number(ageHours.toFixed(4)),
+    isLatest: compared.length > 0 && compared.every((market) => latestRuns[market] === reportVersions[market]),
+    latestRuns,
+    reportVersions,
+  };
+}
+
+function researchRouteStatus(route = {}) {
+  const pendingTaskIds = Array.isArray(route.pendingTaskIds) ? route.pendingTaskIds : [];
+  const routeReady = pendingTaskIds.length === 0;
+  return {
+    strictProduction: {
+      status: "BLOCKED_GATE03",
+      canStart: false,
+      reason: "strict production remains frozen by Gate03; this status is independent of research readiness.",
+    },
+    research: {
+      status: routeReady ? "READY_FOR_RESEARCH_REVIEW" : "WAITING_ROUTE_EVIDENCE",
+      canStartD1: routeReady,
+      pendingTaskCount: pendingTaskIds.length,
+      pendingTaskIds: pendingTaskIds.slice(0, 64),
+      reason: routeReady
+        ? "D1-D3 research may be scheduled only with an experimentId and hypothesisId."
+        : "Route transition evidence is incomplete; no research fitting has been started.",
+    },
+    data: {
+      status: routeReady ? "READY_FOR_PIT_AUDIT" : "WAITING_ROUTE_EVIDENCE",
+      reason: "Data-lake file presence is not equivalent to actionable PIT row coverage; the next data audit remains explicit.",
+    },
+    model: {
+      status: route?.modelTrainingStarted === true ? "STARTED" : "NOT_STARTED_BY_POLICY",
+      reason: route?.modelTrainingStarted === true ? "Research model execution is recorded by the route artifact." : "No model fitting is allowed before the route gate is signed.",
+    },
+    labels: {
+      status: route?.formalOofStarted === true ? "IN_PROGRESS" : "WAITING_PRE_REGISTERED_HYPOTHESIS",
+      reason: "Labels must be pre-registered and compared under the declared horizon before formal OOF.",
+    },
+  };
+}
+
+async function writeResearchModelVersionSnapshot(market, training = {}) {
+  const key = safeMarket(market);
+  const manifest = training?.manifest || {};
+  const lane = String(manifest.training_lane || manifest.trainingLane || "").trim().toLowerCase();
+  if (!RESEARCH_TRAINING_LANES.has(lane)) return null;
+  const version = String(manifest.model_version || "").trim();
+  if (!version) return null;
+  const directory = researchModelRegistryDir(key);
+  await mkdir(directory, { recursive: true });
+  const payload = {
+    registrySchema: "research-candidate-registry-v1",
+    market: key,
+    savedAt: new Date().toISOString(),
+    manifest,
+    dataset: training.dataset || null,
+    evidenceTier: manifest.evidence_tier || (lane === "prequential_shadow" ? "D3" : "D1"),
+    evidenceType: manifest.evidence_type || null,
+    trainingLane: lane,
+    productionEligibility: {
+      ...(training.productionEligibility || {}),
+      eligible: false,
+      autoPromotionAllowed: false,
+      championUpdateAllowed: false,
+      longTradeGateAllowed: false,
+    },
+    horizonModels: training.horizonModels || [],
+    pointers: { productionChampion: null, latestEligibleModel: null, longTradeGate: null },
+    note: "Research Candidate only. This artifact is isolated from the production registry, Champion and live trade gate.",
+  };
+  const filename = `${safeCachePart(version)}.json`;
+  let previous = { schema: "research-registry-v1", market: key, versions: [] };
+  try {
+    previous = JSON.parse(await readFile(researchModelRegistryIndexPath(key), "utf8"));
+  } catch {
+    // First research candidate for this market.
+  }
+  const horizon = Number(manifest.comparison_key_fields?.horizon || manifest.comparisonKeyFields?.horizon || 5);
+  const primary = (training.horizonModels || []).find((row) => Number(row.horizon) === horizon)
+    || (training.horizonModels || [])[0]
+    || {};
+  const entry = {
+    modelVersion: version,
+    savedAt: payload.savedAt,
+    trainingLane: lane,
+    evidenceTier: payload.evidenceTier,
+    evidenceType: payload.evidenceType,
+    experimentId: manifest.experiment_id || manifest.experimentId || null,
+    hypothesisId: manifest.hypothesis_id || manifest.hypothesisId || null,
+    comparisonKey: manifest.comparison_key || manifest.comparisonKey || null,
+    comparisonKeyFields: manifest.comparison_key_fields || manifest.comparisonKeyFields || null,
+    status: primary.status || training.status || "RESEARCH",
+    available: Boolean(primary.available),
+    promotionEligible: false,
+    productionEligibility: false,
+    longTradeGateActive: false,
+    artifactFilename: filename,
+  };
+  const transitionLogPath = join(directory, "state-transitions.jsonl");
+  let previousState = null;
+  try {
+    const lines = String(await readFile(transitionLogPath, "utf8")).split("\n").filter(Boolean);
+    const last = lines.length ? JSON.parse(lines[lines.length - 1]) : null;
+    previousState = last?.nextState || null;
+  } catch {
+    previousState = null;
+  }
+  const nextState = researchStateFromTraining({ status: entry.status, trainingStatus: training.status, manifest });
+  const transition = researchStateTransition(previousState, nextState);
+  if (!transition.allowed) {
+    throw new Error(`Research state transition rejected: ${transition.previousState || "INITIAL"} -> ${transition.nextState || "UNKNOWN"}`);
+  }
+  await appendFile(transitionLogPath, `${JSON.stringify({
+    schema: "research-state-transition-v1",
+    createdAt: payload.savedAt,
+    market: key,
+    modelVersion: version,
+    trainingLane: lane,
+    experimentId: entry.experimentId,
+    hypothesisId: entry.hypothesisId,
+    previousState,
+    nextState,
+    transitionReason: transition.reason,
+  })}\n`, "utf8");
+  payload.stateTransitionLog = transitionLogPath;
+  await writeFile(join(directory, filename), JSON.stringify(payload, null, 2), "utf8");
+  const versions = [entry, ...(Array.isArray(previous.versions) ? previous.versions : []).filter((row) => row.modelVersion !== version)].slice(0, 100);
+  const researchPointers = researchRegistryPointers(versions);
+  const indexPayload = {
+    schema: "research-registry-v1",
+    market: key,
+    ...researchPointers,
+    versions,
+  };
+  await writeFile(researchModelRegistryIndexPath(key), JSON.stringify(indexPayload, null, 2), "utf8");
+  return { ...entry, registryRole: "latest-research-attempt" };
+}
+
 async function writeProductionModelVersionSnapshot(market, training = {}) {
   const key = safeMarket(market);
   const manifest = training?.manifest;
+  const lane = String(manifest?.training_lane || manifest?.trainingLane || "strict_production").trim().toLowerCase();
+  if (lane && lane !== "strict_production") return writeResearchModelVersionSnapshot(key, training);
   const version = String(manifest?.model_version || "").trim();
   if (!version) return null;
+  const comparison = comparisonKeyFromManifest(manifest);
+  // Persist the identity used for every promotion comparison.  A missing or
+  // legacy identity is intentionally not treated as comparable to a new run.
+  manifest.comparison_key = comparison.key;
+  manifest.comparison_key_fields = comparison.fields;
   const directory = productionModelRegistryDir(key);
   await mkdir(directory, { recursive: true });
   const payload = {
@@ -2406,6 +3149,16 @@ async function writeProductionModelVersionSnapshot(market, training = {}) {
     horizonModels: (training.horizonModels || []).map((row) => ({
       horizon: row.horizon,
       available: row.available,
+      status: row.status,
+      trainingStatus: row.trainingStatus,
+      attemptCompleted: row.attemptCompleted,
+      modelProduced: row.modelProduced,
+      artifactProduced: row.artifactProduced,
+      predictiveModelProduced: row.predictiveModelProduced,
+      tradeModelProduced: row.tradeModelProduced,
+      modelFamilyStatus: row.modelFamilyStatus,
+      activationReason: row.activationReason,
+      productionActivationBlocked: row.productionActivationBlocked,
       modelVersion: row.modelVersion,
       deploymentStatus: row.deploymentStatus,
       productionEvidencePassed: row.productionEvidencePassed,
@@ -2461,13 +3214,24 @@ async function writeProductionModelVersionSnapshot(market, training = {}) {
     trainingAsOf: manifest.training_as_of || null,
     deploymentStatus: manifest.deployment_status || "research",
     eligible: Boolean(training.productionEligibility?.eligible),
+    available: Boolean((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.available),
+    status: (training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.status || training.status || null,
+    trainingStatus: (training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.trainingStatus || training.trainingStatus || null,
+    modelFamilyStatus: (training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.modelFamilyStatus || null,
+    activationReason: (training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.activationReason || null,
+    productionActivationBlocked: (training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.productionActivationBlocked !== false,
     productionEvidencePassed: Boolean((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.productionEvidencePassed),
+    artifactProduced: Boolean((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.artifactProduced ?? training.manifest),
+    predictiveModelProduced: Boolean((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.predictiveModelProduced),
+    tradeModelProduced: Boolean((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.tradeModelProduced),
     balancedAccuracyPct: Number((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.directionMetrics?.balancedAccuracyPct ?? -1),
     brierSkill: Number((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.directionMetrics?.brierSkillScore ?? -10),
     ecePct: Number((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.directionMetrics?.ecePct ?? 100),
     oofRows: Number((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.oofRows || 0),
     independentDates: Number((training.horizonModels || []).find((row) => Number(row.horizon) === 5)?.directionMetrics?.testDates || 0),
     filename,
+    comparisonKey: comparison.key,
+    comparisonKeyFields: comparison.fields,
   };
   const candidateQuality = (row) => [
     row?.productionEvidencePassed ? 1 : 0,
@@ -2489,25 +3253,43 @@ async function writeProductionModelVersionSnapshot(market, training = {}) {
   const versions = [entry, ...(Array.isArray(previous.versions) ? previous.versions : []).filter((row) => row.modelVersion !== version)].slice(0, 80);
   const previousLatest = previous.latestRun || previous.latest || null;
   const frozenBaseline = previous.frozenBaseline || previousLatest || entry;
-  const priorBest = previous.bestChallenger || previousLatest || null;
-  const bestChallenger = betterCandidate(entry, priorBest) ? entry : priorBest;
-  const explicitlyApproved = entry.eligible === true
-    && entry.productionEvidencePassed === true
-    && ["champion", "production"].includes(String(entry.deploymentStatus || "").toLowerCase())
-    && training.productionActivationApproved === true;
-  const champion = explicitlyApproved ? entry : (previous.champion || null);
+  const priorResearchArtifact = previous.bestResearchArtifact || previous.bestChallenger || previousLatest || null;
+  const bestResearchArtifact = betterCandidate(entry, priorResearchArtifact) ? entry : priorResearchArtifact;
+  const priorComparablePredictive = previous.bestComparablePredictiveCandidate
+    || (previous.bestChallenger?.predictiveModelProduced === true ? previous.bestChallenger : null);
+  const comparablePriorBest = priorComparablePredictive?.comparisonKey === comparison.key ? priorComparablePredictive : null;
+  const entryComparablePredictive = entry.predictiveModelProduced === true
+    && !["NO_MODEL", "PARTIAL", "EVIDENCE_INSUFFICIENT"].some((value) => String(entry.status || entry.trainingStatus || "").toUpperCase().startsWith(value));
+  const bestComparablePredictiveCandidate = entryComparablePredictive && betterCandidate(entry, comparablePriorBest)
+    ? entry
+    : comparablePriorBest;
+  const priorChampion = previous.champion || null;
+  const promotionDecision = championPromotionDecision(entry, priorChampion, training, comparison.key);
+  const champion = promotionDecision.explicitlyApproved ? entry : priorChampion;
+  const latestEligibleModel = promotionDecision.explicitlyApproved
+    ? entry
+    : previous.latestEligibleModel || null;
+  entry.championComparisonMatches = promotionDecision.championComparisonMatches;
+  entry.nonInferiorToChampion = promotionDecision.nonInferiorToChampion;
+  entry.promotionBlockReason = promotionDecision.blockReason;
   const indexPayload = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     market: key,
+    comparisonKey: comparison.key,
+    comparisonKeyFields: comparison.fields,
     latestRun: entry,
+    latestAttempt: entry,
+    latestEligibleModel,
     latest: entry,
     frozenBaseline,
-    bestChallenger,
+    bestResearchArtifact,
+    bestComparablePredictiveCandidate,
+    bestChallenger: bestComparablePredictiveCandidate,
     champion,
     versions,
   };
   await writeFile(productionModelRegistryIndexPath(key), JSON.stringify(indexPayload, null, 2), "utf8");
-  return { ...entry, registryRole: champion?.modelVersion === entry.modelVersion ? "champion" : bestChallenger?.modelVersion === entry.modelVersion ? "best-challenger" : "latest-run", championModelVersion: champion?.modelVersion || null };
+  return { ...entry, registryRole: champion?.modelVersion === entry.modelVersion ? "champion" : bestComparablePredictiveCandidate?.modelVersion === entry.modelVersion ? "best-comparable-predictive-candidate" : bestResearchArtifact?.modelVersion === entry.modelVersion ? "best-research-artifact" : "latest-run", championModelVersion: champion?.modelVersion || null };
 }
 
 async function readFactorResearchModelSnapshot(market, symbol) {
@@ -2768,6 +3550,23 @@ function normalizeUniverseEventDate(value) {
   return "";
 }
 
+function inferUsAssetClass(name = "", type = "", explicit = "") {
+  const text = `${String(name || "")} ${String(type || "")}`.toLowerCase();
+  const declared = String(explicit || "").trim().toLowerCase();
+  if (declared) return declared;
+  if (/\b(etf|exchange traded fund|index fund)\b/.test(text)) return "etf";
+  if (/\b(cef|closed[- ]end fund|closed[- ]end trust)\b/.test(text)) return "cef";
+  if (/\b(preferred|preference shares?|depositary preferred)\b/.test(text)) return "preferred";
+  if (/\b(warrant|rights?|units?)\b/.test(text)) return "derivative-or-unit";
+  if (/\b(adr|ads|american depositary|depositary shares?)\b/.test(text)) return "adr";
+  if (/\b(acquisition corp|acquisition corporation|blank check|spac)\b/.test(text)) return "spac";
+  return "common-stock";
+}
+
+function isPlaceholderSector(value = "") {
+  return /^(?:us equities|us equity|equity|general|unknown|n\/a|na|other)$/i.test(String(value || "").trim());
+}
+
 function universeRow(symbol, name = "", market = "ASX", extra = {}) {
   const key = safeMarket(market);
   const rawSymbol = String(symbol || "").trim();
@@ -2777,16 +3576,23 @@ function universeRow(symbol, name = "", market = "ASX", extra = {}) {
   if (/^(?:security name|company name|issuer name|description)$/i.test(rawName)) return null;
   const code = cleanCode(symbol, key);
   if (!isValidMarketCode(code, key)) return null;
+  const assetClass = key === "US"
+    ? inferUsAssetClass(rawName, extra.type, extra.assetClass)
+    : String(extra.assetClass || (String(extra.type || "").toLowerCase().includes("etf") ? "etf" : "common-stock"));
+  const sector = isPlaceholderSector(extra.sector) ? "" : String(extra.sector || "").slice(0, 120);
+  const industry = isPlaceholderSector(extra.industry) ? "" : String(extra.industry || "").slice(0, 160);
   return {
     symbol: normalizeMarketSymbol(code, key),
     code,
     name: String(rawName || code).trim().slice(0, 160),
     market: key,
     exchange: String(extra.exchange || key).slice(0, 40),
-    sector: String(extra.sector || "").slice(0, 120),
-    industry: String(extra.industry || "").slice(0, 160),
+    sector,
+    industry,
+    sectorQuality: sector || industry ? "provider" : "missing-or-placeholder",
     source: String(extra.source || "universe-provider").slice(0, 80),
     type: String(extra.type || "stock").slice(0, 40),
+    assetClass,
     listingDate: normalizeUniverseEventDate(extra.listingDate || extra.list_date || extra.listedAt || extra.f26),
     delistingDate: normalizeUniverseEventDate(extra.delistingDate || extra.delist_date || extra.delistedAt),
     listed: extra.listed !== false && String(extra.list_status || extra.status || "active").toLowerCase() !== "delisted",
@@ -2851,10 +3657,12 @@ function trainingEligibleUniverseRow(row = {}, market = "ASX") {
   const code = cleanCode(row.symbol, key);
   const name = String(row.name || "").toLowerCase();
   const type = String(row.type || "stock").toLowerCase();
+  const assetClass = String(row.assetClass || "").toLowerCase();
   const eligibleTypes = key === "CN"
     ? new Set(["stock", "common stock", "ordinary share", "a share"])
     : new Set(["stock", "common stock", "ordinary share", "adr"]);
   if (!eligibleTypes.has(type)) return false;
+  if (key === "US" && ["etf", "cef", "preferred", "derivative-or-unit", "spac"].includes(assetClass)) return false;
   if (/\b(warrant|warrants|right|rights|unit|units|preferred|preference|debenture|bond|note due|notes due|deferred settlement)\b/.test(name)) return false;
   // ASX ordinary-company codes are three characters. Longer codes commonly
   // identify deferred-settlement, options, rights, warrants or other temporary
@@ -2896,31 +3704,71 @@ async function writeUniverseCache(payload) {
   await mkdir(snapshotBasePath, { recursive: true });
   await writeFile(universePathForMarket(key), JSON.stringify(clean), "utf8");
   universeResponseCache.set(key, { time: Date.now(), value: clean });
-  await persistPitDataset(
-    "universe",
-    key,
-    "",
-    universePointInTimeRecords(clean.rows, clean.fetchedAt, key),
-    clean.source,
-  );
-  universePitPersistedMarkets.add(key);
+  // The real-time universe endpoint must not wait for a large PIT write.  A
+  // persisted marker prevents every server restart from re-ingesting the same
+  // full universe before company-level PIT work can start.
+  void scheduleUniversePitPersist(clean);
   return clean;
 }
 
+async function scheduleUniversePitPersist(universe = {}) {
+  const key = safeMarket(universe.market);
+  const fetchedAt = String(universe.fetchedAt || "");
+  if (!fetchedAt || !Array.isArray(universe.rows) || !universe.rows.length) return;
+  if (universePitPersistedMarkets.get(key) === fetchedAt) return;
+  universePitPersistedMarkets.set(key, fetchedAt);
+  const marker = `universe-pit-persisted-${key.toLowerCase()}`;
+  try {
+    const persisted = await readPitProviderCache(marker, 365 * 24 * 60 * 60_000).catch(() => null);
+    if (String(persisted?.fetchedAt || "") === fetchedAt) return;
+    await persistPitDataset(
+      "universe",
+      key,
+      "",
+      universePointInTimeRecords(universe.rows, fetchedAt, key),
+      universe.source || "universe-cache",
+    );
+    await writePitProviderCache(marker, {
+      records: [],
+      fetchedAt,
+      source: universe.source || "universe-cache",
+      persistedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    if (universePitPersistedMarkets.get(key) === fetchedAt) universePitPersistedMarkets.delete(key);
+    runtimeEvents.publish("data-lake.universe_ingest_error", {
+      market: key,
+      error: error.message || String(error),
+    });
+  }
+}
+
 function parseNasdaqTraderRows(text = "", market = "US") {
-  return String(text).split(/\r?\n/)
-    .filter((line) => line && !/^(?:Symbol|ACT Symbol|Nasdaq Traded)\||^File Creation Time/i.test(line))
+  const lines = String(text).split(/\r?\n/).filter(Boolean);
+  const header = lines.find((line) => /^(?:Symbol|ACT Symbol|Nasdaq Traded)\|/i.test(line)) || "";
+  const headers = header.split("|").map((value) => value.trim().toLowerCase());
+  const indexOf = (name) => headers.indexOf(name.toLowerCase());
+  const etfIndex = indexOf("etf");
+  const testIssueIndex = indexOf("test issue");
+  return lines
+    .filter((line) => line && line !== header && !/^File Creation Time/i.test(line))
     .map((line) => {
       const cells = line.split("|");
       const symbol = cells[0];
       const name = cells[1];
-      const testIssue = cells.includes("Y");
-      const etfIndex = line.startsWith("Symbol|") ? -1 : cells.length > 7 ? 6 : -1;
-      const isEtf = etfIndex >= 0 && cells[etfIndex] === "Y";
-      if (testIssue || isEtf) return null;
-      return universeRow(symbol, name, market, { source: "nasdaq-trader-symbol-directory", exchange: "US", type: "stock" });
+      const testIssue = testIssueIndex >= 0 ? String(cells[testIssueIndex] || "").toUpperCase() === "Y" : false;
+      const isEtf = etfIndex >= 0 && String(cells[etfIndex] || "").toUpperCase() === "Y";
+      if (testIssue) return null;
+      const assetClass = isEtf ? "etf" : inferUsAssetClass(name, "stock");
+      return universeRow(symbol, name, market, {
+        source: "nasdaq-trader-symbol-directory",
+        exchange: "US",
+        type: assetClass === "adr" ? "adr" : "stock",
+        assetClass,
+      });
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((row) => row.assetClass !== "etf");
 }
 
 async function fetchAsxUniverse() {
@@ -3065,17 +3913,7 @@ async function fetchMarketUniverse(market = "ASX", options = {}) {
   if (!force) {
     const cached = await readUniverseCache(key);
     if (cached?.rows?.length) {
-      if (!universePitPersistedMarkets.has(key)) {
-        const availableAt = cached.fetchedAt || new Date().toISOString();
-        await persistPitDataset(
-          "universe",
-          key,
-          "",
-          universePointInTimeRecords(cached.rows, availableAt, key),
-          cached.source || "universe-cache",
-        );
-        universePitPersistedMarkets.add(key);
-      }
+      void scheduleUniversePitPersist(cached);
       return cached;
     }
   }
@@ -4849,6 +5687,15 @@ function persistIntradayTrainingEvidence(summary = {}) {
     const sampleCount = Math.max(0, ...rows.map((row) => Number(row.sampleCount || row.samples || 0)));
     const updated = rows.some((row) => row.reusedModel !== true && Number(row.sampleCount || 0) >= 40);
     const failed = rows.length > 0 && usableRows.length === 0 && rows.some((row) => row.error);
+    const datasetSignature = rows.find((row) => row.datasetSignature)?.datasetSignature || `${sampleCount}:${rows.map((row) => `${row.symbol || ""}:${row.samples || row.sampleCount || 0}`).sort().join(",")}`;
+    const newRowsSinceModel = Math.max(0, ...rows.map((row) => Number(row.newRowsSinceModel || 0)));
+    const evidenceSignature = JSON.stringify({ datasetSignature, newRowsSinceModel, updated, failed });
+    const previousSignature = backendMonitorState.lastIntradayEvidenceSignatureByMarket?.[market];
+    if (previousSignature === evidenceSignature && !updated && !failed) continue;
+    backendMonitorState.lastIntradayEvidenceSignatureByMarket = {
+      ...(backendMonitorState.lastIntradayEvidenceSignatureByMarket || {}),
+      [market]: evidenceSignature,
+    };
     const recordedAt = summary.updatedAt || new Date().toISOString();
     const runId = `intraday-${market.toLowerCase()}-${Date.parse(recordedAt) || Date.now()}`;
     evidenceRegistry.persistJob({
@@ -4860,7 +5707,7 @@ function persistIntradayTrainingEvidence(summary = {}) {
       progress: 1,
       createdAt: recordedAt,
       updatedAt: recordedAt,
-      payload: { dataVersion: rows.find((row) => row.datasetSignature)?.datasetSignature || null },
+      payload: { dataVersion: datasetSignature || null },
       result: {
         available: rows.some((row) => Number(row.sampleCount || 0) >= 40 || row.reusedModel === true),
         framework: "local-minute-ridge-no-future-labels",
@@ -4871,7 +5718,7 @@ function persistIntradayTrainingEvidence(summary = {}) {
       detail: {
         phase: updated ? "minute-model-updated" : "minute-evidence-collected",
         sampleCount,
-        newRowsSinceModel: Math.max(0, ...rows.map((row) => Number(row.newRowsSinceModel || 0))),
+        newRowsSinceModel,
         reasons: rows.map((row) => row.reason || row.error || row.source).filter(Boolean).slice(0, 12),
       },
       error: failed ? rows.map((row) => row.error).filter(Boolean).join(" | ") : null,
@@ -4935,7 +5782,7 @@ async function runBackendIntradayTraining(config = {}, runtime = {}, { recordEvi
     await mkdir(backendMonitorBasePath, { recursive: true });
     await writeFile(intradaySamplesPathForMarket(market), JSON.stringify({ market, updatedAt: new Date().toISOString(), samples }, null, 2), "utf8");
     if (existingModel?.datasetSignature === datasetSignature) {
-      results.push({ market, reusedModel: true, sampleCount: samples.length, reason: "no newly completed minute-bar sample" });
+      results.push({ market, reusedModel: true, sampleCount: samples.length, datasetSignature, reason: "no newly completed minute-bar sample" });
       continue;
     }
     const minimumNewRows = Math.max(20, Number(process.env.BACKEND_MONITOR_INCREMENTAL_MIN_NEW_ROWS || minuteResources.minimumNewRows));
@@ -4951,6 +5798,7 @@ async function runBackendIntradayTraining(config = {}, runtime = {}, { recordEvi
         sampleCount: samples.length,
         newRowsSinceModel,
         minimumNewRows,
+        datasetSignature,
         reason: `waiting for ${minimumNewRows} newly completed minute samples before incremental training`,
       });
       continue;
@@ -5590,6 +6438,57 @@ async function runBackendMonitorScheduledTick() {
   return runBackendMonitorTick("interval");
 }
 
+function compactTrainingSupervisorEvent(event = {}) {
+  const evaluation = event.evaluation;
+  return {
+    id: event.id,
+    type: event.type,
+    market: event.market,
+    cycleId: event.cycleId || null,
+    attempt: event.attempt ?? null,
+    createdAt: event.createdAt || null,
+    jobId: event.jobId || null,
+    stage: event.stage || null,
+    provider: event.provider || null,
+    label: event.label || null,
+    model: event.model || null,
+    available: event.available,
+    disabled: event.disabled,
+    verdict: event.verdict || null,
+    score: event.score ?? null,
+    action: event.action || null,
+    outcome: event.outcome || null,
+    accepted: event.accepted,
+    operatorNote: compactText(event.operatorNote, 240),
+    rationale: compactText(event.rationale, 500),
+    reason: compactText(event.reason, 500),
+    error: compactText(event.error, 500),
+    blockingIssues: (event.blockingIssues || []).slice(0, 4).map((item) => compactText(item, 320)),
+    recommendedActions: (event.recommendedActions || []).slice(0, 8),
+    changes: (event.changes || []).slice(0, 12),
+    nextActionAt: event.nextActionAt || null,
+    nextCycleAt: event.nextCycleAt || null,
+    modelVersion: event.modelVersion || null,
+    dataVersion: event.dataVersion || null,
+    repeatedEvidence: event.repeatedEvidence === true,
+    evaluation: evaluation ? {
+      passed: evaluation.passed === true,
+      score: evaluation.score ?? null,
+      acceptanceLevel: evaluation.acceptanceLevel || null,
+      modelVersion: evaluation.modelVersion || null,
+      deploymentStatus: evaluation.deploymentStatus || null,
+      failedChecks: (evaluation.failedChecks || []).slice(0, 12),
+      checks: (evaluation.checks || []).map((check) => ({
+        id: check.id,
+        label: check.label,
+        passed: check.passed === true,
+        blocking: check.blocking !== false,
+      })).slice(0, 24),
+      summary: evaluation.summary || {},
+    } : null,
+  };
+}
+
 async function backendMonitorStatus(options = {}) {
   const compact = options.compact === true;
   if (compact) {
@@ -5623,7 +6522,8 @@ async function backendMonitorStatus(options = {}) {
         enabled: trainingSupervisorConfig().enabled,
         deferred: true,
         markets: {},
-        providers: trainingSupervisorProviderStatus(),
+        reviewMode: "deterministic_only",
+        aiReviewEnabled: false,
         logs: [],
         activeJobs: {},
         order_execution_enabled: false,
@@ -5705,11 +6605,9 @@ async function backendMonitorStatus(options = {}) {
     intradayModels,
     trainingSupervisor: {
       ...supervisorStatus,
-      providers: trainingSupervisorProviderStatus().map((provider) => ({
-        ...provider,
-        enabled: supervisorStatus.reviewersEnabled?.[provider.id] !== false,
-      })),
-      logs: supervisorLogs.events || [],
+      reviewMode: "deterministic_only",
+      aiReviewEnabled: false,
+      logs: (supervisorLogs.events || []).map(compactTrainingSupervisorEvent),
       activeJobs: supervisorActiveJobs,
       order_execution_enabled: false,
     },
@@ -6145,11 +7043,20 @@ function wilsonInterval(hits, total, z = 1.959963984540054) {
 function binaryMetric(rows = [], predicate) {
   const total = rows.length;
   const hits = rows.filter(predicate).length;
+  const rate = total ? hits / total * 100 : null;
+  const interval = wilsonInterval(hits, total);
+  // Keep the displayed point estimate and interval tied to the same
+  // numerator/denominator.  This also protects old cached evidence from
+  // rendering an impossible lower bound above its point estimate.
+  if (interval && rate != null) {
+    interval.low = Math.min(interval.low, Number(rate.toFixed(2)));
+    interval.high = Math.max(interval.high, Number(rate.toFixed(2)));
+  }
   return {
     hits,
     total,
-    rate: total ? hits / total * 100 : null,
-    confidenceInterval: wilsonInterval(hits, total),
+    rate,
+    confidenceInterval: interval,
   };
 }
 
@@ -7638,6 +8545,15 @@ function shouldRotateProviderKey(provider, message) {
   if (String(provider).toLowerCase() === "tiingo") {
     return /HTTP\s+(401|402|403|429)|quota|rate limit|invalid token|token.*invalid|unauthori[sz]ed|forbidden|exceeded/i.test(value);
   }
+  if (String(provider).toLowerCase() === "fred") {
+    return /HTTP\s+(400|401|403|429)|api_key|api key|quota|rate limit|invalid|unauthori[sz]ed|forbidden|exceeded/i.test(value);
+  }
+  if (String(provider).toLowerCase() === "alphavantage") {
+    return /HTTP\s+(401|402|403|429)|25 requests per day|free API requests|quota|rate limit|api key|invalid|unauthori[sz]ed|forbidden|premium/i.test(value);
+  }
+  if (String(provider).toLowerCase() === "marketaux") {
+    return /HTTP\s+(401|402|403|429)|quota|rate limit|api token|invalid|unauthori[sz]ed|forbidden|exceeded/i.test(value);
+  }
   return /HTTP\s+(401|402|403|429)|quota|rate limit|unauthori[sz]ed|forbidden|exceeded/i.test(value);
 }
 
@@ -7654,7 +8570,10 @@ async function withProviderApiKey(provider, options = {}, task) {
   const runtime = previous.day === day
     ? { ...previous, blockedUntil: { ...(previous.blockedUntil || {}) } }
     : { day, activeIndex: 0, blockedUntil: {}, lastFailoverAt: previous.lastFailoverAt || null };
-  const start = Math.max(0, Math.min(keys.length - 1, Number(runtime.activeIndex || 0)));
+  const preferredIndex = Number.isFinite(Number(options.startIndex))
+    ? Number(options.startIndex)
+    : Number(runtime.activeIndex || 0);
+  const start = ((Math.trunc(preferredIndex) % keys.length) + keys.length) % keys.length;
   const order = [...Array(keys.length).keys()].map((offset) => (start + offset) % keys.length);
   let attempted = 0;
   let lastError = null;
@@ -8671,6 +9590,43 @@ async function fetchAsxOfficialQuote(code) {
   }, "ASX");
   if (!quote) throw new Error(`ASX official quote for ${clean} had no usable price.`);
   return quote;
+}
+
+async function fetchAsxEquityStocksQuote(code) {
+  const clean = cleanCode(code, "ASX");
+  if (!clean || clean.startsWith("^")) throw new Error("ASX Equity Stocks quote requires a company symbol.");
+  const endpoint = new URL("https://migizitech.wixsite.com/asxprices/_functions/getasxprices");
+  endpoint.searchParams.set("apikey", "free");
+  endpoint.searchParams.set("symbols", clean);
+  const payload = await fetchJson(endpoint, 8_000);
+  const rows = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.data) ? payload.data
+      : Array.isArray(payload?.items) ? payload.items : [];
+  const row = rows.find((item) => cleanCode(item?.Code || item?.code || item?.Symbol || item?.symbol, "ASX") === clean)
+    || rows[0];
+  const price = Number(row?.Price ?? row?.price);
+  if (!Number.isFinite(price) || price <= 0) throw new Error(`ASX Equity Stocks returned no usable price for ${clean}.`);
+  const change = Number(row?.Chg ?? row?.change);
+  const changePercent = Number(row?.ChgPc ?? row?.changePercent);
+  return normalizeQuote({
+    symbol: clean,
+    price,
+    previousClose: Number.isFinite(change) ? price - change : null,
+    change: Number.isFinite(change) ? change : null,
+    changePercent: Number.isFinite(changePercent) ? changePercent : null,
+    volume: Number(row?.TrdVol ?? row?.volume) || null,
+    currency: "AUD",
+    exchange: "ASX",
+    asOf: null,
+    date: null,
+    retrievedAt: new Date().toISOString(),
+    timeVerified: false,
+    retrievalTimeTrusted: true,
+    source: "asx-equity-stocks-free-api",
+    delayed: true,
+    note: "Free ASX Equity Stocks snapshot; timestamp is not independently verified and is never merged into historical candles.",
+  }, "ASX");
 }
 
 function stooqQuoteSymbolForMarket(code, market = "US") {
@@ -9739,44 +10695,47 @@ function tiingoTickersForCode(code, market = "US") {
 }
 
 async function fetchFinnhubCandles(code, range, interval, market = "US") {
-  if (!process.env.FINNHUB_API_KEY) throw new Error("FINNHUB_API_KEY is required");
+  if (!providerApiKeys("finnhub").length) throw new Error("FINNHUB_API_KEY or FINNHUB_API_KEYS is required");
   const key = safeMarket(market);
   const backoffKey = `finnhub-${key.toLowerCase()}`;
-  const backoff = providerBackoffReason(backoffKey);
-  if (backoff) throw new Error(backoff);
   const symbols = finnhubSymbolsForCode(code, key);
   if (!symbols.length) throw new Error(`Finnhub does not support ${key} symbol ${code} in this adapter.`);
   const from = Math.floor(new Date(rangeStartIso(range)).getTime() / 1000);
   const to = Math.floor(Date.now() / 1000);
-  const errors = [];
-  for (const symbol of symbols) {
-    const endpoint = new URL("https://finnhub.io/api/v1/stock/candle");
-    endpoint.searchParams.set("symbol", symbol);
-    endpoint.searchParams.set("resolution", finnhubResolution(interval));
-    endpoint.searchParams.set("from", String(from));
-    endpoint.searchParams.set("to", String(to));
-    endpoint.searchParams.set("token", process.env.FINNHUB_API_KEY);
-    try {
-      const payload = await fetchJson(endpoint, 7000);
-      if (payload?.s && payload.s !== "ok") throw new Error(payload?.s === "no_data" ? "no_data" : payload?.s);
-      const candles = finnhubRows(payload, interval);
-      if (candles.length) {
-        return {
-          candles,
-          source: `finnhub-${key.toLowerCase()}${cleanCode(code, key).startsWith("^") ? "-index" : ""}-${symbol}`,
-          unit: cleanCode(code, key).startsWith("^") ? "points" : undefined,
-        };
+  return withProviderApiKey("finnhub", {
+    backoffKey,
+    backoffMs: 20 * 60 * 1000,
+    label: `Finnhub ${key}`,
+    exhaustedReason: `Finnhub ${key} key pool exhausted after quota/auth checks; using another real source if available.`,
+  }, async (apiKey) => {
+    const errors = [];
+    for (const symbol of symbols) {
+      const endpoint = new URL("https://finnhub.io/api/v1/stock/candle");
+      endpoint.searchParams.set("symbol", symbol);
+      endpoint.searchParams.set("resolution", finnhubResolution(interval));
+      endpoint.searchParams.set("from", String(from));
+      endpoint.searchParams.set("to", String(to));
+      endpoint.searchParams.set("token", apiKey);
+      try {
+        const payload = await fetchJson(endpoint, 7000);
+        if (payload?.s && payload.s !== "ok") throw new Error(payload?.s === "no_data" ? "no_data" : payload?.s);
+        const candles = finnhubRows(payload, interval);
+        if (candles.length) {
+          return {
+            candles,
+            source: `finnhub-${key.toLowerCase()}${cleanCode(code, key).startsWith("^") ? "-index" : ""}-${symbol}`,
+            unit: cleanCode(code, key).startsWith("^") ? "points" : undefined,
+          };
+        }
+        errors.push(`${symbol}: no rows`);
+      } catch (error) {
+        const message = String(error.message || error);
+        if (/429|limit|rate|token|Forbidden|unauthorized/i.test(message)) throw error;
+        errors.push(`${symbol}: ${message}`);
       }
-      errors.push(`${symbol}: no rows`);
-    } catch (error) {
-      const message = String(error.message || error);
-      if (/429|limit|rate|token|Forbidden|unauthorized/i.test(message)) {
-        backoffProvider(backoffKey, 20 * 60 * 1000, `Finnhub ${key} skipped after rate/permission error; using another real source if available.`);
-      }
-      errors.push(`${symbol}: ${message}`);
     }
-  }
-  throw new Error(errors.join(" | ") || "Finnhub returned no candles.");
+    throw new Error(errors.join(" | ") || "Finnhub returned no candles.");
+  });
 }
 
 async function fetchTiingoCandles(code, range, interval, market = "US") {
@@ -9907,33 +10866,33 @@ async function fetchEodhdCandles(code, range, interval, market = "ASX") {
 }
 
 async function fetchAlphaVantageCandles(code, range, interval, market = "US") {
-  if (!process.env.ALPHAVANTAGE_API_KEY) throw new Error("ALPHAVANTAGE_API_KEY is required");
+  if (!providerApiKeys("alphavantage").length) throw new Error("ALPHAVANTAGE_API_KEY or ALPHAVANTAGE_API_KEYS is required");
   const key = safeMarket(market);
   if (key === "ASX") throw new Error("Alpha Vantage is not configured as an ASX source in this app.");
   const backoffKey = `alphavantage-${key.toLowerCase()}`;
-  const backoff = providerBackoffReason(backoffKey);
-  if (backoff) throw new Error(backoff);
-  await throttleAlphaVantage();
-  const endpoint = new URL("https://www.alphavantage.co/query");
-  endpoint.searchParams.set("symbol", alphaVantageSymbolForCode(code, key));
-  endpoint.searchParams.set("apikey", process.env.ALPHAVANTAGE_API_KEY);
-  endpoint.searchParams.set("outputsize", range === "1mo" ? "compact" : "full");
-  if (isIntradayInterval(interval)) {
-    endpoint.searchParams.set("function", "TIME_SERIES_INTRADAY");
-    endpoint.searchParams.set("interval", { "5m": "5min", "15m": "15min", "60m": "60min" }[interval] || "60min");
-  } else {
-    endpoint.searchParams.set("function", "TIME_SERIES_DAILY_ADJUSTED");
-  }
-  const payload = await fetchJson(endpoint, 8000);
-  if (payload.Note || payload.Information) {
-    const message = payload.Note || payload.Information;
-    if (/25 requests per day|free API requests|rate limit|premium/i.test(message)) {
-      backoffProvider(backoffKey, /25 requests per day|free API requests/i.test(message) ? 12 * 60 * 60 * 1000 : 90 * 1000, `Alpha Vantage ${key} skipped after rate/daily limit; using another real source if available.`);
+  return withProviderApiKey("alphavantage", {
+    backoffKey,
+    backoffMs: 12 * 60 * 60 * 1000,
+    label: `Alpha Vantage ${key}`,
+    exhaustedReason: `Alpha Vantage ${key} key pool exhausted after quota/auth checks; using another real source if available.`,
+  }, async (apiKey) => {
+    await throttleAlphaVantage();
+    const endpoint = new URL("https://www.alphavantage.co/query");
+    endpoint.searchParams.set("symbol", alphaVantageSymbolForCode(code, key));
+    endpoint.searchParams.set("apikey", apiKey);
+    endpoint.searchParams.set("outputsize", range === "1mo" ? "compact" : "full");
+    if (isIntradayInterval(interval)) {
+      endpoint.searchParams.set("function", "TIME_SERIES_INTRADAY");
+      endpoint.searchParams.set("interval", { "5m": "5min", "15m": "15min", "60m": "60min" }[interval] || "60min");
+    } else {
+      endpoint.searchParams.set("function", "TIME_SERIES_DAILY_ADJUSTED");
     }
-    throw new Error(message);
-  }
-  const candles = alphaVantageRows(payload);
-  return { candles, source: `alphavantage-${key.toLowerCase()}` };
+    const payload = await fetchJson(endpoint, 8000);
+    if (payload.Note || payload.Information) throw new Error(payload.Note || payload.Information);
+    const candles = alphaVantageRows(payload);
+    if (!candles.length) throw new Error(`Alpha Vantage returned no candles for ${code}.`);
+    return { candles, source: `alphavantage-${key.toLowerCase()}` };
+  });
 }
 
 async function fetchYahooMarketCandles(code, range, interval, market = "ASX") {
@@ -10406,6 +11365,7 @@ function quoteCandidates(market, code) {
   return {
     ASX: [
       ["asx-official-quote", () => fetchAsxOfficialQuote(code)],
+      ["asx-equity-stocks-free-api", () => fetchAsxEquityStocksQuote(code)],
       ["stockanalysis-asx-quote", () => fetchStockAnalysisAsxQuote(code)],
       ["yahoo-asx-quote", () => fetchYahooQuote(code, key)],
       ["eodhd-asx-quote", () => fetchEodhdQuote(code, key)],
@@ -10914,7 +11874,7 @@ async function fetchSnapshotMarketCandles(symbol, range, interval, market = "ASX
   };
 }
 
-async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
+async function fetchMarketCandles(symbol, range, interval, market = "ASX", options = {}) {
   const key = safeMarket(market);
   const provider = providerForMarket(key);
   const code = cleanCode(symbol, key);
@@ -10947,8 +11907,17 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
           ? "已按数据源保护策略接受单一真实源。"
           : "Dual-source cross-check degraded to single real source.",
     });
+    const maximizeHistoricalCoverage = options?.maximizeHistoricalCoverage === true
+      && interval === "1d"
+      && ["1y", "2y", "3y", "5y", "8y", "10y", "12y", "15y"].includes(String(range));
     let limitedProviderCalls = 0;
-    const maxLimitedProviderCalls = key === "US" ? 4 : key === "ASX" ? 2 : 1;
+    // Interactive refreshes retain the low-call budget. Historical backfill is
+    // explicitly allowed to walk the configured provider pools so a partial
+    // Alpaca/Yahoo result does not prevent a longer backup history from being
+    // collected.
+    const maxLimitedProviderCalls = maximizeHistoricalCoverage
+      ? 12
+      : key === "US" ? 4 : key === "ASX" ? 2 : 1;
     const minimumCoverage = minimumProviderCoverage(range, interval);
     for (const [source, task] of candidates) {
       const skipError = providerSkipError(source);
@@ -10974,19 +11943,45 @@ async function fetchMarketCandles(symbol, range, interval, market = "ASX") {
       }
       if (successful.length >= 2 && successful.some((value) => value.candles.length >= minimumCoverage)) break;
       if (key === "CN" && successful.some((value) => value.candles.length >= minimumCoverage)) break;
-      if (
+      if (!maximizeHistoricalCoverage && (
         key === "US"
         && process.env.US_REQUIRE_DUAL_SOURCE !== "true"
         && successful.some((value) => value.candles.length >= minimumCoverage)
-      ) break;
-      if (
+      )) break;
+      if (!maximizeHistoricalCoverage && (
         key === "ASX"
         && process.env.ASX_REQUIRE_DUAL_SOURCE !== "true"
         && successful.some((value) => value.candles.length >= minimumCoverage)
-      ) break;
+      )) break;
+      if (maximizeHistoricalCoverage && successful.some((value) => value.candles.length >= candleLimitForRange(range))) break;
     }
     if (successful.length === 0) {
       throw new Error(`Market provider failure. ${errors.join(" | ")}`);
+    }
+    if (maximizeHistoricalCoverage) {
+      const coverageOrdered = [...successful].sort((a, b) => (
+        b.candles.length - a.candles.length
+        || String(latestByDate(b.candles)?.date || "").localeCompare(String(latestByDate(a.candles)?.date || ""))
+      ));
+      const primary = coverageOrdered[0];
+      const secondary = coverageOrdered[1] || null;
+      const crosscheck = secondary ? compareMarketSources(primary, secondary) : singleSourceValidation(primary, errors);
+      return remember({
+        ...primary,
+        source: `${primary.source}-longest-real-history`,
+        secondary: secondary || undefined,
+        validation: {
+          ...crosscheck,
+          status: secondary ? crosscheck.status : "real_single_source_history",
+          selectedBy: "maximum-real-candle-coverage",
+          providerCandidatesChecked: successful.map((value) => value.source),
+        },
+        warning: [
+          primary.warning,
+          `历史补齐已检查 ${successful.length} 个真实源，选择 ${primary.source} 的最长历史（${primary.candles.length} 根）。`,
+          ...compactProviderErrors(errors),
+        ].filter(Boolean).join(" "),
+      });
     }
     if (successful.length === 1) {
       const source = successful[0];
@@ -11291,7 +12286,7 @@ async function evaluateFactorLab(payload = {}, update = async () => {}, signal =
 function providerConfigured(source) {
   const name = String(source || "").toLowerCase();
   if (name.includes("alpaca")) return alpacaConfigured();
-  const pooledProviders = ["eodhd", "twelvedata", "tiingo"];
+  const pooledProviders = ["eodhd", "twelvedata", "tiingo", "fmp", "alphavantage", "marketaux", "growthwithvalue", "stockmarketapi"];
   const pooled = pooledProviders.find((marker) => name.includes(marker));
   if (pooled) return providerApiKeys(pooled).length > 0;
   const keyedProviders = [
@@ -11302,6 +12297,8 @@ function providerConfigured(source) {
     ["marketaux", "MARKETAUX_API_KEY"],
     ["simfin", "SIMFIN_API_KEY"],
     ["fmp", "FMP_API_KEY"],
+    ["growthwithvalue", "GROWTH_WITH_VALUE_API_KEY"],
+    ["stockmarketapi", "STOCKMARKETAPI_API_KEY"],
     ["openfigi", "OPENFIGI_API_KEY"],
   ];
   const keyed = keyedProviders.find(([marker]) => name.includes(marker));
@@ -11310,7 +12307,7 @@ function providerConfigured(source) {
 
 function providerCapabilityRows(candidates = []) {
   return candidates.map(([source]) => {
-    const pooled = ["eodhd", "twelvedata", "tiingo"].find((marker) => String(source).toLowerCase().includes(marker));
+    const pooled = ["eodhd", "twelvedata", "tiingo", "fmp", "alphavantage", "marketaux", "growthwithvalue", "stockmarketapi"].find((marker) => String(source).toLowerCase().includes(marker));
     const keyPool = pooled ? providerKeyPoolStatus(pooled) : null;
     return {
       source,
@@ -11344,12 +12341,18 @@ function newsProviderStatus() {
   return {
     primary: primary || "auto",
     providers: rows.map((row) => {
-      const configured = row.env ? Boolean(process.env[row.env]) : true;
+      const configured = row.name === "fred"
+        ? providerApiKeys("fred").length > 0
+        : row.name === "marketaux"
+          ? providerConfigured("marketaux")
+          : row.env ? Boolean(process.env[row.env]) : true;
       const backoff = providerBackoffReason(row.backoffKey) || providerBackoffReason(row.name) || "";
       return {
         name: row.name,
         tier: row.tier,
         configured,
+        ...(row.name === "fred" ? { keyPool: providerKeyPoolStatus("fred") } : {}),
+        ...(row.name === "marketaux" ? { keyPool: providerKeyPoolStatus("marketaux") } : {}),
         backoff,
         status: !configured ? "missing_key" : backoff ? "backoff_or_limit" : "ready",
         primary: primary === row.name,
@@ -11364,20 +12367,113 @@ function pitProviderStatus() {
     { name: "alpha-vantage-listing-status", env: "ALPHAVANTAGE_API_KEY", scope: "US active/delisted listing history", historical: true },
     { name: "simfin", env: "SIMFIN_API_KEY", scope: "US as-reported statements", historical: true },
     { name: "fmp", env: "FMP_API_KEY", scope: "US delisted and symbol-change history", historical: true },
+    { name: "fmp-asx-financials", env: "FMP_API_KEY", scope: "ASX structured financial statements (plan entitlement required)", historical: true },
     { name: "tiingo", env: "TIINGO_API_KEY", scope: "US historical dividends, splits and adjusted-price coverage", historical: true },
-    { name: "openfigi", env: "OPENFIGI_API_KEY", scope: "current identifier validation", historical: false },
+    { name: "tiingo-asx-financials", env: "TIINGO_API_KEY", scope: "ASX reported financial statements (plan entitlement required)", historical: true },
+    { name: "finnhub-asx-financials", env: "FINNHUB_API_KEY", scope: "ASX filed financial statements (plan entitlement required)", historical: true },
+    { name: "growthwithvalue-asx-financials", env: "GROWTH_WITH_VALUE_API_KEY", scope: "ASX financial statements and ratios (filing-time verification required)", historical: true },
+    { name: "stockmarketapi-ai-asx-financials", env: "STOCKMARKETAPI_API_KEY", scope: "ASX financial statements, filings and annual reports", historical: true },
+    { name: "asx-equity-stocks", env: null, scope: "ASX quote, statistics and market depth (not PIT fundamentals)", historical: false },
+    { name: "openfigi", env: null, scope: "current identifier validation (anonymous low-rate; optional key for higher quota)", historical: false },
     { name: "tushare", env: "TUSHARE_TOKEN", scope: "CN filings, listing status and corporate actions", historical: true },
     { name: "eastmoney", env: null, scope: "CN publication-dated fundamentals fallback", historical: true },
+    { name: "eastmoney-public-corporate-actions", env: null, scope: "CN public dividend, ex-date and record-date fallback", historical: true },
     { name: "baostock", env: null, scope: "CN historical adjustment factors and corporate-action coverage", historical: true },
     { name: "asx-official-announcements", env: null, scope: "ASX listing, delisting and corporate-action announcements", historical: true },
     { name: "asx-official-financial-disclosures", env: null, scope: "ASX dated annual, half-year and quarterly financial-report disclosures (event evidence, not reconstructed numeric statements)", historical: true },
+    { name: "asx-official-reports-archive", env: null, scope: "ASX official reports archive and report publication metadata", historical: true },
     { name: "fred-alfred", env: "FRED_API_KEY", scope: "macro initial-release vintages", historical: true },
+    { name: "cninfo-official-disclosure", env: null, scope: "CN official publication-dated announcements and reports", historical: true },
+    { name: "sse-szse-official-disclosure", env: null, scope: "CN exchange disclosure companion source", historical: true },
+    { name: "rba-official", env: null, scope: "Australian policy releases and speeches", historical: true },
+    { name: "gdelt-event-pit", env: null, scope: "global timestamped news/event Shadow features", historical: false },
+    { name: "bls-public-api-shadow", env: null, scope: "US macro series without complete vintage history", historical: false },
+    { name: "abs-sdmx", env: "ABS_SDMX_ENABLED", scope: "Australian macro SDMX source", historical: false },
   ];
   return rows.map((row) => ({
     ...row,
-    configured: row.env ? Boolean(process.env[row.env]) : true,
-    status: row.env && !process.env[row.env] ? "missing_key" : "ready",
+    configured: row.name === "fmp" || row.name === "fmp-asx-financials"
+      ? providerConfigured("fmp")
+      : row.name === "fred-alfred"
+        ? providerApiKeys("fred").length > 0
+      : row.name === "alpha-vantage-listing-status"
+        ? providerConfigured("alphavantage")
+        : row.name === "tiingo-asx-financials"
+          ? providerConfigured("tiingo")
+          : row.name === "finnhub-asx-financials"
+            ? providerConfigured("finnhub")
+            : row.name === "growthwithvalue-asx-financials"
+              ? providerConfigured("growthwithvalue")
+              : row.name === "stockmarketapi-ai-asx-financials"
+                ? providerConfigured("stockmarketapi")
+          : row.name === "abs-sdmx"
+          ? String(process.env.ABS_SDMX_ENABLED || "true").toLowerCase() !== "false"
+          : row.env ? Boolean(process.env[row.env]) : true,
+    keyPool: row.name === "fmp" || row.name === "fmp-asx-financials"
+      ? providerKeyPoolStatus("fmp")
+      : row.name === "fred-alfred"
+        ? providerKeyPoolStatus("fred")
+      : row.name === "alpha-vantage-listing-status"
+        ? providerKeyPoolStatus("alphavantage")
+        : row.name === "tiingo-asx-financials"
+          ? providerKeyPoolStatus("tiingo")
+          : row.name === "finnhub-asx-financials"
+            ? providerKeyPoolStatus("finnhub")
+            : row.name === "growthwithvalue-asx-financials"
+              ? providerKeyPoolStatus("growthwithvalue")
+              : row.name === "stockmarketapi-ai-asx-financials"
+                ? providerKeyPoolStatus("stockmarketapi")
+        : null,
+    status: row.name === "fmp" || row.name === "fmp-asx-financials"
+      ? (providerConfigured("fmp") ? "ready" : "missing_key")
+      : row.name === "fred-alfred"
+        ? (providerApiKeys("fred").length > 0 ? "ready" : "missing_key")
+      : row.name === "alpha-vantage-listing-status"
+        ? (providerConfigured("alphavantage") ? "ready" : "missing_key")
+        : row.name === "tiingo-asx-financials"
+          ? (providerConfigured("tiingo") ? "ready" : "missing_key")
+          : row.name === "finnhub-asx-financials"
+            ? (providerConfigured("finnhub") ? "ready" : "missing_key")
+            : row.name === "growthwithvalue-asx-financials"
+              ? (providerConfigured("growthwithvalue") ? "ready" : "missing_key")
+              : row.name === "stockmarketapi-ai-asx-financials"
+                ? (providerConfigured("stockmarketapi") ? "ready" : "missing_key")
+        : row.name === "abs-sdmx"
+          ? (String(process.env.ABS_SDMX_ENABLED || "true").toLowerCase() === "false" ? "disabled" : "ready")
+          : row.env && !process.env[row.env] ? "missing_key" : "ready",
   }));
+}
+
+function freePitSourceStatus() {
+  const catalogRows = publicPitSourceCatalog().map((row) => ({
+    ...row,
+    status: row.name === "abn-lookup-web-services"
+      ? (String(process.env.ABN_LOOKUP_GUID || "").trim() ? "ready-shadow" : "requires-guid")
+      : row.status,
+    configured: row.name === "fred-alfred"
+      ? providerApiKeys("fred").length > 0
+      : row.name === "alpha-vantage-listing-status"
+        ? providerConfigured("alphavantage")
+        : row.name === "simfin-asreported"
+          ? Boolean(process.env.SIMFIN_API_KEY)
+          : row.name === "fmp-asx-financials"
+            ? providerConfigured("fmp")
+            : row.name === "tiingo-asx-financials"
+              ? providerConfigured("tiingo")
+              : row.name === "finnhub-asx-financials"
+            ? providerConfigured("finnhub")
+          : row.name === "growthwithvalue-asx-financials"
+            ? providerConfigured("growthwithvalue")
+            : row.name === "stockmarketapi-ai-asx-financials"
+              ? providerConfigured("stockmarketapi")
+          : true,
+    note: row.pit === "not-pit"
+      ? "仅供报价/订单簿或执行研究；不属于PIT基本面，不能进入正式OOF。"
+      : row.pit === "shadow-only" || row.pit === "event-timestamp" || String(row.pit || "").startsWith("shadow-")
+      ? "页面和Shadow研究可用；未经历史版本验证，不进入正式OOF。"
+      : "可进入PIT数据湖，但仍需保留原始响应、时间戳和版本。",
+  }));
+  return [...publicIdentitySourceStatus(process.env), ...catalogRows];
 }
 
 async function dataCapabilities(market = "ASX", symbol = "") {
@@ -11819,26 +12915,34 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all", options = {
   };
 
   const fetchMarketaux = async () => {
-    if (!process.env.MARKETAUX_API_KEY) return { source: "marketaux-disabled", news: [] };
-    const endpoint = new URL("https://api.marketaux.com/v1/news/all");
-    endpoint.searchParams.set("api_token", process.env.MARKETAUX_API_KEY);
-    endpoint.searchParams.set("language", "en");
-    endpoint.searchParams.set("filter_entities", "true");
-    endpoint.searchParams.set("limit", "10");
-    if (key === "US" && safeScope !== "macro" && code) endpoint.searchParams.set("symbols", code);
-    else endpoint.searchParams.set("search", impactQueries.slice(0, 2).map((item) => item.query).join(" OR "));
-    const payload = await fetchJson(endpoint, 4000);
-    return {
-      source: "marketaux",
-      news: addNewsMeta((payload.data || []).map((item) => ({
-        title: item.title,
-        publisher: item.source,
-        link: item.url,
-        publishedAt: item.published_at,
-        description: item.description || item.snippet,
-        channel: safeScope === "macro" ? "macro-global" : "direct-stock",
-      })), "marketaux", safeScope === "macro" ? "macro-global" : "direct-stock", key, code),
-    };
+    if (!providerApiKeys("marketaux").length) return { source: "marketaux-disabled", news: [] };
+    return withProviderApiKey("marketaux", {
+      backoffKey: "marketaux-news",
+      runtimeKey: "marketaux-news",
+      backoffMs: 60 * 60 * 1000,
+      label: "MarketAux news",
+      exhaustedReason: "MarketAux key pool exhausted after quota/auth checks; using another real news source if available.",
+    }, async (apiKey) => {
+      const endpoint = new URL("https://api.marketaux.com/v1/news/all");
+      endpoint.searchParams.set("api_token", apiKey);
+      endpoint.searchParams.set("language", "en");
+      endpoint.searchParams.set("filter_entities", "true");
+      endpoint.searchParams.set("limit", "10");
+      if (key === "US" && safeScope !== "macro" && code) endpoint.searchParams.set("symbols", code);
+      else endpoint.searchParams.set("search", impactQueries.slice(0, 2).map((item) => item.query).join(" OR "));
+      const payload = await fetchJson(endpoint, 4000);
+      return {
+        source: "marketaux",
+        news: addNewsMeta((payload.data || []).map((item) => ({
+          title: item.title,
+          publisher: item.source,
+          link: item.url,
+          publishedAt: item.published_at,
+          description: item.description || item.snippet,
+          channel: safeScope === "macro" ? "macro-global" : "direct-stock",
+        })), "marketaux", safeScope === "macro" ? "macro-global" : "direct-stock", key, code),
+      };
+    });
   };
 
   const fetchEastmoney = async () => {
@@ -11881,7 +12985,7 @@ async function fetchNewsItems(symbol, market = "ASX", scope = "all", options = {
     key === "CN" ? "tianapi" : key === "US" ? "marketaux" : "newsapi"
   )).toLowerCase();
   const limitedNewsTasks = [
-    { name: "marketaux", configured: Boolean(process.env.MARKETAUX_API_KEY), task: fetchMarketaux },
+    { name: "marketaux", configured: providerConfigured("marketaux"), task: fetchMarketaux },
     { name: "newsapi", configured: Boolean(process.env.NEWSAPI_KEY), task: fetchNewsApi },
     { name: "newsdata", configured: Boolean(process.env.NEWSDATA_API_KEY), task: fetchNewsData },
     { name: "thenewsapi", configured: Boolean(process.env.THENEWSAPI_KEY), task: fetchTheNewsApi },
@@ -12015,7 +13119,24 @@ async function fetchFundamentals(symbol, market = "ASX") {
   if (!providerConfigured("eodhd")) {
     if (key === "ASX") {
       try {
-        const value = await fetchStockAnalysisAsxFundamentals(symbol);
+        const historical = await fetchAsxHistoricalPit(symbol).catch((error) => ({
+          records: [],
+          source: "asx-structured-fundamentals-unavailable",
+          warnings: [error.message || String(error)],
+        }));
+        const snapshot = await fetchStockAnalysisAsxFundamentals(symbol).catch(() => ({ fundamentals: null, source: "stockanalysis-asx-fundamentals-unavailable" }));
+        const latest = historical?.records?.at(-1);
+        const historicalWarnings = historical?.warnings?.filter(Boolean).join(" | ");
+        const value = {
+          source: [historical?.source, snapshot.source].filter(Boolean).join("+") || "asx-fundamentals-unavailable",
+          historicalRecords: historical?.records || [],
+          shadowHistoricalRecords: historical?.shadowRecords || [],
+          financialDisclosures: historical?.disclosures || [],
+          fundamentals: snapshot.fundamentals || latest?.values || null,
+          warning: historical?.records?.length
+            ? historicalWarnings || null
+            : `No strict ASX historical structured fundamentals returned; current public snapshot remains Shadow-only.${historicalWarnings ? ` ${historicalWarnings}` : ""}`,
+        };
         fundamentalsResponseCache.set(cacheKey, { time: Date.now(), value });
         return value;
       } catch (error) {
@@ -12067,8 +13188,25 @@ async function fetchFundamentals(symbol, market = "ASX") {
     }
     if (key === "ASX") {
       try {
-        const fallback = await fetchStockAnalysisAsxFundamentals(symbol);
-        const value = { ...fallback, warning: `EODHD fundamentals unavailable; StockAnalysis public snapshot used. ${error.message}` };
+        const historical = await fetchAsxHistoricalPit(symbol).catch((fallbackError) => ({
+          records: [],
+          source: "asx-structured-fundamentals-unavailable",
+          warnings: [fallbackError.message || String(fallbackError)],
+        }));
+        const fallback = await fetchStockAnalysisAsxFundamentals(symbol).catch(() => ({ fundamentals: null, source: "stockanalysis-asx-fundamentals-unavailable" }));
+        const latest = historical?.records?.at(-1);
+        const historicalWarnings = historical?.warnings?.filter(Boolean).join(" | ");
+        const value = {
+          ...fallback,
+          source: [historical?.source, fallback.source].filter(Boolean).join("+") || "asx-fundamentals-unavailable",
+          historicalRecords: historical?.records || [],
+          shadowHistoricalRecords: historical?.shadowRecords || [],
+          financialDisclosures: historical?.disclosures || [],
+          fundamentals: fallback.fundamentals || latest?.values || null,
+          warning: historical?.records?.length
+            ? `EODHD unavailable; strict historical fallback used. ${historicalWarnings || ""} ${error.message}`.trim()
+            : `EODHD unavailable; StockAnalysis public snapshot remains Shadow-only. ${error.message}${historicalWarnings ? ` | ${historicalWarnings}` : ""}`,
+        };
         fundamentalsResponseCache.set(cacheKey, { time: Date.now(), value });
         return value;
       } catch (fallbackError) {
@@ -12177,6 +13315,7 @@ function asxHistoricalUniverseRecords(items = [], symbol = "") {
     const parsedAt = new Date(availableAt || "");
     const timestamp = Number.isFinite(parsedAt.getTime()) ? parsedAt.toISOString() : null;
     if (!timestamp) return [];
+    const observed = parsedAt.getTime() <= Date.now();
     return [{
       id: `${code}:${delisted ? "delisted" : "listed"}:${timestamp.slice(0, 10)}`,
       symbol: normalizeMarketSymbol(code, "ASX"),
@@ -12186,7 +13325,11 @@ function asxHistoricalUniverseRecords(items = [], symbol = "") {
       event_time: item.event_time || timestamp,
       available_at: timestamp,
       revision: "asx-official-announcement",
-      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerified: observed,
+      historicalAvailabilityUnverified: !observed,
+      historicalAvailabilityVerificationMethod: observed
+        ? "asx-official-announcement-published-time"
+        : "future-asx-announcement-timestamp-quarantined",
       sourceProvider: "asx-official-historical-announcements",
       title,
       link: item.link || null,
@@ -12207,17 +13350,21 @@ function asxHistoricalCorporateActionRecords(items = [], symbol = "", { coverage
     const parsedAt = new Date(availableAt || "");
     const timestamp = Number.isFinite(parsedAt.getTime()) ? parsedAt.toISOString() : null;
     if (!timestamp) return [];
+    const observed = parsedAt.getTime() <= Date.now();
     return [{
       id: `${code}:${eventType}:${timestamp.slice(0, 10)}:${String(item.id || item.link || title).slice(-80)}`,
       event_time: item.event_time || timestamp,
       available_at: timestamp,
-      first_seen_at: timestamp,
+      first_seen_at: observed ? timestamp : new Date().toISOString(),
       revision: "asx-official-announcement",
       eventType,
       title,
       link: item.link || null,
-      historicalAvailabilityVerified: true,
-      historicalAvailabilityVerificationMethod: "asx-official-announcement-published-time",
+      historicalAvailabilityVerified: observed,
+      historicalAvailabilityUnverified: !observed,
+      historicalAvailabilityVerificationMethod: observed
+        ? "asx-official-announcement-published-time"
+        : "future-asx-announcement-timestamp-quarantined",
       sourceProvider: "asx-official-historical-announcements",
     }];
   });
@@ -12620,19 +13767,27 @@ async function fetchFlowOptionsFactor(symbol, market = "ASX", candles = null) {
 }
 
 async function fetchFredMacroFactor() {
-  if (!process.env.FRED_API_KEY) {
+  if (!providerApiKeys("fred").length) {
     return { available: false, source: "fred-disabled", score: 0, thesis: ["FRED API key is not configured."] };
   }
   const cached = macroResponseCache.get("fred-us");
   if (cached && Date.now() - cached.time < Number(process.env.MACRO_CACHE_TTL_MS || 30 * 60 * 1000)) return cached.value;
+  const fetchFredJson = (endpoint, timeoutMs = 4500) => withProviderApiKey(
+    "fred",
+    { backoffKey: "fred", label: "FRED", keyBackoffMs: 20 * 60_000 },
+    (key) => {
+      const request = new URL(endpoint.toString());
+      request.searchParams.set("api_key", key);
+      return fetchJson(request, timeoutMs);
+    },
+  );
   const fetchSeries = async (seriesId, limit = 14) => {
     const endpoint = new URL("https://api.stlouisfed.org/fred/series/observations");
     endpoint.searchParams.set("series_id", seriesId);
-    endpoint.searchParams.set("api_key", process.env.FRED_API_KEY);
     endpoint.searchParams.set("file_type", "json");
     endpoint.searchParams.set("sort_order", "desc");
     endpoint.searchParams.set("limit", String(limit));
-    const payload = await fetchJson(endpoint, 4500);
+    const payload = await fetchFredJson(endpoint, 4500);
     return (payload.observations || [])
       .map((row) => ({ date: row.date, value: Number(row.value) }))
       .filter((row) => Number.isFinite(row.value));
@@ -12974,14 +14129,177 @@ async function writeHistoricalBacktestEvidence(market, symbol, strategy, evidenc
 }
 
 async function queueHistoricalBacktestEvidence({ market, symbol, strategy, range = "5y", reason = "evidence-precompute" }) {
+  const key = safeMarket(market);
+  const code = normalizeMarketSymbol(symbol, key);
+  const normalizedStrategy = normalizeBackendStrategy(strategy || {});
+  const requiredRows = normalizedStrategy.horizonDays <= 5 ? 260 : normalizedStrategy.horizonDays <= 15 ? 500 : 750;
+  const runtime = await readBackendMonitorRuntime().catch(() => ({}));
+  let noProgress = historyNoProgressEntryForSymbol(runtime, key, code, requiredRows);
+  if (!noProgress) {
+    // Market-level history locks predate the per-symbol lock. Reuse the
+    // matching result here too, so repeated dashboard refreshes do not create
+    // a new terminal "waiting-for-history" task while the provider is known
+    // to have returned the same shallow history.
+    const marketNoProgress = runtime.historyNoProgressByMarket?.[key] || null;
+    const lastNoProgressJob = marketNoProgress?.lastJobId
+      ? await backgroundJobs.get(marketNoProgress.lastJobId).catch(() => null)
+      : null;
+    const matchingRow = (lastNoProgressJob?.result?.results || []).find((candidate) => (
+      normalizeMarketSymbol(candidate?.symbol || "", key) === code
+    ));
+    if (matchingRow && Number(matchingRow.rows || 0) < requiredRows) {
+      noProgress = {
+        ...marketNoProgress,
+        availableRows: Number(matchingRow.rows || 0),
+        requiredRows,
+        source: matchingRow.source || "unavailable",
+        lastJobId: lastNoProgressJob.id,
+      };
+    }
+  }
+  const blockedUntil = Date.parse(String(noProgress?.blockedUntil || "")) || 0;
+  if (blockedUntil > Date.now()) {
+    return {
+      id: noProgress.lastJobId || `history-cooldown-${key}-${code}-${requiredRows}`,
+      type: "historical-backtest-symbol",
+      market: key,
+      symbol: code,
+      status: "complete",
+      progress: 1,
+      reused: true,
+      deduplicated: true,
+      blockedOnData: true,
+      blockedUntil: noProgress.blockedUntil,
+      availableRows: Number(noProgress.availableRows || 0),
+      requiredRows,
+    };
+  }
+  const recent = await backgroundJobs.list({ type: "historical-backtest-symbol", market: key, limit: 24 }).catch(() => ({ jobs: [] }));
+  const details = await Promise.all((recent.jobs || []).map((entry) => backgroundJobs.get(entry.id).catch(() => null)));
+  const sameRequest = details
+    .filter((entry) => normalizeMarketSymbol(entry?.payload?.symbol || "", key) === code)
+    .filter((entry) => {
+      const candidate = normalizeBackendStrategy(entry?.payload?.strategy || {});
+      return candidate.horizonDays === normalizedStrategy.horizonDays
+        && candidate.targetUpside === normalizedStrategy.targetUpside
+        && candidate.stopLoss === normalizedStrategy.stopLoss;
+    })
+    .sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")))
+    .find((entry) => ["queued", "running"].includes(entry.status)
+      || Date.now() - Date.parse(entry.updatedAt || entry.createdAt || 0) < 2 * 60 * 60_000);
+  if (sameRequest) return { ...sameRequest, reused: true, deduplicated: true };
   return backgroundJobs.create("historical-backtest-symbol", {
-    market: safeMarket(market),
-    symbol: normalizeMarketSymbol(symbol, market),
-    strategy,
+    market: key,
+    symbol: code,
+    strategy: normalizedStrategy,
     range,
     reason,
     maxAttempts: 2,
   }).catch(() => null);
+}
+
+async function recordHistoryNoProgressForSymbol({ market, symbol, requiredRows, availableRows, source, jobId }) {
+  const runtime = await readBackendMonitorRuntime().catch(() => ({}));
+  runtime.historyNoProgressBySymbol = runtime.historyNoProgressBySymbol || {};
+  const key = `${safeMarket(market)}:${normalizeMarketSymbol(symbol, market)}:${Number(requiredRows || 0)}`;
+  const prior = runtime.historyNoProgressBySymbol[key] || {};
+  const attempts = Number(prior.attempts || 0) + 1;
+  const baseBackoffMs = Math.max(
+    30 * 60_000,
+    Number(process.env.HISTORY_NO_PROGRESS_BACKOFF_MS || 2 * 60 * 60_000),
+  );
+  const backoffMs = Math.min(7 * 24 * 60 * 60_000, baseBackoffMs * (2 ** Math.min(5, attempts - 1)));
+  const entry = {
+    attempts,
+    lastJobId: jobId || prior.lastJobId || null,
+    lastCheckedAt: new Date().toISOString(),
+    availableRows: Number(availableRows || 0),
+    requiredRows: Number(requiredRows || 0),
+    source: source || "unavailable",
+    blockedUntil: new Date(Date.now() + backoffMs).toISOString(),
+    reason: "symbol-backfill-repeatedly-below-required-depth",
+  };
+  runtime.historyNoProgressBySymbol[key] = entry;
+  await writeBackendMonitorRuntime(runtime);
+  return entry;
+}
+
+function historyNoProgressEntryForSymbol(runtime = {}, market = "ASX", symbol = "", requiredRows = 0) {
+  const keyPrefix = `${safeMarket(market)}:${normalizeMarketSymbol(symbol, market)}:`;
+  const minimumRows = Number(requiredRows || 0);
+  return Object.entries(runtime.historyNoProgressBySymbol || {})
+    .filter(([key, entry]) => key.startsWith(keyPrefix)
+      && Number(entry?.requiredRows || key.slice(keyPrefix.length) || 0) >= minimumRows
+      && (Date.parse(String(entry?.blockedUntil || "")) || 0) > Date.now())
+    .sort((left, right) => Number(left[1]?.requiredRows || 0) - Number(right[1]?.requiredRows || 0))[0]?.[1] || null;
+}
+
+async function continueHistoricalBacktestAfterHistoryBackfill(job) {
+  if (job?.status !== "complete" || job?.type !== "history-backfill") return null;
+  const followUp = job.payload?.followUpHistoricalBacktest;
+  if (!followUp?.market || !followUp?.symbol || !followUp?.strategy) return null;
+  const market = safeMarket(followUp.market);
+  const symbol = normalizeMarketSymbol(followUp.symbol, market);
+  const strategy = normalizeBackendStrategy(followUp.strategy);
+  const requiredRows = strategy.horizonDays <= 5 ? 260 : strategy.horizonDays <= 15 ? 500 : 750;
+  const runtime = await readBackendMonitorRuntime().catch(() => ({}));
+  const resultRows = Array.isArray(job.result?.results) ? job.result.results : [];
+  const row = resultRows.find((candidate) => normalizeMarketSymbol(candidate?.symbol || "", market) === symbol);
+  const candidateNoProgress = historyNoProgressEntryForSymbol(runtime, market, symbol, requiredRows);
+  const symbolNoProgress = candidateNoProgress
+    && Number(row?.rows || 0) <= Number(candidateNoProgress.availableRows || 0)
+    ? candidateNoProgress
+    : null;
+  const symbolBlockedUntil = Date.parse(String(symbolNoProgress?.blockedUntil || "")) || 0;
+  if (symbolBlockedUntil > Date.now()) {
+    runtimeEvents.publish("historical_backtest.follow_up_suppressed", {
+      market,
+      symbol,
+      historyJobId: job.id,
+      requiredRows,
+      blockedUntil: new Date(symbolBlockedUntil).toISOString(),
+      reason: "symbol-history-no-progress-cooldown",
+    });
+    return null;
+  }
+  if (!row || Number(row.rows || 0) < requiredRows) {
+    const noProgress = await recordHistoryNoProgressForSymbol({
+      market,
+      symbol,
+      requiredRows,
+      availableRows: Number(row?.rows || 0),
+      source: row?.source || "unavailable",
+      jobId: job.id,
+    }).catch(() => null);
+    runtimeEvents.publish("historical_backtest.waiting_for_history", {
+      market,
+      symbol,
+      jobId: job.id,
+      availableRows: Number(row?.rows || 0),
+      requiredRows,
+      source: row?.source || "unavailable",
+      reason: "history-backfill-complete-but-required-depth-not-reached",
+      blockedUntil: noProgress?.blockedUntil || null,
+    });
+    return null;
+  }
+  const next = await queueHistoricalBacktestEvidence({
+    market,
+    symbol,
+    strategy,
+    range: followUp.range || ({ ASX: "10y", US: "10y", CN: "8y" }[market] || "10y"),
+    reason: followUp.reason || "history-backfill-complete",
+  });
+  if (next) {
+    runtimeEvents.publish("historical_backtest.follow_up_queued", {
+      market,
+      symbol,
+      historyJobId: job.id,
+      jobId: next.id,
+      requiredRows,
+    });
+  }
+  return next;
 }
 
 function historicalBacktestFactor(result) {
@@ -13162,7 +14480,7 @@ async function fetchBacktestCandlesForSymbol(symbol, market, range = "5y") {
   const key = safeMarket(market);
   const code = normalizeMarketSymbol(symbol, key);
   try {
-    const data = await fetchMarketCandles(code, range, "1d", key);
+    const data = await fetchMarketCandles(code, range, "1d", key, { maximizeHistoricalCoverage: true });
     return { symbol: code, market: key, candles: data.candles || [], source: data.source || "market-data", warning: data.warning || "" };
   } catch (marketError) {
     const fallback = await fetchSnapshotMarketCandles(code, range, "1d", key, marketError)
@@ -13227,9 +14545,60 @@ async function crossSectionalFactorResearchForItems({ market = "ASX", items = []
 
 async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy = {}, range = "", limit, largeSample = true, productionTraining = false, trainingOptions = {}, progress = null, signal = null, trainingRunId = null, resume = false } = {}) {
   const key = safeMarket(market);
+  const trainingLane = String(trainingOptions.trainingLane || trainingOptions.training_lane || "strict_production").trim().toLowerCase();
+  const researchLanes = new Set(["core_research", "sparse_expert", "transfer_research", "prequential_shadow"]);
+  const strictGate03Approved = trainingOptions.strictGate03Approved === true
+    || trainingOptions.strict_gate03_approved === true
+    || trainingOptions.gate03NextPhasePermitted === true;
+  const experimentId = String(trainingOptions.experimentId || trainingOptions.experiment_id || "").trim();
+  const hypothesisId = String(trainingOptions.hypothesisId || trainingOptions.hypothesis_id || "").trim();
+  if (productionTraining === true && trainingLane === "strict_production" && !strictGate03Approved) {
+    return {
+      framework: "strict-market-oof-training",
+      market: key,
+      available: false,
+      status: "BLOCKED_GATE03",
+      trainingStatus: "BLOCKED_GATE03",
+      trainingLane,
+      evidenceTier: "D4",
+      evidenceType: "strict_production",
+      productionTraining: {
+        available: false,
+        status: "BLOCKED_GATE03",
+        trainingStatus: "BLOCKED_GATE03",
+        trainingLane,
+        evidenceTier: "D4",
+        evidenceType: "strict_production",
+        promotionEligible: false,
+        reason: "strict_production_blocked_by_gate03",
+        productionEligibility: {
+          eligible: false,
+          autoPromotionAllowed: false,
+          championUpdateAllowed: false,
+          longTradeGateAllowed: false,
+          reason: "strict_production_blocked_by_gate03",
+        },
+      },
+      generatedAt: new Date().toISOString(),
+    };
+  }
+  if (productionTraining === true && researchLanes.has(trainingLane) && (!experimentId || !hypothesisId)) {
+    return {
+      framework: "research-market-oof-training",
+      market: key,
+      available: false,
+      status: "REJECTED_RESEARCH_REQUEST",
+      trainingStatus: "REJECTED",
+      trainingLane,
+      evidenceTier: trainingLane === "prequential_shadow" ? "D3" : "D1",
+      evidenceType: trainingLane === "prequential_shadow" ? "prequential_shadow" : "restricted_oof",
+      reason: "research_requires_experiment_and_hypothesis_id",
+      generatedAt: new Date().toISOString(),
+    };
+  }
   const resolvedRange = range || process.env[`HISTORICAL_BACKTEST_RANGE_${key}`] || process.env.HISTORICAL_BACKTEST_RANGE || ({ US: "10y", ASX: "10y", CN: "8y" }[key] || "10y");
   if (productionTraining === true && resume === true) {
-    const resumeHorizons = numberListEnv(process.env.PRODUCTION_MODEL_HORIZONS, [5])
+    const resumeHorizons = (researchLanes.has(trainingLane) ? [10, 20] : numberListEnv(process.env.PRODUCTION_MODEL_HORIZONS, [5]))
       .map((value) => Math.max(1, Math.round(Number(value || 5))))
       .filter((value, index, rows) => rows.indexOf(value) === index)
       .slice(0, 3);
@@ -13245,18 +14614,28 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
       production_embargo_days: Number(trainingOptions.embargoDays ?? process.env.PRODUCTION_MODEL_EMBARGO_DAYS ?? 7),
       production_min_train_dates: Number(trainingOptions.minTrainDates ?? process.env.PRODUCTION_MODEL_MIN_TRAIN_DATES ?? 500),
       production_test_dates: Number(trainingOptions.testDates ?? process.env.PRODUCTION_MODEL_TEST_DATES ?? 120),
-      enable_tree_models: process.env.PRODUCTION_MODEL_TREE_ENABLED !== "false",
-      enable_sklearn_models: process.env.PRODUCTION_SKLEARN_ENABLED !== "false",
+      enable_tree_models: trainingOptions.enableTreeModels !== undefined
+        ? trainingOptions.enableTreeModels === true
+        : process.env.PRODUCTION_MODEL_TREE_ENABLED !== "false",
+      enable_sklearn_models: trainingOptions.enableSklearnModels !== undefined
+        ? trainingOptions.enableSklearnModels === true
+        : process.env.PRODUCTION_SKLEARN_ENABLED !== "false",
       max_model_weight: Number(trainingOptions.maxModelWeight ?? process.env.PRODUCTION_MODEL_MAX_WEIGHT ?? 0.35),
       max_residual_correlation: Number(trainingOptions.maxResidualCorrelation ?? process.env.PRODUCTION_MODEL_MAX_RESIDUAL_CORRELATION ?? 0.8),
+      expert_residual_correlation: Number(trainingOptions.expertResidualCorrelation ?? process.env.PRODUCTION_MODEL_EXPERT_RESIDUAL_CORRELATION ?? 0.65),
       tree_max_rows: Number(trainingOptions.treeMaxRows ?? process.env.PRODUCTION_TREE_MAX_ROWS ?? 40_000),
       tree_iterations: Number(trainingOptions.treeIterations ?? process.env.PRODUCTION_TREE_ITERATIONS ?? 72),
       tree_threads: Number(trainingOptions.treeThreads ?? process.env.PRODUCTION_TREE_THREADS ?? 2),
       tree_class_balance: String(trainingOptions.treeClassBalance ?? process.env.PRODUCTION_TREE_CLASS_BALANCE ?? "SqrtBalanced"),
       baseline_max_rows: Number(trainingOptions.baselineMaxRows ?? process.env.PRODUCTION_BASELINE_MAX_ROWS ?? 6_000),
       quantile_max_rows: Number(trainingOptions.quantileMaxRows ?? process.env.PRODUCTION_QUANTILE_MAX_ROWS ?? 6_000),
+      // Outer OOF must see the complete date x symbol panel. Model fitting
+      // remains bounded by tree/baseline row caps inside the Python worker.
+      panel_max_symbols: Number(trainingOptions.panelMaxSymbols ?? process.env.PRODUCTION_PANEL_MAX_SYMBOLS_PER_DATE ?? 0),
+      panel_date_stride: Number(trainingOptions.panelDateStride ?? process.env.PRODUCTION_PANEL_DATE_STRIDE ?? 1),
       artifact_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
       checkpoint_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
+      progress_path: join(snapshotBasePath, "models", "oof", key.toLowerCase(), "runtime-progress.json"),
       training_run_id: trainingRunId,
       resume_latest_dataset: true,
       resume_min_symbols: Math.max(50, Math.floor(Math.min(
@@ -13265,6 +14644,14 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
       ) * 0.8)),
       resume_min_dates: 500,
       resume_require_pit_version: true,
+      training_lane: trainingLane,
+      experiment_id: experimentId || null,
+      hypothesis_id: hypothesisId || null,
+      experimentId: experimentId || null,
+      hypothesisId: hypothesisId || null,
+      changed_hypotheses: trainingOptions.changedHypotheses || trainingOptions.changed_hypotheses || trainingOptions.changedHypothesis || null,
+      changedHypotheses: trainingOptions.changedHypotheses || trainingOptions.changed_hypotheses || trainingOptions.changedHypothesis || null,
+      strict_gate03_approved: strictGate03Approved,
     }, Number(process.env.PRODUCTION_MODEL_TIMEOUT_MS || 60 * 60 * 1000), { signal });
     if (resumedModel?.available && Number(resumedModel?.dataset?.rawRows || 0) > 0) {
       if (typeof progress === "function") await progress(0.86, { phase: "feature-matrix-checkpoint-restored" });
@@ -13400,7 +14787,9 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     strategyHorizon,
     Math.max(30, strategyHorizon >= 25 ? strategyHorizon : 30),
   ].map((value) => Math.max(1, Math.round(Number(value || 15)))))].slice(0, 4);
-  const productionHorizons = numberListEnv(process.env.PRODUCTION_MODEL_HORIZONS, [5])
+  const productionHorizons = researchLanes.has(trainingLane)
+    ? [10, 20]
+    : numberListEnv(process.env.PRODUCTION_MODEL_HORIZONS, [5])
     .map((value) => Math.max(1, Math.round(Number(value || 5))))
     .filter((value, index, rows) => rows.indexOf(value) === index)
     .slice(0, 3);
@@ -13428,23 +14817,46 @@ async function historicalBacktestBatch({ market = "ASX", symbols = [], strategy 
     production_embargo_days: Number(trainingOptions.embargoDays ?? process.env.PRODUCTION_MODEL_EMBARGO_DAYS ?? 7),
     production_min_train_dates: Number(trainingOptions.minTrainDates ?? process.env.PRODUCTION_MODEL_MIN_TRAIN_DATES ?? 500),
     production_test_dates: Number(trainingOptions.testDates ?? process.env.PRODUCTION_MODEL_TEST_DATES ?? 120),
-    enable_tree_models: process.env.PRODUCTION_MODEL_TREE_ENABLED !== "false",
-    enable_sklearn_models: process.env.PRODUCTION_SKLEARN_ENABLED !== "false",
+    enable_tree_models: trainingOptions.enableTreeModels !== undefined
+      ? trainingOptions.enableTreeModels === true
+      : process.env.PRODUCTION_MODEL_TREE_ENABLED !== "false",
+    enable_sklearn_models: trainingOptions.enableSklearnModels !== undefined
+      ? trainingOptions.enableSklearnModels === true
+      : process.env.PRODUCTION_SKLEARN_ENABLED !== "false",
     max_model_weight: Number(trainingOptions.maxModelWeight ?? process.env.PRODUCTION_MODEL_MAX_WEIGHT ?? 0.35),
     max_residual_correlation: Number(trainingOptions.maxResidualCorrelation ?? process.env.PRODUCTION_MODEL_MAX_RESIDUAL_CORRELATION ?? 0.8),
+    expert_residual_correlation: Number(trainingOptions.expertResidualCorrelation ?? process.env.PRODUCTION_MODEL_EXPERT_RESIDUAL_CORRELATION ?? 0.65),
     tree_max_rows: Number(trainingOptions.treeMaxRows ?? process.env.PRODUCTION_TREE_MAX_ROWS ?? 40_000),
     tree_iterations: Number(trainingOptions.treeIterations ?? process.env.PRODUCTION_TREE_ITERATIONS ?? 72),
     tree_threads: Number(trainingOptions.treeThreads ?? process.env.PRODUCTION_TREE_THREADS ?? 2),
     tree_class_balance: String(trainingOptions.treeClassBalance ?? process.env.PRODUCTION_TREE_CLASS_BALANCE ?? "SqrtBalanced"),
     baseline_max_rows: Number(trainingOptions.baselineMaxRows ?? process.env.PRODUCTION_BASELINE_MAX_ROWS ?? 6_000),
     quantile_max_rows: Number(trainingOptions.quantileMaxRows ?? process.env.PRODUCTION_QUANTILE_MAX_ROWS ?? 6_000),
+    label_tournament_max_rows: Number(trainingOptions.labelTournamentMaxRows ?? process.env.PRODUCTION_LABEL_TOURNAMENT_MAX_ROWS ?? 2_000),
+    label_tournament_epochs: Number(trainingOptions.labelTournamentEpochs ?? process.env.PRODUCTION_LABEL_TOURNAMENT_EPOCHS ?? 8),
+    // Outer OOF must see the complete date x symbol panel. Model fitting
+    // remains bounded by tree/baseline row caps inside the Python worker.
+    panel_max_symbols: Number(trainingOptions.panelMaxSymbols ?? process.env.PRODUCTION_PANEL_MAX_SYMBOLS_PER_DATE ?? 0),
+    panel_date_stride: Number(trainingOptions.panelDateStride ?? process.env.PRODUCTION_PANEL_DATE_STRIDE ?? 1),
     artifact_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
     checkpoint_dir: join(snapshotBasePath, "models", "oof", key.toLowerCase()),
+    progress_path: join(snapshotBasePath, "models", "oof", key.toLowerCase(), "runtime-progress.json"),
     market_point_in_time_features: pitPanel.marketPointInTimeFeatures || [],
     load_pit_from_data_lake: productionTraining === true,
     data_lake_root: join(snapshotBasePath, "data-lake"),
     pit_rows_per_symbol: Number(process.env.PRODUCTION_MODEL_PIT_ROWS_PER_SYMBOL || 600),
     training_run_id: trainingRunId,
+    job_type: String(trainingOptions.jobType || "model_experiment"),
+    changed_hypothesis: trainingOptions.changedHypothesis || null,
+    changed_hypotheses: trainingOptions.changedHypotheses || trainingOptions.changed_hypotheses || trainingOptions.changedHypothesis || null,
+    training_lane: trainingLane,
+    trainingLane,
+    experiment_id: experimentId || null,
+    experimentId: experimentId || null,
+    hypothesis_id: hypothesisId || null,
+    hypothesisId: hypothesisId || null,
+    strict_gate03_approved: strictGate03Approved,
+    strictGate03Approved,
   };
   let productionModel = null;
   if (productionTraining === true) {
@@ -13620,6 +15032,32 @@ async function readFactorEvolutionSchedulerState() {
   } catch {
     return {};
   }
+}
+
+function readFactorEvolutionSchedulerStateFast() {
+  try {
+    const payload = JSON.parse(readFileSync(factorEvolutionSchedulerPath(), "utf8"));
+    return payload && typeof payload === "object" ? payload : {};
+  } catch {
+    return {};
+  }
+}
+
+// Factor evolution is only meaningful when the research input changed.  The
+// scheduler used to look at elapsed time alone, so a restart could enqueue the
+// same panel repeatedly and consume provider/CPU budget without adding
+// evidence.  Replenishment snapshots already carry the stable training
+// signature used by the OOF pipeline; reuse it here rather than hashing the
+// volatile snapshot timestamp.
+async function factorEvolutionInputSignatures(markets = []) {
+  const entries = await Promise.all([...new Set(markets.map(safeMarket))].map(async (market) => {
+    const stored = await readPersistedDataReplenishmentSnapshot(market).catch(() => null);
+    const signature = stored?.snapshot
+      ? dataReplenishmentTrainingSignature(stored.snapshot)
+      : null;
+    return [market, signature || "missing:data-replenishment-snapshot"];
+  }));
+  return Object.fromEntries(entries);
 }
 
 async function writeFactorEvolutionSchedulerState(patch = {}) {
@@ -13799,6 +15237,9 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
   }
   const runMode = mode === "heavy" ? "heavy" : "light";
   const cycleMarkets = options.market ? [safeMarket(options.market)] : config.markets;
+  const inputSignatures = options.inputSignatures || {
+    ...(await factorEvolutionInputSignatures(cycleMarkets)),
+  };
   factorEvolutionScheduler.running = true;
   factorEvolutionScheduler.activeMode = runMode;
   factorEvolutionScheduler.lastStartedAt = new Date().toISOString();
@@ -13888,6 +15329,7 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
       mode: runMode,
       startedAt: factorEvolutionScheduler.lastStartedAt,
       finishedAt,
+      inputSignatures,
       markets: marketResults,
       config: {
         markets: cycleMarkets,
@@ -13901,9 +15343,14 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
     };
     factorEvolutionScheduler.lastFinishedAt = finishedAt;
     factorEvolutionScheduler.lastResult = summary;
+    const previousState = await readFactorEvolutionSchedulerState();
     await writeFactorEvolutionSchedulerState({
       runningMode: "",
       [`${runMode}LastFinishedAt`]: finishedAt,
+      lastInputSignaturesByMarket: {
+        ...(previousState.lastInputSignaturesByMarket || {}),
+        ...inputSignatures,
+      },
       lastResult: summary,
       lastError: "",
     });
@@ -13925,7 +15372,10 @@ async function runFactorEvolutionCycle(mode = "light", options = {}) {
 
 async function factorEvolutionSchedulerStatus() {
   const config = factorEvolutionConfig();
-  const state = await readFactorEvolutionSchedulerState();
+  // This endpoint is polled by the UI and only needs the small scheduler
+  // state file.  Avoid putting a status request behind asynchronous disk work
+  // while a large research artifact is being written.
+  const state = readFactorEvolutionSchedulerStateFast();
   return {
     enabled: config.enabled,
     running: factorEvolutionScheduler.running,
@@ -13962,22 +15412,54 @@ async function tickFactorEvolutionScheduler(reason = "timer") {
   const config = factorEvolutionConfig();
   if (!config.enabled || factorEvolutionScheduler.running) return;
   const state = await readFactorEvolutionSchedulerState();
+  const inputSignatures = await factorEvolutionInputSignatures(config.markets);
+  let previousInputSignatures = state.lastAttemptInputSignaturesByMarket
+    || state.lastInputSignaturesByMarket
+    || {};
+  // Migrate the pre-signature scheduler state once.  If a recent factor job
+  // already attempted the current data, remember that attempt instead of
+  // scheduling the same panel again after the next restart.
+  if (!Object.keys(previousInputSignatures).length && (state.lightLastStartedAt || state.heavyLastStartedAt)) {
+    const referenceTime = Math.max(
+      Date.parse(state.lightLastStartedAt || "") || 0,
+      Date.parse(state.heavyLastStartedAt || "") || 0,
+    );
+    const recentAttempts = evidenceRegistry.backgroundJobs({ type: "factor-evolution", limit: 48 }).jobs || [];
+    const hasRecentAttempt = recentAttempts.some((job) => {
+      const updatedAt = Date.parse(job.updatedAt || job.createdAt || "") || 0;
+      return updatedAt >= referenceTime && ["queued", "running", "complete", "failed", "cancelled", "deferred"].includes(job.status);
+    });
+    if (hasRecentAttempt) {
+      previousInputSignatures = { ...inputSignatures };
+      await writeFactorEvolutionSchedulerState({ lastAttemptInputSignaturesByMarket: previousInputSignatures }).catch(() => null);
+    }
+  }
+  const inputChanged = (market) => previousInputSignatures[market] !== inputSignatures[market];
   const heavyDue = isFactorEvolutionDue(state, "heavy", config.heavyIntervalMs, {
     requirePreviousRun: process.env.FACTOR_EVOLUTION_RUN_HEAVY_ON_FIRST_START !== "true",
   });
   const lightDue = isFactorEvolutionDue(state, "light", config.lightIntervalMs);
-  if (!heavyDue && !lightDue) return;
+  if ((!heavyDue && !lightDue) || !config.markets.some(inputChanged)) return;
   const mode = heavyDue ? "heavy" : "light";
   console.log(`Factor evolution scheduler queued ${mode} cycle (${reason}).`);
-  return Promise.all(config.markets.map((market) => backgroundJobs.create("factor-evolution", {
+  const scheduledMarkets = config.markets.filter(inputChanged);
+  const jobs = await Promise.all(scheduledMarkets.map((market) => backgroundJobs.create("factor-evolution", {
     market,
     mode,
     reason,
+    inputSignature: inputSignatures[market],
     resourceProfile: trainingResources.current().selected,
     limit: mode === "heavy" ? config.heavySymbolLimit : config.lightSymbolLimit,
     generations: config.lightGenerations,
     population: config.lightPopulation,
   })));
+  await writeFactorEvolutionSchedulerState({
+    lastAttemptInputSignaturesByMarket: {
+      ...(state.lastAttemptInputSignaturesByMarket || state.lastInputSignaturesByMarket || {}),
+      ...Object.fromEntries(scheduledMarkets.map((market) => [market, inputSignatures[market]])),
+    },
+  }).catch(() => null);
+  return jobs;
 }
 
 function marketRegimeFactor(candles) {
@@ -16740,19 +18222,6 @@ function aiProviderStatus() {
   }));
 }
 
-function trainingSupervisorProviderStatus() {
-  const active = new Map(aiProviderStatus().map((provider) => [provider.id, provider]));
-  return [
-    { id: "openai", label: "OpenAI", model: process.env.OPENAI_MODEL || "gpt-4.1-mini", configured: Boolean(process.env.OPENAI_API_KEY) },
-    { id: "siliconflow", label: "硅基流动", model: process.env.SILICONFLOW_MODEL || "deepseek-ai/DeepSeek-V3.2", configured: Boolean(process.env.SILICONFLOW_API_KEY) },
-    { id: "hunyuan", label: "腾讯混元", model: process.env.HUNYUAN_MODEL || process.env.TENCENT_HUNYUAN_MODEL || "deepseek-v3.2", configured: Boolean(process.env.HUNYUAN_API_KEY || process.env.TENCENT_HUNYUAN_API_KEY) },
-  ].map((provider) => ({
-    ...provider,
-    active: active.has(provider.id),
-    role: TRAINING_REVIEWER_ROLES[provider.id] || "独立训练审核",
-  }));
-}
-
 function trainingSupervisorConfig() {
   const configuredMarkets = envList("TRAINING_SUPERVISOR_MARKETS")
     .map((market) => String(market || "").toUpperCase())
@@ -16760,18 +18229,19 @@ function trainingSupervisorConfig() {
   return {
     enabled: envFlag("TRAINING_SUPERVISOR_ENABLED", true),
     // Weekly/monthly learning schedules decide when new evidence warrants a
-    // training cycle. The supervisor must not refit unchanged data every few
-    // hours merely because a reviewer is out of quota.
+    // training cycle. The controller must not refit unchanged data repeatedly.
     autoCycleEnabled: envFlag("TRAINING_SUPERVISOR_AUTOCYCLE_ENABLED", false),
+    // D0-D5 freezes identical automatic retries. Operators can still launch
+    // a changed plan explicitly from the training control surface.
+    autoReworkEnabled: envFlag("TRAINING_SUPERVISOR_AUTOREWORK_ENABLED", false),
     markets: configuredMarkets.length ? [...new Set(configuredMarkets)] : ["ASX", "US", "CN"],
     maxAttempts: Math.max(1, Math.min(8, Number(process.env.TRAINING_SUPERVISOR_MAX_ATTEMPTS || 3))),
     cadenceMs: Math.max(60_000, Number(process.env.TRAINING_SUPERVISOR_CADENCE_HOURS || 24) * 60 * 60_000),
-    retryDelayMs: Math.max(60_000, Number(process.env.TRAINING_SUPERVISOR_RETRY_DELAY_MS || 10 * 60_000)),
+    retryDelayMs: Math.max(60_000, Number(process.env.TRAINING_SUPERVISOR_RETRY_DELAY_MS || 60_000)),
     attentionRetryMs: Math.max(60_000, Number(process.env.TRAINING_SUPERVISOR_ATTENTION_RETRY_HOURS || 6) * 60 * 60_000),
-    startupDelayMs: Math.max(0, Number(process.env.TRAINING_SUPERVISOR_STARTUP_DELAY_MS || 5 * 60 * 1000)),
+    startupDelayMs: Math.max(0, Number(process.env.TRAINING_SUPERVISOR_STARTUP_DELAY_MS || 10_000)),
     checkIntervalMs: Math.max(15_000, Number(process.env.TRAINING_SUPERVISOR_CHECK_MS || 60_000)),
     maxJobAgeMs: Math.max(60_000, Number(process.env.TRAINING_SUPERVISOR_MAX_JOB_AGE_MS || 75 * 60_000)),
-    minAiApprovals: Math.max(1, Math.min(3, Number(process.env.TRAINING_SUPERVISOR_MIN_AI_APPROVALS || 2))),
     baseSymbolLimit: Math.max(10, Number(process.env.TRAINING_SUPERVISOR_BASE_SYMBOL_LIMIT || 100)),
     maxSymbols: Math.max(20, Number(process.env.TRAINING_SUPERVISOR_MAX_SYMBOLS || 500)),
     ranges: {
@@ -16790,8 +18260,14 @@ function trainingSupervisorConfig() {
       minStopEvents: Math.max(500, Number(process.env.TRAINING_SUPERVISOR_MIN_STOP_EVENTS || 500)),
       minFolds: Math.max(5, Number(process.env.TRAINING_SUPERVISOR_MIN_FOLDS || 5)),
       minPositiveFolds: Math.max(4, Number(process.env.TRAINING_SUPERVISOR_MIN_POSITIVE_FOLDS || 4)),
-      minBrierSkill: Number(process.env.TRAINING_SUPERVISOR_MIN_BRIER_SKILL || 0),
-      maxEcePct: Math.min(5, Math.max(0.1, Number(process.env.TRAINING_SUPERVISOR_MAX_ECE_PCT || 5))),
+      // These are the stage-one promotion gates from the current audit plan,
+      // not display preferences.  A saved/old run may still show its legacy
+      // evaluation, but a new review must use the stricter values.
+      minBrierSkill: Number(process.env.TRAINING_SUPERVISOR_MIN_BRIER_SKILL || 0.02),
+      minDirectionMcc: Number(process.env.TRAINING_SUPERVISOR_MIN_DIRECTION_MCC || 0),
+      minRelativeMajorityAccuracyPct: Number(process.env.TRAINING_SUPERVISOR_MIN_RELATIVE_MAJORITY_PP || 0),
+      minThresholdCoveragePct: Math.max(50, Number(process.env.TRAINING_SUPERVISOR_MIN_THRESHOLD_COVERAGE_PCT || 50)),
+      maxEcePct: Math.min(3, Math.max(0.1, Number(process.env.TRAINING_SUPERVISOR_MAX_ECE_PCT || 3))),
       minCalibrationSlope: Math.max(0.8, Number(process.env.TRAINING_SUPERVISOR_MIN_CALIBRATION_SLOPE || 0.8)),
       maxCalibrationSlope: Math.min(1.2, Number(process.env.TRAINING_SUPERVISOR_MAX_CALIBRATION_SLOPE || 1.2)),
       minProbabilityBucketEvents: Math.max(30, Number(process.env.TRAINING_SUPERVISOR_MIN_BUCKET_EVENTS || 30)),
@@ -16799,193 +18275,6 @@ function trainingSupervisorConfig() {
       minExpectedValuePct: Number(process.env.TRAINING_SUPERVISOR_MIN_EXPECTED_VALUE_PCT || 0),
     },
   };
-}
-
-const TRAINING_REVIEWER_ROLES = Object.freeze({
-  openai: "方法审计员：重点检查 point-in-time、OOF、purge/embargo、概率校准和结论是否被样本外证据支持。",
-  siliconflow: "训练优化员：重点检查欠拟合/过拟合、样本深度、模型残差相关性，并提出不降低门槛的返工动作。",
-  hunyuan: "验收风控员：重点检查成本后期望、Top-K 稳定性、漂移和是否达到 Shadow/Paper 验收标准。",
-});
-
-const TRAINING_REWORK_ACTIONS = new Set([
-  "expand_universe",
-  "extend_history",
-  "increase_fold_count",
-  "tighten_weight_cap",
-  "prune_correlated_models",
-  "inspect_data_quality",
-  "keep_shadow",
-]);
-
-function compactTrainingReviewEvidence(result = {}, evaluation = {}, context = {}) {
-  const training = result?.productionTraining || result?.result?.productionTraining || {};
-  return {
-    market: context.market || null,
-    cycleId: context.cycleId || null,
-    attempt: context.attempt || null,
-    jobId: context.jobId || null,
-    deterministicEvaluation: {
-      passed: evaluation.passed === true,
-      score: Number(evaluation.score || 0),
-      acceptanceLevel: evaluation.acceptanceLevel || "shadow_research",
-      failedChecks: evaluation.failedChecks || [],
-      checks: (evaluation.checks || []).map((check) => ({
-        id: check.id,
-        label: check.label,
-        passed: check.passed,
-        blocking: check.blocking,
-        value: check.value,
-        threshold: check.threshold,
-        detail: check.detail,
-      })),
-      summary: evaluation.summary || {},
-    },
-    manifest: training.manifest || null,
-    productionEligibility: training.productionEligibility || null,
-    monitoringStatus: training.monitoringStatus || null,
-    horizonModels: (training.horizonModels || []).map((model) => ({
-      horizon: model.horizon,
-      available: model.available,
-      oofRows: model.oofRows,
-      metaTestRows: model.metaTestRows,
-      eventCounts: model.eventCounts,
-      metrics: model.metrics,
-      directionMetrics: model.directionMetrics,
-      rankingMetrics: model.rankingMetrics,
-      expectedValue: model.expectedValue,
-      longTradeExpectedValue: model.longTradeExpectedValue,
-      longTradeGate: model.longTradeGate,
-      selectiveRankingHead: model.selectiveRankingHead,
-      highConfidenceFalsePositiveRiskHead: model.highConfidenceFalsePositiveRiskHead,
-      leakageControl: model.leakageControl,
-      foldMetrics: (model.foldMetrics || []).map((fold) => ({
-        fold: fold.fold,
-        testDates: fold.testDates,
-        brierSkillScore: fold.brierSkillScore,
-        ecePct: fold.ecePct,
-        topDecileLift: fold.topDecileLift,
-        expectedValuePct: fold.expectedValuePct,
-        featureDrift: fold.featureDrift,
-      })),
-    })),
-  };
-}
-
-function normalizeTrainingReviewerResponse(data = {}, provider = {}) {
-  const verdict = ["accept", "rework", "needs_data"].includes(String(data.verdict || "").toLowerCase())
-    ? String(data.verdict).toLowerCase()
-    : "rework";
-  return {
-    provider: provider.id,
-    label: provider.label,
-    model: provider.model,
-    available: true,
-    verdict,
-    score: Math.max(0, Math.min(100, Number(data.score || 0))),
-    rationale: String(data.rationale || data.summary || "未返回审核理由。").slice(0, 800),
-    blockingIssues: Array.isArray(data.blockingIssues) ? data.blockingIssues.map((item) => String(item).slice(0, 240)).slice(0, 8) : [],
-    recommendedActions: Array.isArray(data.recommendedActions)
-      ? data.recommendedActions.map((item) => String(item).toLowerCase()).filter((item) => TRAINING_REWORK_ACTIONS.has(item)).slice(0, 8)
-      : [],
-    reviewedAt: new Date().toISOString(),
-  };
-}
-
-async function reviewTrainingCycleWithAi({ market, result, evaluation, context = {} } = {}) {
-  const providers = new Map(aiProviderCandidates().map((provider) => [provider.id, provider]));
-  const catalog = trainingSupervisorProviderStatus();
-  const timeoutMs = Math.max(5_000, Number(process.env.TRAINING_SUPERVISOR_AI_TIMEOUT_MS || 45_000));
-  const evidence = compactTrainingReviewEvidence(result, evaluation, { ...context, market });
-  const reservations = [];
-  for (const descriptor of catalog) {
-    if (context.reviewerEnabled?.[descriptor.id] === false) {
-      reservations.push({ terminal: {
-        provider: descriptor.id,
-        label: descriptor.label,
-        model: descriptor.model,
-        available: false,
-        disabled: true,
-        verdict: "rework",
-        score: 0,
-        rationale: `${descriptor.label} 已被用户手动关闭，本轮未调用且不计验收票。`,
-        blockingIssues: [],
-        recommendedActions: ["keep_shadow"],
-        reviewedAt: new Date().toISOString(),
-      } });
-      continue;
-    }
-    const provider = providers.get(descriptor.id);
-    if (!provider) {
-      reservations.push({ terminal: {
-        provider: descriptor.id,
-        label: descriptor.label,
-        model: descriptor.model,
-        available: false,
-        disabled: false,
-        verdict: "rework",
-        score: 0,
-        rationale: `${descriptor.label} 未配置或未加入 AI_PROVIDER_ORDER，本轮不能计验收票。`,
-        blockingIssues: ["provider unavailable"],
-        recommendedActions: ["keep_shadow"],
-        error: "provider unavailable",
-        reviewedAt: new Date().toISOString(),
-      } });
-      continue;
-    }
-    const budget = await takeBackendMonitorBudget("aiCalls", 1, { training: true }).catch((error) => ({ ok: false, reason: error.message || String(error) }));
-    reservations.push({ provider, budget });
-  }
-  return Promise.all(reservations.map(async ({ provider, budget, terminal }) => {
-    if (terminal) return terminal;
-    if (!budget.ok) {
-      return {
-        provider: provider.id,
-        label: provider.label,
-        model: provider.model,
-        available: false,
-        verdict: "rework",
-        score: 0,
-        rationale: "本轮 AI 审核预算不可用。",
-        blockingIssues: [budget.reason || "AI budget unavailable"],
-        recommendedActions: ["keep_shadow"],
-        error: budget.reason || "AI budget unavailable",
-        reviewedAt: new Date().toISOString(),
-      };
-    }
-    const systemPrompt = [
-      "你是 Global Quant Watch 的独立模型训练监工。",
-      TRAINING_REVIEWER_ROLES[provider.id] || "独立检查训练结果与样本外证据。",
-      "硬规则：不得建议降低验收门槛；不得用训练内指标替代 OOF；不得忽略未来函数、交易成本、校准或样本不足。",
-      "如果 deterministicEvaluation.passed=false，verdict 只能是 rework 或 needs_data。",
-      "accept 只表示训练周期通过 Shadow/Research 验收，不代表可自动实盘，也不允许发送真实订单。",
-      `recommendedActions 只能从 ${[...TRAINING_REWORK_ACTIONS].join(", ")} 中选择。`,
-      "仅返回 JSON：{verdict,score,rationale,blockingIssues,recommendedActions}。",
-    ].join("\n");
-    const input = [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: JSON.stringify(evidence) },
-    ];
-    try {
-      const response = provider.type === "responses"
-        ? await callOpenAiResponsesJson(input, timeoutMs)
-        : await callOpenAiCompatibleJson(input, timeoutMs, provider);
-      return normalizeTrainingReviewerResponse(response.data, provider);
-    } catch (error) {
-      return {
-        provider: provider.id,
-        label: provider.label,
-        model: provider.model,
-        available: false,
-        verdict: "rework",
-        score: 0,
-        rationale: `${provider.label} 审核调用失败，不能计为通过票。`,
-        blockingIssues: [String(error.message || error).slice(0, 240)],
-        recommendedActions: ["keep_shadow"],
-        error: String(error.message || error).slice(0, 500),
-        reviewedAt: new Date().toISOString(),
-      };
-    }
-  }));
 }
 
 function inputToChatMessages(input) {
@@ -17147,6 +18436,106 @@ function localAnalysisEnvelope(input, source = "local-rules") {
     analysis: strategyDecision(localAnalysis(input), input),
     source,
   };
+}
+
+async function readFastTaskPage({ recentHours = 0, limit = 80, offset = 0, type = null, market = null } = {}) {
+  const basePath = join(snapshotBasePath, "background-jobs");
+  const requestedLimit = Math.max(1, Math.min(120, Number(limit || 80)));
+  const requestedOffset = Math.max(0, Math.min(100_000, Number(offset || 0)));
+  const normalizedMarket = market ? String(market).toUpperCase() : null;
+  const cutoff = Number(recentHours) > 0 ? Date.now() - Number(recentHours) * 60 * 60 * 1000 : null;
+  const timestampFromFilename = (filename) => Number(filename.match(/-(\d{13,})(?:-[a-zA-Z0-9]{8})?\.json$/)?.[1] || 0);
+  const compact = (job) => ({
+    id: job.id,
+    type: job.type,
+    market: job.market,
+    status: job.status,
+    progress: job.progress,
+    detail: job.detail,
+    error: job.error,
+    failureCategory: job.failureCategory,
+    attempt: job.attempt,
+    maxAttempts: job.maxAttempts,
+    trainingRunId: job.trainingRunId,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    progressAt: job.progressAt,
+    finishedAt: job.finishedAt,
+    heartbeatAt: job.heartbeatAt,
+    queuePosition: job.queuePosition ?? null,
+    queueAgeMs: Number.isFinite(Date.parse(job.createdAt || "")) ? Math.max(0, Date.now() - Date.parse(job.createdAt)) : 0,
+    stale: job.status === "deferred" && job.failureCategory === "queue_stale",
+    staleAt: job.staleAt || null,
+    dispatchReason: job.dispatchReason || null,
+    pauseRequested: job.pauseRequested === true,
+    pausedAt: job.pausedAt || null,
+    restartedFrom: job.restartedFrom || null,
+    stagnation: job.stagnation || null,
+    resultSummary: job.result && typeof job.result === "object" ? {
+      available: job.result.available,
+      framework: job.result.framework,
+      market: job.result.market,
+      productionEligible: job.result.productionEligibility?.eligible ?? job.result.productionEligible,
+      historyDiagnostics: job.result.historyDiagnostics || null,
+    } : null,
+  });
+  // The evidence registry maintains a compact status index for every persisted
+  // job.  Prefer it for the polling path: historical backtest JSON files can
+  // be several megabytes each, while the task center only needs metadata.
+  const indexed = evidenceRegistry.backgroundJobs({
+    market: normalizedMarket || "",
+    type: type || "",
+    updatedSince: cutoff !== null ? new Date(cutoff).toISOString() : null,
+    limit: requestedLimit,
+    offset: requestedOffset,
+  });
+  if (indexed?.available === true && indexed.totalCandidates > 0) {
+    // The SQLite index can contain a stale `running` row when an older or
+    // empty JSON artifact was left behind by an interrupted process.  The
+    // in-memory scheduler is the authority for live work; do not show a dead
+    // historical row as a second running task while startup reconciliation is
+    // repairing its audit record.
+    const runtime = backgroundJobs?.status?.() || null;
+    const liveIds = new Set([
+      ...(runtime?.running || []),
+      ...(runtime?.pending || []),
+    ].map((job) => String(job.id)));
+    const jobs = indexed.jobs.filter((job) => !(job.status === "running" && !liveIds.has(String(job.id))));
+    return {
+      count: jobs.length,
+      totalCandidates: indexed.totalCandidates,
+      offset: indexed.offset,
+      hasMore: indexed.hasMore,
+      jobs,
+    };
+  }
+  let files = await readdir(basePath, { withFileTypes: true })
+    .then((entries) => entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .filter((entry) => !type || entry.name.startsWith(`${String(type).replace(/[^a-zA-Z0-9-]/g, "-")}-`))
+      .map((entry) => entry.name))
+    .catch(() => []);
+  files.sort((left, right) => timestampFromFilename(right) - timestampFromFilename(left) || right.localeCompare(left));
+  if (cutoff !== null) files = files.filter((filename) => timestampFromFilename(filename) >= cutoff - 2 * 24 * 60 * 60 * 1000);
+  const totalCandidates = files.length;
+  files = files.slice(requestedOffset, requestedOffset + requestedLimit * 2);
+  const rows = [];
+  for (let index = 0; index < files.length && rows.length < requestedLimit; index += 24) {
+    const batch = await Promise.all(files.slice(index, index + 24).map(async (filename) => {
+      try { return JSON.parse(await readFile(join(basePath, filename), "utf8")); } catch { return null; }
+    }));
+    for (const job of batch) {
+      if (!job || rows.length >= requestedLimit) continue;
+      if (type && job.type !== type) continue;
+      if (normalizedMarket && String(job.market || "").toUpperCase() !== normalizedMarket) continue;
+      const updated = Date.parse(job.updatedAt || job.createdAt || "");
+      if (cutoff !== null && (!Number.isFinite(updated) || updated < cutoff)) continue;
+      rows.push(compact(job));
+    }
+  }
+  rows.sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")));
+  return { count: rows.length, totalCandidates, offset: requestedOffset, hasMore: requestedOffset + files.length < totalCandidates, jobs: rows };
 }
 
 async function attachProductionModelGate(input = {}) {
@@ -17524,6 +18913,21 @@ async function parsePortfolioImage(image, market = "ASX") {
 let readinessCache = { checkedAt: 0, payload: null, promise: null };
 let detailedHealthCache = { checkedAt: 0, payload: null, promise: null };
 
+function settleWithin(promise, timeoutMs, fallback) {
+  const limit = Math.max(250, Number(timeoutMs) || 2_500);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(typeof fallback === "function" ? fallback() : fallback), limit);
+    Promise.resolve(promise).then(finish, () => finish(typeof fallback === "function" ? fallback() : fallback));
+  });
+}
+
 async function dependencyReadiness(options = {}) {
   const ttlMs = Math.max(2_000, Number(process.env.READINESS_CACHE_MS || 7_000));
   const now = Date.now();
@@ -17532,16 +18936,17 @@ async function dependencyReadiness(options = {}) {
   }
   if (readinessCache.promise) return readinessCache.promise;
   readinessCache.promise = (async () => {
-    const pythonCore = await runPythonQuantCore(
-      "health",
-      {},
-      Number(process.env.PYTHON_HEALTH_TIMEOUT_MS || 3_000),
-    ).catch((error) => ({
-      ok: false,
-      service: "quant-core-python",
-      error: error.message || String(error),
-      order_execution_enabled: false,
-    }));
+    const healthTimeoutMs = Math.max(750, Number(process.env.PYTHON_HEALTH_TIMEOUT_MS || 3_000));
+    const pythonCore = await settleWithin(
+      runPythonQuantCore("health", {}, healthTimeoutMs),
+      healthTimeoutMs + 250,
+      () => ({
+        ok: false,
+        service: "quant-core-python",
+        error: `health probe exceeded ${healthTimeoutMs}ms`,
+        order_execution_enabled: false,
+      }),
+    );
     const payload = {
       ok: pythonCore?.ok !== false,
       service: "global-quant-watch",
@@ -17583,12 +18988,12 @@ async function detailedHealthSnapshot() {
     }, {});
     const [ready, reddit] = await Promise.all([
       dependencyReadiness(),
-      redditProviderStatus(null, { compact: true }).catch((error) => ({
+      settleWithin(redditProviderStatus(null, { compact: true }), 1_200, () => ({
         available: false,
         configured: false,
         enabled: redditEnabled(),
         provider: "reddit-social",
-        lastError: error.message || String(error),
+        lastError: "Reddit status probe timed out; local cache remains available.",
       })),
     ]);
     const payload = {
@@ -17617,6 +19022,251 @@ async function detailedHealthSnapshot() {
   }
 }
 
+function readPersistedDataReplenishmentSnapshotSync(market = "ASX") {
+  const key = safeMarket(market);
+  const file = join(snapshotBasePath, "data-lake", `replenishment-snapshot-${key.toLowerCase()}.json`);
+  if (!existsSync(file)) return null;
+  try {
+    const stored = JSON.parse(readFileSync(file, "utf8"));
+    const snapshot = stored?.snapshot;
+    const savedAt = Number(stored?.savedAt || Date.parse(snapshot?.generatedAt || ""));
+    if (!snapshot || !Number.isFinite(savedAt) || savedAt <= 0) return null;
+    const pitDatasets = Object.fromEntries(Object.entries(snapshot.pit?.datasets || {}).map(([name, value]) => [name, {
+      markets: { [key]: Number(value?.rows || 0) },
+      verifiedMarkets: { [key]: Number(value?.verifiedRows || 0) },
+      verifiedMarketPct: { [key]: Number(value?.verifiedPct || 0) },
+      symbols: { [key]: Number(value?.symbols || 0) },
+      verifiedSymbols: { [key]: Number(value?.verifiedSymbols || 0) },
+      verifiedSymbolPct: { [key]: Number(value?.verifiedSymbolPct || 0) },
+      trainingUniverseCoveragePct: { [key]: Number(value?.trainingUniverseCoveragePct || 0) },
+      marketDateCoveragePct: { [key]: value?.marketDateCoveragePct ?? null },
+      seriesCount: { [key]: Number(value?.seriesCount || 0) },
+      verifiedSeriesCount: { [key]: Number(value?.verifiedSeriesCount || 0) },
+    }]));
+    return {
+      savedAt,
+      summary: {
+        available: true,
+        markets: {},
+        pitDatasets,
+        partitionItems: Number(snapshot.history?.partitions || 0),
+        persistedSource: "data-replenishment-snapshot",
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+function learningProgressDataLakeSnapshot(market) {
+  const key = safeMarket(market);
+  const refreshMs = Math.max(60_000, Number(process.env.LEARNING_PROGRESS_DATA_LAKE_REFRESH_MS || 5 * 60_000));
+  let cached = learningProgressDataLakeCache.get(key) || null;
+  // Rehydrate the last audited replenishment snapshot after a server restart.
+  // The in-memory summary cache is intentionally ephemeral, but dropping it
+  // on restart made an otherwise usable data lake look like an empty pending
+  // audit until the Python maintenance lane became available again.
+  if (!cached) {
+    const persisted = readPersistedDataReplenishmentSnapshotSync(key);
+    if (persisted) {
+      cached = {
+        updatedAt: persisted.savedAt,
+        summary: persisted.summary,
+        refreshFailureCount: 0,
+        retryAfter: 0,
+      };
+      learningProgressDataLakeCache.set(key, cached);
+    }
+  }
+  const stale = !cached || Date.now() - Number(cached.updatedAt || 0) >= refreshMs;
+  const retryAfter = Number(cached?.retryAfter || 0);
+  const refreshBackoffActive = retryAfter > Date.now();
+  if (stale && !refreshBackoffActive && !learningProgressDataLakeRefreshes.has(key)) {
+    const refresh = runPythonQuantCore("data-lake-summary", { market: key }, 30_000)
+      .then((payload) => {
+        const { items = [], ...summary } = payload || {};
+        const persisted = readPersistedDataReplenishmentSnapshotSync(key);
+        const persistedPit = persisted?.summary?.pitDatasets || {};
+        const hasCoverageValue = (dataset) => {
+          const coverage = dataset?.trainingUniverseCoveragePct;
+          return Number(dataset?.rows || 0) > 0
+            || Number.isFinite(Number(coverage))
+            || Object.values(coverage || {}).some((value) => Number.isFinite(Number(value)));
+        };
+        const persistedHasCoverage = Object.values(persistedPit).some(hasCoverageValue);
+        // The replenishment snapshot is the authoritative, training-universe
+        // scoped PIT receipt.  The generic lake summary may finish later with
+        // older whole-lake coverage semantics; never let that lower-quality
+        // refresh overwrite the exact receipt shown to the operator.
+        const effectiveSummary = persistedHasCoverage
+          ? {
+            ...persisted.summary,
+            ...summary,
+            pitDatasets: persisted.summary.pitDatasets,
+            partitionItems: Number(summary.partitionItems || persisted.summary.partitionItems || 0),
+          }
+          : summary;
+        learningProgressDataLakeCache.set(key, {
+          updatedAt: Date.now(),
+          summary: { ...effectiveSummary, partitionItems: Array.isArray(items) && items.length ? items.length : Number(effectiveSummary.partitionItems || 0) },
+          refreshFailureCount: 0,
+          retryAfter: 0,
+        });
+      })
+      .catch((error) => {
+        const previous = learningProgressDataLakeCache.get(key);
+        const failureCount = Number(previous?.refreshFailureCount || 0) + 1;
+        const backoffMs = Math.min(15 * 60_000, 30_000 * (2 ** Math.min(failureCount - 1, 4)));
+        if (previous) {
+          learningProgressDataLakeCache.set(key, {
+            ...previous,
+            lastError: error.message || String(error),
+            refreshFailureCount: failureCount,
+            retryAfter: Date.now() + backoffMs,
+          });
+        } else {
+          learningProgressDataLakeCache.set(key, {
+            updatedAt: Date.now(),
+            summary: { available: false, rows: 0, error: error.message || String(error), partitionItems: 0 },
+            refreshFailureCount: failureCount,
+            retryAfter: Date.now() + backoffMs,
+          });
+        }
+      })
+      .finally(() => learningProgressDataLakeRefreshes.delete(key));
+    learningProgressDataLakeRefreshes.set(key, refresh);
+  }
+  const summary = cached?.summary || { available: false, rows: 0, partitionItems: 0 };
+  return {
+    ...summary,
+    cached: Boolean(cached),
+    stale,
+    pending: learningProgressDataLakeRefreshes.has(key),
+    updatedAt: cached?.updatedAt ? new Date(cached.updatedAt).toISOString() : null,
+    lastError: cached?.lastError || null,
+  };
+}
+
+function readLearningProgressCacheFast(market) {
+  const key = safeMarket(market);
+  const file = join(snapshotBasePath, "learning-progress", `${key.toLowerCase()}.json`);
+  const state = JSON.parse(readFileSync(file, "utf8"));
+  const normalizePoint = (point) => {
+    if (!point || typeof point !== "object") return point;
+    const samples = { ...(point.samples || {}) };
+    if (Number(samples.effectiveRows || 0) <= 0 && Number(samples.rawRows || 0) > 0) {
+      samples.effectiveRows = Number(samples.fittedRows || samples.rawRows);
+      samples.fittedRows = Number(samples.fittedRows || samples.effectiveRows);
+      samples.eligibleRows = Number(samples.eligibleRows || samples.rawRows);
+      samples.countSource = "legacy-derived-from-raw-rows";
+    }
+    return {
+      ...point,
+      samples,
+      // Availability means strict evidence exists; it is not a promotion
+      // decision. Repair legacy cached flags from the immutable decision.
+      promotionEligible: point?.promotion?.promoted === true,
+      candidateStatus: point.candidateStatus
+        || (point?.promotion?.promoted === true ? "ELIGIBLE" : "REJECTED_LEGACY"),
+    };
+  };
+  const points = (Array.isArray(state.points) ? state.points.slice(-1_000) : []).map(normalizePoint);
+  const fixed = points.filter((point) => point?.evidenceType === "strict_oof");
+  const rolling = points.filter((point) => String(point?.evidenceType || "").includes("observational") || point?.evidenceType === "legacy_mixed_horizon");
+  const terminal = points.filter((point) => ["complete", "failed", "cancelled"].includes(String(point?.status || "")));
+  const completed = terminal.filter((point) => point.status === "complete").length;
+  const observed = {
+    id: `observed-${key.toLowerCase()}-cache`,
+    market: key,
+    horizon: null,
+    createdAt: state.updatedAt || new Date().toISOString(),
+    mode: "evaluate",
+    status: "complete",
+    evidenceType: "live_observational",
+    promotionEligible: false,
+    datasetSignature: null,
+    samples: { rawRows: 0, resolvedRows: 0, uniquePredictions: 0, independentDates: 0 },
+    metrics: {},
+    blockers: ["实时观察样本正在后台更新"],
+    promotion: { promoted: false, blockers: ["observational evidence unavailable"] },
+  };
+  if (!rolling.some((point) => point.id === observed.id)) rolling.push(observed);
+  const latestStrictRun = fixed.at(-1) || null;
+  const latestRun = normalizePoint(state.latestRun) || latestStrictRun || null;
+  return {
+    available: true,
+    market: key,
+    updatedAt: state.updatedAt || null,
+    champion: state.champion || null,
+    latestRun,
+    latestStrictRun,
+    latestObservation: observed,
+    frozenBaseline: normalizePoint(state.frozenBaseline) || null,
+    bestChallenger: normalizePoint(state.bestChallenger || state.challenger) || null,
+    challenger: normalizePoint(state.bestChallenger || state.challenger) || null,
+    observed,
+    curves: { fixed: fixed.slice(-180), rolling: rolling.slice(-180) },
+    schedule: state.schedule || {},
+    frozenTest: state.frozenTest || { status: "provisional" },
+    jobReliability: {
+      total: terminal.length,
+      terminal: terminal.length,
+      complete: completed,
+      failed: terminal.filter((point) => point.status === "failed").length,
+      successPct: terminal.length ? completed / terminal.length * 100 : null,
+      runtimeVersion: 3,
+      currentRuntime: null,
+      allTime: null,
+      evidenceWindow: "local-learning-progress-cache",
+      bounded: true,
+    },
+    blockers: [
+      ...(state.champion ? [] : ["尚无满足硬门槛的5日 Champion"]),
+      "实时观察证据不能替代固定 OOF 测试",
+    ],
+    order_execution_enabled: false,
+    refresh: { mode: "local-cache", pendingJobsImport: true, pendingObservation: true },
+  };
+}
+
+function marketDataAuditSnapshot(market) {
+  const key = safeMarket(market);
+  const lake = learningProgressDataLakeSnapshot(key);
+  const ready = lake.cached && lake.available !== false;
+  const dataset = (value = {}) => ({
+    rows: value.markets?.[key] ?? null,
+    verifiedRows: value.verifiedMarkets?.[key] ?? null,
+    verifiedPct: value.verifiedMarketPct?.[key] ?? null,
+    symbols: value.symbols?.[key] ?? null,
+    verifiedSymbols: value.verifiedSymbols?.[key] ?? null,
+    verifiedSymbolPct: value.verifiedSymbolPct?.[key] ?? null,
+    trainingUniverseCoveragePct: value.trainingUniverseCoveragePct?.[key] ?? null,
+    marketDateCoveragePct: value.marketDateCoveragePct?.[key] ?? null,
+    seriesCount: value.seriesCount?.[key] ?? null,
+    verifiedSeriesCount: value.verifiedSeriesCount?.[key] ?? null,
+  });
+  return {
+    market: key,
+    generatedAt: new Date().toISOString(),
+    schema: "market:exchange:symbol:interval:timestamp",
+    contentVersioned: true,
+    available: ready,
+    snapshotState: ready ? (lake.stale ? "stale-refreshing" : "fresh") : "pending",
+    rows: ready && Object.prototype.hasOwnProperty.call(lake.markets || {}, key)
+      ? lake.markets[key]
+      : null,
+    partitions: ready ? lake.partitionItems ?? null : null,
+    pitDatasets: Object.fromEntries(Object.entries(lake.pitDatasets || {}).map(([name, value]) => [name, dataset(value)])),
+    freshness: {
+      cached: Boolean(lake.cached),
+      stale: Boolean(lake.stale),
+      pending: Boolean(lake.pending),
+      updatedAt: lake.updatedAt || null,
+      lastError: lake.lastError || null,
+    },
+  };
+}
+
 async function handleApi(req, res, url) {
   if (url.pathname === "/api/ping" && req.method === "GET") {
     sendJson(res, 200, { ok: true, version: APP_VERSION, startedAt: SERVER_STARTED_AT });
@@ -17625,6 +19275,64 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/runtime/stream" && req.method === "GET") {
     runtimeEvents.subscribe(req, res, { since: url.searchParams.get("since") || 0 });
+    return;
+  }
+
+  if (url.pathname === "/api/gate03-status" && req.method === "GET") {
+    const processPath = join(root, "reports", "gate03-2026-08-29", "process.json");
+    const reportPath = join(root, "reports", "gate03-2026-08-29", "03数据语义与信息增量-gate.json");
+    const readLocalJson = (path) => {
+      try {
+        return JSON.parse(readFileSync(path, "utf8"));
+      } catch {
+        return null;
+      }
+    };
+    const processState = readLocalJson(processPath);
+    const gateReport = readLocalJson(reportPath);
+    const heartbeatTimeoutMs = Math.max(60_000, Number(process.env.GATE03_HEARTBEAT_TIMEOUT_MS || 10 * 60_000));
+    const updatedAtMs = processState?.updatedAt ? Date.parse(processState.updatedAt) : NaN;
+    const heartbeatAgeMs = Number.isFinite(updatedAtMs) ? Math.max(0, Date.now() - updatedAtMs) : null;
+    let status = processState?.status || (gateReport ? "completed" : "not_started");
+    if (status === "running" && heartbeatAgeMs !== null && heartbeatAgeMs > heartbeatTimeoutMs) status = "stale";
+    const phaseLabels = {
+      "contract-fixtures": "合同与审计规则校验",
+      "full-lake-scan": "完整数据湖与 PIT 扫描",
+      "market-gates-and-report": "三市场门控与报告生成",
+      complete: "已完成，等待下一次审计",
+    };
+    sendJson(res, 200, {
+      schema: "gate03-status-v1",
+      status,
+      running: status === "running",
+      heartbeat: {
+        updatedAt: processState?.updatedAt || gateReport?.generatedAt || null,
+        ageMs: heartbeatAgeMs,
+        timeoutMs: heartbeatTimeoutMs,
+        healthy: status !== "stale" && (status !== "running" || heartbeatAgeMs === null || heartbeatAgeMs <= heartbeatTimeoutMs),
+      },
+      process: processState ? {
+        pid: processState.pid || null,
+        phase: processState.phase || null,
+        phaseLabel: phaseLabels[processState.phase] || processState.phase || "未知阶段",
+        progress: Number.isFinite(Number(processState.progress)) ? Number(processState.progress) : null,
+        startedAt: processState.startedAt || null,
+        updatedAt: processState.updatedAt || null,
+        finishedAt: processState.finishedAt || null,
+        scannedRows: processState.scannedRows || null,
+      } : null,
+      gate: gateReport ? {
+        generatedAt: gateReport.generatedAt || null,
+        passedCount: gateReport.passedCount || 0,
+        blockedCount: gateReport.blockedCount || 0,
+        nextPhasePermitted: gateReport.nextPhasePermitted === true,
+        modelFitStarted: gateReport.modelFitStarted === true,
+        taskRange: gateReport.taskRange || ["G0098", "G0132"],
+        blockingReasons: Array.isArray(gateReport.blockingReasons) ? gateReport.blockingReasons : [],
+        nextActions: Array.isArray(gateReport.nextActions) ? gateReport.nextActions : [],
+      } : null,
+      source: "local-gate03-process-and-report",
+    });
     return;
   }
 
@@ -17725,15 +19433,179 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/learning-progress" && req.method === "GET") {
     const market = marketFromUrl(url);
-    const [progress, dataLake] = await Promise.all([
-      learningProgress.snapshot(market),
-      runPythonQuantCore("data-lake-summary", { market }, 30_000).catch((error) => ({ available: false, rows: 0, error: error.message || String(error) })),
-    ]);
-    const { items: dataLakeItems = [], ...dataLakeSummary } = dataLake || {};
+    // The progress screen is a read path. A full Parquet/DuckDB summary can take
+    // longer than a UI request while ingest is active, so it refreshes in the
+    // background and never holds the persisted evidence curve hostage.
+    const progress = await settleWithin(readLearningProgressCacheFast(market), Number(process.env.LEARNING_PROGRESS_HTTP_TIMEOUT_MS || 1_200), () => ({
+      available: true,
+      market: safeMarket(market),
+      updatedAt: null,
+      latestRun: null,
+      latestStrictRun: null,
+      latestObservation: null,
+      observed: { samples: { resolvedRows: 0, independentDates: 0 }, metrics: {} },
+      curves: { fixed: [], rolling: [] },
+      blockers: ["学习证据正在后台导入；本次请求先返回本地占位状态，完成后自动更新。"],
+      refresh: { mode: "timeout-fallback", pendingJobsImport: true, pendingObservation: true },
+      order_execution_enabled: false,
+    }));
+    const dataLakeSummary = learningProgressDataLakeSnapshot(market);
     sendJson(res, 200, {
       ...progress,
-      dataLake: { ...dataLakeSummary, partitionItems: dataLakeItems.length },
+      dataLake: dataLakeSummary,
     });
+    return;
+  }
+
+  if (url.pathname === "/api/upgrade-progress" && req.method === "GET") {
+    const routePath = join(root, "reports", "research-route-transition-20260903.json");
+    try {
+      const route = JSON.parse(await readFile(routePath, "utf8"));
+      const completed = Array.isArray(route.completedTaskIds) ? route.completedTaskIds.length : 0;
+      const pending = Array.isArray(route.pendingTaskIds) ? route.pendingTaskIds.length : 0;
+      sendJson(res, 200, {
+        schema: "research-optimized-upgrade-progress-v1",
+        planDate: route.planDate || "2026-09-03",
+        taskTotal: 301,
+        taskObserved: completed + pending,
+        acceptedContractOrEvidence: completed,
+        blockedByRealEvidence: pending,
+        notYetRegistered: Math.max(0, 301 - completed - pending),
+        completionPct: Number((completed / 301 * 100).toFixed(2)),
+        realProductionEligibleMarkets: [],
+        researchRoute: {
+          stage: "01研究备选通道可执行化",
+          status: "OPEN",
+          completedTaskIds: route.completedTaskIds || [],
+          pendingTaskIds: route.pendingTaskIds || [],
+          modelTrainingStarted: route.modelTrainingStarted === true,
+          formalOofStarted: route.formalOofStarted === true,
+          championUpdated: route.championUpdated === true,
+          longTradeGateActivated: route.longTradeGateActivated === true,
+          statusDetail: researchRouteStatus(route),
+        },
+        source: "local-research-route-transition",
+        stale: false,
+      });
+      return;
+    } catch {
+      // Fall through to the legacy progress snapshot while the first route
+      // transition audit has not been generated.
+    }
+    const path = join(root, "reports", "upgrade-progress-2026-08-29.json");
+    try {
+      const payload = JSON.parse(await readFile(path, "utf8"));
+      sendJson(res, 200, { ...payload, source: "local-stage-gates", stale: false });
+    } catch {
+      sendJson(res, 200, {
+        schema: "upgrade-progress-v2",
+        taskTotal: 300,
+        taskObserved: 0,
+        acceptedContractOrEvidence: 0,
+        blockedByRealEvidence: 0,
+        notYetRegistered: 300,
+        completionPct: 0,
+        realProductionEligibleMarkets: [],
+        source: "local-stage-gates",
+        stale: true,
+        reason: "阶段验收索引尚未生成",
+      });
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/gate03-status" && req.method === "GET") {
+    const processPath = join(root, "reports", "gate03-2026-08-29", "process.json");
+    const reportPath = join(root, "reports", "gate03-2026-08-29", "03数据语义与信息增量-gate.json");
+    let processState = null;
+    let gateReport = null;
+    let researchRoute = null;
+    try {
+      processState = JSON.parse(await readFile(processPath, "utf8"));
+    } catch {
+      processState = null;
+    }
+    try {
+      gateReport = JSON.parse(await readFile(reportPath, "utf8"));
+    } catch {
+      gateReport = null;
+    }
+    try {
+      researchRoute = JSON.parse(await readFile(join(root, "reports", "research-route-transition-20260903.json"), "utf8"));
+    } catch {
+      researchRoute = null;
+    }
+    const heartbeatTimeoutMs = Math.max(60_000, Number(process.env.GATE03_HEARTBEAT_TIMEOUT_MS || 10 * 60_000));
+    const updatedAtMs = processState?.updatedAt ? Date.parse(processState.updatedAt) : NaN;
+    const heartbeatAgeMs = Number.isFinite(updatedAtMs) ? Math.max(0, Date.now() - updatedAtMs) : null;
+    let status = processState?.status || (gateReport ? "completed" : "not_started");
+    if (status === "running" && heartbeatAgeMs !== null && heartbeatAgeMs > heartbeatTimeoutMs) status = "stale";
+    const phaseLabels = {
+      "contract-fixtures": "合同与审计规则校验",
+      "full-lake-scan": "完整数据湖与 PIT 扫描",
+      "market-gates-and-report": "三市场门控与报告生成",
+      complete: "已完成，等待下一次审计",
+    };
+    sendJson(res, 200, {
+      schema: "gate03-status-v1",
+      status,
+      running: status === "running",
+      heartbeat: {
+        updatedAt: processState?.updatedAt || gateReport?.generatedAt || null,
+        ageMs: heartbeatAgeMs,
+        timeoutMs: heartbeatTimeoutMs,
+        healthy: status !== "stale" && (heartbeatAgeMs === null || heartbeatAgeMs <= heartbeatTimeoutMs),
+      },
+      process: processState ? {
+        pid: processState.pid || null,
+        phase: processState.phase || null,
+        phaseLabel: phaseLabels[processState.phase] || processState.phase || "未知阶段",
+        progress: Number.isFinite(Number(processState.progress)) ? Number(processState.progress) : null,
+        startedAt: processState.startedAt || null,
+        updatedAt: processState.updatedAt || null,
+        finishedAt: processState.finishedAt || null,
+        scannedRows: processState.scannedRows || null,
+      } : null,
+      gate: gateReport ? {
+        generatedAt: gateReport.generatedAt || null,
+        passedCount: gateReport.passedCount || 0,
+        blockedCount: gateReport.blockedCount || 0,
+        nextPhasePermitted: gateReport.nextPhasePermitted === true,
+        modelFitStarted: gateReport.modelFitStarted === true,
+        taskRange: gateReport.taskRange || ["G0098", "G0132"],
+        blockingReasons: Array.isArray(gateReport.blockingReasons) ? gateReport.blockingReasons : [],
+        nextActions: Array.isArray(gateReport.nextActions) ? gateReport.nextActions : [],
+      } : null,
+      researchRoute: researchRoute ? {
+        stage: "01研究备选通道可执行化",
+        status: "OPEN",
+        completedTaskIds: researchRoute.completedTaskIds || [],
+        pendingTaskIds: researchRoute.pendingTaskIds || [],
+        nextAction: researchRoute.nextAction || null,
+        modelTrainingStarted: researchRoute.modelTrainingStarted === true,
+        formalOofStarted: researchRoute.formalOofStarted === true,
+        statusDetail: researchRouteStatus(researchRoute),
+      } : null,
+      source: "local-gate03-process-and-report",
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/microtask-plan" && req.method === "GET") {
+    const path = join(root, "reports", "microtask-plan-2026-08-29.json");
+    try {
+      const payload = JSON.parse(await readFile(path, "utf8"));
+      sendJson(res, 200, { ...payload, source: "local-microtask-plan", stale: false });
+    } catch {
+      sendJson(res, 200, {
+        schema: "microtask-plan-v1",
+        summary: { blockedParentTasks: 0, microtaskCount: 0, statusCounts: {} },
+        groups: [],
+        source: "local-microtask-plan",
+        stale: true,
+        reason: "原子任务清单尚未生成",
+      });
+    }
     return;
   }
 
@@ -17765,11 +19637,471 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/task-center" && req.method === "GET") {
+    const recentHours = Math.max(0, Math.min(168, Number(url.searchParams.get("recentHours") || 0)));
+    const recentCutoff = recentHours > 0
+      ? new Date(Date.now() - recentHours * 60 * 60 * 1000).toISOString()
+      : null;
+    const requestedTaskLimit = Math.max(1, Math.min(120, Number(url.searchParams.get("limit") || 80)));
+    if (url.searchParams.get("fast") === "true") {
+      const fastPayload = await readFastTaskPage({
+        recentHours,
+        limit: requestedTaskLimit,
+        offset: url.searchParams.get("offset") || 0,
+        type: url.searchParams.get("type") || null,
+        market: url.searchParams.get("market") || null,
+      });
+      const fastJobs = fastPayload.jobs;
+      const fastCompleted = fastJobs.filter((job) => ["complete", "failed", "cancelled", "deferred"].includes(job.status));
+      sendJson(res, 200, {
+        updatedAt: new Date().toISOString(),
+        jobs: fastJobs,
+        jobsByStatus: {
+          running: fastJobs.filter((job) => job.status === "running"),
+          queued: fastJobs.filter((job) => job.status === "queued"),
+          paused: fastJobs.filter((job) => job.status === "paused"),
+          completed: fastCompleted,
+        },
+        summary: {
+          total: fastJobs.length,
+          active: fastJobs.filter((job) => ["queued", "running"].includes(job.status)).length,
+          queued: fastJobs.filter((job) => job.status === "queued").length,
+          paused: fastJobs.filter((job) => job.status === "paused").length,
+          running: fastJobs.filter((job) => job.status === "running").length,
+          failed: fastJobs.filter((job) => job.status === "failed").length,
+          complete: fastJobs.filter((job) => job.status === "complete").length,
+          completed: fastCompleted.length,
+          recent24h: recentHours === 24 ? fastJobs.length : null,
+          diagnosisPending: fastJobs.filter((job) => job.status === "running" && job.stagnation && !job.stagnation.resolvedAt).length,
+        },
+        page: {
+          offset: fastPayload.offset,
+          count: fastPayload.count,
+          totalCandidates: fastPayload.totalCandidates,
+          hasMore: fastPayload.hasMore,
+        },
+        policy: {
+          staleAfterMs: 90_000,
+          progressStaleAfterMs: Number(process.env.TASK_DIAGNOSTIC_PROGRESS_STALE_MS || 15 * 60_000),
+          note: "快速摘要只读取任务元数据；点击任务后再读取检查点、子任务和审计结果。",
+        },
+      });
+      return;
+    }
+    const payload = await backgroundJobs.list({
+      market: url.searchParams.get("market") || null,
+      limit: requestedTaskLimit,
+      offset: url.searchParams.get("offset") || 0,
+      updatedSince: recentCutoff,
+      readOnly: url.searchParams.get("fast") === "true",
+    });
+    if (url.searchParams.get("fast") === "true") {
+      const fastJobs = Array.isArray(payload.jobs) ? payload.jobs : [];
+      const fastCompleted = fastJobs.filter((job) => ["complete", "failed", "cancelled", "deferred"].includes(job.status));
+      sendJson(res, 200, {
+        updatedAt: new Date().toISOString(),
+        jobs: fastJobs,
+        jobsByStatus: {
+          running: fastJobs.filter((job) => job.status === "running"),
+          queued: fastJobs.filter((job) => job.status === "queued"),
+          paused: fastJobs.filter((job) => job.status === "paused"),
+          completed: fastCompleted,
+        },
+        summary: {
+          total: fastJobs.length,
+          active: fastJobs.filter((job) => ["queued", "running"].includes(job.status)).length,
+          queued: fastJobs.filter((job) => job.status === "queued").length,
+          paused: fastJobs.filter((job) => job.status === "paused").length,
+          running: fastJobs.filter((job) => job.status === "running").length,
+          failed: fastJobs.filter((job) => job.status === "failed").length,
+          complete: fastJobs.filter((job) => job.status === "complete").length,
+          completed: fastCompleted.length,
+          recent24h: recentHours === 24 ? fastJobs.length : null,
+        },
+        page: {
+          offset: payload.offset || 0,
+          count: payload.count || fastJobs.length,
+          totalCandidates: payload.totalCandidates || fastJobs.length,
+          hasMore: payload.hasMore === true,
+        },
+        policy: {
+          staleAfterMs: 90_000,
+          note: "快速摘要只读取任务元数据；点击任务后再读取检查点、子任务和审计结果。",
+        },
+      });
+      return;
+    }
+    let jobs = Array.isArray(payload.jobs) ? [...payload.jobs] : [];
+    // A supervisor can be queued before it creates a concrete background Job
+    // (for example while waiting for the next retry window). Expose that
+    // durable state here so the homepage never turns a real queued cycle into
+    // a misleading "0 queued".
+    const includeSupervisor = url.searchParams.get("includeSupervisor") !== "false" && recentHours === 0;
+    if (trainingSupervisor && includeSupervisor) {
+      const requestedMarket = url.searchParams.get("market") || null;
+      const supervisorMarkets = requestedMarket
+        ? [safeMarket(requestedMarket)]
+        : ["ASX", "US", "CN"];
+      const supervisorWithTimeout = async (market) => {
+        let timer = null;
+        try {
+          const timeout = new Promise((resolve) => {
+            timer = setTimeout(() => resolve(null), 450);
+            timer.unref?.();
+          });
+          return await Promise.race([trainingSupervisor.status(market).catch(() => null), timeout]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      };
+      const snapshots = await Promise.all(supervisorMarkets.map((market) => supervisorWithTimeout(market)));
+      const supervisorByMarket = new Map(snapshots.map((snapshot, index) => [supervisorMarkets[index], snapshot?.market || snapshot]));
+      const concreteIds = new Set(jobs.map((job) => String(job.id || "")));
+      snapshots.forEach((snapshot, index) => {
+        const state = snapshot?.market || snapshot;
+        if (!state || !["queued", "training", "rework_scheduled", "paused"].includes(String(state.status))) return;
+        if (state.activeJobId && concreteIds.has(String(state.activeJobId))) return;
+        const market = supervisorMarkets[index];
+        const latestQueueEvent = (state.history || []).find((event) => event.type === "queued") || null;
+        const blockedBy = latestQueueEvent?.blockedBy || null;
+        const waitingPhase = state.status === "paused"
+          ? "已暂停：等待手动启动"
+          : state.status === "rework_scheduled"
+          ? "等待返工调度"
+          : state.status === "training"
+            ? "监督器已启动，等待后台 Job"
+            : blockedBy
+              ? `等待${blockedBy}释放训练资源`
+              : "等待监督器创建后台 Job";
+        jobs.unshift({
+          id: `supervisor-${market}-${state.cycleId || "pending"}`,
+          type: "training-supervisor",
+          market,
+          // A supervisor state is not proof that a worker job exists. Keep
+          // the placeholder queued until activeJobId resolves to a concrete
+          // background job, so the UI cannot report phantom progress.
+          status: state.status === "paused" ? "paused" : "queued",
+          progress: 0,
+          detail: {
+            phase: waitingPhase,
+            blockedBy,
+            queueReason: latestQueueEvent?.reason || null,
+            mode: state.currentPlan?.mode || state.currentPlan?.trainingMode || "weekly",
+            cycleId: state.cycleId || null,
+            nextActionAt: state.nextActionAt || null,
+          },
+          queuePosition: Number(state.queueOrder || 0) + 1,
+          error: state.lastError || null,
+          failureCategory: null,
+          attempt: state.attempt || 1,
+          maxAttempts: state.maxAttempts || null,
+          trainingRunId: null,
+          // A supervisor placeholder is a durable queue record, not a live
+          // worker. Use the next scheduling timestamp for its visible clock;
+          // carrying the last training heartbeat here made a healthy queued
+          // market look stale for hours in the task center.
+          createdAt: state.nextActionAt || state.updatedAt || state.lastStartedAt || new Date().toISOString(),
+          updatedAt: state.nextActionAt || state.updatedAt || state.lastStartedAt || new Date().toISOString(),
+          heartbeatAt: state.activeJobId ? (state.lastStartedAt || null) : null,
+          resultSummary: null,
+          supervisorState: state.status,
+        });
+      });
+      // Background OOF jobs finish before the deterministic supervisor writes
+      // its verdict. Join the durable review event back onto the task-center
+      // row so the homepage does not show an already-reviewed job as pending.
+      jobs.forEach((job) => {
+        if (job.type !== "backtest" || job.status !== "complete") return;
+        const supervisor = supervisorByMarket.get(safeMarket(job.market));
+        const review = (supervisor?.history || []).find((event) => event.jobId === job.id
+          && ["gate-evaluation-complete", "deterministic-review-complete"].includes(event.type));
+        if (!review) return;
+        const evaluation = review.evaluation || {};
+        const accepted = review.accepted === true || evaluation.passed === true;
+        job.supervisorReview = {
+          status: accepted ? "accepted" : "rejected",
+          accepted,
+          score: evaluation.score ?? review.score ?? null,
+          evaluatedAt: review.createdAt || null,
+          failedChecks: Array.isArray(evaluation.failedChecks) ? evaluation.failedChecks.slice(0, 8) : [],
+          promotionEvidenceId: evaluation.promotionEvidence?.evidenceId || null,
+        };
+        job.detail = {
+          ...(job.detail || {}),
+          phase: accepted ? "supervisor-accepted" : "supervisor-rejected",
+        };
+      });
+    }
+    if (recentHours > 0) {
+      const cutoff = Date.now() - recentHours * 60 * 60 * 1000;
+      jobs = jobs.filter((job) => {
+        const updated = Date.parse(job.updatedAt || job.createdAt || "");
+        return Number.isFinite(updated) && updated >= cutoff;
+      });
+    }
+    const active = jobs.filter((job) => ["queued", "running"].includes(job.status));
+    const queued = jobs.filter((job) => job.status === "queued");
+    const running = jobs.filter((job) => job.status === "running");
+    const paused = jobs.filter((job) => job.status === "paused");
+    const completed = jobs.filter((job) => ["complete", "failed", "cancelled"].includes(job.status));
+    const taskDiagnostics = buildTaskDiagnostics(jobs, {
+      runtime: {
+        jobs: backgroundJobs.status?.() || null,
+        python: runPythonQuantCore.status?.() || null,
+      },
+    });
+    const diagnosticsById = new Map(taskDiagnostics.jobs.map((job) => [String(job.id), job]));
+    jobs.forEach((job) => {
+      const diagnostic = diagnosticsById.get(String(job.id));
+      if (!diagnostic) return;
+      job.taskHealth = diagnostic.health;
+      job.taskState = diagnostic.state;
+      job.isStalled = diagnostic.isStalled;
+      job.heartbeatAgeMs = diagnostic.heartbeatAgeMs;
+      job.progressAgeMs = diagnostic.progressAgeMs;
+      job.checkpoint = diagnostic.checkpoint;
+      job.taskRecommendation = diagnostic.recommendation;
+    });
+    sendJson(res, 200, {
+      updatedAt: new Date().toISOString(),
+      jobs,
+      jobsByStatus: { running, queued, paused, completed },
+      summary: {
+        total: jobs.length,
+        active: active.length,
+        queued: queued.length,
+        paused: paused.length,
+        running: running.length,
+        failed: jobs.filter((job) => job.status === "failed").length,
+        complete: jobs.filter((job) => job.status === "complete").length,
+        completed: completed.length,
+        recent24h: recentHours === 24 ? jobs.length : null,
+      },
+      policy: {
+        staleAfterMs: 90_000,
+        note: "进度来自后台 Job 心跳与阶段检查点；疑似卡顿不会自动伪造完成百分比。",
+      },
+    });
+    return;
+  }
+
+  const taskActionRoute = url.pathname.match(/^\/api\/task-center\/([^/]+)\/(start|pause|resume|restart|cancel|up|down|move)$/);
+  if (taskActionRoute && req.method === "POST") {
+    const taskId = decodeURIComponent(taskActionRoute[1]);
+    const action = taskActionRoute[2];
+    const actionPayload = await readJsonBody(req).catch(() => ({}));
+    if (taskId.startsWith("supervisor-")) {
+      if (!trainingSupervisor) throw Object.assign(new Error("Training supervisor is not initialized."), { statusCode: 503 });
+      const market = taskId.split("-")[1];
+      const result = await trainingSupervisor.control({ market, action, position: actionPayload.position, source: "task-center" });
+      sendJson(res, result.accepted === false ? 409 : 200, result);
+      return;
+    }
+    const actionMap = {
+      start: () => backgroundJobs.start(taskId),
+      restart: () => backgroundJobs.restart(taskId),
+      pause: () => backgroundJobs.pause(taskId),
+      resume: () => backgroundJobs.resume(taskId),
+      cancel: () => backgroundJobs.cancel(taskId),
+      up: () => backgroundJobs.reorder(taskId, "up"),
+      down: () => backgroundJobs.reorder(taskId, "down"),
+      move: () => backgroundJobs.reorder(taskId, { position: actionPayload.position }),
+    };
+    const job = await (actionMap[action] || (() => null))();
+    sendJson(res, job ? 200 : 404, job || { error: "Background task not found." });
+    return;
+  }
+
+  const taskDetailRoute = url.pathname.match(/^\/api\/task-center\/([^/]+)$/);
+  if (taskDetailRoute && req.method === "GET") {
+    const taskId = decodeURIComponent(taskDetailRoute[1]);
+    if (taskId.startsWith("supervisor-")) {
+      if (!trainingSupervisor) throw Object.assign(new Error("Training supervisor is not initialized."), { statusCode: 503 });
+      const market = taskId.split("-")[1];
+      const snapshot = await trainingSupervisor.status(market);
+      const state = snapshot.market || snapshot;
+      const events = Array.isArray(state.history) ? state.history : [];
+      sendJson(res, 200, {
+        id: taskId,
+        type: "training-supervisor",
+        market,
+        status: state.status === "paused" ? "paused" : ["training", "evaluating", "reviewing"].includes(state.status) ? "running" : "queued",
+        progress: state.activeJobId ? null : 0,
+        detail: { phase: state.status === "paused" ? "已暂停" : state.status === "rework_scheduled" ? "等待返工调度" : "等待监督器创建后台 Job" },
+        createdAt: state.nextActionAt || state.updatedAt || null,
+        updatedAt: state.updatedAt || null,
+        supervisorState: state.status,
+        currentPlan: state.currentPlan || null,
+        checkpoints: {},
+        subtasks: (() => {
+          const current = state.activeJobId ? [{ id: state.activeJobId, label: "训练 Job", status: "running" }] : [];
+          const completed = events.slice().reverse().filter((event) => ["job-started", "gate-evaluation-complete", "deterministic-review-complete"].includes(event.type)).slice(0, 12);
+          const pending = state.activeJobId ? [] : [{ id: "launch", label: "创建训练 Job", status: state.status === "paused" ? "paused" : "queued" }];
+          return { current, completed, pending, all: [...completed.map((item) => ({ ...item, status: "complete", label: item.label || item.type })), ...current, ...pending] };
+        })(),
+        history: events.slice(0, 24),
+      });
+      return;
+    }
+    // Terminal backtest artifacts can be several megabytes.  Read the live
+    // object only while the worker owns it; completed details come from the
+    // compact evidence index and still expose checkpoints/subtask state.
+    let job = backgroundJobs.isRunning(taskId)
+      ? await backgroundJobs.get(taskId)
+      : null;
+    if (!job) job = evidenceRegistry.backgroundJobs({ id: taskId, limit: 1 }).jobs?.[0] || null;
+    if (!job) job = await backgroundJobs.get(taskId);
+    if (!job) {
+      sendJson(res, 404, { error: "Background task not found." });
+      return;
+    }
+    const checkpoints = job.checkpoints && typeof job.checkpoints === "object" ? job.checkpoints : {};
+    const jobType = String(job.type || "");
+    const isHistoryJob = ["history-backfill", "rqdata-backfill"].includes(jobType);
+    const isPitJob = jobType === "pit-enrichment";
+    const isCorporateActionJob = ["corporate-action-backfill", "cn-corporate-action-backfill"].includes(jobType);
+    const phaseOrder = isHistoryJob
+      ? [
+        ["load-history", "加载历史数据"],
+        ["persist-data", "写入数据湖"],
+        ["audit", "刷新数据审计"],
+      ]
+      : isPitJob
+        ? [
+          ["load-pit", "加载 PIT 数据源"],
+          ["persist-data", "写入 PIT 数据湖"],
+          ["audit", "刷新 PIT 审计"],
+        ]
+        : isCorporateActionJob
+          ? [
+            ["load-actions", "加载公司行动"],
+            ["persist-data", "写入公司行动层"],
+            ["audit", "刷新公司行动审计"],
+          ]
+      : [
+        ["load-history", "加载历史数据"],
+        ["feature-matrix", "构建特征矩阵"],
+        ["oof-fold-training", "OOF 分折训练"],
+        ["calibration", "概率校准"],
+        ["promotion-review", "确定性验收"],
+        ["report", "生成报告"],
+      ];
+    const currentPhase = String(job.detail?.phase || job.detail?.stage || "");
+    const phaseText = currentPhase.toLowerCase();
+    const phaseAliases = isHistoryJob
+      ? [
+        ["load-history", ["load-history", "loading-point-in-time-history", "history-backfill", "rqdata-backfill"]],
+        ["persist-data", ["persist-data", "persisting-historical-data-lake", "rqdata-data-lake-complete"]],
+        ["audit", ["audit", "data-audit", "snapshot-refresh", "evidence-ready"]],
+      ]
+      : isPitJob
+        ? [
+          ["load-pit", ["loading-point-in-time-universe", "point-in-time-fundamentals", "scanning-changed-local-pit-caches"]],
+          ["persist-data", ["persisting-point-in-time-data-lake", "local-pit-cache-backfill-complete"]],
+          ["audit", ["audit", "pit-audit", "snapshot-refresh", "evidence-ready"]],
+        ]
+        : isCorporateActionJob
+          ? [
+            ["load-actions", ["loading-cn-training-universe", "querying-baostock-adjustment-history", "corporate-action-history", "fallback-eastmoney-corporate-actions"]],
+            ["persist-data", ["corporate-action-evidence-persisted", "cn-corporate-action-evidence-persisted"]],
+            ["audit", ["audit", "corporate-action-audit", "evidence-ready"]],
+          ]
+      : [
+        ["load-history", ["load-history", "loading-point-in-time-history", "persisting-historical-data-lake"]],
+        ["feature-matrix", ["feature-matrix", "restoring-feature-matrix", "feature-matrix-build"]],
+        ["oof-fold-training", ["oof-fold-training", "label-tournament", "fold-training"]],
+        ["calibration", ["calibration", "probability-calibration"]],
+        ["promotion-review", ["promotion-review", "supervisor-review", "supervisor-rejected", "supervisor-accepted"]],
+        ["report", ["report", "model-report"]],
+      ];
+    const currentIndex = phaseOrder.findIndex(([key]) => (phaseAliases.find(([alias]) => alias === key)?.[1] || [key]).some((token) => phaseText.includes(token)));
+    const subtasks = phaseOrder.map(([id, label], index) => ({
+      id,
+      label,
+      status: Object.keys(checkpoints).some((key) => key.toLowerCase().includes(id)) || job.status === "complete"
+        ? "complete"
+        : index === currentIndex ? "running" : "pending",
+      detail: Object.entries(checkpoints).find(([key]) => key.toLowerCase().includes(id))?.[1] || null,
+    }));
+    sendJson(res, 200, {
+      ...job,
+      subtasks: {
+        current: subtasks.filter((item) => item.status === "running"),
+        completed: subtasks.filter((item) => item.status === "complete"),
+        pending: subtasks.filter((item) => item.status === "pending"),
+        all: subtasks,
+      },
+      queue: backgroundJobs.status(),
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/task-diagnostics" && req.method === "GET") {
+    const market = url.searchParams.get("market") || null;
+    const requestedJobId = url.searchParams.get("jobId") || null;
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") || 80)));
+    // Diagnostics is polled by the task center. Use the compact evidence
+    // index by default so a large completed OOF artifact can never block the
+    // status endpoint while the actual worker continues to run.
+    const listed = url.searchParams.get("fast") === "false"
+      ? await backgroundJobs.list({ market, limit })
+      : await readFastTaskPage({ market, limit });
+    const rows = Array.isArray(listed.jobs) ? [...listed.jobs] : [];
+    if (requestedJobId && !rows.some((job) => String(job.id) === requestedJobId)) {
+      const requested = await backgroundJobs.get(requestedJobId);
+      if (requested) rows.unshift(requested);
+    }
+    // Only active jobs are expanded. Terminal job files can contain large
+    // result payloads; diagnostics should remain a fast health/read path.
+    // The list endpoint intentionally stays compact. Reading a full active
+    // artifact here can block on a large OOF result; the detail endpoint is
+    // the only path that should expand checkpoints and raw history.
+    const jobs = rows;
+    const runtime = {
+      jobs: backgroundJobs.status?.() || null,
+      python: runPythonQuantCore.status?.() || null,
+    };
+    const diagnostics = buildTaskDiagnostics(jobs, {
+      runtime,
+      staleAfterMs: Number(process.env.TASK_DIAGNOSTIC_STALE_MS || 90_000),
+      queueStaleAfterMs: Number(process.env.TASK_DIAGNOSTIC_QUEUE_STALE_MS || 5 * 60_000),
+      progressStaleAfterMs: Number(process.env.TASK_DIAGNOSTIC_PROGRESS_STALE_MS || 15 * 60_000),
+    });
+    const activeRuntimeJobs = new Map((runtime.jobs?.running || []).map((job) => [String(job.id), job]));
+    diagnostics.jobs = diagnostics.jobs.map((job) => ({
+      ...job,
+      worker: activeRuntimeJobs.has(String(job.id))
+        ? { active: true, progress: activeRuntimeJobs.get(String(job.id))?.progress ?? null }
+        : { active: false },
+    }));
+    diagnostics.query = {
+      market: market ? safeMarket(market) : null,
+      jobId: requestedJobId,
+      returned: diagnostics.jobs.length,
+    };
+    sendJson(res, 200, diagnostics);
+    return;
+  }
+
   if (url.pathname === "/api/model-reports" && req.method === "GET") {
-    sendJson(res, 200, await modelReports.list({
+    const listed = await modelReports.list({
       market: url.searchParams.get("market") || null,
       limit: url.searchParams.get("limit") || 30,
-    }));
+    });
+    const registryVersions = {};
+    const requestedMarkets = new Set((listed.reports || []).flatMap((report) => report.scope || []).map(safeMarket));
+    for (const market of requestedMarkets) {
+      try {
+        // The registry index is tiny and local. Reading it synchronously avoids
+        // waiting behind large background filesystem work in libuv's thread pool.
+        const registry = JSON.parse(readFileSync(productionModelRegistryIndexPath(market), "utf8"));
+        registryVersions[market] = registry.latestAttempt?.modelVersion || registry.latestRun?.modelVersion || null;
+      } catch {
+        registryVersions[market] = null;
+      }
+    }
+    const reports = (listed.reports || []).map((report) => modelReportFreshness(report, registryVersions));
+    sendJson(res, 200, { ...listed, reports });
     return;
   }
 
@@ -17842,44 +20174,115 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/pit-provider-status" && req.method === "GET") {
-    sendJson(res, 200, { providers: pitProviderStatus(), updatedAt: new Date().toISOString() });
+    const rqdata = await runPythonQuantCore("rqdata-status", { project_root: root }).catch((error) => ({
+      available: false,
+      source: "rqdata",
+      reason: error.message || String(error),
+    }));
+    sendJson(res, 200, {
+      providers: [
+        ...pitProviderStatus(),
+        {
+          name: "ricequant-rqdata",
+          env: "RQSDK_LICENSE",
+          scope: "CN historical OHLCV and adjusted bars",
+          historical: true,
+          configured: Boolean(rqdata.configured),
+          available: Boolean(rqdata.available),
+          expiresAt: rqdata.expiresAt || null,
+          remainingDays: rqdata.remainingDays ?? null,
+          quota: rqdata.quota || null,
+          status: rqdata.available ? "ready" : rqdata.expired ? "expired" : "unavailable",
+          pit: "strict-for-bars; event/fundamental availability remains separately verified",
+        },
+      ],
+      updatedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/free-pit-sources" && req.method === "GET") {
+    sendJson(res, 200, {
+      providers: freePitSourceStatus(),
+      updatedAt: new Date().toISOString(),
+      policy: {
+        strictPIT: "仅 historicalAvailabilityVerified=true 的记录进入正式 OOF/生产模型。",
+        shadow: "没有完整历史版本的免费宏观或媒体源只进入 Shadow，不制造生产置信度。",
+        credentials: "不在前端返回密钥；不会批量注册或绕过供应商额度。",
+      },
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/pit-gap-report" && req.method === "GET") {
+    const market = String(url.searchParams.get("market") || "ALL").toUpperCase();
+    const normalizedMarket = ["ASX", "US", "CN"].includes(market) ? market : "ALL";
+    const providers = [
+      ...pitProviderStatus(),
+      ...(newsProviderStatus().providers || []),
+    ];
+    if (normalizedMarket === "ALL") {
+      const reports = ["ASX", "US", "CN"].map((item) => {
+        const lake = learningProgressDataLakeSnapshot(item);
+        return buildPitGapReport({ market: item, coverage: lake.pitDatasets || {}, coverageAvailable: lake.cached && lake.available !== false, providerStatus: providers });
+      });
+      sendJson(res, 200, {
+        market: "ALL",
+        generatedAt: new Date().toISOString(),
+        strictOofReady: reports.every((report) => report.strictOofReady),
+        reports,
+        note: "覆盖率仅表示审计后的可验证记录，不代表模型已经获得增量预测能力；未满足门槛的数据只能进入 Shadow，不能提升线上置信度。",
+      });
+      return;
+    }
+    const lake = learningProgressDataLakeSnapshot(normalizedMarket);
+    sendJson(res, 200, buildPitGapReport({
+      market: normalizedMarket,
+      coverage: lake.pitDatasets || {},
+      coverageAvailable: lake.cached && lake.available !== false,
+      providerStatus: providers,
+    }));
     return;
   }
 
   if (url.pathname === "/api/social/reddit/status" && req.method === "GET") {
-    sendJson(res, 200, await redditProviderStatus());
+    // The cache can contain tens of thousands of raw Reddit records.  Status
+    // must remain a cheap health check; the data-center can explicitly request
+    // the slower detailed listing with ?detail=1.
+    const detailed = url.searchParams.get("detail") === "1";
+    const fallback = () => ({
+      ...redditStatusBase(),
+      cacheCount: null,
+      itemCount: null,
+      lastCachedAt: null,
+      cache: { available: false, summary: { totalFiles: null, itemCount: null, latestCachedAt: null }, timedOut: true },
+      background: redditBackgroundStatus(),
+      warning: "Detailed Reddit cache scan exceeded the status budget; use local cache or retry.",
+    });
+    const status = detailed
+      ? await settleWithin(redditProviderStatus(null), 1_800, fallback)
+      : await redditProviderStatus(null, { compact: true });
+    sendJson(res, 200, status);
     return;
   }
 
   if (url.pathname === "/api/data-audit" && req.method === "GET") {
     const market = marketFromUrl(url);
     const [lake, lastAudit] = await Promise.all([
-      runPythonQuantCore("data-lake-summary", { market }, 30_000).catch((error) => ({ available: false, error: error.message || String(error) })),
+      Promise.resolve(marketDataAuditSnapshot(market)),
       readFile(join(snapshotBasePath, "data-lake", "isolation-audit-state.json"), "utf8").then(JSON.parse).catch(() => null),
     ]);
     sendJson(res, 200, {
-      market,
-      generatedAt: new Date().toISOString(),
-      schema: "market:exchange:symbol:interval:timestamp",
-      contentVersioned: true,
-      rows: lake.markets?.[market] || 0,
-      partitions: (lake.items || []).filter((row) => row.market === market).length,
-      pitDatasets: Object.fromEntries(Object.entries(lake.pitDatasets || {}).map(([name, value]) => [name, {
-        rows: value.markets?.[market] || 0,
-        verifiedRows: value.verifiedMarkets?.[market] || 0,
-        verifiedPct: value.verifiedMarketPct?.[market] || 0,
-        symbols: value.symbols?.[market] || 0,
-        verifiedSymbols: value.verifiedSymbols?.[market] || 0,
-        verifiedSymbolPct: value.verifiedSymbolPct?.[market] || 0,
-        trainingUniverseCoveragePct: value.trainingUniverseCoveragePct?.[market] || 0,
-      }])),
+      ...lake,
       isolationAudit: lastAudit,
       quarantine: {
         invalidRows: lastAudit?.invalidRowsQuarantined ?? null,
         duplicateRowsRemoved: lastAudit?.duplicateRowsRemoved ?? null,
         intervalKeysMigrated: lastAudit?.intervalKeysMigrated ?? null,
       },
-      warning: Number(lake.pitDatasets?.universe?.trainingUniverseCoveragePct?.[market] || 0) < 100
+      warning: !lake.available
+        ? "Data-audit snapshot is loading in the background; the page intentionally does not replace coverage with false zero values."
+        : Number(lake.pitDatasets?.universe?.trainingUniverseCoveragePct || 0) < 100
         ? "Historical-universe coverage is incomplete; survivor-bias risk remains explicit and unverified rows are excluded from production OOF."
         : null,
     });
@@ -17887,7 +20290,17 @@ async function handleApi(req, res, url) {
   }
 
   if (url.pathname === "/api/data-replenishment" && req.method === "GET") {
-    sendJson(res, 200, await dataReplenishmentSnapshot(marketFromUrl(url)));
+    const force = ["1", "true", "yes"].includes(String(url.searchParams.get("refresh") || "").toLowerCase());
+    // A health refresh starts a fresh audit, but must not hold the UI hostage
+    // behind a busy Parquet/DuckDB writer.  Operators can explicitly request a
+    // synchronous audit with wait=1; normal pages receive the latest complete
+    // snapshot and the SSE refresh event when the audit finishes.
+    const waitForFresh = ["1", "true", "yes"].includes(String(url.searchParams.get("wait") || "").toLowerCase());
+    const snapshot = await dataReplenishmentSnapshot(marketFromUrl(url), { force, waitForFresh });
+    sendJson(res, 200, {
+      ...snapshot,
+      replenishmentPlan: snapshot.replenishmentPlan || dataReplenishmentRoundPlan(snapshot),
+    });
     return;
   }
 
@@ -17895,43 +20308,79 @@ async function handleApi(req, res, url) {
     const payload = await readJsonBody(req);
     const market = safeMarket(payload.market || marketFromUrl(url));
     const scope = String(payload.scope || "all").toLowerCase();
-    const snapshot = await dataReplenishmentSnapshot(market);
+    // Manual replenishment must enqueue from the last audited local snapshot
+    // immediately. A fresh all-market PIT audit can take tens of seconds and
+    // previously made this control path time out before any resumable jobs
+    // were created. Refresh it in the background for the next request.
+    const snapshot = await dataReplenishmentSnapshot(market, { force: false, waitForFresh: false });
+    void dataReplenishmentSnapshot(market, { force: true, waitForFresh: false }).catch(() => {});
     const resources = await trainingResources.get();
     const dataProfile = resources.profile.data || {};
     const jobs = [];
-    if (["all", "pit"].includes(scope)) {
-      const explicitSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
-        .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
-      const requestedSymbols = explicitSymbols.length
-        ? explicitSymbols
-        : prioritizedPitGapSymbols(snapshot, market, Number(dataProfile.pitBatch || 30));
-      const job = await backgroundJobs.create("pit-enrichment", {
-        market,
-        symbols: requestedSymbols,
-        limit: requestedSymbols.length || Number(dataProfile.pitBatch || 30),
-        officialHistoryLimit: requestedSymbols.length || Number(dataProfile.officialPitBatch || 15),
-        corporateActionLimit: 0,
-        forceUniverse: payload.forceUniverse === true,
-        forceHistory: payload.forceHistory === true,
-        reason: `manual-data-replenishment:${resources.selected}`,
-        resourceProfile: resources.selected,
-      });
-      jobs.push({ family: "pit", id: job.id, status: job.status });
+    if (["all", "pit", "pit-deep"].includes(scope)) {
+      const activePit = (await backgroundJobs.list({ type: "pit-enrichment", market, limit: 10 }))
+        .jobs?.find((job) => ["queued", "running"].includes(job.status));
+      if (activePit) {
+        jobs.push({ family: "pit", id: activePit.id, status: activePit.status, reused: true });
+      } else {
+        const explicitSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
+          .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+        const deepPit = scope === "pit-deep";
+        const pitLimit = deepPit
+          ? Math.max(30, Math.min(70, Number(payload.limit || 45)))
+          : Number(dataProfile.pitBatch || 30);
+        const requestedSymbols = explicitSymbols.length
+          ? explicitSymbols
+          : prioritizedPitGapSymbols(snapshot, market, pitLimit);
+        const officialBatch = Math.max(1, Math.min(
+          requestedSymbols.length || pitLimit,
+          deepPit ? pitLimit : Number(dataProfile.officialPitBatch || 15),
+        ));
+        const job = await backgroundJobs.create("pit-enrichment", {
+          market,
+          symbols: requestedSymbols,
+          limit: requestedSymbols.length || pitLimit,
+          liveUniverse: payload.liveUniverse === true,
+          officialHistoryLimit: officialBatch,
+          corporateActionLimit: 0,
+          forceUniverse: payload.forceUniverse === true,
+          // A deep PIT run is specifically for replacing legacy shallow caches
+          // with dated annual/quarterly disclosures and as-reported statements.
+          forceHistory: payload.forceHistory === true || deepPit,
+          // Preserve the explicit macro refresh request. Without forwarding this
+          // flag, the worker can legally reuse the previous macro cache even when
+          // the user asked for a fresh vintage pull.
+          refreshMacro: payload.refreshMacro === true,
+          identityLimit: Math.max(0, Math.min(100, Number(payload.identityLimit ?? process.env.PIT_IDENTITY_LIMIT ?? 30))),
+          reason: `manual-data-replenishment:${resources.selected}:${scope}`,
+          resourceProfile: resources.selected,
+        });
+        jobs.push({ family: "pit", id: job.id, status: job.status });
+      }
     }
-    if (["all", "history"].includes(scope)) {
+    if (["all", "history", "history-deep"].includes(scope)) {
       const activeHistory = (snapshot.jobs.history || []).find((job) => ["queued", "running"].includes(job.status));
       if (activeHistory) {
         jobs.push({ family: "history", id: activeHistory.id, status: activeHistory.status, reused: true });
       } else {
-        const historySymbols = (snapshot.history.nextSymbols || []).map((row) => row.symbol);
+        const deepHistory = scope === "history-deep";
+        const explicitSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
+          .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+        const historySymbols = explicitSymbols.length
+          ? explicitSymbols
+          : (snapshot.history.nextSymbols || []).map((row) => row.symbol);
         const job = await backgroundJobs.create("history-backfill", {
           market,
           symbols: historySymbols,
           range: snapshot.target.range,
-          requiredRows: snapshot.target.researchRows,
-          includeDelisted: true,
+          requiredRows: deepHistory ? snapshot.target.deepHistoryRows : snapshot.target.researchRows,
+          // Delisted expansion is opt-in because it can require a slow
+          // historical-universe provider call. Routine manual refreshes should
+          // advance the requested live symbols first; the PIT universe job can
+          // be run explicitly when that extra dataset is needed.
+          includeDelisted: payload.includeDelisted === true,
           delistedBatch: Number(dataProfile.delistedBatch || 10),
-          reason: `manual-data-replenishment:${resources.selected}`,
+          reason: `manual-data-replenishment:${resources.selected}:${scope}`,
           resourceProfile: resources.selected,
         });
         jobs.push({ family: "history", id: job.id, status: job.status });
@@ -17972,6 +20421,54 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/rqdata/status" && req.method === "GET") {
+    sendJson(res, 200, await runPythonQuantCore("rqdata-status", { project_root: root }, 30_000));
+    return;
+  }
+
+  if (url.pathname === "/api/rqdata/backfill" && req.method === "POST") {
+    const payload = await readJsonBody(req);
+    const symbols = normalizeSymbolListForMarket(payload.symbols || [], "CN")
+      .filter((symbol) => !cleanCode(symbol, "CN").startsWith("^"));
+    const requestedSymbolsKey = [...new Set(symbols.map((symbol) => cleanCode(symbol, "CN")))].sort().join(",");
+    if (requestedSymbolsKey) {
+      const dedupeWindowMs = Math.max(
+        30 * 60_000,
+        Number(process.env.RQDATA_BACKFILL_DEDUPE_MS || 6 * 60 * 60_000),
+      );
+      const recent = await backgroundJobs.list({ type: "rqdata-backfill", market: "CN", limit: 24 }).catch(() => ({ jobs: [] }));
+      const candidates = await Promise.all((recent.jobs || []).map((entry) => backgroundJobs.get(entry.id).catch(() => null)));
+      const duplicate = candidates
+        .filter((entry) => entry && ["queued", "running"].includes(entry.status)
+          || entry && entry.status === "complete"
+            && Date.now() - (Date.parse(entry.updatedAt || entry.createdAt || "") || 0) <= dedupeWindowMs)
+        .find((entry) => [...new Set((entry.payload?.symbols || []).map((symbol) => cleanCode(symbol, "CN")))].sort().join(",") === requestedSymbolsKey);
+      if (duplicate) {
+        // A completed RQData batch may have written Parquet before the last
+        // readiness snapshot was persisted. Refresh the snapshot, but never
+        // spend the provider quota fetching an identical symbol set again.
+        void dataReplenishmentSnapshot("CN", { force: true, waitForFresh: false }).catch(() => {});
+        sendJson(res, 202, {
+          ...duplicate,
+          reused: true,
+          deduplicated: true,
+          reason: "identical RQData symbol batch was recently processed; readiness snapshot refresh started",
+        });
+        return;
+      }
+    }
+    const job = await backgroundJobs.create("rqdata-backfill", {
+      ...payload,
+      market: "CN",
+      symbols,
+      limit: Math.max(1, Math.min(550, Number(payload.limit || process.env.RQDATA_SYMBOL_LIMIT || 550))),
+      reason: payload.reason || "manual-rqdata-pit-and-history-backfill",
+    });
+    runtimeEvents.publish("rqdata.backfill_queued", { jobId: job.id, symbols: symbols.length, retrainAfter: payload.retrainAfter === true });
+    sendJson(res, 202, job);
+    return;
+  }
+
   if (url.pathname === "/api/data-health" && req.method === "GET") {
     const market = marketFromUrl(url);
     const sampleCode = normalizeMarketSymbol(url.searchParams.get("symbol") || { ASX: "BHP", US: "AAPL", CN: "600519" }[market], market);
@@ -18000,6 +20497,7 @@ async function handleApi(req, res, url) {
       newsProviders: newsProviderStatus().providers || [],
       newsPrimary: newsProviderStatus().primary || process.env.NEWS_PRIMARY_PROVIDER || "auto",
       pitProviders: pitProviderStatus(),
+      freePitSources: freePitSourceStatus(),
       newsCache,
       socialProviders: [redditStatus],
       redditSocial: redditStatus,
@@ -18025,11 +20523,29 @@ async function handleApi(req, res, url) {
     const status = await trainingSupervisor.status(market);
     const activeJob = status.market?.activeJobId ? await getSupervisorBackgroundJob(status.market.activeJobId) : null;
     const full = url.searchParams.get("full") === "1";
-    const logs = await trainingSupervisor.logs({ market, limit: full ? 120 : 24 });
+    const terminalActiveJob = activeJob && ["failed", "cancelled", "complete"].includes(activeJob.status);
     const marketStatus = status.market ? {
       ...status.market,
+      ...(terminalActiveJob ? {
+        status: activeJob.status === "complete" ? "evaluating" : "completed_not_promoted",
+        activeJobId: null,
+        lastError: activeJob.error || status.market.lastError || null,
+        reconciliationPending: true,
+      } : {}),
       history: full ? status.market.history : (status.market.history || []).slice(0, 12),
     } : null;
+    const compactStateEvents = marketStatus
+      ? marketStatus.history || []
+      : Object.values(status.markets || {}).flatMap((row) => row.history || [])
+        .sort((left, right) => String(right.createdAt || "").localeCompare(String(left.createdAt || "")))
+        .slice(0, 24);
+    const logs = full
+      ? await settleWithin(
+        trainingSupervisor.logs({ market, limit: 120 }),
+        Number(process.env.TRAINING_SUPERVISOR_LOG_READ_TIMEOUT_MS || 1_200),
+        { events: compactStateEvents, timedOut: true },
+      )
+      : { events: compactStateEvents };
     sendJson(res, 200, {
       ...status,
       market: marketStatus,
@@ -18044,11 +20560,9 @@ async function handleApi(req, res, url) {
         updatedAt: activeJob.updatedAt,
         error: activeJob.error || null,
       } : null,
-      providers: trainingSupervisorProviderStatus().map((provider) => ({
-        ...provider,
-        enabled: status.reviewersEnabled?.[provider.id] !== false,
-      })),
-      logs: logs.events || [],
+      reviewMode: "deterministic_only",
+      aiReviewEnabled: false,
+      logs: full ? logs.events || [] : (logs.events || []).map(compactTrainingSupervisorEvent),
       order_execution_enabled: false,
     });
     return;
@@ -18083,9 +20597,11 @@ async function handleApi(req, res, url) {
     sendJson(res, 202, await trainingSupervisor.trigger({
       market,
       mode,
+      resume: payload.resume === true,
       reason: payload.reason || "manual-ui",
       source: payload.source || "manual-ui",
       operatorNote: payload.operatorNote || "",
+      changedHypothesis: String(payload.changedHypothesis || "").trim(),
     }));
     return;
   }
@@ -18096,6 +20612,7 @@ async function handleApi(req, res, url) {
     const market = safeMarket(payload.market || marketFromUrl(url));
     sendJson(res, 202, await trainingSupervisor.reviewLatest({
       market,
+      jobId: payload.jobId || "",
       source: payload.source || "manual-ui",
       operatorNote: payload.operatorNote || "",
     }));
@@ -18202,6 +20719,23 @@ async function handleApi(req, res, url) {
       market: url.searchParams.get("market") || marketFromUrl(url),
       family: url.searchParams.get("family") || "",
       limit: Number(url.searchParams.get("limit") || 500),
+    }));
+    return;
+  }
+
+  if (url.pathname === "/api/evidence/snapshots" && req.method === "GET") {
+    sendJson(res, 200, evidenceRegistry.snapshots({
+      market: url.searchParams.get("market") || marketFromUrl(url),
+      limit: Number(url.searchParams.get("limit") || 100),
+    }));
+    return;
+  }
+
+  if (url.pathname === "/api/evidence/experiments" && req.method === "GET") {
+    sendJson(res, 200, evidenceRegistry.experiments({
+      market: url.searchParams.get("market") || marketFromUrl(url),
+      family: url.searchParams.get("family") || "",
+      limit: Number(url.searchParams.get("limit") || 100),
     }));
     return;
   }
@@ -18942,20 +21476,101 @@ async function handleApi(req, res, url) {
     const evidenceTargetRows = strategy.horizonDays <= 5 ? 260 : strategy.horizonDays <= 15 ? 500 : 750;
     const cached = await readHistoricalBacktestEvidence(market, symbol, strategy);
     const stale = !cached?.computedAt || Date.now() - Date.parse(cached.computedAt) > 24 * 60 * 60_000;
-    const evidenceJob = (!cached || stale)
-      ? await queueHistoricalBacktestEvidence({ market, symbol, strategy, range, reason: cached ? "daily-evidence-refresh" : "missing-evidence-precompute" })
-      : null;
-    const localDepth = cached ? null : await runPythonQuantCore("data-lake-read", {
-      market, symbol, interval: "1d", limit: 1_000,
-    }, 8_000).catch(() => ({ rows: null }));
-    const availableRows = Number(cached?.dataDepth?.availableRows ?? cached?.dataDepth?.candleRows ?? localDepth?.rows ?? 0);
+    // The task-center and chart poll this endpoint frequently.  Do not wait
+    // for the shared Python ingest lane just to discover local history depth;
+    // the durable per-symbol cache is enough for a fast, honest decision and
+    // the background evidence job can still read the full data lake.
+    const localHistory = cached ? null : await readLocalMarketHistoryPayload(market, symbol, "1d");
+    const availableRows = Number(cached?.dataDepth?.availableRows ?? cached?.dataDepth?.candleRows ?? localHistory?.candles?.length ?? 0);
+    let evidenceJob = null;
     let backfillJob = null;
+    let waitingForData = false;
     if (availableRows < evidenceTargetRows) {
-      backfillJob = await backgroundJobs.create("history-backfill", {
-        market, symbols: [symbol], interval: "1d",
-        range: { ASX: "10y", US: "10y", CN: "8y" }[market] || "10y",
-        requiredRows: evidenceTargetRows, reason: "historical-backtest-evidence-gap", maxAttempts: 1,
-      }).catch(() => null);
+      const backfillCooldownMs = Math.max(
+        5 * 60_000,
+        Number(process.env.HISTORICAL_BACKTEST_BACKFILL_COOLDOWN_MS || 2 * 60 * 60_000),
+      );
+      const runtime = await readBackendMonitorRuntime().catch(() => ({}));
+      const candidateNoProgress = historyNoProgressEntryForSymbol(runtime, market, symbol, evidenceTargetRows);
+      let noProgress = candidateNoProgress
+        && availableRows <= Number(candidateNoProgress.availableRows || 0)
+        ? candidateNoProgress
+        : null;
+      // Older runtime records tracked the whole batch rather than the symbol.
+      // Reuse that evidence when its last result contains this symbol, so a
+      // stale single-symbol request cannot bypass the market-level backoff.
+      if (!noProgress) {
+        const marketNoProgress = runtime.historyNoProgressByMarket?.[market] || null;
+        const lastNoProgressJob = marketNoProgress?.lastJobId
+          ? await backgroundJobs.get(marketNoProgress.lastJobId).catch(() => null)
+          : null;
+        const matchingRow = (lastNoProgressJob?.result?.results || []).find((candidate) => (
+          normalizeMarketSymbol(candidate?.symbol || "", market) === symbol
+        ));
+        if (matchingRow && availableRows <= Number(matchingRow.rows || 0)) {
+          noProgress = {
+            ...marketNoProgress,
+            availableRows: Number(matchingRow.rows || 0),
+            requiredRows: evidenceTargetRows,
+            source: matchingRow.source || "unavailable",
+            lastJobId: lastNoProgressJob.id,
+          };
+        }
+      }
+      const noProgressUntil = Date.parse(String(noProgress?.blockedUntil || "")) || 0;
+      if (noProgressUntil > Date.now()) {
+        waitingForData = true;
+        backfillJob = {
+          id: noProgress.lastJobId || null,
+          status: "complete",
+          reused: true,
+          blockedOnData: true,
+          availableRows: Number(noProgress.availableRows || 0),
+          requiredRows: evidenceTargetRows,
+          source: noProgress.source || "unavailable",
+          blockedUntil: noProgress.blockedUntil,
+        };
+      }
+      const recentBackfills = waitingForData
+        ? { jobs: [] }
+        : await backgroundJobs.list({ type: "history-backfill", market, limit: 24 }).catch(() => ({ jobs: [] }));
+      const fullBackfills = await Promise.all((recentBackfills.jobs || []).map((entry) => backgroundJobs.get(entry.id).catch(() => null)));
+      const sameSymbolBackfill = fullBackfills
+        .filter((entry) => Array.isArray(entry?.payload?.symbols)
+          && entry.payload.symbols.some((candidate) => normalizeMarketSymbol(candidate, market) === symbol))
+        .filter((entry) => Number(entry.payload?.requiredRows || 0) >= evidenceTargetRows)
+        .sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")))
+        .find((entry) => ["queued", "running"].includes(entry.status)
+          || Date.now() - Date.parse(entry.updatedAt || entry.createdAt || 0) < backfillCooldownMs);
+      if (waitingForData) {
+        // The no-progress lock above is the authoritative answer. Do not
+        // create another provider request until its bounded cooldown ends.
+      } else if (sameSymbolBackfill) {
+        backfillJob = { ...sameSymbolBackfill, reused: true };
+      } else {
+        backfillJob = await backgroundJobs.create("history-backfill", {
+          market, symbols: [symbol], interval: "1d",
+          range: { ASX: "10y", US: "10y", CN: "8y" }[market] || "10y",
+          requiredRows: evidenceTargetRows,
+          reason: "historical-backtest-evidence-gap",
+          maxAttempts: 1,
+          followUpHistoricalBacktest: {
+            market,
+            symbol,
+            strategy,
+            range,
+            reason: "history-backfill-complete",
+          },
+        }).catch(() => null);
+      }
+    } else if (!cached || stale) {
+      evidenceJob = await queueHistoricalBacktestEvidence({
+        market,
+        symbol,
+        strategy,
+        range,
+        reason: cached ? "daily-evidence-refresh" : "missing-evidence-precompute",
+      });
     }
     sendJson(res, 200, {
       ...(cached || {
@@ -18963,11 +21578,13 @@ async function handleApi(req, res, url) {
         market,
         symbol,
         reason: availableRows < evidenceTargetRows
-          ? `Historical evidence needs ${evidenceTargetRows} daily candles; ${availableRows} are locally available.`
+          ? waitingForData
+            ? `History backfill is paused until ${backfillJob?.blockedUntil || "the next provider cooldown"}; ${availableRows} real daily candles are locally available.`
+            : `Historical evidence needs ${evidenceTargetRows} daily candles; ${availableRows} are locally available.`
           : "Historical evidence is queued for background calculation.",
       }),
-      status: cached ? (stale ? "cached-refreshing" : "ready") : "queued",
-      calculationStatus: cached ? "complete" : "queued",
+      status: cached ? (stale ? "cached-refreshing" : "ready") : waitingForData ? "waiting-for-history" : "queued",
+      calculationStatus: cached ? "complete" : waitingForData ? "blocked-on-data" : "queued",
       range,
       dataDepth: {
         ...(cached?.dataDepth || {}),
@@ -19018,6 +21635,13 @@ async function handleApi(req, res, url) {
       limit: payload.limit,
       largeSample: payload.largeSample !== false,
       productionTraining: payload.productionTraining === true,
+      trainingOptions: payload.trainingOptions || {
+        trainingLane: payload.trainingLane || payload.training_lane,
+        experimentId: payload.experimentId || payload.experiment_id,
+        hypothesisId: payload.hypothesisId || payload.hypothesis_id,
+        changedHypotheses: payload.changedHypotheses || payload.changed_hypotheses || payload.changedHypothesis || payload.changed_hypothesis,
+        strictGate03Approved: payload.strictGate03Approved === true || payload.strict_gate03_approved === true,
+      },
     }));
     return;
   }
@@ -19141,10 +21765,21 @@ async function oofFoldCheckpointSnapshot(market) {
   return snapshot;
 }
 
-async function watchOofFoldCheckpoints({ market, update, checkpoint, expectedFolds = 5, signal }) {
+async function watchOofFoldCheckpoints({ market, update, checkpoint, expectedFolds = 5, progressPath = "", trainingRunId = null, signal }) {
   const baseline = await oofFoldCheckpointSnapshot(market);
   const recorded = new Set();
+  let lastProgressSignature = "";
   let busy = false;
+  const readRuntimeProgress = async () => {
+    if (!progressPath) return null;
+    try {
+      const payload = JSON.parse(await readFile(progressPath, "utf8"));
+      if (trainingRunId && payload?.trainingRunId && String(payload.trainingRunId) !== String(trainingRunId)) return null;
+      return payload;
+    } catch {
+      return null;
+    }
+  };
   const sync = async () => {
     if (busy || signal?.aborted) return;
     busy = true;
@@ -19163,6 +21798,28 @@ async function watchOofFoldCheckpoints({ market, update, checkpoint, expectedFol
           completedFoldCheckpoints: recorded.size,
           expectedFoldCheckpoints: expectedFolds,
         });
+      }
+      const runtimeProgress = await readRuntimeProgress();
+      if (runtimeProgress) {
+        const signature = JSON.stringify(runtimeProgress);
+        if (signature !== lastProgressSignature) {
+          lastProgressSignature = signature;
+          const completedFolds = Number(runtimeProgress.completedFolds || 0);
+          const foldCount = Number(runtimeProgress.foldCount || expectedFolds || 1);
+          const foldProgress = Math.min(0.20, Math.max(0, completedFolds / Math.max(1, foldCount) * 0.20));
+          await update(0.60 + foldProgress, {
+            phase: "oof-fold-training",
+            trainingPhase: runtimeProgress.phase || null,
+            horizon: runtimeProgress.horizon ?? null,
+            fold: runtimeProgress.fold ?? null,
+            completedFolds,
+            expectedFolds: foldCount,
+            trainingRows: runtimeProgress.rowCount ?? null,
+            trainingSymbols: runtimeProgress.symbolCount ?? null,
+            trainingDates: runtimeProgress.dateCount ?? null,
+            progressUpdatedAt: runtimeProgress.updatedAt || null,
+          });
+        }
       }
     } finally {
       busy = false;
@@ -19199,6 +21856,65 @@ backgroundJobs.register("training", async (payload, update) => {
     results: rows,
   };
 });
+let eastmoneyActionRequestChain = Promise.resolve();
+let eastmoneyActionNextRequestAt = 0;
+
+async function fetchEastmoneyCorporateActionThrottled(symbol, signal) {
+  const queued = eastmoneyActionRequestChain.then(async () => {
+    if (signal?.aborted) throw Object.assign(new Error("Eastmoney corporate-action fallback was cancelled."), { code: "JOB_CANCELLED" });
+    const intervalMs = Math.max(150, Number(process.env.EASTMONEY_ACTION_INTERVAL_MS || 350));
+    const delay = Math.max(0, eastmoneyActionNextRequestAt - Date.now());
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    eastmoneyActionNextRequestAt = Date.now() + intervalMs;
+    return fetchEastmoneyCorporateActionHistory(symbol);
+  });
+  eastmoneyActionRequestChain = queued.catch(() => null);
+  return queued;
+}
+
+async function runEastmoneyCorporateActionFallback(symbols, aggregate, context, update, completedBase, total) {
+  const requested = Array.isArray(symbols) ? symbols : [];
+  if (!requested.length) return [];
+  const results = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < requested.length) {
+      if (context.signal.aborted) throw Object.assign(new Error("Eastmoney corporate-action fallback was cancelled."), { code: "JOB_CANCELLED" });
+      const symbol = requested[cursor++];
+      try {
+        const records = await fetchEastmoneyCorporateActionThrottled(symbol, context.signal);
+        await persistPitBatches([{
+          dataset: "corporate_actions",
+          market: "CN",
+          symbol,
+          source: "eastmoney-cn-corporate-actions",
+          records,
+        }], { signal: context.signal });
+        const row = { symbol, available: true, source: "eastmoney-cn-corporate-actions", events: records.length };
+        results.push(row);
+        aggregate.available = true;
+        aggregate.inserted += records.length;
+      } catch (error) {
+        results.push({ symbol, available: false, source: "eastmoney-cn-corporate-actions", error: error.message || String(error) });
+      }
+      const completed = completedBase + results.length;
+      await update(0.12 + completed / Math.max(1, total) * 0.84, {
+        phase: "fallback-eastmoney-corporate-actions",
+        completed,
+        total,
+        fallbackCompleted: results.length,
+        fallbackTotal: requested.length,
+      });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, requested.length) }, worker));
+  // The Python pass already counts these symbols as checked/failed. The
+  // fallback only replaces a failed row; keep aggregate counters stable.
+  aggregate.failed = Math.max(0, aggregate.failed - results.filter((row) => row.available === true).length);
+  aggregate.results.push(...results);
+  return results;
+}
+
 backgroundJobs.register("learning-evaluation", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
   await update(0.08, { phase: "resolving-prediction-labels" });
@@ -19223,17 +21939,44 @@ async function runCnCorporateActionChunks(symbols, payload, update, context) {
   for (let offset = 0; offset < symbols.length; offset += chunkSize) {
     if (context.signal.aborted) throw Object.assign(new Error("A-share corporate-action backfill was cancelled."), { code: "JOB_CANCELLED" });
     const chunk = symbols.slice(offset, offset + chunkSize);
-    const result = await runPythonQuantCore("baostock-corporate-actions", {
-      project_root: root,
-      symbols: chunk,
-      start_date: payload.startDate || "2000-01-01",
-      end_date: payload.endDate || new Date().toISOString().slice(0, 10),
-      refresh_days: payload.refreshDays || 30,
-      force: payload.force === true,
-    }, Number(process.env.BAOSTOCK_ACTION_CHUNK_TIMEOUT_MS || 4 * 60_000), { signal: context.signal });
+    let result;
+    try {
+      result = await runPythonQuantCore("baostock-corporate-actions", {
+        project_root: root,
+        symbols: chunk,
+        start_date: payload.startDate || "2000-01-01",
+        end_date: payload.endDate || new Date().toISOString().slice(0, 10),
+        refresh_days: payload.refreshDays || 30,
+        force: payload.force === true,
+      }, Number(process.env.BAOSTOCK_ACTION_CHUNK_TIMEOUT_MS || 4 * 60_000), { signal: context.signal });
+    } catch (error) {
+      result = {
+        available: false,
+        checked: chunk.length,
+        failed: chunk.length,
+        inserted: 0,
+        batches: 0,
+        results: chunk.map((symbol) => ({ symbol, available: false, source: "baostock", error: error.message || String(error) })),
+      };
+    }
     aggregate.available ||= result.available === true;
     for (const key of ["checked", "skippedFresh", "failed", "inserted", "batches"]) aggregate[key] += Number(result[key] || 0);
     aggregate.results.push(...(result.results || []));
+    const resultBySymbol = new Map((result.results || []).map((row) => [cleanCode(row.symbol || "", "CN"), row]));
+    const fallbackSymbols = chunk.filter((symbol) => {
+      const row = resultBySymbol.get(cleanCode(symbol, "CN"));
+      return !row || row.available !== true || Number(row.inserted || row.events || 0) <= 0;
+    });
+    if (fallbackSymbols.length && payload.disableEastmoneyFallback !== true) {
+      await runEastmoneyCorporateActionFallback(
+        fallbackSymbols,
+        aggregate,
+        context,
+        update,
+        Math.max(0, offset),
+        symbols.length,
+      );
+    }
     const completed = Math.min(symbols.length, offset + chunk.length);
     await context.checkpoint(`cn-corporate-action-batch-${Math.ceil(completed / chunkSize)}`, { completed, total: symbols.length });
     await update(0.12 + completed / Math.max(1, symbols.length) * 0.84, { phase: "querying-baostock-adjustment-history", completed, total: symbols.length });
@@ -19386,7 +22129,108 @@ backgroundJobs.register("historical-backtest-symbol", async (payload, update, co
     dataVersion: candleContentVersion(candles),
   });
   if (candles.length < requiredRows) {
-    throw Object.assign(new Error(`Historical evidence requires ${requiredRows} real daily candles; ${candles.length} are available from ${marketData.source || "local data lake"}.`), { code: "INSUFFICIENT_HISTORY" });
+    const runtime = await readBackendMonitorRuntime().catch(() => ({}));
+    let noProgress = historyNoProgressEntryForSymbol(runtime, market, symbol, requiredRows);
+    // Older market-level records may predate per-symbol cooldowns. Reuse the
+    // matching row from that batch so the worker cannot bypass a valid lock.
+    if (!noProgress) {
+      const marketNoProgress = runtime.historyNoProgressByMarket?.[market] || null;
+      const lastNoProgressJob = marketNoProgress?.lastJobId
+        ? await backgroundJobs.get(marketNoProgress.lastJobId).catch(() => null)
+        : null;
+      const matchingRow = (lastNoProgressJob?.result?.results || []).find((candidate) => (
+        normalizeMarketSymbol(candidate?.symbol || "", market) === symbol
+      ));
+      if (matchingRow && candles.length <= Number(matchingRow.rows || 0)) {
+        noProgress = {
+          ...marketNoProgress,
+          availableRows: Number(matchingRow.rows || 0),
+          requiredRows,
+          source: matchingRow.source || "unavailable",
+          lastJobId: lastNoProgressJob.id,
+        };
+      }
+    }
+    const noProgressUntil = Date.parse(String(noProgress?.blockedUntil || "")) || 0;
+    const blockedByNoProgress = Boolean(noProgressUntil > Date.now()
+      && candles.length <= Number(noProgress?.availableRows || 0));
+    let backfillJob = null;
+    if (blockedByNoProgress) {
+      backfillJob = {
+        id: noProgress.lastJobId || null,
+        status: "complete",
+        reused: true,
+        blockedOnData: true,
+        availableRows: Number(noProgress.availableRows || candles.length),
+        requiredRows,
+        source: noProgress.source || marketData.source || "unavailable",
+        blockedUntil: noProgress.blockedUntil,
+      };
+    } else {
+      const recentBackfills = await backgroundJobs.list({ type: "history-backfill", market, limit: 24 }).catch(() => ({ jobs: [] }));
+      const fullBackfills = await Promise.all((recentBackfills.jobs || []).map((entry) => backgroundJobs.get(entry.id).catch(() => null)));
+      const sameSymbolBackfill = fullBackfills
+        .filter((entry) => Array.isArray(entry?.payload?.symbols)
+          && entry.payload.symbols.some((candidate) => normalizeMarketSymbol(candidate, market) === symbol))
+        .filter((entry) => Number(entry.payload?.requiredRows || 0) >= requiredRows)
+        .sort((left, right) => String(right.updatedAt || right.createdAt || "").localeCompare(String(left.updatedAt || left.createdAt || "")))
+        .find((entry) => ["queued", "running"].includes(entry.status)
+          || Date.now() - Date.parse(entry.updatedAt || entry.createdAt || 0) < 2 * 60 * 60_000);
+      if (sameSymbolBackfill) {
+        backfillJob = { ...sameSymbolBackfill, reused: true };
+      } else {
+        backfillJob = await backgroundJobs.create("history-backfill", {
+          market,
+          symbols: [symbol],
+          interval: "1d",
+          range: { ASX: "10y", US: "10y", CN: "8y" }[market] || "10y",
+          requiredRows,
+          reason: "historical-backtest-handler-history-gap",
+          maxAttempts: 1,
+          followUpHistoricalBacktest: {
+            market,
+            symbol,
+            strategy,
+            range: payload.range || ({ ASX: "10y", US: "10y", CN: "8y" }[market] || "10y"),
+            reason: "history-backfill-complete",
+          },
+        }).catch(() => null);
+      }
+    }
+    await context.checkpoint("waiting-for-history", {
+      rows: candles.length,
+      requiredRows,
+      source: marketData.source,
+      backfillJobId: backfillJob?.id || null,
+      blockedUntil: backfillJob?.blockedUntil || null,
+    });
+    await update(0.95, {
+      phase: "waiting-for-history",
+      rows: candles.length,
+      requiredRows,
+      backfillJobId: backfillJob?.id || null,
+      blockedUntil: backfillJob?.blockedUntil || null,
+    });
+    return {
+      available: false,
+      status: "waiting-for-history",
+      calculationStatus: "blocked-on-data",
+      market,
+      symbol,
+      reason: `Historical evidence needs ${requiredRows} real daily candles; ${candles.length} are available.`,
+      dataDepth: {
+        availableRows: candles.length,
+        requiredRows,
+        first: candles[0]?.date || null,
+        last: candles.at(-1)?.date || null,
+        source: marketData.source || "local-data-lake",
+      },
+      backfillJob: backfillJob ? {
+        id: backfillJob.id,
+        status: backfillJob.status,
+        deduplicated: backfillJob.deduplicated === true,
+      } : null,
+    };
   }
   await update(0.25, { phase: "walk-forward-evaluation", rows: candles.length });
   const result = await historicalBacktestForCandles({ market, symbol, candles, strategy, source: marketData.source });
@@ -19411,6 +22255,66 @@ backgroundJobs.register("historical-backtest-symbol", async (payload, update, co
   await update(0.97, { phase: "evidence-ready", samples: result.metrics?.samples || result.values?.samples || null });
   return evidence;
 });
+
+function classifyHistoryBackfillRow(row = {}, requiredRows = 0) {
+  const rows = Number(row.rows || 0);
+  if (requiredRows > 0 && rows >= requiredRows) return "qualified";
+  const warning = String(row.warning || row.error || "");
+  if (/timed out|timeout|queue wait exceeded/i.test(warning)) return "timeout";
+  if (/quota|rate.?limit|\b429\b|\b403\b|key pool (?:unavailable|exhausted)|edge|permission|subscription|plan|access denied/i.test(warning)) return "provider_limited";
+  if (/ticker .* not found|not found|no daily candles|no history|delisted|not listed/i.test(warning)) return "symbol_unavailable";
+  return rows > 0 ? "short_history" : "no_real_history";
+}
+
+function summarizeHistoryBackfillResults(results = [], requiredRows = 0) {
+  const byDisposition = {
+    qualified: [],
+    short_history: [],
+    provider_limited: [],
+    symbol_unavailable: [],
+    timeout: [],
+    no_real_history: [],
+  };
+  const sourceCounts = {};
+  for (const row of results) {
+    const disposition = classifyHistoryBackfillRow(row, requiredRows);
+    byDisposition[disposition] ||= [];
+    byDisposition[disposition].push(String(row.symbol || ""));
+    const source = String(row.source || "unavailable");
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+  }
+  const sample = (name) => byDisposition[name].slice(0, 20);
+  const providerLimited = byDisposition.provider_limited.length;
+  const structuralShort = byDisposition.symbol_unavailable.length + byDisposition.short_history.length;
+  return {
+    attemptedSymbols: results.length,
+    qualifiedSymbols: byDisposition.qualified.length,
+    providerLimitedSymbols: providerLimited,
+    timeoutSymbols: byDisposition.timeout.length,
+    symbolUnavailableSymbols: byDisposition.symbol_unavailable.length,
+    shortHistorySymbols: byDisposition.short_history.length,
+    noRealHistorySymbols: byDisposition.no_real_history.length,
+    structuralShortSymbols: structuralShort,
+    sourceCounts,
+    samples: {
+      qualified: sample("qualified"),
+      providerLimited: sample("provider_limited"),
+      symbolUnavailable: sample("symbol_unavailable"),
+      shortHistory: sample("short_history"),
+      timeout: sample("timeout"),
+    },
+    nextAction: providerLimited || byDisposition.timeout.length
+      ? "wait-or-switch-provider"
+      : byDisposition.symbol_unavailable.length
+        ? "review-symbol-universe"
+        : "rotate-history-candidates",
+    note: providerLimited
+      ? "本批次受供应商配额、权限或边缘限制影响；在冷却或切换到已授权真实源前，不应重复相同股票批次。"
+      : byDisposition.symbol_unavailable.length
+        ? "部分代码没有可验证历史；应复核股票池、退市状态或换代码，不应把它们当作可无限重试的网络失败。"
+        : "本批次仍有可继续验证的历史缺口。",
+  };
+}
 
 backgroundJobs.register("history-backfill", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
@@ -19454,19 +22358,29 @@ backgroundJobs.register("history-backfill", async (payload, update, context) => 
       const symbol = pendingSymbols[cursor++];
       let row;
       try {
-        let timer = null;
-        const item = await Promise.race([
+        // Keep the outer deadline owned by the job manager. Some provider
+        // clients can leave a network promise pending after their own fetch
+        // timeout; using a regular timer here lets the queue advance and
+        // records that symbol as unavailable instead of freezing the whole
+        // market at its initial 5% progress.
+        const item = await settleWithin(
           fetchBacktestCandlesForSymbol(symbol, market, payload.range || ({ ASX: "10y", US: "10y", CN: "8y" }[market])),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => reject(Object.assign(
-              new Error(`History provider waterfall timed out after ${symbolTimeoutMs}ms for ${symbol}.`),
-              { code: "HISTORY_SYMBOL_TIMEOUT" },
-            )), symbolTimeoutMs);
-            timer.unref?.();
+          symbolTimeoutMs,
+          () => ({
+            symbol,
+            market,
+            candles: [],
+            source: "unavailable",
+            warning: `History provider waterfall timed out after ${symbolTimeoutMs}ms for ${symbol}.`,
+            error: `History provider waterfall timed out after ${symbolTimeoutMs}ms for ${symbol}.`,
           }),
-        ]).finally(() => { if (timer) clearTimeout(timer); });
+        );
         if (item.candles?.length) {
-          await writeMarketHistoryCache(market, symbol, payload.interval || "1d", item.candles, { source: item.source });
+          await writeMarketHistoryCache(market, symbol, payload.interval || "1d", item.candles, {
+            source: item.source,
+            awaitDataLake: true,
+            signal: context.signal,
+          });
         }
         row = { symbol, rows: item.candles?.length || 0, source: item.source, warning: item.warning || item.error || "" };
         await context.checkpoint(`symbol-${symbol}`, { rows: row.rows, source: row.source, warning: row.warning });
@@ -19489,15 +22403,59 @@ backgroundJobs.register("history-backfill", async (payload, update, context) => 
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(1, pendingSymbols.length)) }, worker));
   const results = symbols.map((symbol) => resultBySymbol.get(symbol)).filter(Boolean);
+  const requiredRows = Number(payload.requiredRows || 0);
+  const historyDiagnostics = summarizeHistoryBackfillResults(results, requiredRows);
   return {
     market,
-    requiredRows: Number(payload.requiredRows || 0),
-    complete: results.filter((row) => row.rows >= Number(payload.requiredRows || 0)).length,
+    requiredRows,
+    complete: historyDiagnostics.qualifiedSymbols,
     concurrency,
     symbolTimeoutMs,
     resumedFromCheckpoints: results.filter((row) => row.resumedFromCheckpoint).length,
+    historyDiagnostics,
     results,
   };
+});
+backgroundJobs.register("rqdata-backfill", async (payload, update, context) => {
+  const market = safeMarket(payload.market || "CN");
+  if (market !== "CN") throw new Error("RQData backfill is restricted to CN symbols.");
+  const status = await runPythonQuantCore("rqdata-status", { project_root: root }, 30_000, { signal: context.signal });
+  if (status.available !== true) return { ...status, market, skipped: true };
+  const requested = normalizeSymbolListForMarket(payload.symbols || [], market)
+    .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
+  const universe = requested.length
+    ? requested
+    : (await expandTrainingSymbolsForMarket({
+      market,
+      limit: Number(payload.limit || process.env.RQDATA_SYMBOL_LIMIT || 550),
+      largeSample: true,
+    })).trainingSymbols;
+  const symbols = universe.slice(0, Math.max(1, Math.min(550, Number(payload.limit || 550))));
+  const range = String(payload.range || process.env.RQDATA_DEFAULT_RANGE || "10y");
+  const startDate = payload.startDate || (range === "10y" ? "2010-01-01" : null);
+  await update(0.08, { phase: "rqdata-status-ready", symbols: symbols.length, expiresAt: status.expiresAt });
+  const result = await runPythonQuantCore("rqdata-candles", {
+    project_root: root,
+    market,
+    symbols,
+    interval: payload.interval || "1d",
+    start_date: startDate,
+    end_date: payload.endDate || new Date().toISOString().slice(0, 10),
+    adjust_type: payload.adjustType || "pre",
+    batch_size: Number(payload.batchSize || 20),
+    limit: symbols.length,
+  }, Number(process.env.RQDATA_BACKFILL_TIMEOUT_MS || 60 * 60_000), { signal: context.signal });
+  await update(0.92, { phase: "rqdata-data-lake-complete", succeeded: result.succeeded || 0, failed: result.failed || 0 });
+  let training = null;
+  if (payload.retrainAfter === true && result.available === true && trainingSupervisor) {
+    training = await trainingSupervisor.trigger({
+      market: "CN",
+      mode: "full",
+      reason: "rqdata-backfill-complete-strict-oof-rebuild",
+      source: "rqdata-backfill",
+    });
+  }
+  return { ...result, market, symbols: symbols.length, range, training };
 });
 backgroundJobs.register("data-lake-migrate", async (payload, update, context) => {
   const markets = payload.market ? [safeMarket(payload.market)] : Object.keys(MARKET_CONFIG);
@@ -19542,17 +22500,45 @@ backgroundJobs.register("data-lake-migrate", async (payload, update, context) =>
 let secCompanyTickerMapCache = null;
 let secRequestChain = Promise.resolve();
 let secNextRequestAt = 0;
+let cninfoRequestChain = Promise.resolve();
+let cninfoNextRequestAt = 0;
+let cninfoOrgIdMapCache = null;
+
+async function cninfoOrgIdMap() {
+  if (cninfoOrgIdMapCache?.expiresAt > Date.now()) return cninfoOrgIdMapCache.value;
+  const payload = await fetchJson("https://www.cninfo.com.cn/new/data/szse_stock.json", 25_000, {
+    "user-agent": "GlobalQuantWatch/1.0",
+    referer: "https://www.cninfo.com.cn/",
+    origin: "https://www.cninfo.com.cn",
+  });
+  const rows = Array.isArray(payload?.stockList) ? payload.stockList : [];
+  const value = new Map(rows.map((row) => [
+    String(row?.code || "").trim(),
+    String(row?.orgId || "").trim(),
+  ]).filter(([code, orgId]) => /^\d{6}$/.test(code) && orgId));
+  if (!value.size) throw new Error("CNINFO public security-to-orgId map returned no usable rows.");
+  cninfoOrgIdMapCache = { value, expiresAt: Date.now() + 7 * 24 * 60 * 60_000 };
+  return value;
+}
 
 async function fetchSecJson(url, timeoutMs = 25_000) {
-  const waitMs = Math.max(110, Number(process.env.SEC_REQUEST_INTERVAL_MS || 160));
+  const waitMs = Math.max(500, Number(process.env.SEC_REQUEST_INTERVAL_MS || 1000));
   const task = secRequestChain.then(async () => {
-    const delay = Math.max(0, secNextRequestAt - Date.now());
-    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-    secNextRequestAt = Date.now() + waitMs;
-    return fetchJson(url, timeoutMs, {
-      "user-agent": process.env.SEC_USER_AGENT || "GlobalQuantWatch/1.0 contact@example.com",
-      "accept-encoding": "gzip, deflate",
-    });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const delay = Math.max(0, secNextRequestAt - Date.now());
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      secNextRequestAt = Date.now() + waitMs;
+      try {
+        return await fetchJson(url, timeoutMs, {
+          "user-agent": process.env.SEC_USER_AGENT || "GlobalQuantWatch/1.0 contact@example.com",
+          "accept-encoding": "gzip, deflate",
+        });
+      } catch (error) {
+        if (!/HTTP 429\b/i.test(String(error?.message || error)) || attempt === 2) throw error;
+        secNextRequestAt = Date.now() + Math.max(waitMs * 3, 2_000);
+      }
+    }
+    throw new Error("SEC request retry exhausted.");
   });
   secRequestChain = task.catch(() => null);
   return task;
@@ -19578,10 +22564,21 @@ async function fetchSecHistoricalPit(symbol) {
     fetchSecJson(`https://data.sec.gov/submissions/CIK${cik}.json`, 25_000),
     fetchSecJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, 30_000),
   ]);
-  return normalizeSecPitRecords(code, submissions, companyFacts).map((record) => ({
-    ...record,
-    sourceProvider: "sec-companyfacts-pit",
-  }));
+  const submissionRows = secRecentRows(submissions);
+  const historicFiles = Array.isArray(submissions?.filings?.files) ? submissions.filings.files : [];
+  for (const file of historicFiles.slice(0, 8)) {
+    const name = String(file?.name || "").trim();
+    if (!/^CIK\d+-submissions-\d+\.json$/i.test(name)) continue;
+    const historic = await fetchSecJson(`https://data.sec.gov/submissions/${name}`, 25_000).catch(() => null);
+    if (historic) submissionRows.push(...secRecentRows(historic));
+  }
+  return {
+    records: normalizeSecPitRecords(code, submissions, companyFacts).map((record) => ({
+      ...record,
+      sourceProvider: "sec-companyfacts-pit",
+    })),
+    disclosures: normalizeSecDisclosureRecords(code, submissionRows),
+  };
 }
 
 async function fetchSimfinHistoricalPit(symbol) {
@@ -19622,17 +22619,386 @@ async function fetchSimfinHistoricalPit(symbol) {
   return records;
 }
 
+async function fetchFmpHistoricalPit(symbol) {
+  if (!providerApiKeys("fmp").length) throw new Error("FMP_API_KEY or FMP_API_KEYS is not configured.");
+  const code = cleanCode(symbol, "US").replace(".", "-");
+  return withProviderApiKey("fmp", {
+    backoffKey: "fmp-us-financial-statements-pit",
+    runtimeKey: "fmp-us-financial-statements-pit",
+    backoffMs: 60 * 60_000,
+    label: "FMP US as-reported financial statements",
+  }, async (apiKey) => {
+    const load = async (path) => {
+      const endpoint = new URL(`https://financialmodelingprep.com/stable/${path}`);
+      endpoint.searchParams.set("symbol", code);
+      endpoint.searchParams.set("apikey", apiKey);
+      return fetchJson(endpoint, 30_000);
+    };
+    const settled = await Promise.allSettled([
+      load("income-statement-as-reported"),
+      load("balance-sheet-statement-as-reported"),
+      load("cash-flow-statement-as-reported"),
+    ]);
+    const statements = ["income", "balance-sheet", "cash-flow"];
+    const records = settled.flatMap((result, index) => result.status === "fulfilled"
+      ? normalizeFmpStatementPitRecords(code, result.value, {
+        statement: statements[index],
+        sourceProvider: "fmp-asreported-financial-statements-pit",
+        sourceQuality: 0.93,
+      })
+      : []);
+    const warnings = settled.flatMap((result) => result.status === "rejected"
+      ? [result.reason?.message || String(result.reason)]
+      : []);
+    if (!records.length) throw new Error(warnings.join(" | ") || `FMP returned no dated as-reported PIT statements for ${code}.`);
+    return { records, disclosures: [], warnings };
+  });
+}
+
+async function fetchFmpAsxHistoricalPit(symbol) {
+  if (!providerApiKeys("fmp").length) throw new Error("FMP_API_KEY or FMP_API_KEYS is not configured.");
+  const code = `${cleanCode(symbol, "ASX")}.AX`;
+  return withProviderApiKey("fmp", {
+    backoffKey: "fmp-asx-financial-statements-pit",
+    runtimeKey: "fmp-asx-financial-statements-pit",
+    backoffMs: 60 * 60_000,
+    label: "FMP ASX historical financial statements",
+  }, async (apiKey) => {
+    const load = async (path) => {
+      const endpoint = new URL(`https://financialmodelingprep.com/stable/${path}`);
+      endpoint.searchParams.set("symbol", code);
+      endpoint.searchParams.set("period", "annual");
+      endpoint.searchParams.set("limit", "40");
+      endpoint.searchParams.set("apikey", apiKey);
+      return fetchJson(endpoint, 30_000);
+    };
+    const statementNames = ["income", "balance-sheet", "cash-flow"];
+    const standardPaths = ["income-statement", "balance-sheet-statement", "cash-flow-statement"];
+    const settled = await Promise.allSettled(standardPaths.map(load));
+    let records = settled.flatMap((result, index) => result.status === "fulfilled"
+      ? normalizeFmpStatementPitRecords(code, result.value, {
+        statement: statementNames[index],
+        sourceProvider: "fmp-asx-financial-statements-pit",
+        sourceQuality: 0.9,
+      })
+      : []);
+    const warnings = settled.flatMap((result) => result.status === "rejected"
+      ? [result.reason?.message || String(result.reason)]
+      : []);
+    if (!records.length) {
+      const asReportedPaths = ["income-statement-as-reported", "balance-sheet-statement-as-reported", "cash-flow-statement-as-reported"];
+      const asReported = await Promise.allSettled(asReportedPaths.map(load));
+      records = asReported.flatMap((result, index) => result.status === "fulfilled"
+        ? normalizeFmpStatementPitRecords(code, result.value, {
+          statement: statementNames[index],
+          sourceProvider: "fmp-asx-asreported-financial-statements-pit",
+          sourceQuality: 0.92,
+        })
+        : []);
+      warnings.push(...asReported.flatMap((result) => result.status === "rejected"
+        ? [result.reason?.message || String(result.reason)]
+        : []));
+    }
+    if (!records.length) throw new Error(warnings.join(" | ") || `FMP returned no dated ASX PIT statements for ${code}.`);
+    return { records, disclosures: [], warnings };
+  });
+}
+
+async function fetchTiingoAsxHistoricalPit(symbol) {
+  if (!providerApiKeys("tiingo").length) throw new Error("TIINGO_API_KEY or TIINGO_API_KEYS is not configured.");
+  const code = `${cleanCode(symbol, "ASX")}.AX`;
+  return withProviderApiKey("tiingo", {
+    backoffKey: "tiingo-asx-financial-statements-pit",
+    runtimeKey: "tiingo-asx-financial-statements-pit",
+    backoffMs: 60 * 60_000,
+    label: "Tiingo ASX historical financial statements",
+  }, async (apiKey) => {
+    const endpoint = new URL(`https://api.tiingo.com/tiingo/fundamentals/${encodeURIComponent(code)}/statements`);
+    endpoint.searchParams.set("startDate", "2000-01-01");
+    endpoint.searchParams.set("asReported", "true");
+    endpoint.searchParams.set("token", apiKey);
+    const payload = await fetchJson(endpoint, 30_000);
+    const records = normalizeFmpStatementPitRecords(code, payload, {
+      statement: "financial-statement",
+      sourceProvider: "tiingo-asx-financial-statements-pit",
+      sourceQuality: 0.86,
+    });
+    if (!records.length) throw new Error(`Tiingo returned no dated ASX PIT statements for ${code}.`);
+    return { records, disclosures: [], warnings: [] };
+  });
+}
+
+function normalizeFinnhubAsxFinancialsPit(symbol, payload = {}) {
+  const code = cleanCode(symbol, "ASX");
+  const reports = Array.isArray(payload?.data) ? payload.data : [];
+  const number = (value) => {
+    if (value == null || value === "") return null;
+    const parsed = Number(String(value).replace(/,/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  const normalized = (value) => String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  const records = reports.flatMap((item, index) => {
+    const report = item?.report && typeof item.report === "object" ? item.report : item;
+    const facts = [
+      ...(Array.isArray(report?.ic) ? report.ic : []),
+      ...(Array.isArray(report?.bs) ? report.bs : []),
+      ...(Array.isArray(report?.cf) ? report.cf : []),
+      ...(Array.isArray(report?.fundamental) ? report.fundamental : []),
+      ...(Array.isArray(report?.fundamentals) ? report.fundamentals : []),
+      ...(Array.isArray(item?.data) ? item.data : []),
+    ];
+    const pick = (names) => {
+      const wanted = names.map(normalized);
+      const row = facts.find((fact) => {
+        const label = normalized(fact?.concept || fact?.label || fact?.name || fact?.metric);
+        return wanted.some((name) => label === name || label.endsWith(name));
+      });
+      return number(row?.value ?? row?.amount ?? row?.val);
+    };
+    const eventTime = safeIsoTimestamp(
+      report?.endDate || report?.periodEndDate || item?.endDate || item?.periodEndDate,
+      null,
+    );
+    const availableAt = safeIsoTimestamp(
+      report?.filedDate || report?.filingDate || report?.acceptedDate || item?.filedDate || item?.filingDate,
+      null,
+    );
+    if (!eventTime || !availableAt || availableAt < eventTime) return [];
+    const revenue = pick(["revenue", "revenues", "salesrevenuenet", "sales"]);
+    const netIncome = pick(["netincome", "netincomeloss", "netincomeapplicabletocommonshares"]);
+    const assets = pick(["assets", "totalassets"]);
+    const liabilities = pick(["liabilities", "totalliabilities"]);
+    const equity = pick(["stockholdersequity", "stockholdersequityincludingportionattributabletononcontrollinginterest", "totalequity"]);
+    const operatingCashFlow = pick(["netcashprovidedbyusedinoperatingactivities", "operatingcashflow"]);
+    const capitalExpenditure = pick(["paymentsforpropertyplantandequipment", "capitalexpenditure", "capitalexpenditures"]);
+    const dilutedEps = pick(["earningspersharediluted", "epsdiluted", "eps"]);
+    if (![revenue, netIncome, assets, liabilities, equity, operatingCashFlow, capitalExpenditure, dilutedEps].some((value) => value !== null)) return [];
+    return [{
+      id: `${code}:finnhub:${eventTime.slice(0, 10)}:${availableAt.slice(0, 10)}:${index}`,
+      event_time: eventTime,
+      available_at: availableAt,
+      revision: String(report?.accn || report?.form || item?.accn || availableAt).slice(0, 100),
+      statement: String(report?.form || item?.form || "financials-reported"),
+      fiscalYear: report?.fiscalYear || item?.fiscalYear || null,
+      fiscalPeriod: report?.fp || item?.fp || null,
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityMethod: "finnhub-filed-date",
+      sourceProvider: "finnhub-asx-financials-reported-pit",
+      values: {
+        revenue,
+        netIncome,
+        assets,
+        liabilities,
+        equity,
+        operatingCashFlow,
+        capitalExpenditure,
+        dilutedEps,
+        profitMargin: revenue !== null && netIncome !== null ? netIncome / Math.max(1, Math.abs(revenue)) : null,
+        debtToAssets: assets !== null && liabilities !== null ? liabilities / Math.max(1, Math.abs(assets)) : null,
+        sourceQuality: 0.88,
+      },
+    }];
+  });
+  return [...new Map(records.map((record) => [record.id, record])).values()]
+    .sort((left, right) => left.available_at.localeCompare(right.available_at));
+}
+
+async function fetchFinnhubAsxHistoricalPit(symbol) {
+  if (!providerApiKeys("finnhub").length) throw new Error("FINNHUB_API_KEY is not configured.");
+  const code = `${cleanCode(symbol, "ASX")}.AX`;
+  return withProviderApiKey("finnhub", {
+    backoffKey: "finnhub-asx-financials-reported",
+    runtimeKey: "finnhub-asx-financials-reported",
+    backoffMs: 6 * 60 * 60_000,
+    label: "Finnhub ASX reported financials",
+  }, async (apiKey) => {
+    const endpoint = new URL("https://finnhub.io/api/v1/stock/financials-reported");
+    endpoint.searchParams.set("symbol", code);
+    endpoint.searchParams.set("freq", "annual");
+    endpoint.searchParams.set("token", apiKey);
+    const payload = await fetchJson(endpoint, 30_000);
+    const records = normalizeFinnhubAsxFinancialsPit(code, payload);
+    if (!records.length) throw new Error(`Finnhub returned no dated ASX reported financials for ${code}.`);
+    return { records, disclosures: [], warnings: [] };
+  });
+}
+
+function splitVerifiedAsxPitRecords(records = []) {
+  const strict = [];
+  const shadow = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    if (record?.historicalAvailabilityVerified === true) strict.push(record);
+    else shadow.push(record);
+  }
+  return { strict, shadow };
+}
+
+async function fetchGrowthWithValueAsxHistoricalPit(symbol) {
+  if (!providerApiKeys("growthwithvalue").length) {
+    throw new Error("GROWTH_WITH_VALUE_API_KEY or GROWTH_WITH_VALUE_API_KEYS is not configured.");
+  }
+  const code = `${cleanCode(symbol, "ASX")}.AU`;
+  return withProviderApiKey("growthwithvalue", {
+    backoffKey: "growthwithvalue-asx-financials-pit",
+    runtimeKey: "growthwithvalue-asx-financials-pit",
+    backoffMs: 60 * 60_000,
+    label: "Growth With Value ASX historical statements",
+  }, async (apiKey) => {
+    const load = async (path) => {
+      const endpoint = new URL(`https://api.growthwithvalue.com/${path}`);
+      endpoint.searchParams.set("ticker", code);
+      if (["inc", "bs", "cf"].includes(path)) {
+        endpoint.searchParams.set("allfields", "true");
+        endpoint.searchParams.set("order", "asc");
+      }
+      endpoint.searchParams.set("api_key", apiKey);
+      return fetchJson(endpoint, 30_000);
+    };
+    const paths = ["inc", "bs", "cf"];
+    const settled = await Promise.allSettled(paths.map(load));
+    const retrievedAt = new Date().toISOString();
+    const allRecords = settled.flatMap((result, index) => result.status === "fulfilled"
+      ? normalizeGrowthWithValuePitRecords(code, result.value, {
+        retrievedAt,
+        sourceProvider: `growth-with-value-asx-${paths[index]}-pit`,
+      })
+      : []);
+    const warnings = settled.flatMap((result, index) => result.status === "rejected"
+      ? [`${paths[index]}: ${result.reason?.message || String(result.reason)}`]
+      : []);
+    const { strict, shadow } = splitVerifiedAsxPitRecords(allRecords);
+    if (!strict.length && !shadow.length) {
+      throw new Error(warnings.join(" | ") || `Growth With Value returned no ASX statement rows for ${code}.`);
+    }
+    return {
+      records: strict,
+      shadowRecords: shadow,
+      disclosures: [],
+      warnings: [
+        ...warnings,
+        ...(shadow.length ? [`Growth With Value returned ${shadow.length} period rows without filing timestamps; retained as Shadow-only.`] : []),
+      ],
+    };
+  });
+}
+
+async function fetchStockMarketApiAsxHistoricalPit(symbol) {
+  if (!providerApiKeys("stockmarketapi").length) {
+    throw new Error("STOCKMARKETAPI_API_KEY or STOCKMARKETAPI_API_KEYS is not configured.");
+  }
+  const code = cleanCode(symbol, "ASX");
+  return withProviderApiKey("stockmarketapi", {
+    backoffKey: "stockmarketapi-ai-asx-financials-pit",
+    runtimeKey: "stockmarketapi-ai-asx-financials-pit",
+    backoffMs: 60 * 60_000,
+    label: "StockMarketAPI.ai ASX historical statements",
+  }, async (apiKey) => {
+    const base = "https://stockmarketapi.ai/api/v1";
+    const headers = { "X-API-Key": apiKey };
+    const financialsUrl = `${base}/companies/${encodeURIComponent(code)}/financials`;
+    const filingsUrl = `${base}/companies/${encodeURIComponent(code)}/filings?source=asx&limit=100`;
+    const [financialsResult, filingsResult] = await Promise.allSettled([
+      fetchJson(financialsUrl, 30_000, headers),
+      fetchJson(filingsUrl, 30_000, headers),
+    ]);
+    const financials = financialsResult.status === "fulfilled" ? financialsResult.value : null;
+    const filingsPayload = filingsResult.status === "fulfilled" ? filingsResult.value : {};
+    const filings = Array.isArray(filingsPayload?.filings)
+      ? filingsPayload.filings
+      : Array.isArray(filingsPayload?.data) ? filingsPayload.data : [];
+    const retrievedAt = new Date().toISOString();
+    const allRecords = financials
+      ? normalizeStockMarketApiPitRecords(code, financials, {
+        retrievedAt,
+        filings,
+      })
+      : [];
+    const warnings = [
+      ...(financialsResult.status === "rejected" ? [`financials: ${financialsResult.reason?.message || String(financialsResult.reason)}`] : []),
+      ...(filingsResult.status === "rejected" ? [`filings: ${filingsResult.reason?.message || String(filingsResult.reason)}`] : []),
+    ];
+    const { strict, shadow } = splitVerifiedAsxPitRecords(allRecords);
+    if (!strict.length && !shadow.length) {
+      throw new Error(warnings.join(" | ") || `StockMarketAPI.ai returned no ASX statement rows for ${code}.`);
+    }
+    return {
+      records: strict,
+      shadowRecords: shadow,
+      disclosures: filings.map((filing) => ({
+        symbol: code,
+        event_time: safeIsoTimestamp(filing?.filing_date || filing?.filingDate, retrievedAt),
+        available_at: safeIsoTimestamp(filing?.filing_date || filing?.filingDate, retrievedAt),
+        publishedAt: safeIsoTimestamp(filing?.filing_date || filing?.filingDate, retrievedAt),
+        title: filing?.description || filing?.form_type || "ASX filing",
+        link: filing?.markdown_url || filing?.document_url || null,
+        sourceProvider: "stockmarketapi-ai-asx-filings",
+        historicalAvailabilityVerified: Boolean(filing?.filing_date || filing?.filingDate),
+      })),
+      warnings: [
+        ...warnings,
+        ...(shadow.length ? [`StockMarketAPI.ai returned ${shadow.length} period rows without a verifiable filing date; retained as Shadow-only.`] : []),
+      ],
+    };
+  });
+}
+
+async function fetchAsxHistoricalPit(symbol) {
+  const requests = [
+    providerApiKeys("fmp").length ? fetchFmpAsxHistoricalPit(symbol) : null,
+    providerApiKeys("tiingo").length ? fetchTiingoAsxHistoricalPit(symbol) : null,
+    providerApiKeys("finnhub").length ? fetchFinnhubAsxHistoricalPit(symbol) : null,
+    providerApiKeys("growthwithvalue").length ? fetchGrowthWithValueAsxHistoricalPit(symbol) : null,
+    providerApiKeys("stockmarketapi").length ? fetchStockMarketApiAsxHistoricalPit(symbol) : null,
+  ].filter(Boolean);
+  if (!requests.length) throw new Error("No ASX structured historical fundamentals provider is configured.");
+  const settled = await Promise.allSettled(requests);
+  const records = settled.flatMap((result) => result.status === "fulfilled"
+    ? result.value.records || []
+    : []);
+  const shadowRecords = settled.flatMap((result) => result.status === "fulfilled"
+    ? result.value.shadowRecords || []
+    : []);
+  const disclosures = settled.flatMap((result) => result.status === "fulfilled"
+    ? result.value.disclosures || []
+    : []);
+  const warnings = settled.flatMap((result) => result.status === "rejected"
+    ? [result.reason?.message || String(result.reason)]
+    : []);
+  if (!records.length && !shadowRecords.length) throw new Error(warnings.join(" | ") || "No ASX historical fundamental records returned.");
+  return {
+    records: [...new Map(records.map((record) => [record.id, record])).values()]
+      .sort((left, right) => left.event_time.localeCompare(right.event_time)),
+    shadowRecords: [...new Map(shadowRecords.map((record) => [record.id, record])).values()]
+      .sort((left, right) => left.event_time.localeCompare(right.event_time)),
+    disclosures,
+    source: [...new Set(records.map((record) => record.sourceProvider).filter(Boolean))].join("+") || "asx-historical-fundamentals",
+    warnings: [
+      ...warnings,
+      ...(shadowRecords.length && !records.length ? ["ASX sources returned only unverified period-level fundamentals; strict PIT records are empty."] : []),
+    ],
+  };
+}
+
 async function fetchUsHistoricalPit(symbol) {
-  const settled = await Promise.allSettled([
+  const requests = [
     fetchSecHistoricalPit(symbol),
     fetchSimfinHistoricalPit(symbol),
-  ]);
-  const records = settled.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+    ...(providerApiKeys("fmp").length ? [fetchFmpHistoricalPit(symbol)] : []),
+  ];
+  const settled = await Promise.allSettled(requests);
+  const records = settled.flatMap((result) => result.status === "fulfilled"
+    ? (Array.isArray(result.value) ? result.value : result.value.records || [])
+    : []);
+  const disclosures = settled.flatMap((result) => result.status === "fulfilled"
+    ? (Array.isArray(result.value) ? [] : result.value.disclosures || [])
+    : []);
   const warnings = settled.flatMap((result) => result.status === "rejected"
     ? [result.reason?.message || String(result.reason)]
     : []);
   if (!records.length) throw new Error(warnings.join(" | ") || `No verified US PIT statements for ${symbol}.`);
-  return { records, warnings };
+  return { records, disclosures, warnings };
 }
 
 function pitProviderCachePath(name) {
@@ -19651,6 +23017,38 @@ async function writePitProviderCache(name, payload) {
   await writeFile(path, JSON.stringify({ ...payload, savedAt: new Date().toISOString() }, null, 2), "utf8");
 }
 
+async function fetchIdentityBundle(symbol, market, legalName, { force = false } = {}) {
+  const code = cleanCode(symbol, market);
+  const cacheName = `identity-${safeMarket(market).toLowerCase()}-${code}`;
+  if (!force) {
+    const cached = await readPitProviderCache(cacheName, Math.max(60_000, Number(process.env.PIT_IDENTITY_CACHE_MS || 30 * 24 * 60 * 60_000))).catch(() => null);
+    if (cached) return cached;
+  }
+  const retrievedAt = new Date().toISOString();
+  const settled = await Promise.allSettled([
+    fetchGleifIdentityRecords(legalName, {
+      symbol: code,
+      market: safeMarket(market),
+      retrievedAt,
+      fetchJson,
+    }),
+    safeMarket(market) === "ASX"
+      ? fetchAbnLookupRecords(legalName, {
+        symbol: code,
+        market: safeMarket(market),
+        retrievedAt,
+        guid: process.env.ABN_LOOKUP_GUID,
+        fetchText,
+      })
+      : Promise.resolve({ records: [], source: "abn-lookup-public-api", warning: "market-not-ASX" }),
+  ]);
+  const records = settled.flatMap((result) => result.status === "fulfilled" ? result.value.records || [] : []);
+  const warnings = settled.flatMap((result) => result.status === "rejected" ? [result.reason?.message || String(result.reason)] : result.value?.warning ? [result.value.warning] : []);
+  const result = { records, warnings, fetchedAt: retrievedAt, source: "gleif-public-api+abn-lookup-public-api" };
+  await writePitProviderCache(cacheName, result).catch(() => null);
+  return result;
+}
+
 function csvObjectRows(text = "") {
   const lines = String(text || "").trim().split(/\r?\n/).filter(Boolean);
   if (lines.length < 2) return [];
@@ -19662,7 +23060,7 @@ function csvObjectRows(text = "") {
 }
 
 async function fetchAlphaVantageHistoricalUniversePit({ force = false } = {}) {
-  if (!process.env.ALPHAVANTAGE_API_KEY) throw new Error("ALPHAVANTAGE_API_KEY is not configured.");
+  if (!providerApiKeys("alphavantage").length) throw new Error("ALPHAVANTAGE_API_KEY or ALPHAVANTAGE_API_KEYS is not configured.");
   const cacheName = "alphavantage-us-historical-universe";
   const cacheMaxAgeMs = Math.max(24 * 60 * 60_000, Number(process.env.ALPHAVANTAGE_LISTING_STATUS_CACHE_MS || 7 * 24 * 60 * 60_000));
   if (!force) {
@@ -19672,12 +23070,23 @@ async function fetchAlphaVantageHistoricalUniversePit({ force = false } = {}) {
   const warnings = [];
   const rows = [];
   for (const state of ["active", "delisted"]) {
-    await throttleAlphaVantage();
-    const endpoint = new URL("https://www.alphavantage.co/query");
-    endpoint.searchParams.set("function", "LISTING_STATUS");
-    endpoint.searchParams.set("state", state);
-    endpoint.searchParams.set("apikey", process.env.ALPHAVANTAGE_API_KEY);
-    const text = await fetchText(endpoint, 35_000, { accept: "text/csv,text/plain,*/*" }).catch((error) => {
+    const text = await withProviderApiKey("alphavantage", {
+      backoffKey: "alphavantage-us-universe-pit",
+      runtimeKey: "alphavantage-us-universe-pit",
+      backoffMs: 12 * 60 * 60_000,
+      label: `Alpha Vantage ${state} listing status`,
+    }, async (apiKey) => {
+      await throttleAlphaVantage();
+      const endpoint = new URL("https://www.alphavantage.co/query");
+      endpoint.searchParams.set("function", "LISTING_STATUS");
+      endpoint.searchParams.set("state", state);
+      endpoint.searchParams.set("apikey", apiKey);
+      const responseText = await fetchText(endpoint, 35_000, { accept: "text/csv,text/plain,*/*" });
+      if (/^\s*(\{|Information|Note|Error Message)/i.test(responseText)) {
+        throw new Error(String(responseText).slice(0, 240));
+      }
+      return responseText;
+    }).catch((error) => {
       warnings.push(`Alpha Vantage ${state}: ${error.message || String(error)}`);
       return "";
     });
@@ -19695,62 +23104,76 @@ async function fetchAlphaVantageHistoricalUniversePit({ force = false } = {}) {
 }
 
 async function fetchFmpHistoricalUniversePit({ force = false } = {}) {
-  if (!process.env.FMP_API_KEY) throw new Error("FMP_API_KEY is not configured.");
+  if (!providerApiKeys("fmp").length) throw new Error("FMP_API_KEY or FMP_API_KEYS is not configured.");
   const cacheMaxAgeMs = Math.max(24 * 60 * 60_000, Number(process.env.FMP_UNIVERSE_CACHE_MS || 7 * 24 * 60 * 60_000));
   if (!force) {
     const cached = await readPitProviderCache("fmp-us-historical-universe", cacheMaxAgeMs);
     if (cached?.records?.length) return { records: cached.records, source: "fmp-historical-universe-cache", cached: true, warnings: [] };
   }
-  const delistedRows = [];
-  const paginationWarnings = [];
-  const maxPages = Math.max(1, Math.min(20, Number(process.env.FMP_UNIVERSE_MAX_PAGES || 12)));
-  for (let page = 0; page < maxPages; page += 1) {
-    const endpoint = new URL("https://financialmodelingprep.com/stable/delisted-companies");
-    endpoint.searchParams.set("page", String(page));
-    endpoint.searchParams.set("limit", "100");
-    endpoint.searchParams.set("apikey", process.env.FMP_API_KEY);
-    const value = await fetchJson(endpoint, 30_000).catch((error) => {
-      paginationWarnings.push(`FMP delisted page ${page}: ${error.message || String(error)}`);
-      return [];
-    });
-    const rows = Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
-    delistedRows.push(...rows);
-    if (rows.length < 100) break;
-  }
-  const changes = new URL("https://financialmodelingprep.com/stable/symbol-change");
-  changes.searchParams.set("page", "0");
-  changes.searchParams.set("limit", "1000");
-  changes.searchParams.set("apikey", process.env.FMP_API_KEY);
-  const settled = await Promise.allSettled([Promise.resolve(delistedRows), fetchJson(changes, 30_000)]);
-  const records = [
-    ...(settled[0].status === "fulfilled" ? normalizeFmpHistoricalUniverseRecords(settled[0].value) : []),
-    ...(settled[1].status === "fulfilled" ? normalizeFmpSymbolChangeRecords(settled[1].value) : []),
-  ];
-  const deduped = [...new Map(records.map((record) => [record.id, record])).values()];
-  const warnings = [...paginationWarnings, ...settled.flatMap((result) => result.status === "rejected"
-    ? [result.reason?.message || String(result.reason)]
-    : [])];
-  if (!deduped.length) throw new Error(warnings.join(" | ") || "FMP returned no historical universe events.");
-  await writePitProviderCache("fmp-us-historical-universe", { records: deduped });
-  return { records: deduped, source: "fmp-historical-universe-pit", cached: false, warnings };
+  return withProviderApiKey("fmp", {
+    backoffKey: "fmp-us-universe-pit",
+    runtimeKey: "fmp-us-universe-pit",
+    backoffMs: 60 * 60_000,
+    label: "FMP US historical universe",
+  }, async (apiKey) => {
+    const delistedRows = [];
+    const paginationWarnings = [];
+    const maxPages = Math.max(1, Math.min(20, Number(process.env.FMP_UNIVERSE_MAX_PAGES || 12)));
+    for (let page = 0; page < maxPages; page += 1) {
+      const endpoint = new URL("https://financialmodelingprep.com/stable/delisted-companies");
+      endpoint.searchParams.set("page", String(page));
+      endpoint.searchParams.set("limit", "100");
+      endpoint.searchParams.set("apikey", apiKey);
+      const value = await fetchJson(endpoint, 30_000).catch((error) => {
+        paginationWarnings.push(`FMP delisted page ${page}: ${error.message || String(error)}`);
+        return [];
+      });
+      const rows = Array.isArray(value) ? value : Array.isArray(value?.data) ? value.data : [];
+      delistedRows.push(...rows);
+      if (rows.length < 100) break;
+    }
+    const changes = new URL("https://financialmodelingprep.com/stable/symbol-change");
+    changes.searchParams.set("page", "0");
+    changes.searchParams.set("limit", "1000");
+    changes.searchParams.set("apikey", apiKey);
+    const settled = await Promise.allSettled([Promise.resolve(delistedRows), fetchJson(changes, 30_000)]);
+    const records = [
+      ...(settled[0].status === "fulfilled" ? normalizeFmpHistoricalUniverseRecords(settled[0].value) : []),
+      ...(settled[1].status === "fulfilled" ? normalizeFmpSymbolChangeRecords(settled[1].value) : []),
+    ];
+    const deduped = [...new Map(records.map((record) => [record.id, record])).values()];
+    const warnings = [...paginationWarnings, ...settled.flatMap((result) => result.status === "rejected"
+      ? [result.reason?.message || String(result.reason)]
+      : [])];
+    if (!deduped.length) throw new Error(warnings.join(" | ") || "FMP returned no historical universe events.");
+    await writePitProviderCache("fmp-us-historical-universe", { records: deduped });
+    return { records: deduped, source: "fmp-us-historical-universe-pit", cached: false, warnings };
+  });
 }
 
 async function fetchFmpCompanyUniversePit(symbol, { force = false } = {}) {
-  if (!process.env.FMP_API_KEY) throw new Error("FMP_API_KEY is not configured.");
+  if (!providerApiKeys("fmp").length) throw new Error("FMP_API_KEY or FMP_API_KEYS is not configured.");
   const code = cleanCode(symbol, "US");
   const cacheName = `fmp-us-profile-${code.replace(/[^A-Z0-9_-]/g, "-")}`;
   if (!force) {
     const cached = await readPitProviderCache(cacheName, Math.max(7 * 24 * 60 * 60_000, Number(process.env.FMP_PROFILE_CACHE_MS || 30 * 24 * 60 * 60_000)));
     if (cached?.records?.length) return cached.records;
   }
-  const endpoint = new URL("https://financialmodelingprep.com/stable/profile");
-  endpoint.searchParams.set("symbol", code);
-  endpoint.searchParams.set("apikey", process.env.FMP_API_KEY);
-  const payload = await fetchJson(endpoint, 25_000);
-  const records = normalizeFmpHistoricalUniverseRecords(payload).filter((record) => record.symbol === code && record.status === "active");
-  if (!records.length) throw new Error(`FMP returned no dated listing profile for ${code}.`);
-  await writePitProviderCache(cacheName, { records });
-  return records;
+  return withProviderApiKey("fmp", {
+    backoffKey: "fmp-us-company-pit",
+    runtimeKey: "fmp-us-company-pit",
+    backoffMs: 30 * 60_000,
+    label: "FMP US company history",
+  }, async (apiKey) => {
+    const endpoint = new URL("https://financialmodelingprep.com/stable/profile");
+    endpoint.searchParams.set("symbol", code);
+    endpoint.searchParams.set("apikey", apiKey);
+    const payload = await fetchJson(endpoint, 25_000);
+    const records = normalizeFmpHistoricalUniverseRecords(payload).filter((record) => record.symbol === code && record.status === "active");
+    if (!records.length) throw new Error(`FMP returned no dated listing profile for ${code}.`);
+    await writePitProviderCache(cacheName, { records });
+    return records;
+  });
 }
 
 async function fetchEodhdCompanyUniversePit(symbol, market) {
@@ -19819,36 +23242,43 @@ async function fetchEodhdCorporateActionHistory(symbol, market) {
 }
 
 async function fetchFmpCorporateActionHistory(symbol) {
-  if (!process.env.FMP_API_KEY) throw new Error("FMP_API_KEY is not configured.");
+  if (!providerApiKeys("fmp").length) throw new Error("FMP_API_KEY or FMP_API_KEYS is not configured.");
   const code = cleanCode(symbol, "US");
-  const load = async (kind) => {
-    const endpoint = new URL(`https://financialmodelingprep.com/stable/${kind}`);
-    endpoint.searchParams.set("symbol", code);
-    endpoint.searchParams.set("apikey", process.env.FMP_API_KEY);
-    return fetchJson(endpoint, 25_000);
-  };
-  const settled = await Promise.allSettled([load("dividends"), load("splits")]);
-  const records = [
-    ...(settled[0].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[0].value, { provider: "fmp-dividends-pit", eventType: "dividend" }) : []),
-    ...(settled[1].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[1].value, { provider: "fmp-splits-pit", eventType: "split" }) : []),
-  ];
-  if (!records.length && settled.every((result) => result.status === "rejected")) {
-    throw new Error(settled.map((result) => result.status === "rejected" ? result.reason?.message || String(result.reason) : "").filter(Boolean).join(" | ") || `No FMP corporate actions for ${code}.`);
-  }
-  if (settled.some((result) => result.status === "fulfilled")) records.push({
-    id: `${code}:fmp-corporate-action-coverage:2000-01-01`,
-    event_time: "2000-01-01",
-    available_at: "2000-01-01",
-    first_seen_at: new Date().toISOString(),
-    revision: "coverage-v1",
-    eventType: "coverage",
-    coverageStart: "2000-01-01",
-    coverageEnd: new Date().toISOString().slice(0, 10),
-    historicalAvailabilityVerified: true,
-    historicalAvailabilityVerificationMethod: "fmp-historical-dividend-split-range-query",
-    sourceProvider: "fmp-corporate-actions",
+  return withProviderApiKey("fmp", {
+    backoffKey: "fmp-us-corporate-actions",
+    runtimeKey: "fmp-us-corporate-actions",
+    backoffMs: 60 * 60_000,
+    label: "FMP US corporate actions",
+  }, async (apiKey) => {
+    const load = async (kind) => {
+      const endpoint = new URL(`https://financialmodelingprep.com/stable/${kind}`);
+      endpoint.searchParams.set("symbol", code);
+      endpoint.searchParams.set("apikey", apiKey);
+      return fetchJson(endpoint, 25_000);
+    };
+    const settled = await Promise.allSettled([load("dividends"), load("splits")]);
+    const records = [
+      ...(settled[0].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[0].value, { provider: "fmp-dividends-pit", eventType: "dividend" }) : []),
+      ...(settled[1].status === "fulfilled" ? normalizeCorporateActionRecords(code, settled[1].value, { provider: "fmp-splits-pit", eventType: "split" }) : []),
+    ];
+    if (!records.length && settled.every((result) => result.status === "rejected")) {
+      throw new Error(settled.map((result) => result.status === "rejected" ? result.reason?.message || String(result.reason) : "").filter(Boolean).join(" | ") || `No FMP corporate actions for ${code}.`);
+    }
+    if (settled.some((result) => result.status === "fulfilled")) records.push({
+      id: `${code}:fmp-corporate-action-coverage:2000-01-01`,
+      event_time: "2000-01-01",
+      available_at: "2000-01-01",
+      first_seen_at: new Date().toISOString(),
+      revision: "coverage-v1",
+      eventType: "coverage",
+      coverageStart: "2000-01-01",
+      coverageEnd: new Date().toISOString().slice(0, 10),
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerificationMethod: "fmp-historical-dividend-split-range-query",
+      sourceProvider: "fmp-corporate-actions",
+    });
+    return records;
   });
-  return records;
 }
 
 async function fetchTiingoCorporateActionHistory(symbol) {
@@ -19916,6 +23346,83 @@ async function fetchTiingoCorporateActionHistory(symbol) {
   });
 }
 
+// Yahoo's chart events endpoint is a real, keyless fallback for US split and
+// dividend history.  It is deliberately used only after the configured
+// licensed providers have been exhausted.  The ex-date is the earliest safe
+// point at which a historical price adjustment can affect a signal; we never
+// back-date an event to the retrieval time.
+async function fetchYahooCorporateActionHistory(symbol, market = "US") {
+  const key = safeMarket(market);
+  const code = cleanCode(symbol, key);
+  const yahooSymbol = yahooSymbolForMarket(code, key);
+  const backoffKey = `yahoo-${key.toLowerCase()}-corporate-actions`;
+  const blocked = providerBackoffReason(backoffKey);
+  if (blocked) throw new Error(blocked);
+  const endpoint = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}`);
+  endpoint.searchParams.set("period1", "946684800");
+  endpoint.searchParams.set("period2", String(Math.floor(Date.now() / 1000)));
+  endpoint.searchParams.set("interval", "1d");
+  endpoint.searchParams.set("includePrePost", "false");
+  endpoint.searchParams.set("events", "div,splits");
+  try {
+    const payload = await fetchJson(endpoint, 20_000);
+    const result = payload?.chart?.result?.[0];
+    validateYahooMetaForMarket(result?.meta || {}, yahooSymbol, key);
+    const events = Object.entries(result?.events || {}).flatMap(([rawType, rows]) => (
+      Object.values(rows || {}).flatMap((row) => {
+        const timestamp = Number(row?.date);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return [];
+        const eventTime = new Date(timestamp * 1000).toISOString();
+        const eventType = rawType === "splits" ? "split" : rawType === "dividends" ? "dividend" : rawType;
+        const ratio = row?.splitRatio || row?.ratio || null;
+        const amount = row?.amount == null ? null : Number(row.amount);
+        return [{
+          id: `${code}:yahoo-${eventType}:${timestamp}`,
+          symbol: code,
+          eventType,
+          event_time: eventTime,
+          available_at: eventTime,
+          first_seen_at: eventTime,
+          revision: String(timestamp),
+          historicalAvailabilityVerified: true,
+          historicalAvailabilityVerificationMethod: "yahoo-chart-ex-date-events",
+          sourceProvider: `yahoo-${key.toLowerCase()}-corporate-actions`,
+          values: {
+            amount: Number.isFinite(amount) ? amount : null,
+            ratio,
+            currency: result?.meta?.currency || null,
+          },
+        }];
+      })
+    ));
+    const timestamps = Array.isArray(result?.timestamp) ? result.timestamp.map(Number).filter(Number.isFinite) : [];
+    const coverageStart = timestamps.length ? new Date(Math.min(...timestamps) * 1000).toISOString().slice(0, 10) : null;
+    const coverageEnd = timestamps.length ? new Date(Math.max(...timestamps) * 1000).toISOString().slice(0, 10) : null;
+    if (!coverageStart || !coverageEnd) throw new Error(`Yahoo returned no dated US history for ${code}.`);
+    events.push({
+      id: `${code}:yahoo-corporate-action-coverage:${coverageStart}`,
+      symbol: code,
+      eventType: "coverage",
+      event_time: coverageStart,
+      available_at: coverageStart,
+      first_seen_at: new Date().toISOString(),
+      revision: `coverage-${coverageStart}-${coverageEnd}`,
+      coverageStart,
+      coverageEnd,
+      historicalAvailabilityVerified: true,
+      historicalAvailabilityVerificationMethod: "yahoo-chart-dated-event-range",
+      sourceProvider: `yahoo-${key.toLowerCase()}-corporate-actions`,
+    });
+    return events;
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (/429|403|Too Many Requests|Unexpected token|not valid JSON/i.test(message)) {
+      backoffProvider(backoffKey, /403/.test(message) ? 60 * 60_000 : 15 * 60_000, `Yahoo Finance ${key} corporate-action endpoint skipped after edge/rate limit.`);
+    }
+    throw error;
+  }
+}
+
 async function fetchTushareCorporateActionHistory(symbol) {
   if (!process.env.TUSHARE_TOKEN) throw new Error("TUSHARE_TOKEN is not configured.");
   const backoffKey = "tushare-cn-dividend-pit";
@@ -19942,13 +23449,38 @@ async function fetchTushareCorporateActionHistory(symbol) {
   return normalizeCorporateActionRecords(code, rows, { provider: "tushare-dividend-pit", eventType: "dividend", sourceQuality: 0.96 });
 }
 
+async function fetchEastmoneyCorporateActionHistory(symbol) {
+  return fetchEastmoneyCorporateActions(symbol, {
+    pageSize: Number(process.env.EASTMONEY_ACTION_PAGE_SIZE || 200),
+    timeoutMs: Number(process.env.EASTMONEY_ACTION_TIMEOUT_MS || 20_000),
+  });
+}
+
 async function fetchCorporateActionHistory(symbol, market) {
   const key = safeMarket(market);
-  if (key === "CN") return fetchTushareCorporateActionHistory(symbol);
+  if (key === "CN") {
+    const providers = [
+      () => fetchTushareCorporateActionHistory(symbol),
+      () => fetchEastmoneyCorporateActionHistory(symbol),
+    ];
+    const errors = [];
+    for (const provider of providers) {
+      try {
+        const records = await provider();
+        if (records.length) return records;
+      } catch (error) {
+        errors.push(error.message || String(error));
+      }
+    }
+    throw new Error(errors.join(" | ") || `No CN corporate-action history provider is available for ${symbol}.`);
+  }
   const providers = [
-    ...(key === "US" && process.env.FMP_API_KEY ? [() => fetchFmpCorporateActionHistory(symbol)] : []),
+    ...(key === "US" && providerApiKeys("fmp").length ? [() => fetchFmpCorporateActionHistory(symbol)] : []),
     ...(key === "US" && providerConfigured("tiingo") ? [() => fetchTiingoCorporateActionHistory(symbol)] : []),
     ...(providerConfigured("eodhd") ? [() => fetchEodhdCorporateActionHistory(symbol, key)] : []),
+    // Keyless Yahoo chart events are an equal-eligibility fallback for
+    // coverage queries; they are not restricted to training-only use.
+    ...(["US", "ASX"].includes(key) ? [() => fetchYahooCorporateActionHistory(symbol, key)] : []),
   ];
   const errors = [];
   for (const provider of providers) {
@@ -20022,16 +23554,21 @@ async function fetchEodhdDelistedUniverseCandidates(market, { force = false } = 
 }
 
 async function fetchOpenFigiIdentifierMappings(symbols, market) {
-  if (!process.env.OPENFIGI_API_KEY) throw new Error("OPENFIGI_API_KEY is not configured.");
   const key = safeMarket(market);
-  const requested = [...new Set((symbols || []).map((symbol) => cleanCode(symbol, key)).filter(Boolean))].slice(0, 100);
+  // OpenFIGI permits anonymous mapping at a lower limit.  Keep the no-key
+  // path useful for identity cleanup without pretending it has keyed quota.
+  const requestLimit = process.env.OPENFIGI_API_KEY ? 100 : 10;
+  const requested = [...new Set((symbols || []).map((symbol) => cleanCode(symbol, key)).filter(Boolean))].slice(0, requestLimit);
   if (!requested.length) return [];
+  const headers = process.env.OPENFIGI_API_KEY
+    ? { "x-openfigi-apikey": process.env.OPENFIGI_API_KEY }
+    : {};
   const payload = await fetchJsonPost("https://api.openfigi.com/v3/mapping", requested.map((symbol) => ({
     idType: "ID_EXCH_SYMBOL",
     idValue: symbol,
     marketSecDes: "Equity",
     securityType2: "Common Stock",
-  })), 30_000, { "x-openfigi-apikey": process.env.OPENFIGI_API_KEY });
+  })), 30_000, headers);
   const mappings = normalizeOpenFigiMappings(requested, payload, key);
   if (!mappings.length) {
     const messages = (Array.isArray(payload) ? payload : []).map((row) => row?.error || row?.warning).filter(Boolean);
@@ -20113,6 +23650,123 @@ async function fetchCnHistoricalPit(symbol) {
   return fetchEastmoneyHistoricalPit(symbol);
 }
 
+async function fetchCninfoHistoricalPit(symbol, options = {}) {
+  if (String(process.env.CNINFO_PIT_ENABLED || "true").toLowerCase() === "false") {
+    return { records: [], financialDisclosures: [], warnings: ["CNINFO PIT is disabled by configuration."], cached: false };
+  }
+  const code = cleanCode(symbol, "CN");
+  if (!/^\d{6}$/.test(code)) return { records: [], financialDisclosures: [], warnings: [`Invalid CNINFO A-share code: ${code}`], cached: false };
+  const cacheName = `cninfo-disclosures-${code}`;
+  const cacheMaxAgeMs = Math.max(24 * 60 * 60_000, Number(process.env.CNINFO_PIT_CACHE_MS || 30 * 24 * 60 * 60_000));
+  if (options.force !== true) {
+    const cached = await readPitProviderCache(cacheName, cacheMaxAgeMs);
+    if (cached?.records?.length && cached?.statutoryReportCoverage === true) return {
+      records: cached.records,
+      financialDisclosures: cached.financialDisclosures || [],
+      warnings: cached.warnings || [],
+      cached: true,
+    };
+  }
+  const years = Math.max(1, Math.min(12, Number(options.years || process.env.CNINFO_PIT_YEARS || 8)));
+  const endDate = new Date().toISOString().slice(0, 10);
+  const startDate = `${new Date(Date.now() - years * 366 * 24 * 60 * 60_000).toISOString().slice(0, 10)}`;
+  const column = /^(5|6|9)/.test(code) ? "sse" : "szse";
+  const plate = column === "sse" ? "sh" : "sz";
+  const mappedOrgId = await cninfoOrgIdMap().catch(() => "");
+  const orgId = (mappedOrgId instanceof Map ? mappedOrgId.get(code) : "") || (column === "sse"
+    ? `gssh${code.padStart(7, "0")}`
+    : `gssz${code.padStart(7, "0")}`);
+  const maxPages = Math.max(1, Math.min(20, Number(options.maxPages || process.env.CNINFO_MAX_PAGES || 8)));
+  // CNINFO caps this endpoint at 30 rows even when a larger pageSize is sent.
+  // Keep the statutory report families separate so a busy issuer's ordinary
+  // announcements cannot crowd out years of dated financial disclosures.
+  const pageSize = 30;
+  const reportFamilies = [
+    { category: "category_ndbg_szsh", label: "annual-report" },
+    { category: "category_bndbg_szsh", label: "semi-annual-report" },
+    { category: "category_yjdbg_szsh", label: "first-quarter-report" },
+    { category: "category_sjdbg_szsh", label: "third-quarter-report" },
+  ];
+  const gapMs = Math.max(180, Number(process.env.CNINFO_REQUEST_INTERVAL_MS || 260));
+  const request = async (pageNum, category = "") => {
+    const task = cninfoRequestChain.then(async () => {
+      const delay = Math.max(0, cninfoNextRequestAt - Date.now());
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      cninfoNextRequestAt = Date.now() + gapMs;
+      return fetchFormJsonPost("https://www.cninfo.com.cn/new/hisAnnouncement/query", {
+        // CNINFO requires the issuer's orgId alongside the six-digit code.
+        // A bare code or a trailing comma can return no rows or an
+        // unfiltered result, both of which are unsafe for PIT joins.
+        stock: `${code},${orgId}`,
+        tabName: "fulltext",
+        pageSize,
+        pageNum,
+        column,
+        plate,
+        searchkey: "",
+        secid: "",
+        category,
+        trade: "",
+        seDate: `${startDate}~${endDate}`,
+        isHLtitle: "true",
+      }, Number(process.env.CNINFO_TIMEOUT_MS || 20_000), {
+        referer: "https://www.cninfo.com.cn/",
+        origin: "https://www.cninfo.com.cn",
+      });
+    });
+    cninfoRequestChain = task.catch(() => null);
+    return task;
+  };
+  const warnings = [];
+  const rows = [];
+  const disclosureKeys = new Map();
+  for (let page = 1; page <= maxPages; page += 1) {
+    try {
+      const payload = await request(page);
+      const pageRows = Array.isArray(payload?.announcements) ? payload.announcements : [];
+      rows.push(...pageRows);
+      if (pageRows.length < pageSize) break;
+    } catch (error) {
+      warnings.push(`CNINFO page ${page}: ${error.message || String(error)}`);
+      break;
+    }
+  }
+  for (const family of reportFamilies) {
+    try {
+      const payload = await request(1, family.category);
+      const pageRows = Array.isArray(payload?.announcements) ? payload.announcements : [];
+      rows.push(...pageRows);
+      for (const record of normalizeCninfoAnnouncementRecords(code, { announcements: pageRows })) {
+        disclosureKeys.set(record.id, family.label);
+      }
+    } catch (error) {
+      warnings.push(`CNINFO ${family.label}: ${error.message || String(error)}`);
+    }
+  }
+  const records = Array.from(new Map(normalizeCninfoAnnouncementRecords(code, { announcements: rows })
+    .map((record) => [record.id, record])).values());
+  const financialDisclosures = records.filter((record) => (
+    disclosureKeys.has(record.id)
+    || /年报|半年报|季报|业绩预告|业绩快报|财务报告|财务报表|利润分配|分红|审计报告|annual report|financial report|earnings/i.test(String(record.title || ""))
+  )).map((record) => ({
+    ...record,
+    disclosureType: disclosureKeys.get(record.id) || "cninfo-official-disclosure",
+    values: { ...(record.values || {}), earningsEvent: 1, sourceQuality: 1, statutoryReport: disclosureKeys.has(record.id) ? 1 : 0 },
+  }));
+  if (!records.length && warnings.length) throw new Error(warnings.join(" | "));
+  await writePitProviderCache(cacheName, {
+    records,
+    financialDisclosures,
+    warnings,
+    code,
+    startDate,
+    endDate,
+    statutoryReportCoverage: true,
+    reportFamilies: reportFamilies.map((family) => family.label),
+  });
+  return { records, financialDisclosures, warnings, cached: false };
+}
+
 async function fetchTushareHistoricalUniversePit() {
   if (!process.env.TUSHARE_TOKEN) return [];
   const cacheName = "tushare-cn-historical-universe";
@@ -20141,38 +23795,57 @@ async function fetchTushareHistoricalUniversePit() {
 
 const PIT_MACRO_SERIES = Object.freeze({
   US: [
-    "FEDFUNDS", "DGS10", "T10Y2Y", "CPIAUCSL", "UNRATE", "GDP",
-    "VIXCLS", "BAMLC0A0CM", "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
+    "FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "CPIAUCSL", "PCEPI", "PPIACO",
+    "UNRATE", "PAYEMS", "GDP", "INDPRO", "VIXCLS", "BAMLC0A0CM", "NFCI",
+    "DTWEXBGS", "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
   ],
   ASX: [
-    "FEDFUNDS", "DGS10", "T10Y2Y", "IRSTCI01AUM156N", "IRLTLT01AUM156N",
+    "FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "IRSTCI01AUM156N", "IRLTLT01AUM156N",
     "CPALTT01AUM657N", "CPALTT01AUQ659N", "LRUNTTTTAUM156S", "AUSGDPRQPSMEI",
-    "VIXCLS", "BAMLC0A0CM",
+    "VIXCLS", "BAMLC0A0CM", "NFCI", "DTWEXBGS",
     "DEXUSAL", "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
   ],
   CN: [
-    "FEDFUNDS", "DGS10", "T10Y2Y", "IRSTCI01CNM156N", "CPALTT01CNM659N",
-    "LRUNTTTTCNM156S", "VIXCLS", "BAMLC0A0CM", "DEXCHUS",
+    "FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "IRSTCI01CNM156N", "CPALTT01CNM659N",
+    "LRUNTTTTCNM156S", "VIXCLS", "BAMLC0A0CM", "NFCI", "DEXCHUS",
     "DCOILBRENTEU", "PCOPPUSDM", "GOLDAMGBD228NLBM",
   ],
 });
 
 const CONSERVATIVE_MARKET_MACRO_SERIES = new Set([
-  "DGS10", "T10Y2Y", "VIXCLS", "DEXUSAL", "DEXCHUS", "GOLDAMGBD228NLBM",
+  "DGS2", "DGS10", "T10Y2Y", "VIXCLS", "DEXUSAL", "DEXCHUS", "DTWEXBGS", "GOLDAMGBD228NLBM",
 ]);
 
 async function fetchFredHistoricalPit(market) {
-  if (!process.env.FRED_API_KEY) return [];
-  const results = await Promise.allSettled(PIT_MACRO_SERIES[safeMarket(market)].map(async (seriesId) => {
+  if (!providerApiKeys("fred").length) return [];
+  const fetchFredJson = (endpoint, timeoutMs = 20_000, startIndex = null) => withProviderApiKey(
+    "fred",
+    {
+      backoffKey: "fred",
+      label: "FRED",
+      keyBackoffMs: 20 * 60_000,
+      ...(Number.isFinite(Number(startIndex)) ? { startIndex } : {}),
+    },
+    (key) => {
+      const request = new URL(endpoint.toString());
+      request.searchParams.set("api_key", key);
+      return fetchJson(request, timeoutMs);
+    },
+  );
+  const fredKeyCount = Math.max(1, providerApiKeys("fred").length);
+  const results = await Promise.allSettled(PIT_MACRO_SERIES[safeMarket(market)].map(async (seriesId, seriesIndex) => {
+    // Spread concurrent series over the configured FRED key pool. The old
+    // shared runtime index made every parallel request start with the primary
+    // key, so a burst could exhaust one key while backups remained untouched.
+    const startIndex = seriesIndex % fredKeyCount;
     const endpoint = new URL("https://api.stlouisfed.org/fred/series/observations");
     endpoint.searchParams.set("series_id", seriesId);
-    endpoint.searchParams.set("api_key", process.env.FRED_API_KEY);
     endpoint.searchParams.set("file_type", "json");
     endpoint.searchParams.set("realtime_start", "1776-07-04");
     endpoint.searchParams.set("realtime_end", "9999-12-31");
     endpoint.searchParams.set("output_type", "4");
     try {
-      const value = await fetchJson(endpoint, 20_000);
+      const value = await fetchFredJson(endpoint, 20_000, startIndex);
       const rows = normalizeFredVintageRecords(seriesId, value.observations || []);
       if (rows.length || !CONSERVATIVE_MARKET_MACRO_SERIES.has(seriesId)) return rows;
     } catch (error) {
@@ -20180,15 +23853,135 @@ async function fetchFredHistoricalPit(market) {
     }
     const marketEndpoint = new URL("https://api.stlouisfed.org/fred/series/observations");
     marketEndpoint.searchParams.set("series_id", seriesId);
-    marketEndpoint.searchParams.set("api_key", process.env.FRED_API_KEY);
     marketEndpoint.searchParams.set("file_type", "json");
     marketEndpoint.searchParams.set("observation_start", "1990-01-01");
     marketEndpoint.searchParams.set("sort_order", "asc");
     marketEndpoint.searchParams.set("limit", "100000");
-    const current = await fetchJson(marketEndpoint, 20_000);
+    const current = await fetchFredJson(marketEndpoint, 20_000, startIndex);
     return normalizeFredVintageRecords(seriesId, current.observations || [], { conservativeMarketClose: true });
   }));
-  return results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  const records = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  const failures = results
+    .filter((result) => result.status === "rejected")
+    .map((result) => String(result.reason?.message || result.reason || "FRED series failed"))
+    .slice(0, 8);
+  if (!records.length && failures.length) {
+    throw new Error(`FRED/ALFRED macro key pool failed for all configured series: ${failures.join(" | ")}`);
+  }
+  return records;
+}
+
+const BLS_PIT_SERIES = Object.freeze([
+  "CUSR0000SA0", // CPI-U, all urban consumers
+  "LNS14000000", // unemployment rate
+  "CES0000000001", // total nonfarm employment
+]);
+
+async function fetchAbsShadowMacroPit(market) {
+  if (safeMarket(market) !== "ASX" || String(process.env.ABS_SDMX_ENABLED || "true").toLowerCase() === "false") return [];
+  const cacheName = "abs-sdmx-macro-shadow";
+  const cacheMaxAgeMs = Math.max(6 * 60 * 60_000, Number(process.env.ABS_SDMX_CACHE_MS || 7 * 24 * 60 * 60_000));
+  const cached = await readPitProviderCache(cacheName, cacheMaxAgeMs);
+  if (cached?.records?.length) return cached.records;
+  const result = await fetchAbsMacro({
+    datasets: process.env.ABS_SDMX_DATASETS || undefined,
+    startPeriod: process.env.ABS_SDMX_START_PERIOD || "1990-01",
+    endPeriod: process.env.ABS_SDMX_END_PERIOD || "",
+    timeoutMs: Number(process.env.ABS_SDMX_TIMEOUT_MS || 30_000),
+  });
+  if (result.errors.length && !result.records.length) throw new Error(result.errors.join(" | "));
+  const records = result.records.map((record) => ({
+    ...record,
+    source: "abs-sdmx-shadow",
+    historicalAvailabilityVerified: false,
+    historicalAvailabilityUnverified: true,
+  }));
+  if (records.length) await writePitProviderCache(cacheName, { records, source: "abs-sdmx-shadow", warnings: result.errors });
+  return records;
+}
+
+async function fetchBlsShadowMacroPit(market) {
+  if (safeMarket(market) !== "US" || String(process.env.BLS_PIT_ENABLED || "true").toLowerCase() === "false") return [];
+  const cacheName = "bls-us-macro-shadow";
+  const cacheMaxAgeMs = Math.max(6 * 60 * 60_000, Number(process.env.BLS_PIT_CACHE_MS || 7 * 24 * 60 * 60_000));
+  const cached = await readPitProviderCache(cacheName, cacheMaxAgeMs);
+  if (cached?.records?.length) return cached.records;
+  const endYear = new Date().getUTCFullYear();
+  const startYear = Math.max(1990, endYear - Number(process.env.BLS_PIT_YEARS || 20));
+  const payload = await fetchJsonPost("https://api.bls.gov/publicAPI/v2/timeseries/data/", {
+    seriesid: BLS_PIT_SERIES,
+    startyear: String(startYear),
+    endyear: String(endYear),
+  }, Number(process.env.BLS_PIT_TIMEOUT_MS || 30_000));
+  const records = normalizeBlsMacroRecords("US", payload, { retrievedAt: new Date().toISOString() });
+  if (records.length) await writePitProviderCache(cacheName, { records, source: "bls-public-api-shadow" });
+  return records;
+}
+
+async function fetchFreePublicMacroPit(market) {
+  const key = safeMarket(market);
+  const cacheName = `free-public-macro-${key.toLowerCase()}`;
+  const cacheMaxAgeMs = Math.max(60 * 60_000, Number(process.env.FREE_PUBLIC_MACRO_CACHE_MS || 12 * 60 * 60_000));
+  const cached = await readPitProviderCache(cacheName, cacheMaxAgeMs);
+  if (cached) return {
+    macro: cached.macro || [],
+    news: cached.news || [],
+    warnings: cached.warnings || [],
+    cached: true,
+  };
+  const warnings = [];
+  const macro = await fetchBlsShadowMacroPit(key).catch((error) => {
+    warnings.push(`BLS: ${error.message || String(error)}`);
+    return [];
+  });
+  const absMacro = await fetchAbsShadowMacroPit(key).catch((error) => {
+    if (key === "ASX") warnings.push(`ABS SDMX: ${error.message || String(error)}`);
+    return [];
+  });
+  macro.push(...absMacro);
+  const news = [];
+  if (key === "ASX") {
+    const rbaFeeds = await Promise.allSettled([
+      fetchText("https://www.rba.gov.au/rss/rss-cb-media-releases.xml", 8_000),
+      fetchText("https://www.rba.gov.au/rss/rss-cb-speeches.xml", 8_000),
+    ]);
+    const rbaItems = rbaFeeds.flatMap((result) => result.status === "fulfilled" ? rssRows(result.value, "rba-official") : []);
+    news.push(...normalizePublishedPitRecords(rbaItems.slice(0, 80).map((item) => ({
+      ...item,
+      source: "rba-official-rss",
+      publisher: "Reserve Bank of Australia",
+      sourceQuality: 1,
+      relevance: 0.9,
+    })), { symbol: "MARKET", sourceQuality: 1 }));
+    if (!rbaItems.length) warnings.push("RBA official RSS returned no rows.");
+  }
+  const queries = macroNewsQueriesFor(key).slice(0, 3);
+  const gdeltResults = await Promise.allSettled(queries.map(async ({ query, channel }) => {
+    const endpoint = new URL("https://api.gdeltproject.org/api/v2/doc/doc");
+    endpoint.searchParams.set("query", query);
+    endpoint.searchParams.set("mode", "ArtList");
+    endpoint.searchParams.set("format", "json");
+    endpoint.searchParams.set("maxrecords", "40");
+    endpoint.searchParams.set("sort", "HybridRel");
+    const payload = await fetchJson(endpoint, Number(process.env.GDELT_PIT_TIMEOUT_MS || 8_000));
+    return gdeltNewsRows(payload).map((item) => ({
+      ...item,
+      source: "gdelt-historical-event-pit",
+      channel,
+      sourceQuality: 0.58,
+      relevance: 0.65,
+    }));
+  }));
+  const gdeltItems = gdeltResults.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  news.push(...normalizePublishedPitRecords(gdeltItems, {
+    symbol: "MARKET",
+    sourceQuality: 0.58,
+    historicalAvailabilityVerified: false,
+  }));
+  if (!gdeltItems.length) warnings.push("GDELT returned no macro event rows.");
+  const value = { macro, news, warnings, cached: false };
+  await writePitProviderCache(cacheName, value);
+  return value;
 }
 
 async function pitUniverseWithFallback(market, force = false) {
@@ -20206,6 +23999,22 @@ async function pitUniverseWithFallback(market, force = false) {
   }
 }
 
+async function resolveWithin(task, timeoutMs, fallback) {
+  const limit = Math.max(500, Number(timeoutMs || 15_000));
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(task),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(typeof fallback === "function" ? fallback() : fallback), limit);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 const DATA_REPLENISHMENT_TARGETS = Object.freeze({
   ASX: Object.freeze({ symbols: 350, researchRows: 750, deepHistoryRows: 2_200, range: "10y" }),
   US: Object.freeze({ symbols: 450, researchRows: 750, deepHistoryRows: 2_000, range: "10y" }),
@@ -20219,22 +24028,27 @@ async function exactTrainingPitCoverage(market, symbols = []) {
   const names = ["universe", "corporate_actions", "fundamentals", "financial_disclosures", "news"];
   const buckets = Object.fromEntries(names.map((name) => [name, new Set()]));
   if (!denominator) return Object.fromEntries(names.map((name) => [name, { verifiedSymbols: 0, trainingUniverseCoveragePct: 0, exact: true }]));
-  const panel = await runPythonQuantCore("data-lake-pit-read", {
+  // Coverage is an existence check, not a request for raw events.  Reading a
+  // full panel per dataset opened thousands of partitions and made the status
+  // page stale while enrichment was active.  The compact query only opens the
+  // candidate symbols (plus a single market-wide universe partition).
+  const panel = await runPythonQuantCore("data-lake-pit-coverage", {
     market: key,
     symbols: requested,
     datasets: names,
-    limit_per_symbol: 24,
-    broadcast_market_wide: false,
-    verified_only: true,
-  }, Number(process.env.DATA_REPLENISHMENT_EXACT_PIT_TIMEOUT_MS || 180_000)).catch(() => ({ items: [] }));
-  for (const item of panel.items || []) {
-    const code = cleanCode(item.symbol, key);
-    if (!code) continue;
-    for (const feature of item.pointInTimeFeatures || []) {
-      if (buckets[feature.dataset]) buckets[feature.dataset].add(code);
+  }, Number(process.env.DATA_REPLENISHMENT_EXACT_PIT_TIMEOUT_MS || 120_000)).catch(() => null);
+  // A timeout or a transient DuckDB lock is not evidence that every symbol
+  // lost its PIT record.  Returning an empty coverage set here used to
+  // overwrite a valid lake summary and create a false 0% snapshot.
+  if (!panel || panel.available === false || !panel.byDataset || typeof panel.byDataset !== "object") {
+    return null;
+  }
+  for (const dataset of names) {
+    for (const symbol of panel.byDataset?.[dataset] || []) {
+      const code = cleanCode(symbol, key);
+      if (!code) continue;
+      buckets[dataset].add(code);
     }
-    if ((item.universeHistory || []).some((row) => row.historicalAvailabilityVerified === true)) buckets.universe.add(code);
-    if ((item.corporateActions || []).some((row) => row.historicalAvailabilityVerified === true)) buckets.corporate_actions.add(code);
   }
   return Object.fromEntries(names.map((name) => [name, {
     verifiedSymbols: buckets[name].size,
@@ -20247,15 +24061,43 @@ async function exactTrainingPitCoverage(market, symbols = []) {
 
 function prioritizedPitGapSymbols(snapshot = {}, market = "ASX", limit = 30) {
   const key = safeMarket(market);
+  const coverage = (name) => Number(snapshot.pit?.datasets?.[name]?.trainingUniverseCoveragePct || 0);
+  // Once a market has passed its universe and corporate-action gates, direct
+  // scarce provider capacity at the two PIT families the strict model still
+  // cannot use: dated numeric fundamentals and dated company events.  Filing
+  // documents remain useful audit evidence, but they must not starve the
+  // model-input layers just because both are missing for the same security.
   const names = key === "ASX"
-    ? ["universe", "financial_disclosures", "news"]
-    : ["universe", "fundamentals", "news"];
+    ? [
+      ...(coverage("universe") < 80 ? ["universe"] : []),
+      ...(coverage("corporate_actions") < 95 ? ["corporate_actions"] : []),
+      ...(coverage("fundamentals") < 80 ? ["fundamentals"] : []),
+      "news",
+      // Dated filings are valuable evidence, but they must not replace the
+      // numeric fundamentals queue. Only revisit them after model-input
+      // fundamentals and events have reached their minimum coverage.
+      ...((coverage("fundamentals") >= 80 && coverage("news") >= 80) ? ["financial_disclosures"] : []),
+    ]
+    : [
+      ...(coverage("universe") < 80 ? ["universe"] : []),
+      ...(coverage("corporate_actions") < 95 ? ["corporate_actions"] : []),
+      ...(coverage("fundamentals") < 80 ? ["fundamentals"] : []),
+      ...(coverage("news") < 80 ? ["news"] : []),
+      // Only consume a low-priority disclosure slot after the model-input
+      // layers are already sufficient for this market.
+      ...((coverage("fundamentals") >= 80 && coverage("news") >= 80) ? ["financial_disclosures"] : []),
+    ];
+  // Prioritise the established core universe first.  Otherwise a newly listed
+  // company that is missing every optional layer can repeatedly outrank a
+  // liquid, long-history constituent that is missing the one PIT layer the
+  // production model actually needs.
+  const coreSymbols = new Set(normalizeSymbolListForMarket(TRAINING_UNIVERSES[key] || [], key));
   const scores = new Map();
   for (const [priority, name] of names.entries()) {
     for (const symbol of snapshot.pit?.datasets?.[name]?.missingSymbols || []) {
       const normalized = normalizeMarketSymbol(symbol, key);
       if (!normalized) continue;
-      const current = scores.get(normalized) || { score: 0, first: priority };
+      const current = scores.get(normalized) || { score: coreSymbols.has(normalized) ? 8 : 0, first: priority };
       current.score += 1;
       current.first = Math.min(current.first, priority);
       scores.set(normalized, current);
@@ -20275,6 +24117,12 @@ function firstStageDataReadiness(snapshot = {}) {
   const datasets = snapshot.pit?.datasets || {};
   const ratio = (value, required) => required > 0 ? Math.max(0, Math.min(1, Number(value || 0) / required)) : 0;
   const coverage = (name) => Math.max(0, Math.min(100, Number(datasets[name]?.trainingUniverseCoveragePct || 0)));
+  const macroDatasetPresent = Object.prototype.hasOwnProperty.call(datasets, "macro");
+  const macroCoverage = () => macroDatasetPresent
+    ? Math.max(0, Math.min(100, Number(
+      datasets.macro?.marketDateCoveragePct ?? datasets.macro?.trainingUniverseCoveragePct ?? 0,
+    )))
+    : 100;
   const numericFundamentalCoverage = coverage("fundamentals");
   const financialDisclosureCoverage = coverage("financial_disclosures");
   const financialPitCoverage = market === "ASX"
@@ -20329,6 +24177,15 @@ function firstStageDataReadiness(snapshot = {}) {
       required: 80,
       passed: coverage("news") >= 80,
     },
+    macro: {
+      label: "宏观发布版本PIT覆盖",
+      actual: macroCoverage(),
+      required: 80,
+      passed: !macroDatasetPresent || macroCoverage() >= 80,
+      basis: "distinct-available-observation-dates",
+      seriesCount: Number(datasets.macro?.seriesCount || 0),
+      verifiedSeriesCount: Number(datasets.macro?.verifiedSeriesCount || 0),
+    },
   };
   const progressWeights = {
     universe: 0.1,
@@ -20337,7 +24194,8 @@ function firstStageDataReadiness(snapshot = {}) {
     historicalUniverse: 0.15,
     corporateActions: 0.15,
     fundamentals: 0.2,
-    events: 0.1,
+    events: 0.05,
+    macro: 0.05,
   };
   const progressPct = Object.entries(gates).reduce((sum, [key, gate]) => (
     sum + Math.min(1, Number(gate.actual || 0) / Math.max(1, Number(gate.required || 1))) * progressWeights[key]
@@ -20357,6 +24215,8 @@ function firstStageDataReadiness(snapshot = {}) {
         ? "pit-enrichment"
       : blockers.some((row) => row.id === "corporateActions")
         ? "corporate-action-backfill"
+        : blockers.some((row) => row.id === "macro")
+          ? "pit-enrichment"
         : blockers.length ? "pit-enrichment" : "strict-oof-challenger",
     note: market === "ASX"
       ? "ASX stage one accepts dated official financial-report disclosures as event evidence; it does not claim structured numeric statements. Model promotion still requires strict OOF, calibration, Top-K and cost gates."
@@ -20364,17 +24224,43 @@ function firstStageDataReadiness(snapshot = {}) {
   };
 }
 
-async function dataReplenishmentSnapshot(market = "ASX") {
+async function buildDataReplenishmentSnapshot(market = "ASX", fallbackSnapshot = null) {
   const key = safeMarket(market);
   const target = DATA_REPLENISHMENT_TARGETS[key];
-  const [resources, lake, universe, pitState, historyJobs, pitJobs] = await Promise.all([
+  const [resources, lakeResult, universe, pitState, historyJobs, pitJobs, monitorRuntime] = await Promise.all([
     trainingResources.get(),
     runPythonQuantCore("data-lake-summary", { market: key }, 60_000).catch((error) => ({ available: false, items: [], pitDatasets: {}, error: error.message || String(error) })),
     pitUniverseWithFallback(key, false),
     readFile(join(snapshotBasePath, "data-lake", "pit-enrichment-state.json"), "utf8").then(JSON.parse).catch(() => ({ cursors: {} })),
-    backgroundJobs.list({ type: "history-backfill", market: key, limit: 5 }),
-    backgroundJobs.list({ type: "pit-enrichment", market: key, limit: 5 }),
+    // Keep enough history to reconcile a broad batch with any later
+    // single-symbol retry. A tiny retry must not hide the provider diagnosis
+    // that explains why the market-wide batch made no progress.
+    backgroundJobs.list({ type: "history-backfill", market: key, limit: 20 }),
+    backgroundJobs.list({ type: "pit-enrichment", market: key, limit: 20 }),
+    readBackendMonitorRuntime().catch(() => ({})),
   ]);
+  const hasUsableLakeSummary = lakeResult?.available !== false
+    && Array.isArray(lakeResult?.items)
+    && lakeResult.items.length > 0;
+  if (!hasUsableLakeSummary && fallbackSnapshot?.market === key) {
+    // A writer can hold the single Python ingest lane while the summary worker
+    // is briefly unavailable.  Preserve the last complete audit instead of
+    // recording a false zero-history snapshot that would trigger redundant
+    // downloads and make the UI claim the local lake vanished.
+    return {
+      ...fallbackSnapshot,
+      generatedAt: new Date().toISOString(),
+      snapshotState: "stale-data-lake",
+      refreshError: lakeResult?.error || "Local data-lake summary is temporarily unavailable.",
+      jobs: {
+        history: historyJobs.jobs || [],
+        pit: pitJobs.jobs || [],
+      },
+    };
+  }
+  const lake = hasUsableLakeSummary
+    ? lakeResult
+    : { available: false, items: [], pitDatasets: {}, error: lakeResult?.error || "Local data-lake summary is unavailable." };
   const dailyRows = new Map((lake.items || [])
     .filter((row) => row.market === key && row.interval === "1d")
     .map((row) => [cleanCode(row.symbol, key), Number(row.rows || 0)]));
@@ -20387,10 +24273,37 @@ async function dataReplenishmentSnapshot(market = "ASX") {
     ...broad,
   ], key).slice(0, target.symbols);
   const exactPitCoverage = await exactTrainingPitCoverage(key, targetSymbols);
+  const coreTrainingSymbols = new Set(normalizeSymbolListForMarket(TRAINING_UNIVERSES[key] || [], key));
+  const researchRequiredSymbols = Math.ceil(target.symbols * 0.8);
+  const researchReadyCount = targetSymbols.filter((symbol) => (
+    (dailyRows.get(cleanCode(symbol, key)) || 0) >= target.researchRows
+  )).length;
+  const researchGateBlocked = researchReadyCount < researchRequiredSymbols;
+  // When the research gate is the active blocker, only queue symbols below
+  // the research threshold.  The previous selector used the deeper threshold
+  // even in this phase, so symbols that already had 750+ rows were repeatedly
+  // re-submitted while the visible research-ready count stayed unchanged.
+  const historyThreshold = researchGateBlocked ? target.researchRows : target.deepHistoryRows;
   const historyCandidates = targetSymbols
     .map((symbol, order) => ({ symbol, order, rows: dailyRows.get(cleanCode(symbol, key)) || 0 }))
-    .filter((row) => row.rows < target.deepHistoryRows)
-    .sort((left, right) => left.rows - right.rows || left.order - right.order);
+    .filter((row) => row.rows < historyThreshold)
+    .sort((left, right) => {
+      const leftCore = coreTrainingSymbols.has(left.symbol) ? 0 : 1;
+      const rightCore = coreTrainingSymbols.has(right.symbol) ? 0 : 1;
+      if (leftCore !== rightCore) return leftCore - rightCore;
+      if (researchGateBlocked) {
+        // The first gate is the 750-row research pool.  Do not spend every
+        // batch on symbols that already pass it; move the shortest eligible
+        // histories toward the research threshold first.
+        const leftReady = left.rows >= target.researchRows ? 1 : 0;
+        const rightReady = right.rows >= target.researchRows ? 1 : 0;
+        if (leftReady !== rightReady) return leftReady - rightReady;
+        return right.rows - left.rows || left.order - right.order;
+      }
+      // Once the research gate is satisfied, use the same queue for the deep
+      // history gate and prioritize symbols closest to the required depth.
+      return right.rows - left.rows || left.order - right.order;
+    });
   const datasets = Object.fromEntries(Object.entries(lake.pitDatasets || {}).map(([name, value]) => [name, {
     rows: Number(value.markets?.[key] || 0),
     verifiedRows: Number(value.verifiedMarkets?.[key] || 0),
@@ -20399,11 +24312,16 @@ async function dataReplenishmentSnapshot(market = "ASX") {
     verifiedSymbols: Number(value.verifiedSymbols?.[key] || 0),
     verifiedSymbolPct: Number(value.verifiedSymbolPct?.[key] || 0),
     trainingUniverseCoveragePct: Number(value.trainingUniverseCoveragePct?.[key] || 0),
+    marketDateCoveragePct: value.marketDateCoveragePct?.[key] == null ? null : Number(value.marketDateCoveragePct[key]),
+    seriesCount: Number(value.seriesCount?.[key] || 0),
+    verifiedSeriesCount: Number(value.verifiedSeriesCount?.[key] || 0),
   }]));
-  for (const [name, exact] of Object.entries(exactPitCoverage)) {
+  for (const [name, exact] of Object.entries(exactPitCoverage || {})) {
     datasets[name] = { ...(datasets[name] || {}), ...exact };
   }
-  const pitCoverage = (dataset) => Number(datasets[dataset]?.trainingUniverseCoveragePct || 0);
+  const pitCoverage = (dataset) => dataset === "macro"
+    ? Number(datasets[dataset]?.marketDateCoveragePct || 0)
+    : Number(datasets[dataset]?.trainingUniverseCoveragePct || 0);
   const dataProfile = resources.profile.data || {};
   const snapshot = {
     market: key,
@@ -20428,10 +24346,23 @@ async function dataReplenishmentSnapshot(market = "ASX") {
       cursor: Number(pitState.cursors?.[key] || 0),
       nextBatch: Number(dataProfile.pitBatch || 30),
       officialBatch: Number(dataProfile.officialPitBatch || 15),
+      providerDiagnostics: key === "ASX"
+        ? pitProviderStatus()
+          .filter((row) => ["fmp-asx-financials", "tiingo-asx-financials", "finnhub-asx-financials", "growthwithvalue-asx-financials", "stockmarketapi-ai-asx-financials", "asx-official-financial-disclosures", "asx-official-reports-archive", "stockanalysis-asx-snapshot"].includes(row.name))
+          .map((row) => ({ name: row.name, configured: row.configured, status: row.status, keyPool: row.keyPool || null }))
+        : [],
     },
     jobs: {
       history: historyJobs.jobs || [],
       pit: pitJobs.jobs || [],
+    },
+    enrichmentControl: {
+      historyBlockedUntil: monitorRuntime.historyNoProgressByMarket?.[key]?.blockedUntil
+        || null,
+      pitBlockedUntil: monitorRuntime.pitNoProgressByMarket?.[key]?.blockedUntil
+        || null,
+      corporateBlockedUntil: monitorRuntime.corporateNoProgressByMarket?.[key]?.blockedUntil
+        || null,
     },
     blockers: [
       targetSymbols.length < target.symbols ? `股票池 ${targetSymbols.length}/${target.symbols}` : null,
@@ -20446,19 +24377,487 @@ async function dataReplenishmentSnapshot(market = "ASX") {
     note: "监控股只决定重点刷新；市场训练池、退市候选、历史行情与PIT事件由后台独立补齐。未验证的退市日期只用于研究抽样，不进入正式PIT门控。",
   };
   snapshot.stageOne = firstStageDataReadiness(snapshot);
+  snapshot.replenishmentPlan = dataReplenishmentRoundPlan(snapshot);
+  snapshot.frontierAssessment = dataFrontierAssessment(snapshot);
   return snapshot;
+}
+
+function pendingDataReplenishmentSnapshot(market = "ASX") {
+  const key = safeMarket(market);
+  const target = DATA_REPLENISHMENT_TARGETS[key];
+  return {
+    market: key,
+    generatedAt: new Date().toISOString(),
+    snapshotState: "refreshing",
+    target,
+    universe: { source: "pending-local-audit", available: null, target: target.symbols, selected: null },
+    history: { partitions: null, researchReadySymbols: null, deepHistorySymbols: null, missingOrShort: null, nextSymbols: [] },
+    pit: { datasets: {}, cursor: 0, nextBatch: null, officialBatch: null },
+    jobs: { history: [], pit: [] },
+    blockers: ["本地数据健康快照正在生成；页面不会等待完整 PIT 审计。"],
+    stageOne: {
+      stage: "stage-one-data",
+      met: false,
+      progressPct: null,
+      gates: {},
+      blockers: [{ id: "snapshotRefresh", label: "数据健康快照", actual: null, required: null }],
+      nextAction: "snapshot-refresh",
+    },
+  };
+}
+
+function dataReplenishmentTrainingSignature(snapshot = {}) {
+  const pitDatasets = Object.fromEntries(Object.entries(snapshot?.pit?.datasets || {}).map(([name, value]) => [name, {
+    rows: Number(value?.rows || 0),
+    verifiedRows: Number(value?.verifiedRows || 0),
+    coverage: Number(value?.trainingUniverseCoveragePct || 0),
+  }]));
+  const payload = {
+    market: safeMarket(snapshot.market || "ASX"),
+    target: snapshot.target || {},
+    universe: {
+      selected: Number(snapshot?.universe?.selected || 0),
+      available: Number(snapshot?.universe?.available || 0),
+    },
+    history: {
+      partitions: Number(snapshot?.history?.partitions || 0),
+      researchReadySymbols: Number(snapshot?.history?.researchReadySymbols || 0),
+      deepHistorySymbols: Number(snapshot?.history?.deepHistorySymbols || 0),
+    },
+    pitDatasets,
+    gates: snapshot?.stageOne?.gates || {},
+  };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex").slice(0, 24);
+}
+
+function dataReplenishmentSnapshotPath(market = "ASX") {
+  return join(snapshotBasePath, "data-lake", `replenishment-snapshot-${safeMarket(market).toLowerCase()}.json`);
+}
+
+function medianPositive(values = []) {
+  const clean = values.filter((value) => Number.isFinite(value) && value > 0).sort((left, right) => left - right);
+  if (!clean.length) return null;
+  const middle = Math.floor(clean.length / 2);
+  return clean.length % 2 ? clean[middle] : (clean[middle - 1] + clean[middle]) / 2;
+}
+
+function recentJobDurationSeconds(jobs = []) {
+  return medianPositive(jobs
+    .filter((job) => job.status === "complete")
+    .map((job) => {
+      const started = Date.parse(job.startedAt || "");
+      const finished = Date.parse(job.updatedAt || job.finishedAt || "");
+      return Number.isFinite(started) && Number.isFinite(finished) ? (finished - started) / 1000 : null;
+    }));
+}
+
+function dataReplenishmentRoundPlan(snapshot = {}) {
+  if (!snapshot?.target || !snapshot?.history || !snapshot?.pit) return null;
+  const market = safeMarket(snapshot.market || "ASX");
+  const now = Date.now();
+  const profile = trainingResources.current()?.profile?.data || {};
+  const historyBatchSize = Math.max(1, Number(profile.historyBatch || 60));
+  const configuredPitBatchSize = Math.max(1, Number(profile.pitBatch || 30));
+  // The automatic stage-one scheduler deliberately uses a floor of 45 symbols
+  // per PIT pass. Report that effective capacity, otherwise the UI overstates
+  // the number of rounds by using the smaller manual button batch size.
+  const pitBatchSize = Math.max(45, configuredPitBatchSize);
+  const historyRemainingSymbols = Math.max(0, Number(snapshot.history.missingOrShort || 0));
+  const historyRounds = Math.ceil(historyRemainingSymbols / historyBatchSize);
+  const datasets = snapshot.pit.datasets || {};
+  const pitDatasetNames = market === "ASX"
+    ? ["fundamentals", "financial_disclosures", "universe", "corporate_actions", "news"]
+    : ["fundamentals", "financial_disclosures", "universe", "corporate_actions", "news"];
+  const missingByDataset = Object.fromEntries(pitDatasetNames.map((name) => [
+    name,
+    Math.max(0, Array.isArray(datasets[name]?.missingSymbols) ? datasets[name].missingSymbols.length : 0),
+  ]));
+  const missingPitSymbols = new Set(pitDatasetNames.flatMap((name) => datasets[name]?.missingSymbols || []));
+  const pitRemainingSymbols = missingPitSymbols.size;
+  const pitRounds = Math.ceil(pitRemainingSymbols / pitBatchSize);
+  const qualityWarnings = pitDatasetNames
+    .map((name) => {
+      const row = datasets[name] || {};
+      const coverage = Number(row.trainingUniverseCoveragePct || 0);
+      const rowVerified = Number(row.verifiedPct || 0);
+      return rowVerified > 0 && coverage >= 80 && rowVerified < 80
+        ? { dataset: name, verifiedPct: rowVerified, trainingUniverseCoveragePct: coverage }
+        : null;
+    })
+    .filter(Boolean);
+  const historyJobs = snapshot.jobs?.history || [];
+  const pitJobs = snapshot.jobs?.pit || [];
+  const historyDiagnosticJobs = historyJobs
+    .filter((job) => job.resultSummary?.historyDiagnostics)
+    .sort((left, right) => {
+      const leftDiagnostics = left.resultSummary.historyDiagnostics;
+      const rightDiagnostics = right.resultSummary.historyDiagnostics;
+      // A market-wide batch is the useful diagnosis when a later one-symbol
+      // retry is still in the recent window. Prefer the broader observation;
+      // use recency only to break ties between equally broad batches.
+      const attemptedDelta = Number(rightDiagnostics.attemptedSymbols || 0)
+        - Number(leftDiagnostics.attemptedSymbols || 0);
+      if (attemptedDelta) return attemptedDelta;
+      return String(right.updatedAt || right.createdAt || "")
+        .localeCompare(String(left.updatedAt || left.createdAt || ""));
+    });
+  const latestHistoryJob = historyDiagnosticJobs[0]
+    || historyJobs.find((job) => job.status === "complete")
+    || null;
+  const latestHistoryDiagnostics = latestHistoryJob?.resultSummary?.historyDiagnostics || null;
+  const providerActionDiagnostics = historyDiagnosticJobs.filter((job) => {
+    const diagnostics = job.resultSummary.historyDiagnostics;
+    return Number(diagnostics.providerLimitedSymbols || 0) > 0
+      || Number(diagnostics.timeoutSymbols || 0) > 0;
+  });
+  const historyProviderBlocked = Number(latestHistoryDiagnostics?.providerLimitedSymbols || 0);
+  const historyTimedOut = Number(latestHistoryDiagnostics?.timeoutSymbols || 0);
+  const historyRequiresProviderAction = providerActionDiagnostics.length > 0
+    || (Boolean(latestHistoryDiagnostics) && (historyProviderBlocked > 0 || historyTimedOut > 0));
+  const cooldowns = snapshot.enrichmentControl || {};
+  const historyCooldownUntil = Date.parse(String(cooldowns.historyBlockedUntil || "")) || 0;
+  const pitCooldownUntil = Date.parse(String(cooldowns.pitBlockedUntil || "")) || 0;
+  const corporateCooldownUntil = Date.parse(String(cooldowns.corporateBlockedUntil || "")) || 0;
+  const historyCooldownActive = historyCooldownUntil > now;
+  const pitCooldownActive = pitCooldownUntil > now;
+  const corporateCooldownActive = corporateCooldownUntil > now;
+  const historyImmediatelyActionableRounds = historyCooldownActive || historyRequiresProviderAction ? 0 : historyRounds;
+  const pitImmediatelyActionableRounds = pitCooldownActive ? 0 : pitRounds;
+  const reAuditRounds = historyImmediatelyActionableRounds + pitImmediatelyActionableRounds > 0 ? 1 : 0;
+  const activeJobs = [...historyJobs, ...pitJobs].filter((job) => ["queued", "running"].includes(job.status));
+  const completedHistory = historyJobs.filter((job) => job.status === "complete").length;
+  const completedPit = pitJobs.filter((job) => job.status === "complete").length;
+  const hasGap = historyRemainingSymbols > 0 || pitRemainingSymbols > 0 || snapshot.blockers?.length > 0;
+  const auditRequired = hasGap ? 1 : 0;
+  const historySeconds = recentJobDurationSeconds(historyJobs);
+  const pitSeconds = recentJobDurationSeconds(pitJobs);
+  const reAuditSeconds = hasGap ? 30 : 0;
+  const estimatedSeconds = (historyRounds * (historySeconds || 90))
+    + (pitRounds * (pitSeconds || 90))
+    + (auditRequired * 30);
+  const queueNote = activeJobs.length
+    ? `${activeJobs.length} 个补齐任务已在运行或排队，轮次缺口会在任务完成后的新快照中扣减。`
+    : "当前没有已登记的补齐任务，下一轮会由调度器按缺口创建。";
+  return {
+    basis: "当前已审计快照 + 均衡档每批容量；轮次是最低下限，不把失败重试和供应商限流伪装成完成",
+    profile: resourcesProfileId(),
+    history: {
+      remainingSymbols: historyRemainingSymbols,
+      batchSize: historyBatchSize,
+      remainingRounds: historyRounds,
+      immediatelyActionableRounds: historyImmediatelyActionableRounds,
+      cooldown: historyCooldownActive ? {
+        blockedUntil: new Date(historyCooldownUntil).toISOString(),
+        reason: "history-provider-or-no-progress-cooldown",
+      } : null,
+      latestBatch: latestHistoryDiagnostics ? {
+        jobId: latestHistoryJob.id,
+        attemptedSymbols: latestHistoryDiagnostics.attemptedSymbols,
+        qualifiedSymbols: latestHistoryDiagnostics.qualifiedSymbols,
+        providerLimitedSymbols: historyProviderBlocked,
+        timeoutSymbols: historyTimedOut,
+        structuralShortSymbols: latestHistoryDiagnostics.structuralShortSymbols,
+        nextAction: latestHistoryDiagnostics.nextAction,
+        note: latestHistoryDiagnostics.note,
+      } : null,
+      completedVisibleBatches: completedHistory,
+      recentBatchSeconds: historySeconds,
+      progressPct: Number(Math.max(0, Math.min(100, 100 - historyRemainingSymbols / Math.max(1, Number(snapshot.universe.target || 1)) * 100)).toFixed(1)),
+    },
+    pit: {
+      remainingUniqueSymbols: pitRemainingSymbols,
+      batchSize: pitBatchSize,
+      configuredBatchSize: configuredPitBatchSize,
+      remainingRounds: pitRounds,
+      immediatelyActionableRounds: pitImmediatelyActionableRounds,
+      cooldown: pitCooldownActive ? {
+        blockedUntil: new Date(pitCooldownUntil).toISOString(),
+        reason: "pit-no-progress-cooldown",
+      } : null,
+      missingByDataset,
+      qualityWarnings,
+      completedVisibleBatches: completedPit,
+      recentBatchSeconds: pitSeconds,
+      progressPct: Number(Math.max(0, Math.min(100, 100 - pitRemainingSymbols / Math.max(1, Number(snapshot.universe.target || 1)) * 100)).toFixed(1)),
+    },
+    reAudit: {
+      remainingRounds: auditRequired,
+      reason: auditRequired ? "补齐批次完成后必须重新生成完整数据健康快照" : "当前快照没有发现缺口",
+    },
+    total: {
+      minimumRemainingRounds: historyRounds + pitRounds + auditRequired,
+      immediatelyActionableRounds: historyImmediatelyActionableRounds + pitImmediatelyActionableRounds + (auditRequired && !historyCooldownActive && !pitCooldownActive ? 1 : 0),
+      historyRounds,
+      pitRounds,
+      reAuditRounds: auditRequired,
+      deferredByCooldown: {
+        history: historyCooldownActive ? historyRounds : 0,
+        pit: pitCooldownActive ? pitRounds : 0,
+        corporateActions: corporateCooldownActive ? 1 : 0,
+      },
+    },
+    execution: {
+      activeOrQueuedJobs: activeJobs.length,
+      runningJobs: activeJobs.filter((job) => job.status === "running").length,
+      queuedJobs: activeJobs.filter((job) => job.status === "queued").length,
+      note: queueNote,
+    },
+    eta: {
+      lowerBoundMinutes: Number((estimatedSeconds / 60).toFixed(1)),
+      historyRateSource: historySeconds ? "recent-completed-batches" : "conservative-default",
+      pitRateSource: pitSeconds ? "recent-completed-batches" : "conservative-default",
+      note: "仅为本地 worker 时间下限；供应商限流、无数据返回和失败重试会延长实际墙钟时间。",
+    },
+  };
+}
+
+function resourcesProfileId() {
+  return trainingResources.current()?.selected || "balanced";
+}
+
+function dataReplenishmentPitGapSignature(snapshot = {}) {
+  const datasets = snapshot?.pit?.datasets || {};
+  const names = ["fundamentals", "financial_disclosures", "universe", "corporate_actions", "news"];
+  return createHash("sha256").update(JSON.stringify(names.map((name) => {
+    const row = datasets[name] || {};
+    return [
+      name,
+      Number(row.trainingUniverseCoveragePct || 0),
+      Number(row.verifiedSymbols || 0),
+      // Row counts can rise from duplicate/extra observations for the same
+      // already-covered symbol. Treating that as gap reduction caused the
+      // scheduler to retry a provider forever even when symbol coverage was
+      // unchanged. A new verified symbol, coverage move, or smaller missing
+      // set is the progress relevant to stage-one readiness.
+      [...(row.missingSymbols || [])].sort(),
+    ];
+  }))).digest("hex").slice(0, 24);
+}
+
+function dataFrontierAssessment(snapshot = {}) {
+  const market = safeMarket(snapshot.market || "ASX");
+  const target = snapshot.target || {};
+  const datasets = snapshot.pit?.datasets || {};
+  const coverage = (name) => Number(datasets[name]?.trainingUniverseCoveragePct || 0);
+  const verifiedSymbols = (name) => Number(datasets[name]?.verifiedSymbols || 0);
+  const fundamentalCoverage = market === "ASX"
+    ? coverage("fundamentals")
+    : coverage("fundamentals");
+  const fundamentalSymbols = verifiedSymbols("fundamentals");
+  const eventCoverage = coverage("news");
+  const universeCoverage = coverage("universe");
+  const historyResearchSymbols = Number(snapshot.history?.researchReadySymbols || 0);
+  const historyDeepSymbols = Number(snapshot.history?.deepHistorySymbols || 0);
+  const plan = snapshot.replenishmentPlan || null;
+  const strictBlockers = [...(snapshot.stageOne?.blockers || []), ...(snapshot.blockers || [])]
+    .map((row) => typeof row === "string" ? row : row?.label || row?.id || "unknown-blocker")
+    .filter(Boolean);
+  const pitSourceNeedsChange = fundamentalCoverage < 80
+    || universeCoverage < 80
+    || Number(datasets.corporate_actions?.trainingUniverseCoveragePct || 0) < 95;
+  const localBackfillActionable = Number(plan?.pit?.immediatelyActionableRounds || 0) > 0
+    || Number(plan?.history?.immediatelyActionableRounds || 0) > 0;
+  const frontierState = pitSourceNeedsChange
+    ? localBackfillActionable
+      ? "local-backfill-still-actionable"
+      : "source-or-archive-frontier"
+    : "lockbox-experiment-frontier";
+  return {
+    schema: "data-frontier-assessment-v1",
+    market,
+    generatedAt: new Date().toISOString(),
+    strictProduction: {
+      status: snapshot.stageOne?.met === true ? "data-ready-pending-model-gates" : "blocked",
+      gatesUnchanged: true,
+      productionOofAllowed: false,
+      longTradeGateAllowed: false,
+      reason: snapshot.stageOne?.met === true
+        ? "数据阶段通过仍需严格OOF、校准、Top-K、成本后EV和滚动稳定性。"
+        : "当前数据门禁未通过，缺口记录和未验证行不能进入正式OOF。",
+    },
+    frontier: {
+      state: frontierState,
+      localBackfillActionable,
+      externalVerifiedSourceRequired: frontierState === "source-or-archive-frontier",
+      nextDecision: frontierState === "local-backfill-still-actionable"
+        ? "complete-the-current-bounded-local-batch"
+        : frontierState === "source-or-archive-frontier"
+          ? "freeze-this-source-and-switch-only-to-a-new-authorized-source-or-archive"
+          : "move-to-fixed-lockbox-label-and-model-experiments",
+      note: "轮次下限不是可交付承诺；供应商限流、无历史和未验证时间语义必须单独计为阻断。",
+    },
+    verifiedCoverage: {
+      targetSymbols: Number(target.symbols || 0),
+      universePct: Number(universeCoverage.toFixed(4)),
+      fundamentalsPct: Number(fundamentalCoverage.toFixed(4)),
+      fundamentalsVerifiedSymbols: fundamentalSymbols,
+      eventsPct: Number(eventCoverage.toFixed(4)),
+      researchHistorySymbols: historyResearchSymbols,
+      deepHistorySymbols: historyDeepSymbols,
+    },
+    fallbackLanes: [
+      {
+        id: "verified-pit-subuniverse",
+        status: fundamentalSymbols > 0 ? "research-shadow-only" : "blocked-no-verified-fundamentals",
+        eligibleSymbols: fundamentalSymbols,
+        allowed: ["按已验证PIT基本面做研究对照", "与价格-only基线在相同锁箱比较"],
+        forbidden: ["缺失基本面静默填零", "正式OOF晋级", "激活longTradeGate"],
+      },
+      {
+        id: "technical-event-shadow",
+        status: eventCoverage >= 80 ? "research-shadow-only" : "blocked-insufficient-events",
+        eligibleSymbols: Math.round(Number(target.symbols || 0) * eventCoverage / 100),
+        allowed: ["技术特征和已验证事件的Shadow实验", "拒绝交易和成本后EV评估"],
+        forbidden: ["把事件覆盖率当作数值财务覆盖率", "在未通过完整门禁时进入生产"],
+      },
+      {
+        id: "full-market-production",
+        status: "blocked-until-strict-gates",
+        eligibleSymbols: Number(target.symbols || 0),
+        allowed: ["完整数据和严格OOF通过后验收"],
+        forbidden: ["为追求覆盖率降低PIT、校准、Top-K或EV门槛"],
+      },
+    ],
+    blockers: strictBlockers.slice(0, 20),
+  };
+}
+
+async function readPersistedDataReplenishmentSnapshot(market = "ASX") {
+  const stored = await readFile(dataReplenishmentSnapshotPath(market), "utf8").then(JSON.parse).catch(() => null);
+  if (!stored?.snapshot || !stored?.savedAt) return null;
+  const savedAt = Number(stored.savedAt);
+  if (!Number.isFinite(savedAt) || savedAt <= 0) return null;
+  return { snapshot: stored.snapshot, savedAt };
+}
+
+async function persistDataReplenishmentSnapshot(market, snapshot) {
+  const savedAt = Date.now();
+  await mkdir(join(snapshotBasePath, "data-lake"), { recursive: true });
+  await writeFile(dataReplenishmentSnapshotPath(market), JSON.stringify({ savedAt, snapshot }, null, 2), "utf8");
+  return { snapshot, savedAt };
+}
+
+async function dataReplenishmentSnapshot(market = "ASX", options = {}) {
+  const key = safeMarket(market);
+  const force = options.force === true;
+  const waitForFresh = options.waitForFresh === true;
+  const maxAgeMs = Math.max(15_000, Number(process.env.DATA_REPLENISHMENT_SNAPSHOT_CACHE_MS || 90_000));
+  let cached = dataReplenishmentSnapshotCache.get(key);
+  if (!cached) {
+    cached = await readPersistedDataReplenishmentSnapshot(key);
+    if (cached) dataReplenishmentSnapshotCache.set(key, cached);
+  }
+  const ageMs = cached ? Math.max(0, Date.now() - cached.savedAt) : null;
+  const cachedPayload = async (stale = false) => {
+    // The heavy lake/PIT summary remains cached, but task state and cooldowns
+    // are cheap and must stay live. Otherwise a completed batch can remain
+    // visibly running until the next full audit finishes.
+    const [historyJobs, pitJobs, monitorRuntime] = await Promise.all([
+      backgroundJobs.list({ type: "history-backfill", market: key, limit: 20 }),
+      backgroundJobs.list({ type: "pit-enrichment", market: key, limit: 20 }),
+      readBackendMonitorRuntime().catch(() => ({})),
+    ]);
+    const liveSnapshot = {
+      ...cached.snapshot,
+      jobs: {
+        history: historyJobs.jobs || [],
+        pit: pitJobs.jobs || [],
+      },
+      enrichmentControl: {
+        historyBlockedUntil: monitorRuntime.historyNoProgressByMarket?.[key]?.blockedUntil || null,
+        pitBlockedUntil: monitorRuntime.pitNoProgressByMarket?.[key]?.blockedUntil || null,
+        corporateBlockedUntil: monitorRuntime.corporateNoProgressByMarket?.[key]?.blockedUntil || null,
+      },
+    };
+    const liveReplenishmentPlan = dataReplenishmentRoundPlan(liveSnapshot);
+    return {
+      ...liveSnapshot,
+      replenishmentPlan: liveReplenishmentPlan,
+      frontierAssessment: dataFrontierAssessment({
+        ...liveSnapshot,
+        replenishmentPlan: liveReplenishmentPlan,
+      }),
+      snapshotState: stale ? "stale-refreshing" : "cached",
+      snapshotCachedAt: new Date(cached.savedAt).toISOString(),
+      snapshotAgeMs: ageMs,
+    };
+  };
+  const startRefresh = () => {
+    let refresh = dataReplenishmentSnapshotRefreshes.get(key);
+    if (!refresh) {
+      refresh = buildDataReplenishmentSnapshot(key, cached?.snapshot || null)
+        .then(async (snapshot) => {
+          const stored = await persistDataReplenishmentSnapshot(key, snapshot);
+          dataReplenishmentSnapshotCache.set(key, stored);
+          runtimeEvents.publish("data.replenishment_snapshot", {
+            market: key,
+            stageOne: snapshot.stageOne,
+            generatedAt: snapshot.generatedAt,
+          });
+          return snapshot;
+        })
+        .finally(() => dataReplenishmentSnapshotRefreshes.delete(key));
+      dataReplenishmentSnapshotRefreshes.set(key, refresh);
+    }
+    return refresh;
+  };
+  if (cached && !force && ageMs <= maxAgeMs) return cachedPayload(false);
+  const refresh = startRefresh();
+  // UI reads must never queue behind long-running Python ingestion.  They get
+  // the last audited local state immediately while one background refresh is
+  // shared by every caller.  Explicit operator/scheduler paths request the
+  // fresh result below.
+  if (cached && !waitForFresh) return cachedPayload(true);
+  if (!cached && !waitForFresh) return pendingDataReplenishmentSnapshot(key);
+  return refresh;
 }
 
 backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
   const market = safeMarket(payload.market || "ASX");
-  const limit = Math.max(1, Math.min(650, Number(payload.limit || process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60)));
+  const automaticEnrichmentBatch = /scheduled-|startup-|automatic-enrichment-recovery/i.test(String(payload.reason || ""))
+    || payload.autoRecoveryAttempt === true
+    || payload.autoRecoveryAttempt > 0;
+  const limit = Math.max(1, Math.min(automaticEnrichmentBatch ? 16 : 650, Number(payload.limit || process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60)));
   await update(0.02, { phase: "loading-point-in-time-universe", market });
-  const universe = await pitUniverseWithFallback(market, payload.forceUniverse === true);
+  const configuredUniverse = {
+    market,
+    source: "configured-training-universe-local",
+    rows: (TRAINING_UNIVERSES[market] || []).map((symbol) => ({ symbol })),
+    warning: "Background PIT collection uses the persisted training universe; live universe refresh is operator opt-in.",
+  };
+  const universe = payload.liveUniverse === true
+    ? await resolveWithin(
+      () => pitUniverseWithFallback(market, payload.forceUniverse === true),
+      Number(process.env.PIT_UNIVERSE_LOAD_TIMEOUT_MS || 15_000),
+      () => ({
+        ...configuredUniverse,
+        source: "configured-training-universe-timeout-fallback",
+        warning: "Live universe lookup exceeded the bounded enrichment window; persisted training universe used for this batch.",
+      }),
+    )
+    : configuredUniverse;
+  const universeNameByCode = new Map((universe.rows || []).map((row) => [
+    cleanCode(row.symbol || row.code, market),
+    String(row.name || row.description || "").trim(),
+  ]));
   const requestedSymbols = normalizeSymbolListForMarket(payload.symbols || [], market)
     .filter((symbol) => !cleanCode(symbol, market).startsWith("^"));
   const eligibleUniverseSymbols = (universe.rows || [])
     .filter((row) => trainingEligibleUniverseRow(row, market))
     .map((row) => row.symbol);
+  // A scheduled recovery batch already carries the symbols selected by the
+  // persisted gap report.  Treating it as a full universe refresh makes every
+  // small PIT batch repeat slow provider calls for delistings, identities and
+  // market membership before it can fetch the company records that actually
+  // close the gap.
+  // An automatic recovery job with an empty symbol list is still a bounded
+  // company-data batch.  Older persisted jobs were created before the
+  // scheduler started carrying prioritized symbols; treating those jobs as a
+  // full universe refresh sends them back through slow external universe and
+  // macro scans.  Operator-triggered empty-list runs retain the full refresh
+  // behavior, while scheduled/recovery runs stay local and resumable.
+  const refreshUniverse = !automaticEnrichmentBatch
+    && (payload.refreshUniverse === true || requestedSymbols.length === 0);
   const historicalCandidateRows = market === "ASX" && payload.historicalUniverseOnly === true
     ? await readPitProviderCache("eodhd-asx-delisted-universe", 365 * 24 * 60 * 60_000)
     : null;
@@ -20478,33 +24877,73 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
   const state = await readFile(statePath, "utf8").then(JSON.parse).catch(() => ({ cursors: {} }));
   state.cursors ||= {};
   const start = requestedSymbols.length ? 0 : Math.max(0, Number(state.cursors[market] || 0)) % Math.max(1, candidates.length);
-  const verifiedPit = requestedSymbols.length ? { items: [] } : await runPythonQuantCore("data-lake-pit-read", {
+  const verifiedPit = requestedSymbols.length ? { symbols: [], byDataset: {} } : await runPythonQuantCore("data-lake-pit-coverage", {
     market,
     symbols: candidates,
     datasets: ["news", "fundamentals", "financial_disclosures"],
-    limit_per_symbol: 1,
-    broadcast_market_wide: false,
-    verified_only: true,
-  }, Number(process.env.DATA_LAKE_PANEL_READ_TIMEOUT_MS || 120_000), { signal: context.signal }).catch(() => ({ items: [] }));
-  const symbolsWithVerifiedPit = new Set((verifiedPit.items || [])
-    .filter((item) => (item.pointInTimeFeatures || []).length > 0)
-    .map((item) => cleanCode(item.symbol, market)));
-  const missingVerifiedPit = candidates.filter((symbol) => !symbolsWithVerifiedPit.has(cleanCode(symbol, market)));
+  }, Number(process.env.DATA_LAKE_COVERAGE_READ_TIMEOUT_MS || 45_000), { signal: context.signal }).catch(() => ({ symbols: [] }));
+  const verifiedByDataset = Object.fromEntries(Object.entries(verifiedPit.byDataset || {}).map(([dataset, symbols]) => [
+    dataset,
+    new Set((symbols || []).map((symbol) => cleanCode(symbol, market))),
+  ]));
+  const verifiedNews = verifiedByDataset.news || new Set();
+  const verifiedFundamentals = verifiedByDataset.fundamentals || new Set();
+  const verifiedFinancials = new Set([
+    ...verifiedFundamentals,
+    ...(verifiedByDataset.financial_disclosures || []),
+  ]);
+  // Use actual local candle depth to choose the next PIT symbols.  A deeper
+  // history gives the statement rows more training value and avoids spending a
+  // scarce provider call on a newly listed security that cannot enter the
+  // long-horizon feature matrix anyway.
+  // Scheduled/manual batches already carry the prioritized gap symbols. Do not
+  // rescan the entire multi-million-row lake just to rank symbols that were
+  // already selected by the last audited snapshot. The full depth scan remains
+  // available for an unscoped operator run where no symbols were supplied.
+  const historySummary = requestedSymbols.length || automaticEnrichmentBatch
+    ? { items: [] }
+    : await runPythonQuantCore("data-lake-summary", { market }, 60_000, { signal: context.signal })
+      .catch(() => ({ items: [] }));
+  const historyRows = new Map((historySummary.items || [])
+    .filter((row) => row.market === market && row.interval === "1d")
+    .map((row) => [cleanCode(row.symbol, market), Number(row.rows || 0)]));
+  // Do not treat a dated disclosure as a numeric statement.  The previous
+  // union allowed ASX financial-disclosure coverage to starve the structured
+  // fundamentals queue, which is why its numeric coverage stayed at 0% even
+  // after the PIT job reported 100% stage readiness.
+  const requireNumericFundamentals = payload.historicalUniverseOnly !== true;
+  const missingVerifiedPit = candidates
+    .filter((symbol) => {
+      const code = cleanCode(symbol, market);
+      return !verifiedNews.has(code)
+        || !verifiedFinancials.has(code)
+        || (requireNumericFundamentals && !verifiedFundamentals.has(code));
+    })
+    .sort((left, right) => {
+      const leftNewsMissing = verifiedNews.has(cleanCode(left, market)) ? 1 : 0;
+      const rightNewsMissing = verifiedNews.has(cleanCode(right, market)) ? 1 : 0;
+      const leftHistory = historyRows.get(cleanCode(left, market)) || 0;
+      const rightHistory = historyRows.get(cleanCode(right, market)) || 0;
+      return leftNewsMissing - rightNewsMissing || rightHistory - leftHistory || left.localeCompare(right);
+    });
   const selected = requestedSymbols.length
     ? requestedSymbols.slice(0, limit)
     : missingVerifiedPit.length
       ? missingVerifiedPit.slice(0, limit)
       : Array.from({ length: Math.min(limit, candidates.length) }, (_, index) => candidates[(start + index) % candidates.length]);
+  const identityLimit = automaticEnrichmentBatch
+    ? 0
+    : Math.max(0, Math.min(selected.length, Number(payload.identityLimit ?? process.env.PIT_IDENTITY_LIMIT ?? 30)));
   const results = [];
   let historicalUniverseRecords = [];
   let historicalUniverseSource = "";
-  if (market === "CN") {
+  if (refreshUniverse && market === "CN") {
     historicalUniverseRecords = await fetchTushareHistoricalUniversePit().catch((error) => {
       results.push({ symbol: "MARKET", dataset: "universe", available: false, error: error.message || String(error) });
       return [];
     });
     historicalUniverseSource = "tushare-historical-listing-status";
-  } else if (market === "US") {
+  } else if (refreshUniverse && market === "US") {
     const providers = await Promise.allSettled([
       fetchFmpHistoricalUniversePit({ force: payload.forceUniverse === true }),
       fetchAlphaVantageHistoricalUniversePit({ force: payload.forceUniverse === true }),
@@ -20518,7 +24957,7 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
     ];
     if (warnings.length) results.push({ symbol: "MARKET", dataset: "universe", available: historicalUniverseRecords.length > 0, warning: warnings.join(" | ") });
   }
-  if (market === "ASX") {
+  if (refreshUniverse && market === "ASX") {
     const officialDelistings = await fetchAsxOfficialRecentDelistings({ force: payload.forceUniverse === true }).catch((error) => {
       results.push({ symbol: "MARKET", dataset: "official-delistings", available: false, error: error.message || String(error) });
       return { records: [] };
@@ -20571,7 +25010,7 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
     }], { signal: context.signal });
     results.push({ symbol: "MARKET", dataset: "universe", available: true, rows: historicalUniverseRecords.length, source: historicalUniverseSource });
   }
-  if (market === "US" && selected.length) {
+  if ((payload.refreshIdentity === true || refreshUniverse) && market === "US" && selected.length) {
     const mappings = await fetchOpenFigiIdentifierMappings(selected, market).catch((error) => {
       results.push({ symbol: "MARKET", dataset: "identifier-mapping", available: false, error: error.message || String(error) });
       return [];
@@ -20587,22 +25026,102 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
       results.push({ symbol: "MARKET", dataset: "identifier-mapping", available: true, rows: mappings.length, historicalAvailabilityVerified: false });
     }
   }
-  await update(0.04, { phase: "loading-macro-initial-vintages", market });
-  const macroRecords = await fetchFredHistoricalPit(market).catch((error) => {
-    results.push({ symbol: "MARKET", dataset: "macro", available: false, error: error.message || String(error) });
-    return [];
-  });
-  if (macroRecords.length) {
+  await update(0.04, { phase: "checking-macro-initial-vintages", market });
+  // Historical macro vintages are shared by every issuer in a market.  Do not
+  // download and rewrite the full FRED/ALFRED history for each company batch:
+  // that starves the PIT writer precisely when financial statements and
+  // announcements need to land. Refresh macro history independently, at a
+  // conservative weekly cadence, and let symbol enrichment focus on company
+  // level records.
+  const macroMarker = `fred-alfred-pit-persisted-${market.toLowerCase()}`;
+  const macroRefreshMs = Math.max(24 * 60 * 60_000, Number(process.env.PIT_MACRO_REFRESH_MS || 7 * 24 * 60 * 60_000));
+  const scopedCompanyBatch = requestedSymbols.length > 0;
+  let macroFresh = payload.refreshMacro !== true
+    && (scopedCompanyBatch
+      ? { scopedBatch: true }
+      : await readPitProviderCache(macroMarker, macroRefreshMs).catch(() => null));
+  // Earlier versions correctly persisted macro vintages but did not write the
+  // lightweight refresh marker. Detect that real persisted layer once, then
+  // mark it fresh instead of replaying a large historical FRED write on every
+  // company-data recovery run.
+  if (!macroFresh && payload.refreshMacro !== true && !scopedCompanyBatch) {
+    const macroSummary = await runPythonQuantCore("data-lake-summary", { market }, 45_000, { signal: context.signal }).catch(() => null);
+    const existingVerifiedRows = Number(macroSummary?.pitDatasets?.macro?.verifiedMarkets?.[market] || 0);
+    if (existingVerifiedRows > 0) {
+      macroFresh = { recoveredFromDataLake: true, verifiedRows: existingVerifiedRows };
+      await writePitProviderCache(macroMarker, {
+        records: [],
+        refreshedAt: new Date().toISOString(),
+        source: "existing-fred-alfred-initial-vintages",
+        verifiedRows: existingVerifiedRows,
+      });
+    }
+  }
+  let macroRows = 0;
+  if (!macroFresh) {
+    let macroRefresh = macroPitRefreshInFlight.get(market);
+    if (!macroRefresh) {
+      macroRefresh = (async () => {
+        const records = await fetchFredHistoricalPit(market);
+        if (records.length) {
+          await persistPitBatches([{
+            dataset: "macro",
+            market,
+            symbol: market === "CN" ? "000000" : "MARKET",
+            source: "fred-alfred-initial-vintages",
+            records,
+          }], { signal: context.signal });
+          await writePitProviderCache(macroMarker, {
+            records: [],
+            refreshedAt: new Date().toISOString(),
+            source: "fred-alfred-initial-vintages",
+          });
+        }
+        return records.length;
+      })().finally(() => macroPitRefreshInFlight.delete(market));
+      macroPitRefreshInFlight.set(market, macroRefresh);
+    }
+    try {
+      const count = await macroRefresh;
+      macroRows = count;
+      results.push({ symbol: "MARKET", dataset: "macro", available: count > 0, rows: count, refreshed: true });
+    } catch (error) {
+      results.push({ symbol: "MARKET", dataset: "macro", available: false, error: error.message || String(error) });
+    }
+  } else {
+    results.push({ symbol: "MARKET", dataset: "macro", available: true, rows: 0, cached: true });
+  }
+  const freePublicMacro = (!scopedCompanyBatch || payload.refreshMacro === true)
+    ? await fetchFreePublicMacroPit(market).catch((error) => ({
+      macro: [],
+      news: [],
+      warnings: [`Free public macro/event sources: ${error.message || String(error)}`],
+    }))
+    : { macro: [], news: [], warnings: [] };
+  if (freePublicMacro.macro?.length) {
     await persistPitBatches([{
       dataset: "macro",
       market,
       symbol: market === "CN" ? "000000" : "MARKET",
-      source: "fred-alfred-initial-vintages",
-      records: macroRecords,
+      source: "free-public-macro-shadow",
+      records: freePublicMacro.macro,
     }], { signal: context.signal });
-    results.push({ symbol: "MARKET", dataset: "macro", available: true, rows: macroRecords.length });
+    results.push({ symbol: "MARKET", dataset: "macro-shadow", available: true, rows: freePublicMacro.macro.length, verified: false });
   }
-  const officialHistoryLimit = Math.max(1, Math.min(selected.length, Number(payload.officialHistoryLimit || process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 20)));
+  if (freePublicMacro.news?.length) {
+    await persistPitBatches([{
+      dataset: "news",
+      market,
+      symbol: "MARKET",
+      source: "free-public-event-feeds",
+      records: freePublicMacro.news,
+    }], { signal: context.signal });
+    results.push({ symbol: "MARKET", dataset: "news-shadow", available: true, rows: freePublicMacro.news.length, verified: freePublicMacro.news.every((row) => row.historicalAvailabilityVerified === true) });
+  }
+  if (freePublicMacro.warnings?.length) results.push({ symbol: "MARKET", dataset: "free-public-event-feeds", available: false, warning: freePublicMacro.warnings.join(" | ") });
+  const officialHistoryLimit = automaticEnrichmentBatch
+    ? Math.max(0, Math.min(selected.length, Number(payload.officialHistoryLimit || process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 8), 8))
+    : Math.max(1, Math.min(selected.length, Number(payload.officialHistoryLimit || process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 20)));
   // Tushare's dividend endpoint is much tighter than stock_basic/fina_indicator.
   // Only one A-share is scheduled per routine run so a concurrent batch cannot
   // exhaust the minute quota. Subsequent jobs resume from the persisted cursor.
@@ -20612,6 +25131,10 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
     : Math.max(0, Math.min(selected.length, requestedCorporateActionLimit));
   const pendingBatches = [];
   const concurrency = Math.max(1, Math.min(8, Number(process.env.PIT_ENRICHMENT_CONCURRENCY || 4)));
+  const pitSymbolTimeoutMs = Math.max(
+    15_000,
+    Math.min(automaticEnrichmentBatch ? 30_000 : 180_000, Number(payload.symbolTimeoutMs || process.env.PIT_SYMBOL_TIMEOUT_MS || 60_000)),
+  );
   let cursor = 0;
   let completed = 0;
   let progressChain = Promise.resolve();
@@ -20638,9 +25161,18 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
       cursor += 1;
       try {
         const historicalUniverseOnly = payload.historicalUniverseOnly === true;
-        const [value, newsValue, announcementValue, officialHistory, listingHistory, corporateHistory, historicalAnnouncements] = await Promise.all([
+        const [value, newsValue, announcementValue, officialHistory, listingHistory, corporateHistory, historicalAnnouncements, cninfoHistory, identityBundle] = await settleWithin(
+          Promise.all([
           historicalUniverseOnly ? Promise.resolve({ fundamentals: null, source: "historical-universe-only" }) : fetchFundamentals(symbol, market),
-          historicalUniverseOnly ? Promise.resolve({ news: [] }) : fetchNewsItems(symbol, market, "all", { mode: "local" }).catch(() => ({ news: [] })),
+          historicalUniverseOnly
+            ? Promise.resolve({ news: [] })
+            // Enrichment is the controlled background refresh path.  It may
+            // reuse a fresh disk snapshot, but a cache miss must fetch real
+            // events; local-only mode made uncovered symbols look empty
+            // forever and kept the strict events gate artificially low.
+            : fetchNewsItems(symbol, market, "all", {
+              mode: payload.refreshNews === true ? "refresh" : "auto",
+            }).catch(() => ({ news: [] })),
           historicalUniverseOnly ? Promise.resolve({ items: [] }) : fetchAsxAnnouncementsFactor(symbol, market).catch(() => ({ items: [] })),
           index < officialHistoryLimit
             ? (market === "US" ? fetchUsHistoricalPit(symbol) : market === "CN" ? fetchCnHistoricalPit(symbol) : Promise.resolve([])).catch((error) => {
@@ -20667,11 +25199,34 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
             : Promise.resolve([]),
           index < officialHistoryLimit && market === "ASX"
             ? fetchAsxHistoricalAnnouncementsPit(symbol, {
-              force: payload.forceHistory === true,
+              force: automaticEnrichmentBatch ? false : payload.forceHistory === true,
               years: payload.historyYears,
             }).catch((error) => ({ news: [], universe: [], corporateActions: [], warnings: [error.message || String(error)] }))
             : Promise.resolve({ news: [], universe: [], corporateActions: [], financialDisclosures: [], warnings: [] }),
-        ]);
+          index < officialHistoryLimit && market === "CN"
+            ? fetchCninfoHistoricalPit(symbol, {
+              force: payload.forceHistory === true,
+              years: payload.historyYears,
+            }).catch((error) => ({ records: [], financialDisclosures: [], warnings: [error.message || String(error)] }))
+            : Promise.resolve({ records: [], financialDisclosures: [], warnings: [] }),
+          index < identityLimit && (market === "US" || market === "ASX")
+            ? fetchIdentityBundle(symbol, market, universeNameByCode.get(cleanCode(symbol, market)) || symbol, { force: payload.forceHistory === true })
+              .catch((error) => ({ records: [], warnings: [error.message || String(error)] }))
+            : Promise.resolve({ records: [], warnings: [] }),
+          ]),
+          pitSymbolTimeoutMs,
+          () => [
+            { fundamentals: null, source: "pit-symbol-timeout", warning: `PIT enrichment timed out after ${pitSymbolTimeoutMs}ms for ${symbol}.` },
+            { news: [] },
+            { items: [] },
+            [],
+            { records: [], warnings: [] },
+            [],
+            { news: [], universe: [], corporateActions: [], financialDisclosures: [], warnings: [] },
+            { records: [], financialDisclosures: [], warnings: [] },
+            { records: [], warnings: [] },
+          ],
+        );
         const retrievedAt = new Date().toISOString();
         const eventTime = value.fundamentals?.asOf || value.fundamentals?.updatedAt || retrievedAt;
         if (value.fundamentals) {
@@ -20684,10 +25239,22 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
             values: value.fundamentals,
           }] });
         }
+        if (identityBundle.records?.length) {
+          pendingBatches.push({
+            dataset: "universe",
+            market,
+            symbol,
+            source: "gleif-public-api+abn-lookup-public-api",
+            records: identityBundle.records,
+          });
+        }
         const officialHistoryRecords = [
           ...(Array.isArray(officialHistory) ? officialHistory : officialHistory?.records || []),
           ...(index < officialHistoryLimit ? value.historicalRecords || [] : []),
         ];
+        const officialDisclosureRecords = Array.isArray(officialHistory)
+          ? officialHistory.disclosures || []
+          : officialHistory?.disclosures || [];
         const officialHistoryWarnings = Array.isArray(officialHistory) ? [] : officialHistory?.warnings || [];
         const officialHistoryBySource = new Map();
         officialHistoryRecords.forEach((record) => {
@@ -20703,6 +25270,38 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
           source,
           records,
         }));
+        if (officialDisclosureRecords.length) pendingBatches.push({
+          dataset: "financial_disclosures",
+          market,
+          symbol,
+          source: "sec-edgar-filing-history-pit",
+          records: officialDisclosureRecords,
+        });
+        if (market === "US" && officialDisclosureRecords.length) {
+          // SEC acceptance timestamps are also verified company events.  Keep
+          // the original disclosure dataset and mirror a compact event record
+          // into the news/event layer so the event gate measures actual
+          // evidence rather than only aggregator headlines.
+          pendingBatches.push({
+            dataset: "news",
+            market,
+            symbol,
+            source: "sec-edgar-filing-events-pit",
+            records: officialDisclosureRecords.map((record) => ({
+              ...record,
+              id: `${record.id}:event`,
+              eventType: "sec-filing",
+              title: `${symbol} ${record.form || "SEC filing"}`,
+              description: `SEC filing accepted at ${record.available_at}.`,
+              values: {
+                ...(record.values || {}),
+                eventRelevance: 1,
+                eventIntensity: 0.8,
+                sourceQuality: 1,
+              },
+            })),
+          });
+        }
         if (listingHistory.records.length) pendingBatches.push({
           dataset: "universe",
           market,
@@ -20738,7 +25337,43 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
           source: "asx-official-financial-disclosures",
           records: historicalAnnouncements.financialDisclosures,
         });
-        const publishedNews = normalizePublishedPitRecords(newsValue.news || [], { symbol, sourceQuality: 0.75 });
+        if (cninfoHistory.records?.length) pendingBatches.push({
+          dataset: "news",
+          market,
+          symbol,
+          source: "cninfo-official-disclosure",
+          records: cninfoHistory.records,
+        });
+        if (cninfoHistory.financialDisclosures?.length) pendingBatches.push({
+          dataset: "financial_disclosures",
+          market,
+          symbol,
+          source: "cninfo-official-disclosure",
+          records: cninfoHistory.financialDisclosures,
+        });
+        // SEC EDGAR filing timestamps are official issuer disclosures and can
+        // enter strict PIT evidence.  Google/GDELT/aggregator headlines are
+        // still useful for Shadow features, but their historical revision
+        // history is not verified and must not inflate the production gate.
+        const allPublishedNews = newsValue.news || [];
+        const verifiedPublishedNews = market === "US"
+          ? allPublishedNews.filter((item) => String(item.source || "").toLowerCase() === "sec-edgar-filings")
+          : [];
+        const shadowPublishedNews = market === "US"
+          ? allPublishedNews.filter((item) => String(item.source || "").toLowerCase() !== "sec-edgar-filings")
+          : allPublishedNews;
+        const publishedNews = [
+          ...normalizePublishedPitRecords(verifiedPublishedNews, {
+            symbol,
+            sourceQuality: 1,
+            historicalAvailabilityVerified: true,
+          }),
+          ...normalizePublishedPitRecords(shadowPublishedNews, {
+            symbol,
+            sourceQuality: 0.75,
+            historicalAvailabilityVerified: false,
+          }),
+        ];
         if (publishedNews.length) pendingBatches.push({ dataset: "news", market, symbol, source: newsValue.source || "multi-news-cache", records: publishedNews });
         const announcements = normalizePublishedPitRecords((announcementValue.items || []).map((item) => ({
           ...item,
@@ -20756,15 +25391,19 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
         });
         results.push({
           symbol,
-          available: Boolean(value.fundamentals || officialHistoryRecords.length || publishedNews.length || announcements.length || historicalAnnouncements.news.length || historicalAnnouncements.universe.length || historicalAnnouncements.corporateActions.length),
+          available: Boolean(value.fundamentals || officialHistoryRecords.length || officialDisclosureRecords.length || publishedNews.length || announcements.length || historicalAnnouncements.news.length || historicalAnnouncements.universe.length || historicalAnnouncements.corporateActions.length || cninfoHistory.records?.length),
           source: value.source || "unknown",
           historicalRows: officialHistoryRecords.length,
+          officialDisclosureRows: officialDisclosureRecords.length,
           historicalSources: [...officialHistoryBySource.keys()],
           historicalUniverseRows: listingHistory.records.length + historicalAnnouncements.universe.length,
           corporateActionRows: corporateHistory.length + historicalAnnouncements.corporateActions.length,
-          financialDisclosureRows: historicalAnnouncements.financialDisclosures?.length || 0,
-          newsRows: publishedNews.length + announcements.length + historicalAnnouncements.news.length,
-          warning: [value.warning, officialHistoryRecords[0]?.fallbackWarning, ...officialHistoryWarnings, ...listingHistory.warnings, ...historicalAnnouncements.warnings].filter(Boolean).join(" | "),
+          financialDisclosureRows: officialDisclosureRecords.length
+            + (historicalAnnouncements.financialDisclosures?.length || 0)
+            + (cninfoHistory.financialDisclosures?.length || 0),
+          newsRows: publishedNews.length + announcements.length + historicalAnnouncements.news.length + (cninfoHistory.records?.length || 0),
+          identityRows: identityBundle.records?.length || 0,
+          warning: [value.warning, officialHistoryRecords[0]?.fallbackWarning, ...officialHistoryWarnings, ...listingHistory.warnings, ...historicalAnnouncements.warnings, ...cninfoHistory.warnings, ...identityBundle.warnings].filter(Boolean).join(" | "),
         });
       } catch (error) {
         results.push({ symbol, available: false, error: error.message || String(error) });
@@ -20789,17 +25428,28 @@ backgroundJobs.register("pit-enrichment", async (payload, update, context) => {
   state.updatedAt = new Date().toISOString();
   await mkdir(join(snapshotBasePath, "data-lake"), { recursive: true });
   await writeFile(statePath, JSON.stringify(state, null, 2), "utf8");
+  const selectedHistoryRows = selected.map((symbol) => ({
+    symbol,
+    rows: Number(historyRows.get(cleanCode(symbol, market)) || 0),
+  }));
+  const deepHistoryThreshold = Number(DATA_REPLENISHMENT_TARGETS[market]?.deepHistoryRows || 0);
   return {
     market,
     universeRows: universe.rows?.length || 0,
     universeWarning: universe.warning || "",
-    macroRows: macroRecords.length,
+    macroRows,
     historicalUniverseRows: historicalUniverseRecords.length + results.reduce((sum, row) => sum + Number(row.historicalUniverseRows || 0), 0),
     corporateActionRows: results.reduce((sum, row) => sum + Number(row.corporateActionRows || 0), 0),
     historicalFundamentalRows: results.reduce((sum, row) => sum + Number(row.historicalRows || 0), 0),
     financialDisclosureRows: results.reduce((sum, row) => sum + Number(row.financialDisclosureRows || 0), 0),
     newsRows: results.reduce((sum, row) => sum + Number(row.newsRows || 0), 0),
     selected: selected.length,
+    selectionEvidence: {
+      historyRows: selectedHistoryRows,
+      deepHistoryThreshold,
+      deepHistorySelected: selectedHistoryRows.filter((row) => row.rows >= deepHistoryThreshold).length,
+      historyPrioritized: market === "ASX" && requestedSymbols.length === 0,
+    },
     missingVerifiedPitBeforeRun: missingVerifiedPit.length,
     available: results.filter((row) => row.available).length,
     failed: results.filter((row) => !row.available).length,
@@ -20853,6 +25503,9 @@ backgroundJobs.register("factor-evolution", async (payload, update, context) => 
   await context.checkpoint("factor-evolution-start", { mode });
   const result = await runFactorEvolutionCycle(mode, {
     market: payload.market,
+    inputSignatures: payload.inputSignature && payload.market
+      ? { [safeMarket(payload.market)]: payload.inputSignature }
+      : undefined,
     limit: payload.limit,
     generations: payload.generations,
     population: payload.population,
@@ -20881,6 +25534,11 @@ backgroundJobs.register("backtest", async (payload, update, context) => {
     update,
     checkpoint: context.checkpoint,
     expectedFolds: Math.max(1, foldCount * horizonCount),
+    progressPath: join(snapshotBasePath, "models", "oof", market.toLowerCase(), "runtime-progress.json"),
+    // The progress file is shared per market. Always bind the watcher to the
+    // immutable run id assigned by the job manager; otherwise a restart can
+    // surface a stale fold/phase from the previous run as current progress.
+    trainingRunId: context.job?.trainingRunId || payload.trainingRunId || null,
     signal: context.signal,
   });
   let result;
@@ -20912,14 +25570,38 @@ backgroundJobs.register("backtest", async (payload, update, context) => {
   });
   await update(0.93, { phase: "calibration-and-ensemble-audit" });
   await update(0.95, { phase: "persisting-evidence" });
-  await update(0.97, { phase: "generating-model-report" });
-  const report = await modelReports.generate({ markets: [market] }).catch((error) => ({
+  // Report rendering reads OOF artifacts and creates DOCX/HTML. It is a
+  // separate research workload and must never hold the training job open:
+  // otherwise a successful fold run is reported as failed when document
+  // generation exceeds the interactive worker timeout.
+  const reportJob = await backgroundJobs.create("model-report", {
+    market,
+    markets: [market],
+    reason: "backtest-complete",
+    trainingRunId: context.job?.trainingRunId || payload.trainingRunId || null,
+    sourceTrainingJobId: context.job?.id || null,
+  }).catch((error) => ({
     available: false,
     error: error.message || String(error),
   }));
-  await context.checkpoint("report", { reportId: report.reportId || null, available: report.available !== false });
-  await update(0.99, { phase: "supervisor-review-ready", reportId: report.reportId || null });
-  return { ...result, modelReport: report };
+  const reportQueued = reportJob?.id ? {
+    available: false,
+    status: "queued",
+    reportJobId: reportJob.id,
+  } : reportJob;
+  await context.checkpoint("report", {
+    reportId: null,
+    available: false,
+    status: reportQueued?.status || "not-queued",
+    reportJobId: reportQueued?.reportJobId || null,
+    error: reportQueued?.error || null,
+  });
+  await update(0.99, {
+    phase: "supervisor-review-ready",
+    reportStatus: reportQueued?.status || "not-queued",
+    reportJobId: reportQueued?.reportJobId || null,
+  });
+  return { ...result, modelReport: reportQueued };
 });
 backgroundJobs.register("model-report", async (payload, update) => {
   await update(0.1, { phase: "auditing-model-artifacts" });
@@ -20970,16 +25652,6 @@ backgroundJobs.register("reddit", async (payload, update) => {
   return { market, symbols: results, refreshedAt: new Date().toISOString() };
 });
 
-const evidenceRegistryImport = (SERVER_RUNTIME_ENABLED ? evidenceRegistry.importJobs() : Promise.resolve({ scanned: 0, imported: 0, failed: 0 }))
-  .then((result) => {
-    runtimeEvents.publish("learning-evidence.imported", result);
-    return result;
-  })
-  .catch((error) => {
-    const result = { scanned: 0, imported: 0, failed: 1, error: error.message || String(error) };
-    runtimeEvents.publish("learning-evidence.import_error", result);
-    return result;
-  });
 const backgroundJobReconciliation = (SERVER_RUNTIME_ENABLED ? backgroundJobs.reconcile() : Promise.resolve({
   scanned: 0,
   repaired: 0,
@@ -20990,6 +25662,23 @@ const backgroundJobReconciliation = (SERVER_RUNTIME_ENABLED ? backgroundJobs.rec
   runtimeEvents.publish("job.reconciliation_error", { error: error.message || String(error) });
   return { scanned: 0, repaired: 0, error: error.message || String(error) };
 });
+// Reconcile persisted jobs before importing their trajectories.  Otherwise a
+// restart can briefly reintroduce thousands of old `running` rows into the
+// evidence registry before the job manager marks them resumable or terminal.
+const evidenceRegistryImport = backgroundJobReconciliation
+  .then(() => (SERVER_RUNTIME_ENABLED ? evidenceRegistry.importJobs() : { scanned: 0, imported: 0, failed: 0 }))
+  .then(() => (SERVER_RUNTIME_ENABLED
+    ? evidenceRegistry.importModelManifests({ modelsPath: join(snapshotBasePath, "models") })
+    : { discovered: 0, imported: 0, unavailable: 0, failed: 0 }))
+  .then((result) => {
+    runtimeEvents.publish("learning-evidence.imported", result);
+    return result;
+  })
+  .catch((error) => {
+    const result = { scanned: 0, imported: 0, failed: 1, error: error.message || String(error) };
+    runtimeEvents.publish("learning-evidence.import_error", result);
+    return result;
+  });
 const dataLakeAuditStatePath = join(snapshotBasePath, "data-lake", "isolation-audit-state.json");
 const DATA_LAKE_AUDIT_SCHEMA = "market-exchange-symbol-interval-timestamp-v2";
 const dataLakeIsolationAudit = (SERVER_RUNTIME_ENABLED ? Promise.all([
@@ -21187,6 +25876,48 @@ const paperAgentGenerationMigration = predictionEvidenceMigration.then(() => (SE
 async function createSupervisorTrainingJob(market, plan = {}, context = {}) {
   const resources = await trainingResources.get();
   const resolvedPlan = trainingResources.trainingPlan(plan.trainingMode || plan.mode || "weekly", plan);
+  // Re-check the isolated runtime at job creation.  This is deliberately a
+  // small probe rather than a full training attempt; it prevents a previous
+  // native-wheel crash from silently forcing all future runs onto Ridge.
+  // The worker-level timeout protects the Python operation, but a broken
+  // worker handoff can leave the surrounding promise unresolved. Bound the
+  // control-plane wait independently so one readiness probe can never block
+  // every later start/pause/review action in the supervisor's serial queue.
+  const nativeReadiness = await settleWithin(
+    runPythonQuantCore("ml-readiness", {}, 8_000).catch(() => null),
+    4_000,
+    null,
+  );
+  const nativeReady = nativeReadiness?.catboost === true
+    && nativeReadiness?.lightgbm === true
+    && nativeReadiness?.sklearn === true;
+  // A readiness probe can be delayed by an occupied interactive lane even
+  // when the isolated runtime itself is healthy. Do not turn a transient probe
+  // timeout into a silent Ridge-only production plan when the configured ML
+  // interpreter exists; the training artifact will still record any import
+  // failure explicitly and keep the candidate in Research.
+  const nativeRuntimeAvailable = existsSync(join(root, ".ml-venv", "bin", "python"))
+    || Boolean(process.env.QUANT_ML_PYTHON_BIN);
+  const nativeRuntimeUsable = nativeReady
+    || (nativeRuntimeAvailable && process.env.QUANT_ASSUME_NATIVE_ML !== "false");
+  const effectivePlan = {
+    ...resolvedPlan,
+    ...(nativeRuntimeUsable && ["safe-python-baseline", "native-ml-isolated"].includes(String(resolvedPlan.nativeModelPolicy || ""))
+      ? {
+        enableTreeModels: true,
+        enableSklearnModels: true,
+        nativeModelPolicy: nativeReady ? "native-ml-probe-passed" : "native-ml-isolated-assumed",
+        runtimeRecovery: nativeReady ? "native-ml-probe-passed" : "native-ml-isolated-assumed",
+      }
+      : {}),
+    nativeModelReadiness: nativeReadiness || { available: false, reason: "probe-unavailable" },
+  };
+  const changedHypothesis = String(effectivePlan.changedHypothesis || "").trim();
+  if (!changedHypothesis) {
+    throw new Error("A production model experiment requires exactly one pre-registered changedHypothesis. Use an evidence_refresh job when no model hypothesis is changing.");
+  }
+  effectivePlan.jobType = "model_experiment";
+  effectivePlan.changedHypothesis = changedHypothesis;
   return backgroundJobs.create("backtest", {
     market: safeMarket(market),
     symbols: [],
@@ -21195,21 +25926,34 @@ async function createSupervisorTrainingJob(market, plan = {}, context = {}) {
       targetUpside: Number(process.env.TRAINING_SUPERVISOR_TARGET_UPSIDE || 5),
       stopLoss: Number(process.env.TRAINING_SUPERVISOR_STOP_LOSS || 4),
     },
-    range: resolvedPlan.range,
-    limit: resolvedPlan.limit,
+    range: effectivePlan.range,
+    limit: effectivePlan.limit,
     largeSample: true,
     productionTraining: true,
-    mode: resolvedPlan.trainingMode || resolvedPlan.mode || "weekly",
-    trainingMode: resolvedPlan.trainingMode || resolvedPlan.mode || "weekly",
-    trainingOptions: resolvedPlan,
+    resume: effectivePlan.resume === true,
+    mode: effectivePlan.trainingMode || effectivePlan.mode || "weekly",
+    trainingMode: effectivePlan.trainingMode || effectivePlan.mode || "weekly",
+    trainingOptions: effectivePlan,
     resourceProfile: resources.selected,
-    supervisorPlan: resolvedPlan,
-    supervisorContext: context,
+    supervisorPlan: effectivePlan,
+    supervisorContext: { ...context, priority: context.priority || "normal" },
   });
 }
 
-async function getSupervisorBackgroundJob(jobId) {
-  const job = jobId ? await backgroundJobs.get(jobId) : null;
+async function getSupervisorBackgroundJob(jobId, options = {}) {
+  if (!jobId) return null;
+  let job = backgroundJobs.isRunning(jobId)
+    ? await backgroundJobs.get(jobId)
+    : evidenceRegistry.backgroundJobs({ id: jobId, limit: 1 }).jobs?.[0] || null;
+  // The evidence registry intentionally stores a compact job index. Training
+  // evaluation requires the immutable result artifact, so hydrate completed
+  // rows whenever the index has no result (or the caller explicitly asks for
+  // it). A 3.6 MB OOF artifact is still far cheaper than falsely scheduling a
+  // new full-market training cycle.
+  if (!job || options.includeResult === true || (job.status === "complete" && !job.result)) {
+    const persisted = await settleWithin(backgroundJobs.get(jobId), 3_000, null);
+    if (persisted) job = persisted;
+  }
   if (job && ["queued", "running"].includes(job.status) && !backgroundJobs.isRunning(jobId)) {
     return {
       ...job,
@@ -21232,14 +25976,15 @@ async function logTrainingSupervisorEvent(market, event = {}) {
     event_type: `model-change-log-training-supervisor-${event.type || "event"}`,
     entity_id: `${market}:training-supervisor:${event.cycleId || "cycle"}:${event.id || event.createdAt || Date.now()}`,
     payload: {
-      title: `AI 训练监工：${event.type || "状态更新"}`,
+      title: `训练门禁：${event.type || "状态更新"}`,
       type: "training-supervisor",
       market,
       cycleId: event.cycleId || null,
       attempt: event.attempt || 0,
       event,
       guardrails: [
-        "确定性 OOF 门槛优先于 AI 投票",
+        "固定 OOF、PIT、校准、漂移与成本门槛决定本轮验收",
+        "外部 AI 不参与训练验收，也不消耗训练审核额度",
         "返工只能扩样本或收紧正则，不能降低验收门槛",
         "通过仅代表 Shadow/Research 验收，禁止真实订单",
       ],
@@ -21252,11 +25997,9 @@ function initializeTrainingSupervisor() {
   trainingSupervisor = createTrainingSupervisor({
     basePath: join(snapshotBasePath, "training-supervisor"),
     markets: config.markets,
-    reviewerIds: ["openai", "siliconflow", "hunyuan"],
     config,
     createTrainingJob: createSupervisorTrainingJob,
     getJob: getSupervisorBackgroundJob,
-    review: reviewTrainingCycleWithAi,
     notify: notifyTrainingSupervisor,
     log: logTrainingSupervisorEvent,
     publish: (type, payload) => runtimeEvents.publish(type, payload),
@@ -21266,27 +26009,48 @@ function initializeTrainingSupervisor() {
 
 initializeTrainingSupervisor();
 
-async function runBackendEnrichmentSchedulerTick() {
-  const config = await readBackendMonitorConfig();
-  if (!config.enabled) return { skipped: true, reason: "backend monitor disabled" };
-  const resources = await trainingResources.get();
+async function runBackendEnrichmentSchedulerTick(options = {}) {
+  if (backendEnrichmentTickRunning) return { skipped: true, reason: "enrichment scheduler already running" };
+  backendEnrichmentTickRunning = true;
+  try {
+    const forceContinuation = options?.forceContinuation === true;
+    const config = await readBackendMonitorConfig();
+    if (!config.enabled) return { skipped: true, reason: "backend monitor disabled" };
+    const resources = await trainingResources.get();
   const dataProfile = resources.profile.data || {};
   const runtime = await readBackendMonitorRuntime();
   runtime.lastRedditWarmupByMarket = runtime.lastRedditWarmupByMarket || {};
   runtime.lastNewsScheduleByMarket = runtime.lastNewsScheduleByMarket || {};
   runtime.lastPitEnrichmentByMarket = runtime.lastPitEnrichmentByMarket || {};
+  runtime.pitNoProgressByMarket = runtime.pitNoProgressByMarket || {};
+  runtime.pitGapSignatureByMarket = runtime.pitGapSignatureByMarket || {};
   runtime.lastCorporateActionByMarket = runtime.lastCorporateActionByMarket || {};
+  runtime.corporateNoProgressByMarket = runtime.corporateNoProgressByMarket || {};
   runtime.lastHistoryReplenishmentByMarket = runtime.lastHistoryReplenishmentByMarket || {};
+  runtime.historyNoProgressByMarket = runtime.historyNoProgressByMarket || {};
   runtime.lastStageReadinessCheckByMarket = runtime.lastStageReadinessCheckByMarket || {};
   runtime.stageOneReadinessByMarket = runtime.stageOneReadinessByMarket || {};
   runtime.stageOneSnapshotsByMarket = runtime.stageOneSnapshotsByMarket || {};
+  runtime.lastDataTrainingSignatureByMarket = runtime.lastDataTrainingSignatureByMarket || {};
+  runtime.lastDataTrainingQueuedAtByMarket = runtime.lastDataTrainingQueuedAtByMarket || {};
   runtime.lastArtifactMaintenanceAt = Number(runtime.lastArtifactMaintenanceAt || 0);
   const queued = [];
   for (const market of Object.keys(MARKET_CONFIG)) {
     const now = Date.now();
-    const stageCheckEveryMs = Math.max(6 * 60 * 60_000, Number(process.env.STAGE_ONE_READINESS_CHECK_MS || 24 * 60 * 60_000));
+    const priorStage = runtime.stageOneReadinessByMarket[market] || { met: false };
+    // While a market is below the auditable data gates, refresh the diagnosis
+    // often enough for completed batches to advance the next queue. Once it
+    // passes, retain the quiet daily-style cadence.
+    const stageCheckEveryMs = Number(process.env.STAGE_ONE_READINESS_CHECK_MS || (
+      priorStage.met ? 6 * 60 * 60_000 : 15 * 60_000
+    ));
     if (now - Number(runtime.lastStageReadinessCheckByMarket[market] || 0) >= stageCheckEveryMs) {
-      const stageSnapshot = await dataReplenishmentSnapshot(market).catch(() => null);
+      // Scheduler health checks must never wait behind the full DuckDB/PIT
+      // summary.  The snapshot helper starts one shared refresh in the
+      // background and returns the last complete state immediately; the next
+      // tick observes the refreshed evidence.  This keeps one slow market
+      // from blocking queue dispatch for the other markets.
+      const stageSnapshot = await dataReplenishmentSnapshot(market, { force: false, waitForFresh: false }).catch(() => null);
       if (stageSnapshot?.stageOne) {
         runtime.stageOneReadinessByMarket[market] = stageSnapshot.stageOne;
         runtime.stageOneSnapshotsByMarket[market] = stageSnapshot;
@@ -21296,6 +26060,63 @@ async function runBackendEnrichmentSchedulerTick() {
     const stageOne = runtime.stageOneReadinessByMarket[market] || { met: false, blockers: [] };
     const stageSnapshot = runtime.stageOneSnapshotsByMarket[market] || null;
     const stageBlockers = new Set((stageOne.blockers || []).map((row) => row.id));
+    const dataSignature = stageSnapshot?.snapshotState === "stale-data-lake"
+      ? null
+      : stageSnapshot ? dataReplenishmentTrainingSignature(stageSnapshot) : null;
+    const dataChanged = Boolean(dataSignature && runtime.lastDataTrainingSignatureByMarket[market] !== dataSignature);
+    // Stage-one readiness can contain a documented evidence fallback (for
+    // example, ASX disclosures standing in for numeric fundamentals). That is
+    // useful for collection, but it is not sufficient permission to fit an
+    // official model. Keep this strict input gate next to the training
+    // trigger so a refreshed snapshot can never enqueue OOF from partial PIT.
+    const pitDatasets = stageSnapshot?.pit?.datasets || {};
+    const numericFundamentalsCoverage = Number(
+      pitDatasets.fundamentals?.verifiedPct
+      ?? pitDatasets.fundamentals?.trainingUniverseCoveragePct
+      ?? 0,
+    );
+    const corporateActionQualityCoverage = Number(
+      pitDatasets.corporate_actions?.verifiedPct
+      ?? pitDatasets.corporate_actions?.trainingUniverseCoveragePct
+      ?? 0,
+    );
+    const historicalUniverseQualityCoverage = Number(
+      pitDatasets.universe?.verifiedPct
+      ?? pitDatasets.universe?.trainingUniverseCoveragePct
+      ?? 0,
+    );
+    const strictStageQualityBlocked = Boolean(stageSnapshot) && (
+      stageSnapshot.snapshotState === "stale-data-lake"
+      || historicalUniverseQualityCoverage < 80
+      || corporateActionQualityCoverage < 95
+      || numericFundamentalsCoverage < 80
+      || Number(pitDatasets.news?.trainingUniverseCoveragePct || 0) < 80
+    );
+    if (stageOne.met && !strictStageQualityBlocked && dataChanged && trainingSupervisor) {
+      const replenishmentFamilies = ["history-backfill", "pit-enrichment", "corporate-action-backfill", "cn-corporate-action-backfill"];
+      const activeReplenishment = (await Promise.all(replenishmentFamilies.map((type) => backgroundJobs.list({ type, market, limit: 5 }))))
+        .flatMap((result) => result.jobs || [])
+        .some((job) => ["queued", "running"].includes(job.status));
+      if (!activeReplenishment) {
+        const training = await trainingSupervisor.trigger({
+          market,
+          mode: "full",
+          reason: "verified-data-version-changed",
+          source: "enrichment-scheduler",
+        });
+        if (training.accepted !== false || training.reason === "already-running") {
+          runtime.lastDataTrainingSignatureByMarket[market] = dataSignature;
+          runtime.lastDataTrainingQueuedAtByMarket[market] = new Date().toISOString();
+          queued.push(training.state?.activeJobId || `${market}-strict-oof-challenger`);
+          runtimeEvents.publish("training.data_version_queued", {
+            market,
+            dataSignature,
+            queued: training.queued === true,
+            jobId: training.state?.activeJobId || null,
+          });
+        }
+      }
+    }
     const cache = await newsDiskCacheSummary(market).catch(() => ({ summary: {} }));
     const decision = newsRefreshDecision(market, cache.summary?.latestCachedAt || null);
     const slotKey = `${decision.slot?.id || decision.reason || "none"}:${zonedDateParts(new Date(), backendMarketSession(market).timeZone).date}`;
@@ -21310,27 +26131,136 @@ async function runBackendEnrichmentSchedulerTick() {
       runtime.lastRedditWarmupByMarket[market] = Date.now();
       queued.push(job.id);
     }
-    const pitStageBlocked = ["historicalUniverse", "fundamentals", "events"].some((id) => stageBlockers.has(id));
-    const pitDefaultCadence = pitStageBlocked ? 24 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
-    const pitEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.PIT_ENRICHMENT_REFRESH_MS || pitDefaultCadence));
-    if (Date.now() - Number(runtime.lastPitEnrichmentByMarket[market] || 0) >= pitEveryMs) {
-      const pitSymbols = prioritizedPitGapSymbols(stageSnapshot || {}, market, Number(dataProfile.pitBatch || 30));
+    // Stage-one readiness intentionally allows some evidence families to pass
+    // on a documented fallback (ASX official disclosures are evidence, not
+    // numeric statements). That must not stop the data lake from continuing
+    // to repair the underlying model-input quality backlog.
+    const pitQualityBacklog = strictStageQualityBlocked;
+    const pitStageBlocked = ["historicalUniverse", "fundamentals", "events"].some((id) => stageBlockers.has(id)) || pitQualityBacklog;
+    // A market that has not met the strict PIT gates should keep moving through
+    // bounded, resumable batches.  Do not let a legacy environment setting turn
+    // this into a multi-hour idle period; an active job is still single-flight,
+    // so this cap never creates concurrent calls to the same provider pool.
+    const pitDefaultCadence = pitStageBlocked ? 8 * 60_000 : 7 * 24 * 60 * 60_000;
+    const pitMinimumCadence = pitStageBlocked ? 5 * 60_000 : 24 * 60 * 60_000;
+    const configuredPitCadence = Number(process.env.PIT_ENRICHMENT_REFRESH_MS || pitDefaultCadence);
+    const pitEveryMs = pitStageBlocked
+      ? Math.max(pitMinimumCadence, Math.min(8 * 60_000, configuredPitCadence))
+      : Math.max(pitMinimumCadence, configuredPitCadence);
+    const activePitJobs = await backgroundJobs.list({ type: "pit-enrichment", market, limit: 10 });
+    const pitAlreadyRunning = (activePitJobs.jobs || []).some((job) => ["queued", "running"].includes(job.status));
+    const pitLastRun = Number(runtime.lastPitEnrichmentByMarket[market] || 0);
+    let pitNoProgress = runtime.pitNoProgressByMarket[market] || {};
+    const pitGapSignature = stageSnapshot ? dataReplenishmentPitGapSignature(stageSnapshot) : null;
+    if (pitGapSignature && pitNoProgress.signature && pitNoProgress.signature !== pitGapSignature) {
+      pitNoProgress = { signature: pitGapSignature, unchangedRuns: 0, blockedUntil: null };
+      runtime.pitNoProgressByMarket[market] = pitNoProgress;
+      runtime.pitGapSignatureByMarket[market] = pitGapSignature;
+    }
+    const pitLastCompletedAt = Date.parse(String(pitNoProgress.lastCompletedAt || "")) || 0;
+    const pitLastActivity = Math.max(pitLastRun, pitLastCompletedAt);
+    if (pitStageBlocked && !pitNoProgress.signature && !pitAlreadyRunning
+      && pitLastActivity > 0 && pitGapSignature
+      && runtime.pitGapSignatureByMarket?.[market] === pitGapSignature) {
+      // Reconcile a completed batch whose terminal callback did not persist
+      // the no-progress marker. Without this, the normal scheduler could
+      // submit the same PIT gap again after restart recovery had correctly
+      // observed the minimum cadence.
+      pitNoProgress = {
+        signature: pitGapSignature,
+        unchangedRuns: 1,
+        lastScheduledAt: pitLastActivity,
+        lastCompletedAt: new Date(pitLastActivity).toISOString(),
+        blockedUntil: null,
+        reason: "reconciled-completed-pit-batch-without-gap-signature-change",
+      };
+      runtime.pitNoProgressByMarket[market] = pitNoProgress;
+    }
+    const pitCadenceReady = pitStageBlocked
+      ? Date.now() - pitLastActivity >= pitEveryMs
+      : pitLastRun > 0 && Date.now() - pitLastRun >= pitEveryMs;
+    const pitNoProgressReadyForDiagnosis = Boolean(
+      pitStageBlocked
+      && !pitAlreadyRunning
+      && pitCadenceReady
+      && Date.now() >= pitBlockedUntil
+      && pitGapSignature
+      && pitNoProgress.signature === pitGapSignature
+      && Number(pitNoProgress.lastScheduledAt || 0) > 0
+      && pitLastRun >= Number(pitNoProgress.lastScheduledAt || 0),
+    );
+    if (pitNoProgressReadyForDiagnosis) {
+      pitNoProgress = {
+        ...pitNoProgress,
+        unchangedRuns: Number(pitNoProgress.unchangedRuns || 0) + 1,
+      };
+      if (pitNoProgress.unchangedRuns >= 2) {
+        pitNoProgress.blockedUntil = new Date(Date.now() + 6 * 60 * 60_000).toISOString();
+        runtime.pitNoProgressByMarket[market] = pitNoProgress;
+        runtimeEvents.publish("data.replenishment_diagnostic", {
+          market,
+          family: "pit-enrichment",
+          reason: "two-consecutive-batches-without-audited-gap-reduction",
+          unchangedRuns: pitNoProgress.unchangedRuns,
+          blockedUntil: pitNoProgress.blockedUntil,
+          gapSignature: pitGapSignature,
+        });
+      }
+    }
+    // Re-read after the diagnostic branch above. Otherwise the second
+    // unchanged completion could set a cooldown in memory while this tick
+    // still used the timestamp captured before that update.
+    const pitNoProgressBlocked = Date.now() < (Date.parse(String(pitNoProgress.blockedUntil || "")) || 0);
+    const pitRemainingSymbols = Number(stageSnapshot?.replenishmentPlan?.pit?.remainingUniqueSymbols || 0);
+    const pitHasOnlyQualityGap = pitStageBlocked && pitRemainingSymbols <= 0;
+    if (pitHasOnlyQualityGap && !pitAlreadyRunning) {
+      runtimeEvents.publish("data.replenishment_diagnostic", {
+        market,
+        family: "pit-enrichment",
+        reason: "quality-gap-without-missing-symbols",
+        nextAction: "switch-to-new-verified-source",
+        qualityWarnings: stageSnapshot?.replenishmentPlan?.pit?.qualityWarnings || [],
+      });
+    }
+    if (!pitHasOnlyQualityGap && !pitAlreadyRunning && pitCadenceReady && !pitNoProgressBlocked && pitNoProgress.unchangedRuns < 2) {
+      const stagePitLimit = pitStageBlocked
+        ? Math.max(45, Number(dataProfile.pitBatch || 30))
+        : Number(dataProfile.pitBatch || 30);
+      const pitSymbols = prioritizedPitGapSymbols(stageSnapshot || {}, market, stagePitLimit);
       const job = await backgroundJobs.create("pit-enrichment", {
         market,
         symbols: pitSymbols,
-        limit: Number(dataProfile.pitBatch || process.env.PIT_ENRICHMENT_SYMBOL_LIMIT || 60),
+        limit: stagePitLimit,
+        liveUniverse: false,
         officialHistoryLimit: pitSymbols.length || Number(dataProfile.officialPitBatch || process.env.PIT_OFFICIAL_SYMBOLS_PER_RUN || 20),
         corporateActionLimit: 0,
+        forceHistory: pitStageBlocked,
         reason: pitStageBlocked ? "scheduled-stage-one-point-in-time-collection" : "scheduled-point-in-time-collection",
         resourceProfile: resources.selected,
       });
       runtime.lastPitEnrichmentByMarket[market] = Date.now();
+      runtime.pitNoProgressByMarket[market] = {
+        signature: pitGapSignature,
+        unchangedRuns: Number(pitNoProgress.unchangedRuns || 0),
+        lastScheduledAt: runtime.lastPitEnrichmentByMarket[market],
+        blockedUntil: null,
+      };
+      runtime.pitGapSignatureByMarket[market] = pitGapSignature;
       queued.push(job.id);
     }
-    const corporateStageBlocked = stageBlockers.has("corporateActions");
-    const corporateDefaultCadence = corporateStageBlocked ? 24 * 60 * 60_000 : 30 * 24 * 60 * 60_000;
-    const corporateActionEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.CORPORATE_ACTION_REFRESH_MS || corporateDefaultCadence));
-    if (Date.now() - Number(runtime.lastCorporateActionByMarket[market] || 0) >= corporateActionEveryMs) {
+    const corporateStageBlocked = stageBlockers.has("corporateActions") || corporateActionQualityCoverage < 95;
+    const corporateDefaultCadence = corporateStageBlocked ? 2 * 60 * 60_000 : 30 * 24 * 60 * 60_000;
+    const corporateMinimumCadence = corporateStageBlocked ? 2 * 60 * 60_000 : 24 * 60 * 60_000;
+    const corporateActionEveryMs = Math.max(corporateMinimumCadence, Number(process.env.CORPORATE_ACTION_REFRESH_MS || corporateDefaultCadence));
+    const activeCorporateJobs = await backgroundJobs.list({ type: "corporate-action-backfill", market, limit: 10 });
+    const corporateAlreadyRunning = (activeCorporateJobs.jobs || []).some((job) => ["queued", "running"].includes(job.status));
+    const corporateLastRun = Number(runtime.lastCorporateActionByMarket[market] || 0);
+    const corporateNoProgressUntil = Date.parse(String(runtime.corporateNoProgressByMarket[market]?.blockedUntil || "")) || 0;
+    const corporateCadenceReady = corporateStageBlocked
+      ? Date.now() - corporateLastRun >= corporateActionEveryMs
+      : corporateLastRun > 0 && Date.now() - corporateLastRun >= corporateActionEveryMs;
+    const corporateNoProgressBlocked = Date.now() < corporateNoProgressUntil;
+    if (!corporateAlreadyRunning && corporateCadenceReady && !corporateNoProgressBlocked) {
       const job = await backgroundJobs.create("corporate-action-backfill", {
         market,
         symbols: normalizeSymbolListForMarket(stageSnapshot?.pit?.datasets?.corporate_actions?.missingSymbols || [], market),
@@ -21341,22 +26271,45 @@ async function runBackendEnrichmentSchedulerTick() {
       runtime.lastCorporateActionByMarket[market] = Date.now();
       queued.push(job.id);
     }
-    const historyStageBlocked = ["researchHistory", "deepHistory"].some((id) => stageBlockers.has(id));
-    const historyDefaultCadence = historyStageBlocked ? 24 * 60 * 60_000 : 7 * 24 * 60 * 60_000;
-    const historyEveryMs = Math.max(24 * 60 * 60_000, Number(process.env.HISTORY_REPLENISHMENT_REFRESH_MS || historyDefaultCadence));
-    if (Date.now() - Number(runtime.lastHistoryReplenishmentByMarket[market] || 0) >= historyEveryMs) {
+    const historyBacklog = Boolean(stageSnapshot) && Number(stageSnapshot.history?.missingOrShort || 0) > 0;
+    const historyStageBlocked = ["researchHistory", "deepHistory"].some((id) => stageBlockers.has(id)) || historyBacklog;
+    const historyDefaultCadence = historyStageBlocked ? 15 * 60_000 : 7 * 24 * 60 * 60_000;
+    const configuredHistoryCadence = Number(process.env.HISTORY_REPLENISHMENT_REFRESH_MS || historyDefaultCadence);
+    const historyEveryMs = historyStageBlocked
+      ? Math.max(10 * 60_000, Math.min(15 * 60_000, configuredHistoryCadence))
+      : Math.max(24 * 60 * 60_000, configuredHistoryCadence);
+    if (forceContinuation && historyStageBlocked) {
+      // Startup recovery must not wait for the previous process's cadence
+      // timestamp. The active-job check below still prevents duplicate work.
+      runtime.lastHistoryReplenishmentByMarket[market] = 0;
+    }
+    const historyLastRun = Number(runtime.lastHistoryReplenishmentByMarket[market] || 0);
+    const historyNoProgressUntil = Date.parse(String(runtime.historyNoProgressByMarket[market]?.blockedUntil || "")) || 0;
+    const historyCadenceReady = historyStageBlocked
+      ? Date.now() - historyLastRun >= historyEveryMs && Date.now() >= historyNoProgressUntil
+      : historyLastRun > 0 && Date.now() - historyLastRun >= historyEveryMs && Date.now() >= historyNoProgressUntil;
+    if (historyCadenceReady) {
       const recent = await backgroundJobs.list({ type: "history-backfill", market, limit: 3 });
       const active = (recent.jobs || []).find((job) => ["queued", "running"].includes(job.status));
       if (!active) {
-        const snapshot = await dataReplenishmentSnapshot(market).catch(() => null);
+        const snapshot = await dataReplenishmentSnapshot(market, { force: false, waitForFresh: false }).catch(() => null);
         const symbols = (snapshot?.history?.nextSymbols || []).map((row) => row.symbol);
         if (symbols.length) {
           const job = await backgroundJobs.create("history-backfill", {
             market,
             symbols,
             range: snapshot.target.range,
-            requiredRows: snapshot.target.researchRows,
-            includeDelisted: true,
+            // Report the gate currently being repaired.  The worker still
+            // stores the longest real history it receives, but a research-gate
+            // batch should not be presented as if every symbol must already
+            // satisfy the deeper 2,000-row target.
+            requiredRows: stageBlockers.has("researchHistory")
+              ? snapshot.target.researchRows
+              : snapshot.target.deepHistoryRows,
+            // Delisted-universe expansion is a separate PIT task.  Keeping it
+            // out of every routine history batch prevents a CN universe API
+            // call from blocking otherwise independent candle backfills.
+            includeDelisted: false,
             delistedBatch: Number(dataProfile.delistedBatch || 10),
             reason: historyStageBlocked ? "scheduled-stage-one-market-data-replenishment" : "scheduled-market-data-replenishment",
             resourceProfile: resources.selected,
@@ -21371,6 +26324,176 @@ async function runBackendEnrichmentSchedulerTick() {
     const job = await backgroundJobs.create("artifact-maintenance", { reason: "weekly-retention-policy" });
     runtime.lastArtifactMaintenanceAt = Date.now();
     queued.push(job.id);
+  }
+    runtime.lastEnrichmentCheckAt = new Date().toISOString();
+    await writeBackendMonitorRuntime(runtime);
+    return { queued };
+  } finally {
+    backendEnrichmentTickRunning = false;
+  }
+}
+
+async function queuePersistedDataRecovery(reason = "persisted-data-recovery") {
+  const config = await readBackendMonitorConfig().catch(() => ({ enabled: false }));
+  if (!config.enabled) return { queued: [], skipped: "backend monitor disabled" };
+  const resources = await trainingResources.get();
+  const dataProfile = resources.profile.data || {};
+  const runtime = await readBackendMonitorRuntime();
+  runtime.lastPitEnrichmentByMarket = runtime.lastPitEnrichmentByMarket || {};
+  runtime.pitNoProgressByMarket = runtime.pitNoProgressByMarket || {};
+  runtime.lastCorporateActionByMarket = runtime.lastCorporateActionByMarket || {};
+  runtime.corporateNoProgressByMarket = runtime.corporateNoProgressByMarket || {};
+  runtime.lastHistoryReplenishmentByMarket = runtime.lastHistoryReplenishmentByMarket || {};
+  runtime.historyNoProgressByMarket = runtime.historyNoProgressByMarket || {};
+  const queued = [];
+  for (const market of Object.keys(MARKET_CONFIG)) {
+    // Older restart-budget failures were written without a payload and
+    // therefore could not be resumed by the terminal callback that existed at
+    // the time.  Reconcile one such data failure at startup before looking at
+    // coverage, so the persisted failure itself becomes a new bounded job.
+    let recoveredFailure = false;
+    for (const type of ["pit-enrichment", "corporate-action-backfill", "cn-corporate-action-backfill", "history-backfill"]) {
+      const recent = await backgroundJobs.list({ type, market, limit: 12 }).catch(() => ({ jobs: [] }));
+      const failed = (recent.jobs || []).find((job) => job.status === "failed"
+        && isAutoRecoverableEnrichmentFailure(job)
+        && Number(job.payload?.autoRecoveryAttempt || 0) < 2);
+      if (failed) {
+        const retry = await autoRecoverEnrichmentJob(failed).catch(() => null);
+        if (retry) {
+          queued.push(retry.id);
+          recoveredFailure = true;
+          break;
+        }
+      }
+    }
+    if (recoveredFailure) continue;
+    const snapshot = runtime.stageOneSnapshotsByMarket?.[market] || null;
+    if (!snapshot) continue;
+    const datasets = snapshot.pit?.datasets || {};
+    const coverage = (name, fallback = 0) => Number(
+      datasets[name]?.verifiedPct
+      ?? datasets[name]?.trainingUniverseCoveragePct
+      ?? fallback,
+    );
+    const strictPitBlocked = snapshot.snapshotState === "stale-data-lake"
+      || coverage("universe") < 80
+      || coverage("corporate_actions") < 95
+      || coverage("fundamentals") < 80
+      || coverage("news") < 80;
+    const pitMissingSymbols = new Set([
+      ...(datasets.fundamentals?.missingSymbols || []),
+      ...(datasets.financial_disclosures?.missingSymbols || []),
+      ...(datasets.universe?.missingSymbols || []),
+      ...(datasets.corporate_actions?.missingSymbols || []),
+      ...(datasets.news?.missingSymbols || []),
+    ]).size;
+    const pitNoProgressUntil = Date.parse(String(runtime.pitNoProgressByMarket[market]?.blockedUntil || "")) || 0;
+    if (strictPitBlocked && Date.now() < pitNoProgressUntil) {
+      // A restart must not bypass the same no-progress cooldown used by the
+      // live scheduler. The prior batch has already proven that this provider
+      // path did not reduce an audited PIT gap.
+      continue;
+    }
+    const pitLastRun = Number(runtime.lastPitEnrichmentByMarket[market] || 0);
+    const pitLastCompletedAt = Date.parse(String(runtime.pitNoProgressByMarket[market]?.lastCompletedAt || "")) || 0;
+    const pitMinimumCadence = Math.max(
+      5 * 60_000,
+      Number(process.env.PIT_ENRICHMENT_MIN_CADENCE_MS || 5 * 60_000),
+    );
+    if (strictPitBlocked && Math.max(pitLastRun, pitLastCompletedAt) > 0
+      && Date.now() - Math.max(pitLastRun, pitLastCompletedAt) < pitMinimumCadence) {
+      // Restart recovery is allowed to resume durable work, but it must not
+      // bypass the same minimum cadence used by the live scheduler.
+      continue;
+    }
+    const activePit = (await backgroundJobs.list({ type: "pit-enrichment", market, limit: 10 })).jobs
+      ?.some((job) => ["queued", "running"].includes(job.status));
+    const currentPitSignature = dataReplenishmentPitGapSignature(snapshot);
+    const persistedPitSignature = runtime.pitGapSignatureByMarket?.[market] || null;
+    const pitLastActivity = Math.max(
+      pitLastRun,
+      Date.parse(String(runtime.pitNoProgressByMarket[market]?.lastCompletedAt || "")) || 0,
+    );
+    if (strictPitBlocked && !activePit && !runtime.pitNoProgressByMarket[market]
+      && pitLastActivity > 0 && persistedPitSignature && persistedPitSignature === currentPitSignature) {
+      // Reconcile a completed PIT batch whose terminal callback predates the
+      // durable no-progress record. This preserves real partial progress while
+      // preventing restart recovery from submitting the same gap again.
+      runtime.pitNoProgressByMarket[market] = {
+        signature: currentPitSignature,
+        unchangedRuns: 1,
+        lastCompletedAt: new Date(pitLastActivity).toISOString(),
+        reason: "reconciled-completed-pit-batch-without-gap-signature-change",
+      };
+      await writeBackendMonitorRuntime(runtime);
+      continue;
+    }
+    if (strictPitBlocked && pitMissingSymbols === 0 && !activePit) {
+      runtimeEvents.publish("data.replenishment_diagnostic", {
+        market,
+        family: "pit-enrichment",
+        reason: "quality-gap-without-missing-symbols",
+        nextAction: "switch-to-new-verified-source",
+      });
+      continue;
+    }
+    if (strictPitBlocked && !activePit) {
+      const limit = Math.max(45, Number(dataProfile.pitBatch || 30));
+      const symbols = prioritizedPitGapSymbols(snapshot, market, limit);
+      const job = await backgroundJobs.create("pit-enrichment", {
+        market,
+        symbols,
+        limit,
+        liveUniverse: false,
+        officialHistoryLimit: symbols.length || Number(dataProfile.officialPitBatch || 20),
+        corporateActionLimit: 0,
+        forceHistory: true,
+        reason,
+        resourceProfile: resources.selected,
+      });
+      runtime.lastPitEnrichmentByMarket[market] = Date.now();
+      queued.push(job.id);
+      // Keep one data family per market in flight. The next family is queued
+      // by the terminal callback after this batch writes its snapshot.
+      continue;
+    }
+    const corporateBlocked = coverage("corporate_actions") < 95
+      || (Array.isArray(datasets.corporate_actions?.missingSymbols) && datasets.corporate_actions.missingSymbols.length > 0);
+    const activeCorporate = (await backgroundJobs.list({ type: "corporate-action-backfill", market, limit: 10 })).jobs
+      ?.some((job) => ["queued", "running"].includes(job.status));
+    const corporateNoProgressUntil = Date.parse(String(runtime.corporateNoProgressByMarket[market]?.blockedUntil || "")) || 0;
+    if (corporateBlocked && !activeCorporate && Date.now() >= corporateNoProgressUntil) {
+      const job = await backgroundJobs.create("corporate-action-backfill", {
+        market,
+        symbols: normalizeSymbolListForMarket(datasets.corporate_actions?.missingSymbols || [], market),
+        limit: Number({ ASX: 350, US: 450, CN: 550 }[market]),
+        refreshDays: 30,
+        reason,
+      });
+      runtime.lastCorporateActionByMarket[market] = Date.now();
+      queued.push(job.id);
+      continue;
+    }
+    const historyBlocked = Number(snapshot.history?.missingOrShort || 0) > 0;
+    const activeHistory = (await backgroundJobs.list({ type: "history-backfill", market, limit: 10 })).jobs
+      ?.some((job) => ["queued", "running"].includes(job.status));
+    const historyNoProgressUntil = Date.parse(String(runtime.historyNoProgressByMarket[market]?.blockedUntil || "")) || 0;
+    if (historyBlocked && !activeHistory && Date.now() >= historyNoProgressUntil) {
+      const symbols = (snapshot.history?.nextSymbols || []).map((row) => row.symbol);
+      if (!symbols.length) continue;
+      const job = await backgroundJobs.create("history-backfill", {
+        market,
+        symbols,
+        range: snapshot.target?.range || DATA_REPLENISHMENT_TARGETS[market]?.range || "10y",
+        requiredRows: snapshot.target?.researchRows || DATA_REPLENISHMENT_TARGETS[market]?.researchRows || 750,
+        includeDelisted: false,
+        delistedBatch: Number(dataProfile.delistedBatch || 10),
+        reason,
+        resourceProfile: resources.selected,
+      });
+      runtime.lastHistoryReplenishmentByMarket[market] = Date.now();
+      queued.push(job.id);
+    }
   }
   runtime.lastEnrichmentCheckAt = new Date().toISOString();
   await writeBackendMonitorRuntime(runtime);
@@ -21446,13 +26569,22 @@ function startBackendMonitorScheduler() {
     });
   }, defaults.refresh.checkMs);
   backendMonitorTimer.unref?.();
-  const enrichmentCheckMs = Math.max(60_000, Number(process.env.BACKEND_ENRICHMENT_CHECK_MS || 15 * 60_000));
+  // Data is still below the auditable stage-one gates in US/CN. A five-minute
+  // scheduler tick only enqueues the next single-flight batch after the prior
+  // one finishes; it does not increase concurrent provider pressure.
+  const enrichmentCheckMs = Math.max(60_000, Number(process.env.BACKEND_ENRICHMENT_CHECK_MS || 5 * 60_000));
   const enrichmentStartupTimer = setTimeout(() => {
-    runBackendEnrichmentSchedulerTick().catch((error) => {
+    runBackendEnrichmentSchedulerTick({ forceContinuation: true }).catch((error) => {
       runtimeEvents.publish("enrichment.error", { error: error.message || String(error) });
     });
   }, Math.max(20_000, Number(process.env.BACKEND_ENRICHMENT_STARTUP_DELAY_MS || 70_000)));
   enrichmentStartupTimer.unref?.();
+  const persistedRecoveryTimer = setTimeout(() => {
+    queuePersistedDataRecovery("startup-persisted-gap-recovery").catch((error) => {
+      runtimeEvents.publish("enrichment.recovery_error", { error: error.message || String(error) });
+    });
+  }, Math.max(5_000, Number(process.env.BACKEND_ENRICHMENT_RECOVERY_DELAY_MS || 8_000)));
+  persistedRecoveryTimer.unref?.();
   backendEnrichmentTimer = setInterval(() => {
     runBackendEnrichmentSchedulerTick().catch((error) => {
       runtimeEvents.publish("enrichment.error", { error: error.message || String(error) });
@@ -21568,13 +26700,14 @@ function startLearningScheduler() {
 
 if (SERVER_RUNTIME_ENABLED) {
   let shutdownStarted = false;
-  const shutdown = () => {
+  const shutdown = async () => {
     if (shutdownStarted) return;
     shutdownStarted = true;
     if (backendMonitorTimer) clearInterval(backendMonitorTimer);
     if (backendEnrichmentTimer) clearInterval(backendEnrichmentTimer);
     if (trainingSupervisorTimer) clearInterval(trainingSupervisorTimer);
     if (learningSchedulerTimer) clearInterval(learningSchedulerTimer);
+    await backgroundJobs.shutdown?.("Backend is stopping; persisted job was interrupted and remains resumable after restart.").catch(() => null);
     runPythonQuantCore.close?.();
     server.close(() => process.exit(0));
     const forcedExit = setTimeout(() => process.exit(0), 3_000);
@@ -21624,6 +26757,7 @@ export {
   alpacaSnapshotQuoteFromPayload,
   alpacaTradeRows,
   factorSignal,
+  dataFrontierAssessment,
   firstStageDataReadiness,
   analysisBatchLimit,
   asxAnnouncementRows,
@@ -21680,6 +26814,12 @@ export {
   providerApiKeys,
   providerKeyPoolStatus,
   withProviderApiKey,
+  comparisonKeyFromManifest,
+  championPromotionDecision,
+  researchRegistryPointerPolicy,
+  researchRegistryPointers,
+  modelReportFreshness,
+  researchRouteStatus,
   sanitizeBackendMonitorConfig,
   trainIntradayLinearModel,
   stockAnalysisHistoryRows,

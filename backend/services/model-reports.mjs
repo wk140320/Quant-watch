@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
 
 const FORMATS = Object.freeze({
@@ -20,28 +21,41 @@ function createModelReportService(options = {}) {
   const basePath = options.basePath || join(root, ".cache", "model-reports");
   const runPython = options.runPython;
   if (!root || typeof runPython !== "function") throw new Error("Model report service requires root and Python client.");
+  let indexCache = null;
 
   async function list(filters = {}) {
-    const payload = await readFile(join(basePath, "index.json"), "utf8")
-      .then((text) => JSON.parse(text))
-      .catch(() => ({ reports: [] }));
+    let payload = null;
+    try {
+      // This is a small local index (not an OOF artifact). A synchronous read
+      // avoids an intermittent macOS async-file stall that used to leave the
+      // strategy page waiting forever for the report list.
+      payload = { ...(JSON.parse(readFileSync(join(basePath, "index.json"), "utf8")) || {}), indexReadTimedOut: false };
+      indexCache = payload;
+    } catch {
+      payload = { reports: [], indexReadTimedOut: false };
+    }
+    if (!payload.reports?.length && indexCache?.reports?.length) payload = { ...indexCache, indexReadTimedOut: false };
     const market = filters.market ? String(filters.market).toUpperCase() : null;
     const limit = Math.max(1, Math.min(100, Number(filters.limit || 30)));
     const reports = (payload.reports || [])
       .filter((row) => !market || (row.scope || []).includes(market))
       .slice(0, limit)
-      .map((row) => ({
-        reportId: row.reportId,
-        generatedAt: row.generatedAt,
-        scope: row.scope,
-        productionReady: row.productionReady === true,
-        links: {
-          json: `/api/model-reports/${encodeURIComponent(row.reportId)}?format=json`,
-          html: `/api/model-reports/${encodeURIComponent(row.reportId)}?format=html`,
-          docx: `/api/model-reports/${encodeURIComponent(row.reportId)}?format=docx`,
-        },
-      }));
-    return { available: true, market, count: reports.length, reports };
+      .map((row) => {
+        return {
+          reportId: row.reportId,
+          generatedAt: row.generatedAt,
+          scope: row.scope,
+          productionReady: row.productionReady === true,
+          reportVersions: row.reportVersions || {},
+          evidenceMetadataAvailable: row.evidenceMetadataAvailable === true,
+          links: {
+            json: `/api/model-reports/${encodeURIComponent(row.reportId)}?format=json`,
+            html: `/api/model-reports/${encodeURIComponent(row.reportId)}?format=html`,
+            docx: `/api/model-reports/${encodeURIComponent(row.reportId)}?format=docx`,
+          },
+        };
+      });
+    return { available: true, market, count: reports.length, reports, indexReadTimedOut: payload.indexReadTimedOut === true };
   }
 
   async function generate(payload = {}) {
@@ -50,7 +64,7 @@ function createModelReportService(options = {}) {
       : payload.market
         ? [payload.market]
         : ["ASX", "US", "CN"];
-    return runPython("model-report-generate", { root, markets }, Number(process.env.MODEL_REPORT_TIMEOUT_MS || 180_000));
+    return runPython("model-report-generate", { root, markets }, Number(process.env.MODEL_REPORT_TIMEOUT_MS || 600_000));
   }
 
   async function artifact(reportId, format = "json") {

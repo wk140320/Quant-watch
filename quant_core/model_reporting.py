@@ -561,6 +561,7 @@ def _hard_gate(dataset: dict[str, Any], horizon_model: dict[str, Any], audit: di
         ("positive_folds", sum(1 for fold in folds if fold.get("positive")) >= PRODUCTION_THRESHOLDS["minPositiveFolds"], sum(1 for fold in folds if fold.get("positive")), PRODUCTION_THRESHOLDS["minPositiveFolds"]),
         ("duplicates", int(audit.get("duplicateRows") or 0) == 0, int(audit.get("duplicateRows") or 0), 0),
         ("cross_market", int(audit.get("crossMarketRows") or 0) == 0, int(audit.get("crossMarketRows") or 0), 0),
+        ("outer_cross_section", (horizon_model.get("productionChecks") or {}).get("outerCrossSectionComplete") is True, (horizon_model.get("outerCrossSection") or {}).get("evaluatedPanelRows"), "complete date x symbol panel"),
         ("future_leakage", int(audit.get("futureAvailabilityRows") or 0) == 0 and int(dataset.get("pointInTimeJoinViolationCount") or 0) == 0, int(audit.get("futureAvailabilityRows") or 0) + int(dataset.get("pointInTimeJoinViolationCount") or 0), 0),
         ("brier_skill", number(metrics.get("brierSkillScore"), -1) > PRODUCTION_THRESHOLDS["minBrierSkill"], number(metrics.get("brierSkillScore"), -1), f">{PRODUCTION_THRESHOLDS['minBrierSkill']}"),
         ("direction_brier_skill", number(direction_metrics.get("brierSkillScore"), -1) > PRODUCTION_THRESHOLDS["minBrierSkill"], number(direction_metrics.get("brierSkillScore"), -1), f">{PRODUCTION_THRESHOLDS['minBrierSkill']}"),
@@ -598,9 +599,41 @@ def horizon_report(
     audit = {"available": False, "reason": model.get("reason") or "No usable OOF artifact."}
     if artifact.get("filename") and artifact_path.exists():
         rows, audit = read_oof_rows(artifact_path, manifest, market)
+    family_status = model.get("modelFamilyStatus") or {}
+    direction_unavailable = (
+        str(family_status.get("direction") or "").upper() == "NO_MODEL"
+        or ("directionModels" in model and not model.get("directionModels"))
+    )
+    path_unavailable = (
+        str(family_status.get("path") or "").upper() == "NO_MODEL"
+        or ("models" in model and not model.get("models"))
+    )
+    direction_outputs = {
+        "directionProbability",
+        "ridgeDirectionPrediction",
+        "elasticDirectionPrediction",
+        "treeDirectionPrediction",
+        "returnDirectionPrediction",
+        "regimeDirectionPrediction",
+        "rankerDirectionPrediction",
+    }
+    path_outputs = {
+        "ensembleProbability",
+        "targetProbability",
+        "stopProbability",
+        "timeoutProbability",
+        "pathSafetyPrediction",
+    }
     classifiers = []
     for key, label, actual_key in MODEL_OUTPUTS:
         result = classification_metrics(rows, key, actual_key)
+        if (direction_unavailable and key in direction_outputs) or (path_unavailable and key in path_outputs):
+            family = "direction" if key in direction_outputs else "path"
+            result = {
+                "available": False,
+                "reason": f"{family} model family is NO_MODEL; neutral placeholder values are excluded from report metrics.",
+                "samples": 0,
+            }
         if result.get("available"):
             result["accuracyCi95"] = classification_accuracy_block_ci(rows, key, actual_key=actual_key)
         classifiers.append({"id": key, "name": label, "task": "classification", "target": actual_key, "metrics": result})
@@ -642,7 +675,17 @@ def horizon_report(
 
 def factor_model_reports(root: Path, market: str) -> list[dict[str, Any]]:
     rows = []
-    for path in sorted((root / ".cache" / "models" / "factor-research").glob("*.json")):
+    factor_dir = root / ".cache" / "models" / "factor-research"
+    try:
+        factor_limit = max(12, min(200, int(os.getenv("MODEL_REPORT_FACTOR_LIMIT", "48"))))
+    except (TypeError, ValueError):
+        factor_limit = 48
+    # Factor research is append-only and can contain hundreds of legacy
+    # artifacts. Reports need a responsive recent view; the full files remain
+    # available for audit and are not deleted by this bound.
+    paths = list(factor_dir.glob("*.json"))
+    paths.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+    for path in paths[:factor_limit]:
         payload = read_json(path, {})
         if str(payload.get("market") or "").upper() != market:
             continue
@@ -787,31 +830,6 @@ def paper_agent_reports(root: Path, market: str) -> list[dict[str, Any]]:
     return reports
 
 
-def supervisor_reports(root: Path, market: str) -> list[dict[str, Any]]:
-    state = read_json(root / ".cache" / "training-supervisor" / "state.json", {})
-    market_state = (state.get("markets") or {}).get(market) or {}
-    reports = []
-    for provider in ("openai", "siliconflow", "hunyuan"):
-        review = next((row for row in market_state.get("reviewers") or [] if row.get("provider") == provider), {})
-        reports.append({
-            "modelId": f"{market.lower()}-supervisor-{provider}",
-            "market": market,
-            "family": "ai_supervisor",
-            "status": "available" if review.get("available") else "unavailable",
-            "available": bool(review.get("available")),
-            "provider": provider,
-            "model": review.get("model"),
-            "verdict": review.get("verdict") or "not_reviewed",
-            "score": review.get("score"),
-            "rationale": review.get("rationale") or review.get("error") or "No review evidence.",
-            "blockingIssues": review.get("blockingIssues") or [],
-            "recommendedActions": review.get("recommendedActions") or [],
-            "reviewedAt": review.get("reviewedAt"),
-            "note": "Supervisor opinions are governance evidence, not prediction accuracy.",
-        })
-    return reports
-
-
 def latest_registry(root: Path, market: str) -> dict[str, Any] | None:
     directory = root / ".cache" / "models" / "registry" / market.lower()
     index = read_json(directory / "index.json", {})
@@ -825,30 +843,14 @@ def latest_registry(root: Path, market: str) -> dict[str, Any] | None:
 def market_report(root: Path, market: str) -> dict[str, Any]:
     registry = latest_registry(root, market)
     horizon_reports: list[dict[str, Any]] = []
-    reviewers = supervisor_reports(root, market)
-    reviewer_approvals = sum(
-        1 for row in reviewers
-        if row.get("available") and row.get("verdict") == "accept"
-    )
     if registry:
         for model in registry.get("horizonModels") or []:
-            report = horizon_report(
+            horizon_reports.append(horizon_report(
                 market,
                 registry,
                 model,
                 root / ".cache" / "models" / "oof" / market.lower(),
-            )
-            review_check = {
-                "id": "ai_supervisor_consensus",
-                "passed": reviewer_approvals >= 2,
-                "value": reviewer_approvals,
-                "threshold": 2,
-            }
-            report["hardGate"]["checks"].append(review_check)
-            if not review_check["passed"]:
-                report["hardGate"]["passed"] = False
-                report["hardGate"]["failedChecks"].append(review_check["id"])
-            horizon_reports.append(report)
+            ))
     dataset = registry.get("dataset") if registry else {}
     production = registry.get("productionEligibility") if registry else {}
     models = [
@@ -856,7 +858,6 @@ def market_report(root: Path, market: str) -> dict[str, Any]:
         intraday_model_report(root, market),
         *factor_model_reports(root, market),
         *paper_agent_reports(root, market),
-        *reviewers,
     ]
     return {
         "market": market,
@@ -876,7 +877,6 @@ def market_report(root: Path, market: str) -> dict[str, Any]:
             "total": len(models),
             "available": sum(1 for model in models if model.get("available")),
             "hardGatePassed": sum(1 for model in models if model.get("hardGate", {}).get("passed")),
-            "aiSupervisorApprovals": reviewer_approvals,
         },
     }
 
@@ -995,7 +995,7 @@ def build_report_evidence(root: Path, markets: list[str] | None = None) -> dict[
         "generatedAt": generated_at,
         "title": "Global Quant Watch 全模型训练与生产验收报告",
         "scope": selected,
-        "honestBoundary": "Unavailable metrics remain unavailable. Duplicate decisions, paper returns, rule heads, and AI reviewer opinions are not relabeled as model accuracy.",
+        "honestBoundary": "Unavailable metrics remain unavailable. Duplicate decisions, paper returns, and rule heads are not relabeled as model accuracy. Promotion uses reproducible out-of-sample gates only.",
         "productionReady": all(
             row.get("productionEligibility", {}).get("eligible") is True
             and any(model.get("hardGate", {}).get("passed") for model in row["models"])
@@ -1010,7 +1010,7 @@ def build_report_evidence(root: Path, markets: list[str] | None = None) -> dict[
             "Complete point-in-time universe, delisting, corporate-action, and event histories.",
             "Run market-level purged walk-forward OOF training to the production sample thresholds.",
             "Keep every failed or under-supported model in Research/Shadow with zero live ensemble weight.",
-            "Require deterministic gates before requesting AI supervisor review.",
+            "Require every deterministic OOF, calibration, drift, and cost-adjusted return gate before promotion.",
         ],
     }
 
@@ -1118,10 +1118,6 @@ def render_html(evidence: dict[str, Any], target: Path) -> None:
                 ]
                 visuals = ""
                 task_detail = ""
-            elif family == "ai_supervisor":
-                metric_rows = [("结论", model.get("verdict")), ("评分", _fmt(model.get("score"), 0)), ("可用", "是" if model.get("available") else "否")]
-                visuals = ""
-                task_detail = ""
             else:
                 values = model.get("metrics") or {}
                 metric_rows = [(key, _fmt(value.get("value") if isinstance(value, dict) else value)) for key, value in list(values.items())[:8]]
@@ -1181,7 +1177,7 @@ p{{color:#c8d0d3}}details{{color:var(--muted)}}pre{{white-space:pre-wrap;color:#
 <nav class="filters" aria-label="报告筛选">
   <button type="button" data-market-filter="ALL" class="active">全部市场</button>
   {''.join(f'<button type="button" data-market-filter="{market}">{market}</button>' for market in evidence['scope'])}
-  <select id="familyFilter"><option value="ALL">全部模型族</option><option value="market_multitask">市场多任务</option><option value="factor_research">因子研究</option><option value="intraday">分钟模型</option><option value="paper_agent">Paper Agent</option><option value="ai_supervisor">AI 监工</option></select>
+  <select id="familyFilter"><option value="ALL">全部模型族</option><option value="market_multitask">市场多任务</option><option value="factor_research">因子研究</option><option value="intraday">分钟模型</option><option value="paper_agent">Paper Agent</option></select>
 </nav>
 {''.join(market_sections)}
 </main><script>
@@ -1257,6 +1253,11 @@ def _set_table_widths(table: Any, widths: list[float]) -> None:
 
 
 def _render_evidence_chart(metrics: dict[str, Any], target: Path) -> bool:
+    # Pillow can block for a long time while loading native image extensions
+    # on some local ML environments. HTML already contains the same evidence
+    # as SVG, so keep raster charts opt-in and make DOCX generation reliable.
+    if str(os.getenv("MODEL_REPORT_ENABLE_RASTER_CHARTS", "false")).lower() not in {"1", "true", "yes"}:
+        return False
     points = metrics.get("reliabilityCurve") or []
     matrix = metrics.get("confusionMatrix") or {}
     if not points or not matrix:
@@ -1502,10 +1503,9 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
             else:
                 doc.add_paragraph("OOF chart unavailable because reliability-curve or confusion-matrix evidence is insufficient.")
 
-    doc.add_heading("3. Paper Agents and AI supervisors", level=1)
+    doc.add_heading("3. Paper Agents", level=1)
     for market in evidence["markets"]:
         agents = [model for model in market["models"] if model.get("family") == "paper_agent"]
-        reviewers = [model for model in market["models"] if model.get("family") == "ai_supervisor"]
         doc.add_heading(market["market"], level=2)
         for agent in agents:
             values = agent.get("metrics") or {}
@@ -1513,11 +1513,6 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
                 f"{agent.get('name') or agent.get('modelId')}: net return after costs {_fmt(values.get('netReturnPct'), suffix='%')}; "
                 f"trades {values.get('tradeCount', 0)}; win rate {_fmt(values.get('winRatePct'), suffix='%')}."
             )
-        for reviewer in reviewers:
-            doc.add_paragraph(
-                f"{reviewer.get('provider')}: verdict={reviewer.get('verdict')}; available={reviewer.get('available')}."
-            )
-
     doc.add_heading("4. Production gates and rework", level=1)
     gate_table = doc.add_table(rows=1, cols=3)
     gate_table.style = "Table Grid"
@@ -1530,7 +1525,7 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
         ("Probability", "Brier Skill > 0, ECE <= 5%, slope 0.8-1.2", "Keep probabilities interpretable"),
         ("Quality", "Zero contamination, duplicates, and leakage; PSI <= 0.40", "Block leakage and drift"),
         ("Return", "Positive Top-K Lift and net EV", "Require economic value after costs"),
-        ("Supervision", "At least two available AI supervisors accept", "Review only after deterministic gates"),
+        ("Decision", "All deterministic gates pass; no external AI vote", "Keep promotion reproducible and quota-independent"),
     )
     for requirement in requirements:
         cells = gate_table.add_row().cells
@@ -1542,7 +1537,7 @@ def render_docx(evidence: dict[str, Any], target: Path) -> None:
     for action in evidence["recommendedActions"]:
         doc.add_paragraph(action, style="List Bullet")
     doc.add_paragraph(
-        "Paper Agent returns, rule heads, AI reviewer opinions, and duplicate predictions are never relabeled as classification accuracy. "
+        "Paper Agent returns, rule heads, and duplicate predictions are never relabeled as classification accuracy. "
         "Missing metrics remain unavailable until a strict OOF artifact can support them."
     )
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1576,6 +1571,12 @@ def generate_model_report(
         "generatedAt": evidence["generatedAt"],
         "scope": evidence["scope"],
         "productionReady": evidence["productionReady"],
+        "reportVersions": {
+            str(row.get("market") or "").upper(): row.get("modelVersion")
+            for row in evidence.get("markets") or []
+            if row.get("market")
+        },
+        "evidenceMetadataAvailable": True,
         "basePath": str(base),
         "jsonPath": str(json_path),
         "htmlPath": str(html_path),

@@ -124,10 +124,42 @@ const SUPERVISOR_STATES = Object.freeze({
   idle: ["等待周期", ""],
   queued: ["已排队", "blue"],
   training: ["训练中", "blue"],
-  reviewing: ["三方验收中", "blue"],
+  evaluating: ["固定门禁核验中", "blue"],
+  reviewing: ["固定门禁核验中", "blue"],
   rework_scheduled: ["自动返工", "gold"],
   accepted: ["本周期通过", "good"],
+  completed_not_promoted: ["未通过门禁", "gold"],
+  awaiting_optional_review: ["旧状态待迁移", "gold"],
   needs_attention: ["需要协助", "danger"],
+});
+
+const SUPERVISOR_GATE_GROUPS = Object.freeze([
+  {
+    label: "数据与隔离",
+    ids: ["training_output", "dataset_rows", "symbol_breadth", "point_in_time", "sample_isolation", "horizon_models", "oof_depth", "event_support", "independent_dates", "leakage_controls"],
+  },
+  {
+    label: "统计与泛化",
+    ids: ["rolling_folds", "brier_skill", "direction_threshold_selection", "balanced_accuracy", "direction_mcc", "relative_majority_accuracy", "direction_threshold_coverage", "calibration_ece", "calibration_slope", "probability_bucket_support", "feature_drift", "monitoring_status"],
+  },
+  {
+    label: "排序与收益",
+    ids: ["top_k_lift", "top10_direction", "expected_value", "direction_accuracy", "production_data"],
+  },
+]);
+
+const SUPERVISOR_EVENT_LABELS = Object.freeze({
+  "cycle-started": "训练周期启动",
+  "job-started": "后台训练启动",
+  "gate-evaluation-started": "固定门禁开始核验",
+  "gate-evaluation-complete": "固定门禁核验完成",
+  "deterministic-review-complete": "历史固定门禁核验",
+  accepted: "本周期通过",
+  rework: "自动安排返工",
+  "completed-not-promoted": "训练完成但未晋级",
+  "unchanged-data": "数据未变化",
+  queued: "等待训练资源",
+  "legacy-ai-review-retired": "旧审核状态已迁移",
 });
 
 function renderTrainingSupervisor(status) {
@@ -149,33 +181,34 @@ function renderTrainingSupervisor(status) {
   marketToggle.checked = cycle.enabled !== false;
   masterToggle.disabled = state.busy;
   marketToggle.disabled = state.busy;
-  $("supervisorMarketLabel").textContent = `${MARKET_LABELS[state.market] || state.market} 市场监工`;
+  $("supervisorMarketLabel").textContent = `${MARKET_LABELS[state.market] || state.market} 市场训练`;
   const controlState = $("supervisorControlState");
-  controlState.textContent = supervisor.enabled === false ? "自动调度已暂停" : cycle.enabled === false ? "本市场已暂停" : "人工控制可用";
+  controlState.textContent = supervisor.enabled === false ? "自动调度已暂停" : cycle.enabled === false ? "本市场已暂停" : "训练控制可用";
   controlState.className = `status-pill ${supervisor.enabled === false || cycle.enabled === false ? "gold" : "good"}`;
   $("supervisorOverview").innerHTML = `
     <div class="supervisor-ops-stat"><span>训练周期</span><strong>${escapeHtml(cycle.cycleId ? String(cycle.cycleId).slice(-18) : "等待首轮")}</strong><small>尝试 ${Number(cycle.attempt || 0)}/${Number(cycle.maxAttempts || supervisor.config?.maxAttempts || 0)}</small></div>
     <div class="supervisor-ops-stat"><span>${activeJob ? "后台作业进度" : "样本外硬门槛"}</span><strong>${activeJob ? `${Math.round(Number(activeJob.progress || 0) * 100)}%` : `${Number(evaluation.score || 0)} / 100`}</strong><small>${activeJob ? `${escapeHtml(jobDetail.phase || activeJob.status || "training")} · ${Number(jobDetail.completed || 0)}/${Number(jobDetail.total || plan.limit || 0)}${jobDetail.symbol ? ` · ${escapeHtml(jobDetail.symbol)}` : ""}` : `${passed}/${(evaluation.checks || []).length} 通过 · ${blockingFailed} 条阻塞 · 只接受 OOF 证据`}</small></div>
-    <div class="supervisor-ops-stat"><span>下一动作</span><strong>${escapeHtml(cycle.status === "training" ? "后台训练进行中" : cycle.status === "reviewing" ? "独立 AI 审核" : cycle.status === "rework_scheduled" ? "自动启动返工" : cycle.status === "accepted" ? "等待下个周期" : "等待调度")}</strong><small>${activeJob ? `更新 ${escapeHtml(formatTime(activeJob.updatedAt, { full: true }))}` : `${escapeHtml(formatTime(cycle.nextActionAt || cycle.nextCycleAt, { full: true }))} · ${Number(plan.limit || 0)} 只 / ${escapeHtml(plan.range || "待定")} / ${Number(plan.foldCount || 0)} 折`}</small></div>
+    <div class="supervisor-ops-stat"><span>下一动作</span><strong>${escapeHtml(cycle.status === "training" ? "后台训练进行中" : ["evaluating", "reviewing"].includes(cycle.status) ? "固定门槛核验" : cycle.status === "rework_scheduled" ? "自动启动返工" : cycle.status === "accepted" ? "等待下个周期" : "等待调度")}</strong><small>${activeJob ? `更新 ${escapeHtml(formatTime(activeJob.updatedAt, { full: true }))}` : `${escapeHtml(formatTime(cycle.nextActionAt || cycle.nextCycleAt, { full: true }))} · ${Number(plan.limit || 0)} 只 / ${escapeHtml(plan.range || "待定")} / ${Number(plan.foldCount || 0)} 折`}</small></div>
   `;
-  const reviewMap = new Map((cycle.reviewers || []).map((review) => [review.provider, review]));
-  const providers = supervisor.providers || [];
-  $("supervisorReviewers").innerHTML = providers.length ? providers.map((provider) => {
-    const review = reviewMap.get(provider.id);
-    const enabled = provider.enabled !== false;
-    const verdict = !enabled || review?.disabled ? ["已关闭", ""]
-      : review?.available === false ? ["失败", "danger"]
-      : review?.verdict === "accept" ? ["通过", "good"]
-        : review?.verdict === "needs_data" ? ["补数据", "gold"]
-          : review?.verdict === "rework" ? ["返工", "gold"]
-            : provider.configured && provider.active ? ["待审核", "blue"] : ["未配置", "danger"];
+  const checks = Array.isArray(evaluation.checks) ? evaluation.checks : [];
+  const checkMap = new Map(checks.map((check) => [check.id, check]));
+  $("supervisorGateGroups").innerHTML = SUPERVISOR_GATE_GROUPS.map((group) => {
+    const rows = group.ids.map((id) => checkMap.get(id)).filter(Boolean);
+    const blockingRows = rows.filter((check) => check.blocking !== false);
+    const failedRows = blockingRows.filter((check) => !check.passed);
+    const verdict = !rows.length ? ["等待证据", ""] : failedRows.length ? [`${failedRows.length} 项阻塞`, "gold"] : ["通过", "good"];
+    const detail = !rows.length
+      ? "本轮训练完成后显示固定门槛结果。"
+      : failedRows.length
+        ? failedRows.map((check) => check.label || check.id).join("；")
+        : `${rows.filter((check) => check.passed).length}/${rows.length} 项已有证据。`;
     return `
-      <article class="supervisor-reviewer-row">
-        <header><div><strong>${escapeHtml(provider.label)}</strong><small>${escapeHtml(provider.model || "")}</small></div><div class="supervisor-reviewer-actions">${statusPill(verdict[0], verdict[1])}<label class="monitor-switch" title="${enabled ? "关闭" : "开启"}${escapeHtml(provider.label)}"><input type="checkbox" data-supervisor-provider="${escapeHtml(provider.id)}" ${enabled ? "checked" : ""}><span></span></label></div></header>
-        <p>${escapeHtml(!enabled ? "已手动关闭：不调用、不消耗额度、不计验收票。" : review?.rationale || provider.role || "独立审核本地训练产物。")}</p>
+      <article class="supervisor-gate-row">
+        <header><div><strong>${escapeHtml(group.label)}</strong><small>${rows.length} 项本地门槛</small></div>${statusPill(verdict[0], verdict[1])}</header>
+        <p>${escapeHtml(detail)}</p>
       </article>
     `;
-  }).join("") : `<div class="muted-line">尚未读取 AI 提供方配置。</div>`;
+  }).join("");
   const logs = (supervisor.logs || []).filter((event) => !event.market || event.market === state.market);
   const operatorLogs = logs.filter((event) => event.type === "operator-action").slice(0, 8);
   $("supervisorOperatorLog").innerHTML = `
@@ -187,18 +220,21 @@ function renderTrainingSupervisor(status) {
       }).join("") : `<p class="muted-line">尚无人工操作记录。</p>`}
     </div>
   `;
+  const gateLogs = logs.filter((event) => event.type !== "operator-action" && event.type !== "reviewer-verdict").slice(0, 12);
   $("supervisorLogs").innerHTML = `
-    <div class="supervisor-log-title"><strong>三方监工日志</strong><span>${logs.length} 条本地记录</span></div>
-    <div class="supervisor-log-grid">
-      ${providers.map((provider) => {
-        const rows = logs.filter((event) => event.type === "reviewer-verdict" && event.provider === provider.id).slice(0, 5);
-        return `<section><header><strong>${escapeHtml(provider.label)}</strong><small>${provider.enabled === false ? "关闭" : "开启"}</small></header>${rows.length ? rows.map((event) => `<article><div>${statusPill(event.disabled ? "未调用" : event.verdict === "accept" ? "通过" : event.available === false ? "失败" : event.verdict === "needs_data" ? "补数据" : "返工", event.verdict === "accept" && !event.disabled ? "good" : event.available === false && !event.disabled ? "danger" : "gold")}<time>${escapeHtml(formatTime(event.reviewedAt || event.createdAt))}</time></div><p>${escapeHtml(event.rationale || event.error || "未附加说明")}</p>${event.blockingIssues?.length ? `<small>阻塞：${escapeHtml(event.blockingIssues.join("；"))}</small>` : ""}</article>`).join("") : `<p class="muted-line">尚无审核日志。</p>`}</section>`;
-      }).join("")}
+    <div class="supervisor-log-title"><strong>确定性门禁记录</strong><span>${gateLogs.length} 条最近记录</span></div>
+    <div class="supervisor-log-grid deterministic-log-grid">
+      <section><header><strong>本地训练证据</strong><small>不调用外部模型</small></header>${gateLogs.length ? gateLogs.map((event) => {
+        const acceptedEvent = event.accepted === true || event.type === "accepted";
+        const failedEvent = event.accepted === false || ["rework", "completed-not-promoted"].includes(event.type);
+        const label = SUPERVISOR_EVENT_LABELS[event.type] || event.type || "状态更新";
+        return `<article><div>${statusPill(label, acceptedEvent ? "good" : failedEvent ? "gold" : "blue")}<time>${escapeHtml(formatTime(event.createdAt))}</time></div><p>${escapeHtml(event.reason || event.error || event.evaluation?.failedChecks?.join("；") || "证据与状态已保存。")}</p></article>`;
+      }).join("") : `<p class="muted-line">尚无门禁记录。</p>`}</section>
     </div>
   `;
   $("supervisorHint").textContent = cycle.lastError
     ? `最近阻塞：${cycle.lastError}`
-    : "训练失败会自动返工；连续不达标时发送桌面/手机通知。";
+    : "训练核验完全由本地固定门槛完成，不消耗外部 AI 额度。";
 }
 
 function renderStatusSummary(status) {
@@ -712,13 +748,13 @@ async function runOnce() {
 async function runSupervisor() {
   setBusy(true);
   try {
-    $("supervisorHint").textContent = `${MARKET_LABELS[state.market] || state.market} 训练监工正在安排本轮任务`;
+    $("supervisorHint").textContent = `${MARKET_LABELS[state.market] || state.market} 训练调度正在安排本轮任务`;
     const result = await fetchJson("/api/training-supervisor/run", {
       method: "POST",
       body: JSON.stringify({ market: state.market, reason: "manual-monitor-app", source: "GlobalQuantMonitor", operatorNote: $("supervisorOperatorNote").value.trim() }),
     });
     $("supervisorHint").textContent = result.reason === "already-running"
-      ? "本市场训练已在运行；监工会继续跟进和验收。"
+      ? "本市场训练已在运行；完成后会自动执行固定门禁核验。"
       : `训练周期已${result.queued ? "排队" : "启动"}；失败将自动返工。`;
     await refreshStatus({ quiet: true });
   } catch (error) {
@@ -731,19 +767,19 @@ async function runSupervisor() {
 async function reviewSupervisor() {
   setBusy(true);
   try {
-    $("supervisorHint").textContent = "正在读取最近完整训练产物并重新执行硬门槛与三方验收";
+    $("supervisorHint").textContent = "正在读取最近完整训练产物并重新执行固定门槛核验";
     const result = await fetchJson("/api/training-supervisor/review", {
       method: "POST",
       body: JSON.stringify({ market: state.market, source: "GlobalQuantMonitor", operatorNote: $("supervisorOperatorNote").value.trim() }),
     });
     $("supervisorHint").textContent = result.reason === "already-running"
-      ? "当前训练或验收正在运行，本次重新验收请求已写入审计日志。"
+      ? "当前训练或核验正在运行，本次重新核验请求已写入审计日志。"
       : result.reason === "no-complete-job"
         ? "当前市场没有可重新验收的完整训练产物。"
-        : "最近训练产物已重新验收；结论与阻断项已写入三方日志。";
+        : "最近训练产物已重新核验；结论与阻断项已写入本地证据日志。";
     await refreshStatus({ quiet: true });
   } catch (error) {
-    $("supervisorHint").textContent = `重新验收失败：${error.message}`;
+    $("supervisorHint").textContent = `重新核验失败：${error.message}`;
   } finally {
     setBusy(false);
   }
@@ -761,28 +797,13 @@ async function toggleSupervisorScope(scope, enabled) {
     await fetchJson("/api/training-supervisor/config", { method: "POST", body: JSON.stringify(payload) });
     await refreshStatus({ quiet: true });
     $("supervisorHint").textContent = scope === "global"
-      ? `自动监工总调度已${enabled ? "开启" : "暂停"}。`
-      : `${MARKET_LABELS[state.market] || state.market} 市场监工已${enabled ? "开启" : "暂停"}。`;
+      ? `自动训练总调度已${enabled ? "开启" : "暂停"}。`
+      : `${MARKET_LABELS[state.market] || state.market} 市场训练已${enabled ? "开启" : "暂停"}。`;
   } catch (error) {
-    $("supervisorHint").textContent = `监工范围切换失败：${error.message}`;
+    $("supervisorHint").textContent = `训练范围切换失败：${error.message}`;
     await refreshStatus({ quiet: true });
   } finally {
     setBusy(false);
-  }
-}
-
-async function toggleSupervisorReviewer(provider, enabled) {
-  try {
-    $("supervisorHint").textContent = `${enabled ? "开启" : "关闭"} ${provider} 监工...`;
-    await fetchJson("/api/training-supervisor/config", {
-      method: "POST",
-      body: JSON.stringify({ market: state.market, reviewer: provider, reviewerEnabled: enabled, source: "GlobalQuantMonitor", operatorNote: $("supervisorOperatorNote").value.trim() }),
-    });
-    await refreshStatus({ quiet: true });
-    $("supervisorHint").textContent = `${provider} 监工已${enabled ? "开启" : "关闭"}，重启后仍保持。`;
-  } catch (error) {
-    $("supervisorHint").textContent = `监工开关失败：${error.message}`;
-    await refreshStatus({ quiet: true });
   }
 }
 
@@ -842,14 +863,6 @@ $("reviewSupervisor").addEventListener("click", reviewSupervisor);
 $("refreshSupervisor").addEventListener("click", () => refreshStatus());
 $("supervisorMasterToggle").addEventListener("change", (event) => toggleSupervisorScope("global", event.target.checked));
 $("supervisorMarketToggle").addEventListener("change", (event) => toggleSupervisorScope("market", event.target.checked));
-$("supervisorReviewers").addEventListener("change", (event) => {
-  const input = event.target.closest("[data-supervisor-provider]");
-  if (!input) return;
-  input.disabled = true;
-  toggleSupervisorReviewer(input.dataset.supervisorProvider, input.checked).finally(() => {
-    if (input.isConnected) input.disabled = false;
-  });
-});
 $("trajectoryChart").addEventListener("pointermove", chartPointer);
 $("trajectoryChart").addEventListener("pointerleave", () => { $("chartTooltip").hidden = true; });
 
